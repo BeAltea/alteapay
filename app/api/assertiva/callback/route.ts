@@ -1,6 +1,19 @@
 import { NextResponse } from "next/server"
 import { createAdminClient } from "@/lib/supabase/admin"
 
+// Format CPF (000.000.000-00) or CNPJ (00.000.000/0000-00)
+function formatDocument(cleanDoc: string): string {
+  const digits = cleanDoc.replace(/\D/g, "")
+  if (digits.length === 11) {
+    // CPF: 000.000.000-00
+    return digits.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4")
+  } else if (digits.length === 14) {
+    // CNPJ: 00.000.000/0000-00
+    return digits.replace(/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, "$1.$2.$3/$4-$5")
+  }
+  return cleanDoc // Return as-is if format doesn't match
+}
+
 function validateAssertivaWebhook(request: Request): boolean {
   // Assertiva envia um header de assinatura (se configurado)
   const signature = request.headers.get("x-assertiva-signature")
@@ -101,11 +114,12 @@ export async function POST(request: Request) {
     const documentType = cleanDoc.length === 11 ? "CPF" : "CNPJ"
     const isPF = documentType === "CPF"
 
-    // 1. Buscar cliente na tabela VMAX
+    // 1. Buscar cliente na tabela VMAX (VMAX stores formatted CPF/CNPJ)
+    const formattedDoc = formatDocument(cleanDoc)
     const { data: vmaxRecord, error: vmaxError } = await supabase
       .from("VMAX")
       .select("*")
-      .eq('"CPF/CNPJ"', cleanDoc)
+      .eq('"CPF/CNPJ"', formattedDoc)
       .single()
 
     if (vmaxRecord) {
