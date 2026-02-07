@@ -189,7 +189,7 @@ export default async function SuperAdminCompaniesPage() {
   const avgDebtPerCustomer = totalCustomers > 0 ? stats.totalVolume / totalCustomers : 0
 
   return (
-    <div className="min-h-screen w-full overflow-x-hidden bg-background space-y-6">
+    <div className="w-full overflow-x-hidden space-y-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>

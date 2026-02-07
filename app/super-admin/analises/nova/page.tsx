@@ -21,7 +21,7 @@ export default async function NovaAnalisePage() {
   }
 
   return (
-    <div className="container mx-auto py-8">
+    <div className="w-full space-y-6">
       <div className="max-w-2xl mx-auto">
         <h1 className="text-3xl font-bold mb-6">Nova Análise Assertiva</h1>
         <p className="text-muted-foreground mb-8">

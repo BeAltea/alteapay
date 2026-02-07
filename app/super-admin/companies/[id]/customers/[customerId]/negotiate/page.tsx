@@ -50,7 +50,7 @@ export default async function SuperAdminNegotiatePage(props: {
   ) || 0
 
   return (
-    <div className="container mx-auto p-4 md:p-8 max-w-5xl space-y-6">
+    <div className="w-full max-w-5xl space-y-6">
       <Link
         href={`/super-admin/companies/${companyId}/customers`}
         className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"

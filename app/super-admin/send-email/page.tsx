@@ -131,7 +131,7 @@ export default async function SendEmailPage() {
   const { companies, recipientsMap, emailTrackingMap } = await fetchData()
 
   return (
-    <div className="min-h-screen w-full overflow-x-hidden bg-background space-y-6">
+    <div className="w-full overflow-x-hidden space-y-6">
       {/* Header */}
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Enviar Email</h1>

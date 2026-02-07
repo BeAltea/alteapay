@@ -10,7 +10,7 @@ export default function MigrateScoresPage() {
   }
 
   return (
-    <div className="container mx-auto p-6 max-w-4xl">
+    <div className="w-full max-w-4xl space-y-6">
       <Card>
         <CardHeader>
           <CardTitle>Migração: Score de Crédito → Score de Recuperação</CardTitle>

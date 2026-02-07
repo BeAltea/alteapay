@@ -160,8 +160,7 @@ export default async function SuperAdminDashboardPage() {
   }
 
   return (
-    <div className="min-h-screen bg-[var(--sa-bg-primary)]">
-      <div className="p-8">
+    <div className="w-full space-y-6">
         {/* Page Header */}
         <div className="flex justify-between items-start mb-8">
           <div>
@@ -461,7 +460,6 @@ export default async function SuperAdminDashboardPage() {
             </div>
           </div>
         </div>
-      </div>
     </div>
   )
 }

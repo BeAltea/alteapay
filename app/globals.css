@@ -1237,3 +1237,329 @@
 .dark .animate-pulse {
   background-color: var(--sa-bg-tertiary) !important;
 }
+
+/* ==========================================================================
+   Gold/Amber/Yellow Action Cards - Force Dark Text for Readability
+   These cards have gold/yellow backgrounds and ALWAYS need dark text
+   ========================================================================== */
+
+/* Gold gradient cards - common pattern for action/CTA cards */
+.bg-gradient-to-br.from-yellow-50,
+.bg-gradient-to-br.from-yellow-100,
+.bg-gradient-to-r.from-yellow-50,
+.bg-gradient-to-r.from-yellow-100,
+[class*="bg-gradient"][class*="yellow"],
+[class*="bg-yellow-50"],
+[class*="bg-yellow-100"],
+[class*="bg-amber-50"],
+[class*="bg-amber-100"],
+.border-yellow-300,
+.border-yellow-400,
+.border-amber-300,
+.border-amber-400 {
+  --card-text-primary: #1E2236 !important;
+  --card-text-secondary: #4D5369 !important;
+}
+
+/* Force dark text on gold/yellow/amber action cards */
+.bg-gradient-to-br.from-yellow-50 h1,
+.bg-gradient-to-br.from-yellow-50 h2,
+.bg-gradient-to-br.from-yellow-50 h3,
+.bg-gradient-to-br.from-yellow-50 h4,
+.bg-gradient-to-br.from-yellow-50 p,
+.bg-gradient-to-br.from-yellow-100 h1,
+.bg-gradient-to-br.from-yellow-100 h2,
+.bg-gradient-to-br.from-yellow-100 h3,
+.bg-gradient-to-br.from-yellow-100 h4,
+.bg-gradient-to-br.from-yellow-100 p,
+.bg-gradient-to-r.from-yellow-50 h1,
+.bg-gradient-to-r.from-yellow-50 h2,
+.bg-gradient-to-r.from-yellow-50 h3,
+.bg-gradient-to-r.from-yellow-50 h4,
+.bg-gradient-to-r.from-yellow-50 p,
+[class*="border-yellow-300"] h3,
+[class*="border-yellow-300"] p,
+[class*="border-yellow-400"] h3,
+[class*="border-yellow-400"] p {
+  color: #1E2236 !important;
+}
+
+/* Subtitle/secondary text on gold cards */
+.bg-gradient-to-br.from-yellow-50 .text-muted-foreground,
+.bg-gradient-to-br.from-yellow-100 .text-muted-foreground,
+.bg-gradient-to-r.from-yellow-50 .text-muted-foreground,
+[class*="border-yellow-300"] .text-muted-foreground,
+[class*="border-yellow-300"] .text-sm,
+[class*="border-yellow-400"] .text-muted-foreground {
+  color: #4D5369 !important;
+}
+
+/* Gold card with border-2 border-yellow-300 pattern (analysis pages) */
+.dark .border-2.border-yellow-300,
+.dark [class*="border-yellow-300"][class*="bg-gradient"] {
+  background: linear-gradient(135deg, rgba(245, 166, 35, 0.15) 0%, rgba(245, 166, 35, 0.05) 100%) !important;
+  border-color: var(--sa-gold-400) !important;
+}
+
+.dark .border-2.border-yellow-300 h3,
+.dark .border-2.border-yellow-300 .text-xl,
+.dark [class*="border-yellow-300"] h3 {
+  color: var(--sa-text-primary) !important;
+}
+
+.dark .border-2.border-yellow-300 p,
+.dark .border-2.border-yellow-300 .text-sm,
+.dark .border-2.border-yellow-300 .text-muted-foreground {
+  color: var(--sa-text-secondary) !important;
+}
+
+/* ==========================================================================
+   Outline/Ghost Buttons - Dark Mode Visibility
+   Ensures proper contrast for inactive filter buttons, sort buttons, etc.
+   ========================================================================== */
+
+/* Base outline button styling in dark mode */
+.dark button[class*="variant-outline"],
+.dark [data-slot="button"]:not([class*="bg-gradient"]):not([class*="bg-primary"]):not([class*="bg-destructive"]),
+.dark button.border:not([class*="bg-"]),
+.dark button[class*="border-"]:not([class*="bg-"]) {
+  background-color: var(--sa-bg-tertiary);
+  border-color: var(--sa-border-primary);
+  color: var(--sa-text-primary);
+}
+
+/* Hover state for outline buttons */
+.dark button[class*="variant-outline"]:hover,
+.dark button.border:hover:not([class*="bg-"]),
+.dark button[class*="border-"]:hover:not([class*="bg-"]) {
+  background-color: var(--sa-border-primary);
+  color: var(--sa-text-primary);
+}
+
+/* Active/selected state buttons (gold background) - ensure dark text */
+button[class*="bg-primary"],
+button[class*="bg-gradient-to-r"][class*="from-yellow"],
+button[class*="bg-gradient-to-r"][class*="from-gold"],
+[data-slot="button"][class*="bg-primary"],
+.dark button[class*="bg-primary"],
+.dark [data-slot="button"][class*="bg-primary"] {
+  color: #1E2236 !important;
+}
+
+/* Sort/filter button row styling */
+.dark .gap-2 > button[class*="outline"],
+.dark .flex.gap-2 > button {
+  background-color: var(--sa-bg-tertiary);
+  border: 1px solid var(--sa-border-primary);
+  color: var(--sa-text-primary);
+}
+
+.dark .gap-2 > button[class*="outline"]:hover,
+.dark .flex.gap-2 > button:hover {
+  background-color: var(--sa-border-primary);
+}
+
+/* ==========================================================================
+   "Selecionar Todos" and Dropdown Buttons - Dark Mode
+   ========================================================================== */
+
+/* Button with gap-2 border-2 pattern (Selecionar Todos) */
+.dark button.gap-2.border-2,
+.dark button[class*="gap-2"][class*="border-2"],
+.dark button[class*="bg-transparent"][class*="border"] {
+  background-color: var(--sa-bg-tertiary) !important;
+  border-color: var(--sa-border-primary) !important;
+  color: var(--sa-text-primary) !important;
+}
+
+.dark button.gap-2.border-2:hover,
+.dark button[class*="gap-2"][class*="border-2"]:hover {
+  background-color: var(--sa-border-primary) !important;
+}
+
+/* Icons inside selection buttons */
+.dark button.gap-2.border-2 svg,
+.dark button[class*="gap-2"][class*="border-2"] svg {
+  color: var(--sa-text-secondary);
+}
+
+/* ==========================================================================
+   Table/List Row Action Buttons (Ver, Editar, Excluir)
+   ========================================================================== */
+
+/* Action buttons in table rows */
+.dark .space-x-2 > [data-slot="button"],
+.dark .flex.space-x-2 > button,
+.dark .flex.space-x-2 > a > button,
+.dark .flex.gap-2 > [data-slot="button"] {
+  background-color: var(--sa-bg-tertiary);
+  border-color: var(--sa-border-primary);
+  color: var(--sa-text-primary);
+}
+
+.dark .space-x-2 > [data-slot="button"]:hover,
+.dark .flex.space-x-2 > button:hover,
+.dark .flex.space-x-2 > a > button:hover {
+  background-color: var(--sa-border-primary);
+}
+
+/* Destructive buttons (Excluir) */
+.dark button[class*="destructive"],
+.dark [data-slot="button"][class*="destructive"] {
+  color: var(--sa-red) !important;
+  border-color: rgba(239, 68, 68, 0.3) !important;
+  background-color: transparent !important;
+}
+
+.dark button[class*="destructive"]:hover,
+.dark [data-slot="button"][class*="destructive"]:hover {
+  background-color: var(--sa-red-bg) !important;
+}
+
+/* ==========================================================================
+   Company/Customer Row Styling
+   ========================================================================== */
+
+/* Row container hover */
+.dark .hover\:bg-gray-50:hover,
+.dark [class*="hover:bg-gray-50"]:hover,
+.dark .hover\:bg-gray-800:hover {
+  background-color: var(--sa-bg-tertiary) !important;
+}
+
+/* Row borders */
+.dark .border-gray-200,
+.dark [class*="border-gray-200"],
+.dark .border-gray-700,
+.dark [class*="border-gray-700"] {
+  border-color: var(--sa-border-primary) !important;
+}
+
+/* Row text colors */
+.dark .text-gray-900,
+.dark [class*="text-gray-900"] {
+  color: var(--sa-text-primary) !important;
+}
+
+.dark .text-gray-500,
+.dark [class*="text-gray-500"],
+.dark .text-gray-400,
+.dark [class*="text-gray-400"],
+.dark .text-gray-600,
+.dark [class*="text-gray-600"] {
+  color: var(--sa-text-secondary) !important;
+}
+
+/* Stat values in rows */
+.dark .text-sm.font-medium {
+  color: var(--sa-text-primary);
+}
+
+/* Stat labels */
+.dark .text-xs.text-gray-500,
+.dark .text-xs.text-gray-400,
+.dark .text-xs.text-muted-foreground {
+  color: var(--sa-text-muted) !important;
+}
+
+/* ==========================================================================
+   Additional Component Fixes
+   ========================================================================== */
+
+/* Search input icon */
+.dark .text-gray-400 {
+  color: var(--sa-text-muted) !important;
+}
+
+/* Page title and description */
+.dark h1.text-3xl,
+.dark .text-3xl.font-bold {
+  color: var(--sa-text-primary);
+}
+
+.dark .text-muted-foreground {
+  color: var(--sa-text-secondary);
+}
+
+/* Empty state styling */
+.dark .text-center.py-8 p.text-lg,
+.dark .text-center p.text-lg.font-medium {
+  color: var(--sa-text-primary) !important;
+}
+
+.dark .text-center.py-8 p.text-gray-600,
+.dark .text-center p.text-gray-400 {
+  color: var(--sa-text-secondary) !important;
+}
+
+/* Card stat icon containers */
+.dark .h-4.w-4.text-muted-foreground {
+  color: var(--sa-text-muted);
+}
+
+/* Ensure white text in dark mode for items with explicit dark:text-white */
+.dark .dark\:text-white {
+  color: var(--sa-text-primary) !important;
+}
+
+/* Badge adjustments for various states */
+.dark .bg-green-500,
+.dark [class*="bg-green-500"] {
+  background-color: var(--sa-green) !important;
+  color: white !important;
+}
+
+.dark .text-green-600,
+.dark .text-green-400,
+.dark [class*="text-green-600"],
+.dark [class*="text-green-400"] {
+  color: var(--sa-green) !important;
+}
+
+.dark .text-red-600,
+.dark .text-red-400,
+.dark [class*="text-red-600"],
+.dark [class*="text-red-400"] {
+  color: var(--sa-red) !important;
+}
+
+.dark .text-yellow-600,
+.dark .text-yellow-400,
+.dark [class*="text-yellow-600"],
+.dark [class*="text-yellow-400"] {
+  color: var(--sa-orange) !important;
+}
+
+.dark .text-orange-600,
+.dark .text-orange-400,
+.dark [class*="text-orange-600"],
+.dark [class*="text-orange-400"] {
+  color: var(--sa-orange) !important;
+}
+
+/* Customer list card hover */
+.dark .hover\:shadow-md:hover {
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -2px rgba(0, 0, 0, 0.2);
+}
+
+/* Analysis score text colors */
+.dark .text-yellow-600,
+.dark .text-xl.font-bold.text-yellow-600 {
+  color: var(--sa-gold-400) !important;
+}
+
+.dark .text-blue-600,
+.dark .text-xl.font-bold.text-blue-600 {
+  color: var(--sa-blue) !important;
+}
+
+/* Container padding consistency */
+.container.mx-auto.py-8 {
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* Ensure main content has consistent spacing */
+.min-h-screen.w-full.space-y-6 {
+  padding: 0;
+}

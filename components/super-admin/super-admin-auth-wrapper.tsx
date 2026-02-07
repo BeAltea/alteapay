@@ -144,7 +144,7 @@ export function SuperAdminAuthWrapper({
         {/* Main Content Area */}
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           <SuperAdminHeader user={user} />
-          <main className="flex-1 overflow-y-auto bg-[var(--sa-bg-primary)]">
+          <main className="flex-1 overflow-y-auto bg-[var(--sa-bg-primary)] p-6 lg:p-8">
             {children}
           </main>
         </div>

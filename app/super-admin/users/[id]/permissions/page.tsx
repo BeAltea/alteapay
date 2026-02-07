@@ -187,7 +187,7 @@ export default function UserPermissionsPage() {
 
   if (loading) {
     return (
-      <div className="container mx-auto p-6 max-w-4xl">
+      <div className="w-full max-w-4xl space-y-6">
         <div className="space-y-6">
           <div className="h-8 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
           <div className="h-32 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
@@ -199,7 +199,7 @@ export default function UserPermissionsPage() {
 
   if (!user) {
     return (
-      <div className="container mx-auto p-6 max-w-4xl">
+      <div className="w-full max-w-4xl space-y-6">
         <Card>
           <CardContent className="p-6 text-center">
             <p className="text-gray-500">Usuário não encontrado.</p>
@@ -213,7 +213,7 @@ export default function UserPermissionsPage() {
   }
 
   return (
-    <div className="container mx-auto p-6 max-w-4xl">
+    <div className="w-full max-w-4xl space-y-6">
       <div className="space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">

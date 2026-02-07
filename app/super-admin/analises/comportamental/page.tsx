@@ -937,7 +937,7 @@ export default function ComportamentalPage() {
   }
 
   return (
-    <div className="container mx-auto py-8 space-y-8">
+    <div className="w-full space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Análise 360</h1>
         <p className="text-muted-foreground mt-1">Visão completa: crédito + comportamental + propensão de pagamento com IA preditiva</p>

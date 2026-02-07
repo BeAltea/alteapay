@@ -27,7 +27,7 @@ export default async function NegotiationsPage() {
   const { companies } = await fetchData()
 
   return (
-    <div className="min-h-screen w-full overflow-x-hidden bg-background space-y-6">
+    <div className="w-full overflow-x-hidden space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Negociações</h1>
         <p className="text-muted-foreground">
