@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   Building2,
   Users,
+  UsersRound,
   BarChart3,
   Settings,
   Shield,
@@ -79,10 +80,10 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
           current: pathname.startsWith("/super-admin/companies"),
         },
         {
-          name: "Usuários",
-          href: "/super-admin/users",
-          icon: Users,
-          current: pathname.startsWith("/super-admin/users"),
+          name: "Clientes",
+          href: "/super-admin/clientes",
+          icon: UsersRound,
+          current: pathname.startsWith("/super-admin/clientes"),
         },
       ],
     },
@@ -154,6 +155,12 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
     {
       label: "Sistema",
       items: [
+        {
+          name: "Usuários",
+          href: "/super-admin/users",
+          icon: Users,
+          current: pathname.startsWith("/super-admin/users"),
+        },
         // Hidden: Auditoria - preserved for future use
         // {
         //   name: "Auditoria",
