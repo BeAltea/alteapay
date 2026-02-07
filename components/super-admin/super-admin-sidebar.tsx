@@ -181,14 +181,14 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
   const SidebarContent = () => (
     <>
       {/* Logo */}
-      <div className="flex h-16 items-center px-5 border-b border-[#323647]">
+      <div className="flex h-16 items-center px-5 border-b border-[var(--sa-border-primary)]">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-gradient-to-br from-[#F5A623] to-[#C77A00] rounded-[10px] flex items-center justify-center flex-shrink-0">
-            <span className="text-[#0F1117] font-bold text-lg">A</span>
+          <div className="w-10 h-10 bg-gradient-to-br from-[var(--sa-gold-400)] to-[var(--sa-gold-600)] rounded-[10px] flex items-center justify-center flex-shrink-0">
+            <span className="text-[var(--sa-bg-primary)] font-bold text-lg">A</span>
           </div>
           <div className="min-w-0">
-            <span className="text-xl font-bold text-[#F0F1F5] font-serif">Altea Pay</span>
-            <div className="text-[11px] text-[#F5A623] uppercase tracking-[1.5px] font-semibold">
+            <span className="text-xl font-bold text-[var(--sa-text-primary)] font-serif">Altea Pay</span>
+            <div className="text-[11px] text-[var(--sa-gold-400)] uppercase tracking-[1.5px] font-semibold">
               Super Admin
             </div>
           </div>
@@ -199,7 +199,7 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
       <nav className="flex-1 px-3 py-4 overflow-y-auto">
         {navigationGroups.map((group) => (
           <div key={group.label} className="mb-2">
-            <div className="text-[10px] uppercase tracking-[2px] text-[#6B7188] px-3 py-4 font-semibold">
+            <div className="text-[10px] uppercase tracking-[2px] text-[var(--sa-text-muted)] px-3 py-4 font-semibold">
               {group.label}
             </div>
             {group.items.map((item) => (
@@ -208,14 +208,14 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
                   className={cn(
                     "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 cursor-pointer mb-0.5",
                     item.current
-                      ? "bg-gradient-to-r from-[rgba(245,166,35,0.15)] to-[rgba(245,166,35,0.05)] text-[#F5A623] border border-[rgba(245,166,35,0.2)]"
-                      : "text-[#9DA3B7] hover:bg-[#252836] hover:text-[#F0F1F5]"
+                      ? "bg-gradient-to-r from-[rgba(245,166,35,0.15)] to-[rgba(245,166,35,0.05)] text-[var(--sa-gold-400)] border border-[rgba(245,166,35,0.2)]"
+                      : "text-[var(--sa-text-secondary)] hover:bg-[var(--sa-bg-tertiary)] hover:text-[var(--sa-text-primary)]"
                   )}
                 >
                   <item.icon className="h-5 w-5 flex-shrink-0" />
                   <span className="truncate flex-1">{item.name}</span>
                   {item.badge && (
-                    <span className="ml-auto bg-[#F06868] text-white text-[10px] px-2 py-0.5 rounded-full font-semibold">
+                    <span className="ml-auto bg-[var(--sa-red)] text-white text-[10px] px-2 py-0.5 rounded-full font-semibold">
                       {item.badge}
                     </span>
                   )}
@@ -228,16 +228,16 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
 
       {/* User Info */}
       {user && (
-        <div className="border-t border-[#323647] p-4">
+        <div className="border-t border-[var(--sa-border-primary)] p-4">
           <div className="flex items-center gap-3 w-full min-w-0">
-            <div className="w-9 h-9 rounded-full bg-gradient-to-br from-[#F5A623] to-[#C77A00] flex items-center justify-center flex-shrink-0">
-              <span className="text-[#0F1117] font-bold text-sm">SA</span>
+            <div className="w-9 h-9 rounded-full bg-gradient-to-br from-[var(--sa-gold-400)] to-[var(--sa-gold-600)] flex items-center justify-center flex-shrink-0">
+              <span className="text-[var(--sa-bg-primary)] font-bold text-sm">SA</span>
             </div>
             <div className="flex-1 text-left min-w-0">
-              <p className="text-[13px] font-semibold text-[#F0F1F5] truncate">
+              <p className="text-[13px] font-semibold text-[var(--sa-text-primary)] truncate">
                 {user.user_metadata?.full_name || "Super Admin"}
               </p>
-              <p className="text-[11px] text-[#6B7188] truncate">{user.email || "admin@alteapay.com"}</p>
+              <p className="text-[11px] text-[var(--sa-text-muted)] truncate">{user.email || "admin@alteapay.com"}</p>
             </div>
           </div>
         </div>
@@ -247,12 +247,12 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
 
   return (
     <>
-      <div className="hidden lg:flex h-full flex-col bg-[#1A1D27] border-r border-[#323647]">
+      <div className="hidden lg:flex h-full flex-col bg-[var(--sa-bg-secondary)] border-r border-[var(--sa-border-primary)]">
         <SidebarContent />
       </div>
 
       <Sheet open={isMobileMenuOpen} onOpenChange={setIsMobileMenuOpen}>
-        <SheetContent side="left" className="p-0 w-80 max-w-[85vw] bg-[#1A1D27] border-r border-[#323647]">
+        <SheetContent side="left" className="p-0 w-80 max-w-[85vw] bg-[var(--sa-bg-secondary)] border-r border-[var(--sa-border-primary)]">
           <div className="flex h-full flex-col">
             <SidebarContent />
           </div>

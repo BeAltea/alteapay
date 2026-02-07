@@ -93,9 +93,9 @@ export function SuperAdminAuthWrapper({
 
   if (error) {
     return (
-      <div className="flex h-screen items-center justify-center bg-[#0F1117]">
+      <div className="flex h-screen items-center justify-center bg-[var(--sa-bg-primary)]">
         <div className="text-center max-w-md p-6">
-          <div className="text-red-500 mb-4">
+          <div className="text-[var(--sa-red)] mb-4">
             <svg className="w-16 h-16 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path
                 strokeLinecap="round"
@@ -105,11 +105,11 @@ export function SuperAdminAuthWrapper({
               />
             </svg>
           </div>
-          <h2 className="text-xl font-semibold text-[#F0F1F5] mb-2">Erro de Autenticação</h2>
-          <p className="text-[#9DA3B7] mb-4">{error}</p>
+          <h2 className="text-xl font-semibold text-[var(--sa-text-primary)] mb-2">Erro de Autenticação</h2>
+          <p className="text-[var(--sa-text-secondary)] mb-4">{error}</p>
           <button
             onClick={() => window.location.reload()}
-            className="px-4 py-2 bg-gradient-to-r from-[#F5A623] to-[#C77A00] text-[#0F1117] rounded-lg hover:opacity-90 transition-colors font-semibold"
+            className="px-4 py-2 bg-gradient-to-r from-[var(--sa-gold-400)] to-[var(--sa-gold-600)] text-[var(--sa-bg-primary)] rounded-lg hover:opacity-90 transition-colors font-semibold"
           >
             Tentar Novamente
           </button>
@@ -120,10 +120,10 @@ export function SuperAdminAuthWrapper({
 
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center bg-[#0F1117]">
+      <div className="flex h-screen items-center justify-center bg-[var(--sa-bg-primary)]">
         <div className="text-center">
-          <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-solid border-[#F5A623] border-r-transparent align-[-0.125em] motion-reduce:animate-[spin_1.5s_linear_infinite]" />
-          <p className="mt-4 text-sm text-[#9DA3B7]">Carregando...</p>
+          <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-solid border-[var(--sa-gold-400)] border-r-transparent align-[-0.125em] motion-reduce:animate-[spin_1.5s_linear_infinite]" />
+          <p className="mt-4 text-sm text-[var(--sa-text-secondary)]">Carregando...</p>
         </div>
       </div>
     )
@@ -135,7 +135,7 @@ export function SuperAdminAuthWrapper({
 
   return (
     <MobileSuperAdminSidebarContext.Provider value={{ isMobileMenuOpen, setIsMobileMenuOpen }}>
-      <div className="flex h-screen bg-[#0F1117] overflow-hidden">
+      <div className="flex h-screen bg-[var(--sa-bg-primary)] overflow-hidden">
         {/* Desktop Sidebar */}
         <div className="hidden lg:block lg:w-64 lg:flex-shrink-0">
           <SuperAdminSidebar user={user} />
@@ -144,7 +144,7 @@ export function SuperAdminAuthWrapper({
         {/* Main Content Area */}
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           <SuperAdminHeader user={user} />
-          <main className="flex-1 overflow-y-auto bg-[#0F1117]">
+          <main className="flex-1 overflow-y-auto bg-[var(--sa-bg-primary)]">
             {children}
           </main>
         </div>
