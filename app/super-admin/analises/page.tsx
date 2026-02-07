@@ -420,8 +420,8 @@ export default function AnalysesPage() {
         {/* Header */}
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">Análise Restritiva</h1>
-            <p className="text-muted-foreground mt-1">Visualize e gerencie todas as análises restritivas realizadas</p>
+            <h1 className="text-3xl font-bold tracking-tight">Análise de Crédito</h1>
+            <p className="text-muted-foreground mt-1">Visualize e gerencie todas as análises de crédito realizadas</p>
           </div>
         </div>
 

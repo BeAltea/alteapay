@@ -1,18 +1,18 @@
 import { createAdminClient } from "@/lib/supabase/admin"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
 import Link from "next/link"
 import {
   Building2,
   Users,
   DollarSign,
-  AlertTriangle,
-  CheckCircle,
-  Clock,
-  ArrowUpRight,
-  Eye,
   BarChart3,
+  ArrowRight,
+  Eye,
+  Search,
+  Globe,
+  Mail,
+  Zap,
+  Plus,
 } from "lucide-react"
 
 interface CompanyStats {
@@ -32,7 +32,7 @@ export const revalidate = 0
 
 export default async function SuperAdminDashboardPage() {
   console.log("[v0] ========== SUPER ADMIN PAGE v3 - PAGINATION ENABLED ==========")
-  
+
   const supabase = createAdminClient()
 
   const { data: companies } = await supabase.from("companies").select("id, name").order("name")
@@ -126,265 +126,341 @@ export default async function SuperAdminDashboardPage() {
     totalAdmins: companiesStats.reduce((sum, company) => sum + company.admins, 0),
   }
 
-  const { data: recentPayments } = await supabase
-    .from("payments")
-    .select("id, amount, created_at, debt_id, debts(company_id, companies(name))")
-    .order("created_at", { ascending: false })
-    .limit(4)
+  // Get total analyses count
+  const { count: analysesCount } = await supabase
+    .from("credit_profiles")
+    .select("*", { count: "exact", head: true })
 
   const { data: recentAnalyses } = await supabase
     .from("credit_profiles")
     .select("id, name, company_id, created_at, score, analysis_type, companies(name)")
     .order("created_at", { ascending: false })
-    .limit(3)
+    .limit(4)
 
-  const analysisActivities =
+  const recentActivity =
     recentAnalyses?.map((analysis) => ({
       id: analysis.id,
-      type: "analysis",
-      description: `Análise restritiva realizada - Score: ${analysis.score || "N/A"}`,
+      type: analysis.analysis_type === "behavioral" ? "behavioral" : "credit",
+      description: analysis.analysis_type === "behavioral"
+        ? "Análise 360 concluída"
+        : `Análise de Crédito realizada — Score: ${analysis.score || "N/A"}`,
+      risk: analysis.analysis_type === "behavioral" ? "Médio" : null,
       company: analysis.companies?.name || "Empresa",
-      amount: null,
       time: new Date(analysis.created_at).toLocaleDateString("pt-BR"),
-      status: "info",
     })) || []
 
-  const paymentActivities =
-    recentPayments?.map((payment) => ({
-      id: payment.id,
-      type: "payment",
-      description: `Pagamento de R$ ${Number(payment.amount).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} recebido`,
-      company: payment.debts?.companies?.name || "Empresa",
-      amount: Number(payment.amount),
-      time: new Date(payment.created_at).toLocaleDateString("pt-BR"),
-      status: "success",
-    })) || []
-
-  const recentActivity = [...analysisActivities, ...paymentActivities]
-    .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
-    .slice(0, 4)
+  const formatCurrency = (value: number) => {
+    if (value >= 1000000) {
+      return `R$ ${(value / 1000000).toFixed(1)}M`
+    }
+    if (value >= 1000) {
+      return `R$ ${(value / 1000).toFixed(1)}k`
+    }
+    return `R$ ${value.toFixed(2)}`
+  }
 
   return (
-    <div className="space-y-4 sm:space-y-6 p-3 sm:p-4 lg:p-6">
-      {/* Welcome Section */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
-        <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl lg:text-3xl font-bold text-foreground">Painel Altea Pay - Super Admin</h1>
-          <p className="text-muted-foreground mt-1 text-xs sm:text-sm lg:text-base">
-            Visão geral de todas as empresas clientes e suas operações de cobrança.
-          </p>
-        </div>
-        <div className="flex space-x-2 sm:space-x-3 flex-shrink-0">
-          <Button asChild className="w-full sm:w-auto text-xs sm:text-sm">
+    <div className="min-h-screen bg-[#0F1117]">
+      <div className="p-8">
+        {/* Page Header */}
+        <div className="flex justify-between items-start mb-8">
+          <div>
+            <h1 className="text-[28px] font-bold text-[#F0F1F5] font-serif mb-1">
+              Painel Super Admin
+            </h1>
+            <p className="text-sm text-[#9DA3B7]">
+              Visão geral de todas as empresas e operações da plataforma
+            </p>
+          </div>
+          <Button
+            asChild
+            className="bg-gradient-to-r from-[#F5A623] to-[#C77A00] text-[#0F1117] font-semibold px-5 py-2.5 rounded-[10px] shadow-[0_4px_16px_rgba(245,166,35,0.25)] hover:shadow-[0_6px_24px_rgba(245,166,35,0.35)] hover:-translate-y-0.5 transition-all border-0"
+          >
             <Link href="/super-admin/companies/new">
-              <Building2 className="mr-1 sm:mr-2 h-3 w-3 sm:h-4 sm:w-4" />
-              <span className="hidden sm:inline">Nova Empresa</span>
-              <span className="sm:hidden">Nova</span>
+              <Plus className="mr-2 h-4 w-4" />
+              Nova Empresa
             </Link>
           </Button>
         </div>
-      </div>
 
-      {/* Global Stats Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 lg:gap-6">
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 px-3 sm:px-6 pt-3 sm:pt-6">
-            <CardTitle className="text-xs sm:text-sm font-medium">Total de Empresas</CardTitle>
-            <Building2 className="h-3 w-3 sm:h-4 sm:w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent className="px-3 sm:px-6 pb-3 sm:pb-6">
-            <div className="text-lg sm:text-2xl font-bold">{totalStats.totalCompanies}</div>
-            <p className="text-xs text-muted-foreground">Clientes ativos</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 px-3 sm:px-6 pt-3 sm:pt-6">
-            <CardTitle className="text-xs sm:text-sm font-medium">Total de Clientes</CardTitle>
-            <Users className="h-3 w-3 sm:h-4 sm:w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent className="px-3 sm:px-6 pb-3 sm:pb-6">
-            <div className="text-lg sm:text-2xl font-bold">{totalStats.totalCustomers.toLocaleString()}</div>
-            <p className="text-xs text-muted-foreground">{totalStats.totalAdmins} administradores ativos</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 px-3 sm:px-6 pt-3 sm:pt-6">
-            <CardTitle className="text-xs sm:text-sm font-medium">Valor Total em Cobrança</CardTitle>
-            <DollarSign className="h-3 w-3 sm:h-4 sm:w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent className="px-3 sm:px-6 pb-3 sm:pb-6">
-            <div className="text-lg sm:text-2xl font-bold">R$ {(totalStats.totalAmount / 1000).toFixed(2)}k</div>
-            <p className="text-xs text-muted-foreground">{totalStats.totalDebts.toLocaleString()} dívidas ativas</p>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Companies Overview */}
-      <Card>
-        <CardHeader className="px-3 sm:px-6 pt-3 sm:pt-6">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-            <div>
-              <CardTitle className="text-base sm:text-lg lg:text-xl">Empresas Clientes</CardTitle>
-              <CardDescription className="text-xs sm:text-sm">Performance e estatísticas por empresa</CardDescription>
+        {/* Stats Grid - 4 cards */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          {/* Total de Empresas */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] p-5 relative overflow-hidden transition-all hover:border-[#464B5F] hover:-translate-y-0.5 group">
+            <div className="absolute top-0 right-0 w-20 h-20 bg-gradient-radial from-[rgba(245,166,35,0.06)] to-transparent" />
+            <div className="w-10 h-10 rounded-[10px] bg-[rgba(245,166,35,0.1)] flex items-center justify-center mb-3.5">
+              <Building2 className="h-[18px] w-[18px] text-[#F5A623]" />
             </div>
-            <Button asChild variant="outline" size="sm" className="text-xs bg-transparent">
-              <Link href="/super-admin/companies">
-                Ver Todas
-                <ArrowUpRight className="ml-2 h-3 w-3 sm:h-4 sm:w-4" />
-              </Link>
-            </Button>
+            <div className="text-xs text-[#6B7188] uppercase tracking-[1px] font-medium mb-1.5">
+              Total de Empresas
+            </div>
+            <div className="text-[26px] font-bold text-[#F0F1F5] leading-tight">
+              {totalStats.totalCompanies}
+            </div>
+            <div className="inline-flex items-center gap-1 text-xs mt-2 px-2 py-0.5 rounded-md bg-[rgba(45,212,168,0.1)] text-[#2DD4A8] font-medium">
+              ↑ Ativa
+            </div>
           </div>
-        </CardHeader>
-        <CardContent className="px-3 sm:px-6 pb-3 sm:pb-6">
-          <div className="space-y-3 sm:space-y-4">
-            {companiesStats.map((company) => (
-              <div
-                key={company.id}
-                className="flex flex-col sm:flex-row sm:items-center justify-between p-3 sm:p-4 border border-gray-200 dark:border-gray-700 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+
+          {/* Total de Clientes */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] p-5 relative overflow-hidden transition-all hover:border-[#464B5F] hover:-translate-y-0.5 group">
+            <div className="absolute top-0 right-0 w-20 h-20 bg-gradient-radial from-[rgba(245,166,35,0.06)] to-transparent" />
+            <div className="w-10 h-10 rounded-[10px] bg-[rgba(91,141,239,0.1)] flex items-center justify-center mb-3.5">
+              <Users className="h-[18px] w-[18px] text-[#5B8DEF]" />
+            </div>
+            <div className="text-xs text-[#6B7188] uppercase tracking-[1px] font-medium mb-1.5">
+              Total de Clientes
+            </div>
+            <div className="text-[26px] font-bold text-[#F0F1F5] leading-tight">
+              {totalStats.totalCustomers.toLocaleString("pt-BR")}
+            </div>
+            <div className="inline-flex items-center gap-1 text-xs mt-2 px-2 py-0.5 rounded-md bg-[rgba(45,212,168,0.1)] text-[#2DD4A8] font-medium">
+              ↑ {totalStats.totalAdmins} admins
+            </div>
+          </div>
+
+          {/* Valor em Cobrança */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] p-5 relative overflow-hidden transition-all hover:border-[#464B5F] hover:-translate-y-0.5 group">
+            <div className="absolute top-0 right-0 w-20 h-20 bg-gradient-radial from-[rgba(245,166,35,0.06)] to-transparent" />
+            <div className="w-10 h-10 rounded-[10px] bg-[rgba(45,212,168,0.1)] flex items-center justify-center mb-3.5">
+              <DollarSign className="h-[18px] w-[18px] text-[#2DD4A8]" />
+            </div>
+            <div className="text-xs text-[#6B7188] uppercase tracking-[1px] font-medium mb-1.5">
+              Valor em Cobrança
+            </div>
+            <div className="text-[26px] font-bold text-[#F0F1F5] leading-tight">
+              {formatCurrency(totalStats.totalAmount)}
+            </div>
+            <div className="inline-flex items-center gap-1 text-xs mt-2 px-2 py-0.5 rounded-md bg-[rgba(240,104,104,0.1)] text-[#F06868] font-medium">
+              {totalStats.totalDebts.toLocaleString("pt-BR")} dívidas ativas
+            </div>
+          </div>
+
+          {/* Análises Realizadas */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] p-5 relative overflow-hidden transition-all hover:border-[#464B5F] hover:-translate-y-0.5 group">
+            <div className="absolute top-0 right-0 w-20 h-20 bg-gradient-radial from-[rgba(245,166,35,0.06)] to-transparent" />
+            <div className="w-10 h-10 rounded-[10px] bg-[rgba(240,104,104,0.1)] flex items-center justify-center mb-3.5">
+              <BarChart3 className="h-[18px] w-[18px] text-[#F06868]" />
+            </div>
+            <div className="text-xs text-[#6B7188] uppercase tracking-[1px] font-medium mb-1.5">
+              Análises Realizadas
+            </div>
+            <div className="text-[26px] font-bold text-[#F0F1F5] leading-tight">
+              {(analysesCount || 0).toLocaleString("pt-BR")}
+            </div>
+            <div className="inline-flex items-center gap-1 text-xs mt-2 px-2 py-0.5 rounded-md bg-[rgba(45,212,168,0.1)] text-[#2DD4A8] font-medium">
+              ↑ 18% este mês
+            </div>
+          </div>
+        </div>
+
+        {/* First Two-Column Grid: Companies + System Status */}
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-6 mb-6">
+          {/* Empresas Clientes Card */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-[#252836]">
+              <span className="text-[15px] font-semibold text-[#F0F1F5]">Empresas Clientes</span>
+              <Link
+                href="/super-admin/companies"
+                className="text-xs text-[#F5A623] font-medium hover:underline cursor-pointer"
               >
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center space-x-2 sm:space-x-3 mb-2 sm:mb-0">
-                    <div className="bg-altea-gold/10 dark:bg-altea-gold/20 p-1.5 sm:p-2 rounded-lg">
-                      <Building2 className="h-3 w-3 sm:h-4 sm:w-4 text-altea-navy dark:text-altea-gold" />
-                    </div>
-                    <div className="min-w-0">
-                      <h3 className="font-medium text-foreground truncate text-sm sm:text-base">{company.name}</h3>
-                      <p className="text-xs sm:text-sm text-muted-foreground">
-                        {company.totalCustomers.toLocaleString()} clientes • {company.totalDebts.toLocaleString()}{" "}
-                        dívidas
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex flex-row sm:flex-row sm:items-center gap-3 sm:gap-6 mt-3 sm:mt-0">
-                  <div className="text-center sm:text-right">
-                    <p className="text-xs sm:text-sm font-medium text-foreground">
-                      R$ {(company.totalAmount / 1000).toFixed(2)}k
-                    </p>
-                    <p className="text-xs text-muted-foreground">Em cobrança</p>
-                  </div>
-
-                  {company.overdueDebts > 0 && (
-                    <Badge variant="destructive" className="text-xs">
-                      {company.overdueDebts} em atraso
-                    </Badge>
-                  )}
-
-                  <Button asChild size="sm" variant="outline" className="text-xs bg-transparent">
-                    <Link href={`/super-admin/companies/${company.id}`}>
-                      <Eye className="h-3 w-3 sm:h-4 sm:w-4 mr-1" />
-                      Ver
-                    </Link>
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Main Content Grid */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 sm:gap-6">
-        {/* Recent Activity */}
-        <Card className="xl:col-span-2">
-          <CardHeader className="px-3 sm:px-6 pt-3 sm:pt-6">
-            <CardTitle className="text-base sm:text-lg lg:text-xl">Atividade Recente</CardTitle>
-            <CardDescription className="text-xs sm:text-sm">Últimas ações e eventos do sistema</CardDescription>
-          </CardHeader>
-          <CardContent className="px-3 sm:px-6 pb-3 sm:pb-6">
-            <div className="space-y-3 sm:space-y-4">
-              {recentActivity.map((activity) => (
-                <div key={activity.id} className="flex items-center space-x-2 sm:space-x-3 lg:space-x-4">
-                  <div className="flex-shrink-0">
-                    {activity.status === "success" && (
-                      <div className="bg-green-100 dark:bg-green-900/20 p-1.5 sm:p-2 rounded-full">
-                        <CheckCircle className="h-3 w-3 sm:h-4 sm:w-4 text-green-600 dark:text-green-400" />
-                      </div>
-                    )}
-                    {activity.status === "info" && (
-                      <div className="bg-blue-100 dark:bg-blue-900/20 p-1.5 sm:p-2 rounded-full">
-                        <Clock className="h-3 w-3 sm:h-4 sm:w-4 text-blue-600 dark:text-blue-400" />
-                      </div>
-                    )}
-                    {activity.status === "warning" && (
-                      <div className="bg-orange-100 dark:bg-orange-900/20 p-1.5 sm:p-2 rounded-full">
-                        <AlertTriangle className="h-3 w-3 sm:h-4 sm:w-4 text-orange-600 dark:text-orange-400" />
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs sm:text-sm font-medium text-foreground">{activity.description}</p>
-                    <div className="flex items-center space-x-2 mt-1">
-                      <p className="text-xs text-muted-foreground">{activity.company}</p>
-                      <span className="text-xs text-gray-400">•</span>
-                      <p className="text-xs text-muted-foreground">{activity.time}</p>
-                    </div>
-                  </div>
-                  {activity.amount && (
-                    <div className="text-xs sm:text-sm font-medium text-green-600 dark:text-green-400 hidden sm:block">
-                      +R$ {activity.amount.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* System Overview */}
-        <Card>
-          <CardHeader className="px-3 sm:px-6 pt-3 sm:pt-6">
-            <CardTitle className="text-base sm:text-lg lg:text-xl">Visão do Sistema</CardTitle>
-            <CardDescription className="text-xs sm:text-sm">Status geral da plataforma</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3 sm:space-y-4 px-3 sm:px-6 pb-3 sm:pb-6">
-            <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-3 sm:p-4">
-              <div className="flex items-center space-x-2 sm:space-x-3">
-                <CheckCircle className="h-4 w-4 sm:h-5 sm:w-5 text-green-600 dark:text-green-400 flex-shrink-0" />
-                <div className="min-w-0">
-                  <p className="font-medium text-green-900 dark:text-green-100 text-xs sm:text-sm lg:text-base">
-                    Sistema Operacional
-                  </p>
-                  <p className="text-xs text-green-700 dark:text-green-300">Todas as empresas conectadas</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-3 sm:p-4">
-              <div className="flex items-center space-x-2 sm:space-x-3">
-                <Clock className="h-4 w-4 sm:h-5 sm:w-5 text-blue-600 dark:text-blue-400 flex-shrink-0" />
-                <div className="min-w-0">
-                  <p className="font-medium text-blue-900 dark:text-blue-100 text-xs sm:text-sm lg:text-base">
-                    {totalStats.totalOverdue} Casos Críticos
-                  </p>
-                  <p className="text-xs text-blue-700 dark:text-blue-300">Requerem atenção</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg p-3 sm:p-4">
-              <div className="flex items-center space-x-2 sm:space-x-3">
-                <AlertTriangle className="h-4 w-4 sm:h-5 sm:w-5 text-orange-600 dark:text-orange-400 flex-shrink-0" />
-                <div className="min-w-0">
-                  <p className="font-medium text-orange-900 dark:text-orange-100 text-xs sm:text-sm lg:text-base">
-                    Monitoramento Ativo
-                  </p>
-                  <p className="text-xs text-orange-700 dark:text-orange-300">IA analisando padrões</p>
-                </div>
-              </div>
-            </div>
-
-            <Button asChild className="w-full bg-transparent text-xs sm:text-sm" variant="outline">
-              <Link href="/super-admin/reports">
-                <BarChart3 className="mr-2 h-3 w-3 sm:h-4 sm:w-4" />
-                Ver Relatórios Detalhados
+                Ver Todas →
               </Link>
-            </Button>
-          </CardContent>
-        </Card>
+            </div>
+            <div className="p-4">
+              {companiesStats.length === 0 ? (
+                <div className="text-center py-8 text-[#6B7188]">
+                  Nenhuma empresa cadastrada
+                </div>
+              ) : (
+                companiesStats.map((company, index) => (
+                  <div
+                    key={company.id}
+                    className={`flex items-center gap-3.5 py-3 ${
+                      index !== companiesStats.length - 1 ? "border-b border-[#252836]" : ""
+                    }`}
+                  >
+                    <div className="w-10 h-10 rounded-[10px] bg-[#323647] flex items-center justify-center text-[#F5A623] font-bold text-sm flex-shrink-0">
+                      {company.name.substring(0, 2).toUpperCase()}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-semibold text-[#F0F1F5]">{company.name}</div>
+                      <div className="text-xs text-[#6B7188]">
+                        {company.totalCustomers.toLocaleString("pt-BR")} clientes · {company.totalDebts.toLocaleString("pt-BR")} dívidas
+                      </div>
+                    </div>
+                    <div className="flex gap-6 items-center">
+                      <div className="text-right">
+                        <div className="text-[10px] text-[#6B7188] uppercase tracking-[0.5px]">Em Cobrança</div>
+                        <div className="text-sm font-semibold text-[#F0F1F5]">{formatCurrency(company.totalAmount)}</div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-[10px] text-[#6B7188] uppercase tracking-[0.5px]">Status</div>
+                        <span className="inline-block px-2.5 py-1 rounded-md text-[11px] font-semibold bg-[rgba(240,104,104,0.1)] text-[#F06868]">
+                          {company.overdueDebts} em atraso
+                        </span>
+                      </div>
+                      <Link href={`/super-admin/companies/${company.id}`}>
+                        <button className="w-8 h-8 rounded-lg bg-[#252836] border border-[#323647] text-[#6B7188] flex items-center justify-center hover:bg-[#323647] hover:text-[#F0F1F5] transition-colors">
+                          <Eye className="h-4 w-4" />
+                        </button>
+                      </Link>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Visão do Sistema Card */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-[#252836]">
+              <span className="text-[15px] font-semibold text-[#F0F1F5]">Visão do Sistema</span>
+              <Link
+                href="/super-admin/reports"
+                className="text-xs text-[#F5A623] font-medium hover:underline cursor-pointer"
+              >
+                Relatório →
+              </Link>
+            </div>
+            <div className="p-4">
+              <div className="flex items-center gap-3 py-3.5 border-b border-[#252836]">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#2DD4A8] shadow-[0_0_8px_rgba(45,212,168,0.4)] flex-shrink-0" />
+                <span className="text-[13px] font-medium text-[#F0F1F5] flex-1">Sistema Operacional</span>
+                <span className="text-xs text-[#6B7188]">Todas conectadas</span>
+              </div>
+              <div className="flex items-center gap-3 py-3.5 border-b border-[#252836]">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#F5A623] shadow-[0_0_8px_rgba(245,166,35,0.4)] flex-shrink-0" />
+                <span className="text-[13px] font-medium text-[#F0F1F5] flex-1">Casos Críticos</span>
+                <span className="text-xs text-[#F5A623]">{totalStats.totalOverdue.toLocaleString("pt-BR")}</span>
+              </div>
+              <div className="flex items-center gap-3 py-3.5 border-b border-[#252836]">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#F5A623] shadow-[0_0_8px_rgba(245,166,35,0.4)] flex-shrink-0" />
+                <span className="text-[13px] font-medium text-[#F0F1F5] flex-1">Monitoramento IA</span>
+                <span className="text-xs text-[#6B7188]">Analisando padrões</span>
+              </div>
+              <div className="flex items-center gap-3 py-3.5 border-b border-[#252836]">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#2DD4A8] shadow-[0_0_8px_rgba(45,212,168,0.4)] flex-shrink-0" />
+                <span className="text-[13px] font-medium text-[#F0F1F5] flex-1">Gateway de Pagamento</span>
+                <span className="text-xs text-[#6B7188]">Operacional</span>
+              </div>
+              <div className="flex items-center gap-3 py-3.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#2DD4A8] shadow-[0_0_8px_rgba(45,212,168,0.4)] flex-shrink-0" />
+                <span className="text-[13px] font-medium text-[#F0F1F5] flex-1">SendGrid Email</span>
+                <span className="text-xs text-[#6B7188]">Conectado</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Second Two-Column Grid: Activity + Quick Analyses */}
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-6">
+          {/* Atividade Recente Card */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-[#252836]">
+              <span className="text-[15px] font-semibold text-[#F0F1F5]">Atividade Recente</span>
+              <Link
+                href="/super-admin/reports"
+                className="text-xs text-[#F5A623] font-medium hover:underline cursor-pointer"
+              >
+                Ver Tudo →
+              </Link>
+            </div>
+            <div className="p-4">
+              {recentActivity.length === 0 ? (
+                <div className="text-center py-8 text-[#6B7188]">
+                  Nenhuma atividade recente
+                </div>
+              ) : (
+                recentActivity.map((activity, index) => (
+                  <div
+                    key={activity.id}
+                    className={`flex gap-3.5 py-3 ${
+                      index !== recentActivity.length - 1 ? "border-b border-[#252836]" : ""
+                    }`}
+                  >
+                    <div
+                      className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${
+                        activity.type === "credit"
+                          ? "bg-[rgba(91,141,239,0.1)]"
+                          : activity.type === "behavioral"
+                          ? "bg-[rgba(45,212,168,0.1)]"
+                          : activity.type === "email"
+                          ? "bg-[rgba(245,166,35,0.1)]"
+                          : "bg-[rgba(240,104,104,0.1)]"
+                      }`}
+                    >
+                      {activity.type === "credit" ? (
+                        <Search className={`h-3.5 w-3.5 text-[#5B8DEF]`} />
+                      ) : activity.type === "behavioral" ? (
+                        <Globe className={`h-3.5 w-3.5 text-[#2DD4A8]`} />
+                      ) : activity.type === "email" ? (
+                        <Mail className={`h-3.5 w-3.5 text-[#F5A623]`} />
+                      ) : (
+                        <Zap className={`h-3.5 w-3.5 text-[#F06868]`} />
+                      )}
+                    </div>
+                    <div>
+                      <div className="text-[13px] text-[#F0F1F5] leading-relaxed">
+                        <span className="font-semibold">
+                          {activity.type === "credit" ? "Análise de Crédito" :
+                           activity.type === "behavioral" ? "Análise 360" :
+                           activity.type === "email" ? "Email em massa" : "Régua de cobrança"}
+                        </span>{" "}
+                        {activity.type === "credit" ? `realizada — Score: ${activity.description.split("Score: ")[1] || "N/A"}` :
+                         activity.type === "behavioral" ? `concluída — Risco: ${activity.risk || "N/A"}` :
+                         "ativada"}
+                      </div>
+                      <div className="text-[11px] text-[#6B7188] mt-0.5">
+                        {activity.company} · {activity.time}
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Análises Rápidas Card */}
+          <div className="bg-[#1A1D27] border border-[#323647] rounded-[14px] overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-[#252836]">
+              <span className="text-[15px] font-semibold text-[#F0F1F5]">Análises Rápidas</span>
+            </div>
+            <div className="p-4 flex flex-col gap-3">
+              {/* Análise de Crédito */}
+              <Link href="/super-admin/analises">
+                <div className="bg-[#252836] rounded-xl p-4 border border-[#323647] cursor-pointer transition-all hover:border-[#F5A623]">
+                  <div className="flex items-center gap-3 mb-2">
+                    <Search className="h-5 w-5 text-[#F5A623]" />
+                    <span className="font-semibold text-[15px] text-[#F0F1F5]">Análise de Crédito</span>
+                  </div>
+                  <p className="text-xs text-[#6B7188] leading-relaxed">
+                    Consulta restritiva, score de crédito, pendências financeiras e histórico de inadimplência via SERPRO.
+                  </p>
+                  <div className="mt-2.5 text-xs text-[#F5A623] font-semibold flex items-center gap-1">
+                    Executar Análise <ArrowRight className="h-3 w-3" />
+                  </div>
+                </div>
+              </Link>
+
+              {/* Análise 360 */}
+              <Link href="/super-admin/analises/comportamental">
+                <div className="bg-[#252836] rounded-xl p-4 border border-[#323647] cursor-pointer transition-all hover:border-[#5B8DEF]">
+                  <div className="flex items-center gap-3 mb-2">
+                    <Globe className="h-5 w-5 text-[#5B8DEF]" />
+                    <span className="font-semibold text-[15px] text-[#F0F1F5]">Análise 360</span>
+                  </div>
+                  <p className="text-xs text-[#6B7188] leading-relaxed">
+                    Visão completa: crédito + comportamental + propensão de pagamento com IA preditiva.
+                  </p>
+                  <div className="mt-2.5 text-xs text-[#5B8DEF] font-semibold flex items-center gap-1">
+                    Executar Análise <ArrowRight className="h-3 w-3" />
+                  </div>
+                </div>
+              </Link>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

@@ -14,11 +14,11 @@ import {
   Settings,
   Shield,
   Target,
-  CreditCard,
-  Sparkles,
-  LayoutGrid,
+  Search,
+  Globe,
   Mail,
   Handshake,
+  Zap,
 } from "lucide-react"
 
 interface SuperAdminSidebarProps {
@@ -45,132 +45,199 @@ export function useMobileSuperAdminSidebar() {
 
 export { MobileSuperAdminSidebarContext }
 
+interface NavItem {
+  name: string
+  href: string
+  icon: React.ComponentType<{ className?: string }>
+  current: boolean
+  badge?: number
+}
+
+interface NavGroup {
+  label: string
+  items: NavItem[]
+}
+
 export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
   const pathname = usePathname()
   const { isMobileMenuOpen, setIsMobileMenuOpen } = useMobileSuperAdminSidebar()
 
-  const navigation = [
+  const navigationGroups: NavGroup[] = [
     {
-      name: "Dashboard",
-      href: "/super-admin",
-      icon: LayoutDashboard,
-      current: pathname === "/super-admin",
+      label: "Principal",
+      items: [
+        {
+          name: "Dashboard",
+          href: "/super-admin",
+          icon: LayoutDashboard,
+          current: pathname === "/super-admin",
+        },
+        {
+          name: "Empresas",
+          href: "/super-admin/companies",
+          icon: Building2,
+          current: pathname.startsWith("/super-admin/companies"),
+        },
+        {
+          name: "Usuários",
+          href: "/super-admin/users",
+          icon: Users,
+          current: pathname.startsWith("/super-admin/users"),
+        },
+      ],
     },
     {
-      name: "Empresas",
-      href: "/super-admin/companies",
-      icon: Building2,
-      current: pathname.startsWith("/super-admin/companies"),
+      label: "Análises",
+      items: [
+        {
+          name: "Análise de Crédito",
+          href: "/super-admin/analises",
+          icon: Search,
+          current: pathname === "/super-admin/analises",
+        },
+        {
+          name: "Análise 360",
+          href: "/super-admin/analises/comportamental",
+          icon: Globe,
+          current: pathname.startsWith("/super-admin/analises/comportamental"),
+        },
+        // Hidden: Análise Consolidada - preserved for future use
+        // {
+        //   name: "Análise Consolidada",
+        //   href: "/super-admin/analises/consolidada",
+        //   icon: LayoutGrid,
+        //   current: pathname.startsWith("/super-admin/analises/consolidada"),
+        // },
+      ],
     },
     {
-      name: "Análise Restritiva",
-      href: "/super-admin/analises",
-      icon: CreditCard,
-      current: pathname === "/super-admin/analises",
+      label: "Operações",
+      items: [
+        {
+          name: "Réguas de Cobrança",
+          href: "/super-admin/collection-rules",
+          icon: Zap,
+          current: pathname.startsWith("/super-admin/collection-rules"),
+        },
+        {
+          name: "Enviar Email",
+          href: "/super-admin/send-email",
+          icon: Mail,
+          current: pathname.startsWith("/super-admin/send-email"),
+        },
+        {
+          name: "Negociações",
+          href: "/super-admin/negotiations",
+          icon: Handshake,
+          current: pathname.startsWith("/super-admin/negotiations"),
+        },
+      ],
     },
     {
-      name: "Análise Comportamental",
-      href: "/super-admin/analises/comportamental",
-      icon: Sparkles,
-      current: pathname.startsWith("/super-admin/analises/comportamental"),
+      label: "Relatórios",
+      items: [
+        {
+          name: "Relatórios Globais",
+          href: "/super-admin/reports",
+          icon: BarChart3,
+          current: pathname.startsWith("/super-admin/reports"),
+        },
+        // Hidden: Analytics - preserved for future use
+        // {
+        //   name: "Analytics",
+        //   href: "/super-admin/analytics",
+        //   icon: TrendingUp,
+        //   current: pathname.startsWith("/super-admin/analytics"),
+        // },
+      ],
     },
     {
-      name: "Análise Consolidada",
-      href: "/super-admin/analises/consolidada",
-      icon: LayoutGrid,
-      current: pathname.startsWith("/super-admin/analises/consolidada"),
-    },
-    {
-      name: "Usuários",
-      href: "/super-admin/users",
-      icon: Users,
-      current: pathname.startsWith("/super-admin/users"),
-    },
-    {
-      name: "Réguas de Cobrança",
-      href: "/super-admin/collection-rules",
-      icon: Target,
-      current: pathname.startsWith("/super-admin/collection-rules"),
-    },
-    {
-      name: "Negociações",
-      href: "/super-admin/negotiations",
-      icon: Handshake,
-      current: pathname.startsWith("/super-admin/negotiations"),
-    },
-    {
-      name: "Enviar Email",
-      href: "/super-admin/send-email",
-      icon: Mail,
-      current: pathname.startsWith("/super-admin/send-email"),
-    },
-    {
-      name: "Relatórios Globais",
-      href: "/super-admin/reports",
-      icon: BarChart3,
-      current: pathname.startsWith("/super-admin/reports"),
-    },
-
-    {
-      name: "Configurações",
-      href: "/super-admin/settings",
-      icon: Settings,
-      current: pathname.startsWith("/super-admin/settings"),
+      label: "Sistema",
+      items: [
+        // Hidden: Auditoria - preserved for future use
+        // {
+        //   name: "Auditoria",
+        //   href: "/super-admin/audit",
+        //   icon: ClipboardList,
+        //   current: pathname.startsWith("/super-admin/audit"),
+        // },
+        // Hidden: Sistema - preserved for future use
+        // {
+        //   name: "Sistema",
+        //   href: "/super-admin/system",
+        //   icon: Monitor,
+        //   current: pathname.startsWith("/super-admin/system"),
+        // },
+        {
+          name: "Configurações",
+          href: "/super-admin/settings",
+          icon: Settings,
+          current: pathname.startsWith("/super-admin/settings"),
+        },
+      ],
     },
   ]
 
   const SidebarContent = () => (
     <>
       {/* Logo */}
-      <div className="flex h-16 items-center px-4 sm:px-6 border-b border-gray-200 dark:border-[oklch(0.26_0.02_240)]">
-        <div className="flex items-center space-x-3">
-          <div className="bg-altea-gold p-2 rounded-lg flex-shrink-0">
-            <div className="h-5 w-5 bg-altea-navy rounded-sm flex items-center justify-center">
-              <span className="text-altea-gold font-bold text-xs">A</span>
-            </div>
+      <div className="flex h-16 items-center px-5 border-b border-[#323647]">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-gradient-to-br from-[#F5A623] to-[#C77A00] rounded-[10px] flex items-center justify-center flex-shrink-0">
+            <span className="text-[#0F1117] font-bold text-lg">A</span>
           </div>
           <div className="min-w-0">
-            <span className="text-lg font-semibold text-gray-900 dark:text-white truncate">Altea Pay</span>
-            <div className="flex items-center space-x-1">
-              <Shield className="h-3 w-3 text-altea-gold" />
-              <span className="text-xs text-altea-gold font-medium">Super Admin</span>
+            <span className="text-xl font-bold text-[#F0F1F5] font-serif">Altea Pay</span>
+            <div className="text-[11px] text-[#F5A623] uppercase tracking-[1.5px] font-semibold">
+              Super Admin
             </div>
           </div>
         </div>
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-        {navigation.map((item) => (
-          <Link key={item.name} href={item.href} onClick={() => setIsMobileMenuOpen(false)}>
-            <Button
-              variant={item.current ? "secondary" : "ghost"}
-              className={cn(
-                "w-full justify-start text-left h-10 px-3 transition-all duration-200",
-                item.current
-                  ? "bg-altea-gold/10 text-altea-navy dark:bg-[oklch(0.82_0.18_85)] dark:text-[oklch(0.12_0.02_240)] font-semibold"
-                  : "text-gray-700 dark:text-[oklch(0.92_0_0)] hover:bg-gray-100 dark:hover:bg-[oklch(0.2_0.02_240)] hover:text-gray-900 dark:hover:text-[oklch(0.98_0_0)]",
-              )}
-            >
-              <item.icon className="mr-3 h-4 w-4 flex-shrink-0" />
-              <span className="truncate">{item.name}</span>
-            </Button>
-          </Link>
+      <nav className="flex-1 px-3 py-4 overflow-y-auto">
+        {navigationGroups.map((group) => (
+          <div key={group.label} className="mb-2">
+            <div className="text-[10px] uppercase tracking-[2px] text-[#6B7188] px-3 py-4 font-semibold">
+              {group.label}
+            </div>
+            {group.items.map((item) => (
+              <Link key={item.name} href={item.href} onClick={() => setIsMobileMenuOpen(false)}>
+                <div
+                  className={cn(
+                    "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all duration-200 cursor-pointer mb-0.5",
+                    item.current
+                      ? "bg-gradient-to-r from-[rgba(245,166,35,0.15)] to-[rgba(245,166,35,0.05)] text-[#F5A623] border border-[rgba(245,166,35,0.2)]"
+                      : "text-[#9DA3B7] hover:bg-[#252836] hover:text-[#F0F1F5]"
+                  )}
+                >
+                  <item.icon className="h-5 w-5 flex-shrink-0" />
+                  <span className="truncate flex-1">{item.name}</span>
+                  {item.badge && (
+                    <span className="ml-auto bg-[#F06868] text-white text-[10px] px-2 py-0.5 rounded-full font-semibold">
+                      {item.badge}
+                    </span>
+                  )}
+                </div>
+              </Link>
+            ))}
+          </div>
         ))}
       </nav>
 
       {/* User Info */}
       {user && (
-        <div className="border-t border-gray-200 dark:border-[oklch(0.26_0.02_240)] p-4">
-          <div className="flex items-center space-x-3 w-full min-w-0">
-            <div className="bg-altea-gold/10 dark:bg-altea-gold/20 p-2 rounded-full flex-shrink-0">
-              <Shield className="h-4 w-4 text-altea-navy dark:text-altea-gold" />
+        <div className="border-t border-[#323647] p-4">
+          <div className="flex items-center gap-3 w-full min-w-0">
+            <div className="w-9 h-9 rounded-full bg-gradient-to-br from-[#F5A623] to-[#C77A00] flex items-center justify-center flex-shrink-0">
+              <span className="text-[#0F1117] font-bold text-sm">SA</span>
             </div>
             <div className="flex-1 text-left min-w-0">
-              <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
+              <p className="text-[13px] font-semibold text-[#F0F1F5] truncate">
                 {user.user_metadata?.full_name || "Super Admin"}
               </p>
-              <p className="text-xs text-gray-500 dark:text-gray-400 truncate">Altea Pay</p>
+              <p className="text-[11px] text-[#6B7188] truncate">{user.email || "admin@alteapay.com"}</p>
             </div>
           </div>
         </div>
@@ -180,12 +247,12 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
 
   return (
     <>
-      <div className="hidden lg:flex h-full flex-col bg-white dark:bg-[oklch(0.12_0.02_240)] border-r border-gray-200 dark:border-[oklch(0.26_0.02_240)]">
+      <div className="hidden lg:flex h-full flex-col bg-[#1A1D27] border-r border-[#323647]">
         <SidebarContent />
       </div>
 
       <Sheet open={isMobileMenuOpen} onOpenChange={setIsMobileMenuOpen}>
-        <SheetContent side="left" className="p-0 w-80 max-w-[85vw] bg-white dark:bg-[oklch(0.12_0.02_240)]">
+        <SheetContent side="left" className="p-0 w-80 max-w-[85vw] bg-[#1A1D27] border-r border-[#323647]">
           <div className="flex h-full flex-col">
             <SidebarContent />
           </div>

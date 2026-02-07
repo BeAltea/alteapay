@@ -239,7 +239,7 @@ export default function ComportamentalPage() {
               <div className="h-10 w-10 rounded-full bg-gradient-to-br from-yellow-500 to-orange-600 flex items-center justify-center">
                 <Sparkles className="h-5 w-5 text-white" />
               </div>
-              Analise Comportamental Completa
+              Análise 360 Completa
             </SheetTitle>
             <SheetDescription>
               {selectedAnalysis.cpf} - {new Date(selectedAnalysis.created_at).toLocaleString("pt-BR")}
@@ -939,8 +939,8 @@ export default function ComportamentalPage() {
   return (
     <div className="container mx-auto py-8 space-y-8">
       <div>
-        <h1 className="text-3xl font-bold tracking-tight">Análise Comportamental</h1>
-        <p className="text-muted-foreground mt-1">Inicie análises comportamentais assíncronas do sistema</p>
+        <h1 className="text-3xl font-bold tracking-tight">Análise 360</h1>
+        <p className="text-muted-foreground mt-1">Visão completa: crédito + comportamental + propensão de pagamento com IA preditiva</p>
       </div>
 
       <div className="flex flex-col sm:flex-row gap-4">
