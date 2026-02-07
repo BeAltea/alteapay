@@ -274,7 +274,7 @@ export async function getAllCustomers() {
       const { data: vmaxPage, error: vmaxPageError } = await supabase
         .from("VMAX")
         .select(
-          'id, Cliente, "CPF/CNPJ", id_company, Cidade, "Dias Inad.", credit_score, risk_level, approval_status, analysis_metadata, last_analysis_date, recovery_score, recovery_class, restrictive_analysis_logs, restrictive_analysis_date, behavioral_analysis_logs, behavioral_analysis_date',
+          'id, Cliente, "CPF/CNPJ", id_company, Cidade, "Dias Inad.", Vencido, credit_score, risk_level, approval_status, analysis_metadata, last_analysis_date, recovery_score, recovery_class, restrictive_analysis_logs, restrictive_analysis_date, behavioral_analysis_logs, behavioral_analysis_date',
         )
         .order("Cliente")
         .range(page * pageSize, (page + 1) * pageSize - 1)
@@ -299,7 +299,7 @@ export async function getAllCustomers() {
     // SOMENTE dados da tabela VMAX (tabela customers foi descontinuada)
     const allCustomers = (vmaxData || []).map((v) => {
         let score = v.credit_score
-        
+
         // Usar logs restritivos se existir, senão analysis_metadata (compatibilidade)
         const analysisLogs = v.restrictive_analysis_logs || v.analysis_metadata
         const analysisDate = v.restrictive_analysis_date || v.last_analysis_date
@@ -320,6 +320,18 @@ export async function getAllCustomers() {
           score = 5
         }
 
+        // Parse Vencido field (currency string like "R$ 1.234,56" or number)
+        let vencido = 0
+        if (v.Vencido) {
+          const vencidoStr = String(v.Vencido)
+          const cleanValue = vencidoStr
+            .replace(/R\$/g, "")
+            .replace(/\s/g, "")
+            .replace(/\./g, "")
+            .replace(",", ".")
+          vencido = Number(cleanValue) || 0
+        }
+
         return {
           id: v.id,
           name: v.Cliente,
@@ -328,6 +340,7 @@ export async function getAllCustomers() {
           city: v.Cidade || "N/A",
           source_table: "VMAX" as const,
           dias_inad: Number(String(v["Dias Inad."] || "0").replace(/\D/g, "")) || 0,
+          vencido,
           credit_score: score,
           risk_level: v.risk_level,
           approval_status: v.approval_status,
@@ -366,6 +379,7 @@ export async function getAllCustomers() {
         company_id: customer.company_id,
         source_table: customer.source_table,
         dias_inad: customer.dias_inad,
+        vencido: customer.vencido,
         credit_score: customer.credit_score,
         risk_level: customer.risk_level,
         approval_status: customer.approval_status,

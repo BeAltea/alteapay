@@ -99,19 +99,21 @@ export default function ComportamentalPage() {
         customer.name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
         customer.document?.toLowerCase().includes(searchTerm.toLowerCase())
       const matchesCompany = filterCompany === "all" || customer.company_id === filterCompany
-      // Filtro por status de análise
-      const hasAnalysis = customer.recovery_score !== null || customer.analysis_metadata !== null
-      const matchesStatus = filterStatus === "all" || 
-        (filterStatus === "pending" && !hasAnalysis) || 
-        (filterStatus === "completed" && hasAnalysis)
+      // Filtro por status de análise - usar behavioral_analysis_logs para Análise 360
+      const hasBehavioralAnalysis = !!customer.behavioral_analysis_logs
+      const matchesStatus = filterStatus === "all" ||
+        (filterStatus === "pending" && !hasBehavioralAnalysis) ||
+        (filterStatus === "completed" && hasBehavioralAnalysis)
       return matchesSearch && matchesCompany && matchesStatus
     })
     .map((customer) => {
+      // Check for analysis in credit_profiles (pendingAnalyses) or in VMAX behavioral_analysis_logs
       const analysis = pendingAnalyses.find((a) => a.cpf?.replace(/\D/g, "") === customer.document?.replace(/\D/g, ""))
+      const hasAnalysisData = !!analysis || !!customer.behavioral_analysis_logs
       return {
         ...customer,
-        hasAnalysis: !!analysis,
-        analysisData: analysis,
+        hasAnalysis: hasAnalysisData,
+        analysisData: analysis || (customer.behavioral_analysis_logs ? { data: customer.behavioral_analysis_logs } : null),
       }
     })
     .sort((a, b) => {
@@ -146,10 +148,11 @@ export default function ComportamentalPage() {
       customer.name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
       customer.document?.toLowerCase().includes(searchTerm.toLowerCase())
     const matchesCompany = filterCompany === "all" || customer.company_id === filterCompany
-    const hasAnalysis = customer.recovery_score !== null || customer.analysis_metadata !== null
-    const matchesStatus = filterStatus === "all" || 
-      (filterStatus === "pending" && !hasAnalysis) || 
-      (filterStatus === "completed" && hasAnalysis)
+    // Usar behavioral_analysis_logs para Análise 360
+    const hasBehavioralAnalysis = !!customer.behavioral_analysis_logs
+    const matchesStatus = filterStatus === "all" ||
+      (filterStatus === "pending" && !hasBehavioralAnalysis) ||
+      (filterStatus === "completed" && hasBehavioralAnalysis)
     return matchesSearch && matchesCompany && matchesStatus
   }).length
 

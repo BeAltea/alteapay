@@ -197,19 +197,15 @@ export default function ClientesPage() {
     currentPage * ITEMS_PER_PAGE
   )
 
-  // Stats for the selected company
+  // Stats based on filtered customers (includes company, search, and status filters)
   const stats = useMemo(() => {
-    const data = selectedCompanyId
-      ? customers.filter((c) => c.company_id === selectedCompanyId)
-      : customers
-
     return {
-      total: data.length,
-      withRestrictiveAnalysis: data.filter((c) => !!c.restrictive_analysis_logs).length,
-      withBehavioralAnalysis: data.filter((c) => !!c.behavioral_analysis_logs).length,
-      totalDebt: data.reduce((acc, c) => acc + (c.vencido || 0), 0),
+      total: filteredCustomers.length,
+      withRestrictiveAnalysis: filteredCustomers.filter((c) => !!c.restrictive_analysis_logs).length,
+      withBehavioralAnalysis: filteredCustomers.filter((c) => !!c.behavioral_analysis_logs).length,
+      totalDebt: filteredCustomers.reduce((acc, c) => acc + (c.vencido || 0), 0),
     }
-  }, [customers, selectedCompanyId])
+  }, [filteredCustomers])
 
   const getAnalysisStatusBadge = (type: "restrictive" | "behavioral", customer: Customer) => {
     if (type === "restrictive") {
