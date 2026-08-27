@@ -132,6 +132,16 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
           icon: Handshake,
         },
         {
+          name: "Negociações Chat",
+          href: "/super-admin/negociacoes-chat",
+          icon: Handshake,
+        },
+        {
+          name: "Redirecionamentos",
+          href: "/super-admin/redirecionamentos",
+          icon: Handshake,
+        },
+        {
           name: "Importar Dados",
           href: "/super-admin/importar-dados",
           icon: FileUp,

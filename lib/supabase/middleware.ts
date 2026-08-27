@@ -65,7 +65,14 @@ export async function updateSession(request: NextRequest) {
     )
 
     const publicPaths = ["/", "/auth/login", "/auth/register", "/auth/portal-register", "/auth/verify-email", "/auth/callback", "/auth/error", "/auth/reset-password", "/auth/forgot-password", "/auth/confirm"]
-    const isPublicPath = publicPaths.includes(currentPath) || currentPath.startsWith("/auth/")
+    // /negociar: chat público do devedor (auth pelo token de handoff, não por
+    // usuário Supabase). /demo e /dev: páginas locais de validação mock.
+    const isPublicPath =
+      publicPaths.includes(currentPath) ||
+      currentPath.startsWith("/auth/") ||
+      currentPath.startsWith("/negociar") ||
+      currentPath.startsWith("/demo") ||
+      currentPath.startsWith("/dev")
 
     let user = null
     let userError = null

@@ -126,3 +126,26 @@ export const bulkNegotiationsQueue = new Queue(QUEUE_CONFIG.bulkNegotiations.nam
     removeOnFail: QUEUE_CONFIG.bulkNegotiations.removeOnFail,
   },
 });
+
+// WhatsApp inbound processing (webhook -> state machine; dormant behind
+// WHATSAPP_CHANNEL_ENABLED)
+export const whatsappQueue = new Queue(QUEUE_CONFIG.whatsapp.name, {
+  connection: getConnection(),
+  defaultJobOptions: {
+    attempts: QUEUE_CONFIG.whatsapp.retries.attempts,
+    backoff: QUEUE_CONFIG.whatsapp.retries.backoff,
+    removeOnComplete: QUEUE_CONFIG.whatsapp.removeOnComplete,
+    removeOnFail: QUEUE_CONFIG.whatsapp.removeOnFail,
+  },
+});
+
+// n8n async turns (webhook -> agent turn -> signed callback to the flow)
+export const n8nQueue = new Queue(QUEUE_CONFIG.n8n.name, {
+  connection: getConnection(),
+  defaultJobOptions: {
+    attempts: QUEUE_CONFIG.n8n.retries.attempts,
+    backoff: QUEUE_CONFIG.n8n.retries.backoff,
+    removeOnComplete: QUEUE_CONFIG.n8n.removeOnComplete,
+    removeOnFail: QUEUE_CONFIG.n8n.removeOnFail,
+  },
+});

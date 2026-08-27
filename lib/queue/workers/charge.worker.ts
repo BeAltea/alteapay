@@ -2,6 +2,7 @@ import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG, ASAAS_NOTIFICATION_DEFAULTS } from '../config';
 import { emailQueue } from '../queues';
+import { createServiceClient } from '../../supabase/service';
 
 const ASAAS_BASE_URL = 'https://api.asaas.com/v3';
 
@@ -185,6 +186,33 @@ export const chargeWorker = WorkerManager.registerWorker<ChargeJobData>(
     const asaasPayment = paymentResult.data;
     console.log(`[CHARGE] Payment created: ${asaasPayment.id}`);
     console.log(`[CHARGE] Invoice URL: ${asaasPayment.invoiceUrl}`);
+
+    // Write-back no acordo: quando o externalReference é um agreement (fluxo
+    // negociação-primeiro/chatbot), grava ids e URLs do ASAAS para a UI do chat
+    // exibir os links (antes disso, agreements.asaas_* ficava sempre nulo).
+    const agreementRef = payment.externalReference;
+    if (agreementRef && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agreementRef)) {
+      const supabase = createServiceClient();
+      const { data: updatedAgreement, error: agreementUpdateError } = await supabase
+        .from('agreements')
+        .update({
+          asaas_customer_id: asaasCustomerId,
+          asaas_payment_id: asaasPayment.id,
+          asaas_status: asaasPayment.status ?? 'PENDING',
+          asaas_billing_type: asaasPayment.billingType ?? payment.billingType,
+          asaas_payment_url: asaasPayment.invoiceUrl ?? null,
+          asaas_invoice_url: asaasPayment.invoiceUrl ?? null,
+          asaas_boleto_url: asaasPayment.bankSlipUrl ?? null,
+          asaas_pix_qrcode_url: asaasPayment.pixQrCodeUrl ?? null,
+        })
+        .eq('id', agreementRef)
+        .select('id');
+      if (agreementUpdateError || !updatedAgreement?.length) {
+        console.warn(`[CHARGE] Agreement write-back skipped (${agreementRef}):`, agreementUpdateError?.message ?? '0 rows');
+      } else {
+        console.log(`[CHARGE] Agreement ${agreementRef} updated with ASAAS links`);
+      }
+    }
 
     // Step 4: Queue email notification if requested
     if (sendEmail && emailTemplate && customer.email) {
