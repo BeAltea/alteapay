@@ -1,20 +1,20 @@
 // POST /api/negotiation/message — um turno de conversa. Grava inbound,
-// chama o agente (server-to-server), grava outbound com tool_calls e
-// prompt_version (LGPD art. 20) e atualiza o funil da sessão.
+// chama o engine (fluxo n8n por padrão; agente legado por env), grava
+// outbound com rastreabilidade LGPD (art. 20) e atualiza o funil da sessão.
 
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { z } from "zod"
 
-import { agentChat } from "@/lib/negotiation/agent-client"
 import { MAX_MESSAGE_CHARS } from "@/lib/negotiation/config"
 import { corsHeaders } from "@/lib/negotiation/cors"
 import { CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { LIMITS, rateLimit } from "@/lib/negotiation/rate-limit"
-import { applyTurnEffects, getSessionFromCookie, loadTenantConfig, recordMessage } from "@/lib/negotiation/sessions"
+import { getSessionFromCookie, loadTenantConfig } from "@/lib/negotiation/sessions"
+import { runChatbotTurn } from "@/lib/negotiation/turn"
 
 export const dynamic = "force-dynamic"
-export const maxDuration = 300 // modelo local ~100s/turno
+export const maxDuration = 300
 
 const bodySchema = z.object({ message: z.string().min(1).max(MAX_MESSAGE_CHARS) })
 
@@ -61,48 +61,25 @@ export async function POST(request: Request) {
   const origin = request.headers.get("origin")
   const headers = corsHeaders(origin, tenant?.allowed_origins ?? [])
 
-  await recordMessage({
-    session,
-    channel: "webchat",
-    direction: "inbound",
-    sender: "debtor",
-    content: message,
-  })
-
-  let agentResponse
+  let result
   try {
-    agentResponse = await agentChat(session.thread_id, message, session.company_id)
+    result = await runChatbotTurn(session, message, "webchat")
   } catch (err) {
-    console.error("[negotiation:message] agente falhou:", err instanceof Error ? err.message : err)
+    console.error("[negotiation:message] engine falhou:", err instanceof Error ? err.message : err)
     return NextResponse.json(
-      { success: false, error: "agente indisponível, tente novamente" },
+      { success: false, error: "atendimento indisponível, tente novamente" },
       { status: 502, headers },
     )
   }
 
-  await recordMessage({
-    session,
-    channel: "webchat",
-    direction: "outbound",
-    sender: "agent",
-    content: agentResponse.reply,
-    tool_calls: agentResponse.tool_calls.length ? agentResponse.tool_calls : null,
-    llm_model: process.env.NEGOTIATION_MODEL || "qwen2.5:14b",
-    prompt_version: agentResponse.prompt_version,
-  })
-
-  await applyTurnEffects(session, agentResponse).catch((err) =>
-    console.error("[negotiation:message] efeitos do turno:", err.message),
-  )
-
   return NextResponse.json(
     {
       success: true,
-      reply: agentResponse.reply,
-      action: agentResponse.action,
-      agreement_id: agentResponse.agreement_id,
-      verified: agentResponse.verified,
-      official_channel_label: agentResponse.action === "redirect_payment"
+      reply: result.reply,
+      action: result.action,
+      agreement_id: result.agreement_id,
+      verified: result.verified,
+      official_channel_label: result.action === "redirect_payment"
         ? tenant?.official_channel_label ?? null
         : null,
     },

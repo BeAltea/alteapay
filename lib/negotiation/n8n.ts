@@ -10,11 +10,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 import IORedis from "ioredis"
 
-import { agentChat } from "./agent-client"
-import type { AgentChatResponse } from "./agent-client"
-import { applyTurnEffects, recordMessage } from "./sessions"
-import type { NegotiationSession } from "./types"
-
 export const N8N_SIGNATURE_HEADER = "x-alteapay-signature"
 export const N8N_TIMESTAMP_HEADER = "x-alteapay-timestamp"
 export const N8N_TIMESTAMP_TOLERANCE_SECONDS = 300
@@ -105,52 +100,7 @@ export async function getCachedTurnResult<T>(key: string): Promise<T | null> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Turno server-side (compartilhado entre a rota sync e o worker async)
-
-export interface N8nTurnResult {
-  reply: string
-  action: AgentChatResponse["action"]
-  agreement_id: string | null
-  verified: boolean
-  events: string[]
-  prompt_version: string
-}
-
-export async function runN8nTurn(session: NegotiationSession, message: string): Promise<N8nTurnResult> {
-  if (!session.thread_id) throw new Error("sessão sem thread_id")
-
-  await recordMessage({
-    session,
-    channel: "n8n",
-    direction: "inbound",
-    sender: "debtor",
-    content: message,
-  })
-
-  const agentResponse = await agentChat(session.thread_id, message, session.company_id)
-
-  await recordMessage({
-    session,
-    channel: "n8n",
-    direction: "outbound",
-    sender: "agent",
-    content: agentResponse.reply,
-    tool_calls: agentResponse.tool_calls.length ? agentResponse.tool_calls : null,
-    llm_model: process.env.NEGOTIATION_MODEL || "qwen2.5:14b",
-    prompt_version: agentResponse.prompt_version,
-  })
-
-  await applyTurnEffects(session, agentResponse).catch((err) =>
-    console.error("[negotiation:n8n] efeitos do turno:", err instanceof Error ? err.message : err),
-  )
-
-  return {
-    reply: agentResponse.reply,
-    action: agentResponse.action,
-    agreement_id: agentResponse.agreement_id,
-    verified: agentResponse.verified,
-    events: agentResponse.events,
-    prompt_version: agentResponse.prompt_version,
-  }
-}
+// O turno server-side vive em lib/negotiation/turn.ts (runChatbotTurn), que
+// chama o engine (fluxo n8n por padrão; agente legado por env). Este módulo
+// fica restrito a segurança e idempotência para não criar ciclo de imports
+// com o engine.

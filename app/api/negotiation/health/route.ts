@@ -2,12 +2,12 @@
 
 import { NextResponse } from "next/server"
 
-import { agentHealth } from "@/lib/negotiation/agent-client"
+import { engineHealth } from "@/lib/negotiation/engine"
 
 export const dynamic = "force-dynamic"
 
 export async function GET() {
-  const agent = await agentHealth()
+  const agent = await engineHealth()
   return NextResponse.json(
     { success: agent.ok, agent },
     { status: agent.ok ? 200 : 503 },

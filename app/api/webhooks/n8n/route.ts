@@ -1,45 +1,54 @@
-// POST /api/webhooks/n8n — ponte segura entre fluxos do n8n e o chatbot de
-// negociação. Autenticação por HMAC-SHA256 sobre `${timestamp}.${corpo}`
-// (headers x-alteapay-signature / x-alteapay-timestamp, janela ±300s).
+// POST /api/webhooks/n8n — API de domínio do chatbot para fluxos do n8n.
+// Autenticação por HMAC-SHA256 sobre `${timestamp}.${corpo}` (headers
+// x-alteapay-signature / x-alteapay-timestamp, janela ±300s).
 //
-// Ações (campo "action" do corpo):
-//   ping            — teste de conectividade/assinatura + saúde do agente
-//   session.create  — cria sessão de negociação e semeia o agente
-//   session.message — turno de conversa; sync (resposta inline, até ~300s)
-//                     ou async (202 + callback assinado no fluxo n8n)
-//   session.status  — funil da sessão + links de pagamento do acordo
+// Os fluxos n8n são o CÉREBRO da conversa; a plataforma é o sistema de
+// registro e de ações de domínio. Ações (campo "action" do corpo):
+//   ping             — teste de conectividade/assinatura + saúde do engine
+//   session.create   — cria sessão de negociação (registro + deep link)
+//   session.message  — turno completo conduzido pela plataforma (engine →
+//                      fluxo N8N_CHAT_FLOW_URL); sync ou async com callback
+//   session.record   — auditoria de mensagem de conversa conduzida PELO fluxo
+//                      (canal externo), com efeitos de funil opcionais
+//   agreement.close  — fecha acordo com as regras de desconto DO SERVIDOR e
+//                      enfileira a cobrança
+//   session.redirect — modo B: registra o redirect e devolve a URL oficial do
+//                      tenant (único caminho para obtê-la)
+//   session.status   — funil da sessão + links de pagamento do acordo
 //
 // Documentação completa: docs/N8N_INTEGRATION.md
 
 import { NextResponse } from "next/server"
 import { z } from "zod"
 
-import { agentHealth, agentSessionInit } from "@/lib/negotiation/agent-client"
+import { closeAgreement } from "@/lib/negotiation/close-agreement"
 import { CONSENT_VERSION, MAX_MESSAGE_CHARS } from "@/lib/negotiation/config"
+import { engineHealth, engineSessionInit } from "@/lib/negotiation/engine"
 import {
   N8N_SIGNATURE_HEADER,
   N8N_TIMESTAMP_HEADER,
   cacheTurnResult,
   getCachedTurnResult,
   markEventSeen,
-  runN8nTurn,
   verifyN8nRequest,
-  type N8nTurnResult,
 } from "@/lib/negotiation/n8n"
 import { onlyDigits } from "@/lib/negotiation/pii"
 import { LIMITS, rateLimit } from "@/lib/negotiation/rate-limit"
 import {
+  applyTurnEffects,
   createHandoffSession,
   loadSessionDebtContext,
   loadTenantConfig,
+  recordMessage,
   updateSession,
 } from "@/lib/negotiation/sessions"
+import { runChatbotTurn, type EngineTurnResult } from "@/lib/negotiation/turn"
 import type { NegotiationSession } from "@/lib/negotiation/types"
 import { n8nQueue } from "@/lib/queue/queues"
 import { createServiceClient } from "@/lib/supabase/service"
 
 export const dynamic = "force-dynamic"
-export const maxDuration = 300 // modo sync espera o turno do agente (~100s local)
+export const maxDuration = 300
 
 const N8N_IP_LIMIT = { limit: 120, windowSeconds: 60 }
 
@@ -70,7 +79,54 @@ const statusSchema = z.object({
   session_id: z.string().uuid(),
 })
 
-const bodySchema = z.discriminatedUnion("action", [pingSchema, createSchema, messageSchema, statusSchema])
+// Auditoria de conversa conduzida PELO fluxo n8n (canal externo): grava a
+// mensagem em conversation_messages e aplica efeitos de funil opcionais.
+const recordSchema = z.object({
+  action: z.literal("session.record"),
+  session_id: z.string().uuid(),
+  direction: z.enum(["inbound", "outbound"]),
+  sender: z.enum(["debtor", "agent", "system", "human_operator"]).optional(),
+  content: z.string().min(1).max(MAX_MESSAGE_CHARS),
+  provider_message_id: z.string().max(256).optional(),
+  // Efeitos do turno decididos pelo fluxo (só com direction=outbound):
+  events: z.array(z.string()).optional(),
+  turn_action: z.enum(["agreement_closed", "redirect_payment", "redirect_attendance", "handoff"]).nullish(),
+  agreement_id: z.string().uuid().nullish(),
+})
+
+// Fechamento de acordo: termos derivam SEMPRE das regras do servidor.
+const closeSchema = z.object({
+  action: z.literal("agreement.close"),
+  session_id: z.string().uuid(),
+  offer_id: z.string().min(1).max(32), // 'avista' | 'parc_N'
+  event_id: z.string().min(1).max(128).optional(), // idempotência
+})
+
+// Modo B: registra o redirect e devolve a URL oficial do tenant.
+const redirectSchema = z.object({
+  action: z.literal("session.redirect"),
+  session_id: z.string().uuid(),
+  offer_presented: z
+    .object({
+      type: z.string().optional(),
+      label: z.string().optional(),
+      total: z.union([z.string(), z.number()]).optional(),
+      installments: z.number().optional(),
+      discount_pct: z.union([z.string(), z.number()]).optional(),
+    })
+    .nullish(),
+  confirmed_intent: z.boolean().optional(),
+})
+
+const bodySchema = z.discriminatedUnion("action", [
+  pingSchema,
+  createSchema,
+  messageSchema,
+  statusSchema,
+  recordSchema,
+  closeSchema,
+  redirectSchema,
+])
 
 function jsonError(status: number, error: string, extra: Record<string, unknown> = {}) {
   return NextResponse.json({ success: false, error, ...extra }, { status })
@@ -180,13 +236,13 @@ async function handleCreate(input: z.infer<typeof createSchema>) {
     })
   }
 
-  // Semeia o thread no agente já na criação: fluxos n8n conversam
-  // server-to-server sem passar pelo resolve do browser.
+  // Semeia o contexto no engine (no-op para o engine n8n — o contexto viaja
+  // em todo turno; obrigatório apenas no engine legado de agente).
   const tenant = await loadTenantConfig(session.company_id)
   const context = await loadSessionDebtContext(session)
   if (session.thread_id && context) {
     try {
-      await agentSessionInit({
+      await engineSessionInit({
         thread_id: session.thread_id,
         company_id: session.company_id,
         customer_name: context.customer_name,
@@ -204,7 +260,7 @@ async function handleCreate(input: z.infer<typeof createSchema>) {
       })
     } catch (err) {
       console.error("[webhooks:n8n] session/init falhou:", err instanceof Error ? err.message : err)
-      return jsonError(502, "agente indisponível — sessão criada mas não inicializada", {
+      return jsonError(502, "engine indisponível — sessão criada mas não inicializada", {
         session_id: session.id,
       })
     }
@@ -241,7 +297,7 @@ async function handleMessage(input: z.infer<typeof messageSchema>) {
   if (!message) return jsonError(422, "mensagem vazia")
 
   if (input.event_id) {
-    const cached = await getCachedTurnResult<N8nTurnResult>(input.event_id)
+    const cached = await getCachedTurnResult<EngineTurnResult>(input.event_id)
     if (cached) {
       return NextResponse.json({ success: true, duplicate: true, session_id: session.id, ...cached })
     }
@@ -272,16 +328,142 @@ async function handleMessage(input: z.infer<typeof messageSchema>) {
     )
   }
 
-  let result: N8nTurnResult
+  let result: EngineTurnResult
   try {
-    result = await runN8nTurn(session, message)
+    result = await runChatbotTurn(session, message, "n8n")
   } catch (err) {
     console.error("[webhooks:n8n] turno falhou:", err instanceof Error ? err.message : err)
-    return jsonError(502, "agente indisponível, tente novamente")
+    return jsonError(502, "engine indisponível, tente novamente")
   }
   if (input.event_id) await cacheTurnResult(input.event_id, result)
 
   return NextResponse.json({ success: true, session_id: session.id, ...result })
+}
+
+async function handleRecord(input: z.infer<typeof recordSchema>) {
+  const session = await loadSessionById(input.session_id)
+  if (!session) return jsonError(404, "sessão não encontrada")
+  if (!session.consent_lgpd_at) {
+    return jsonError(403, "consentimento LGPD pendente — crie a sessão com consent:true")
+  }
+
+  const sender = input.sender ?? (input.direction === "inbound" ? "debtor" : "agent")
+  const message = await recordMessage({
+    session,
+    channel: "n8n",
+    direction: input.direction,
+    sender,
+    content: input.content,
+    llm_model: input.direction === "outbound" ? "n8n-flow" : null,
+    provider_message_id: input.provider_message_id ?? null,
+  })
+
+  if (input.direction === "outbound" && (input.events?.length || input.turn_action)) {
+    await applyTurnEffects(session, {
+      events: input.events ?? [],
+      action: input.turn_action ?? null,
+      agreement_id: input.agreement_id ?? null,
+    }).catch((err) => console.error("[webhooks:n8n] efeitos do record:", err.message))
+  }
+
+  return NextResponse.json({ success: true, message_id: message.id, session_id: session.id })
+}
+
+async function handleClose(input: z.infer<typeof closeSchema>) {
+  const session = await loadSessionById(input.session_id)
+  if (!session) return jsonError(404, "sessão não encontrada")
+  if (!session.consent_lgpd_at) return jsonError(403, "consentimento LGPD pendente")
+  if (!session.identity_verified_at) {
+    return jsonError(403, "identidade não verificada — acordo exige identity_verified")
+  }
+  if (!session.debt_id) return jsonError(409, "sessão sem dívida vinculada")
+  if (session.outcome === "agreement_closed" && session.agreement_id) {
+    return NextResponse.json({
+      success: true,
+      duplicate: true,
+      agreement_id: session.agreement_id,
+      message: "acordo já registrado para esta sessão",
+    })
+  }
+
+  if (input.event_id) {
+    const fresh = await markEventSeen(`close:${input.event_id}`)
+    if (!fresh) {
+      return NextResponse.json({
+        success: true,
+        duplicate: true,
+        agreement_id: session.agreement_id,
+        detail: "event_id já recebido",
+      })
+    }
+  }
+
+  const result = await closeAgreement({
+    company_id: session.company_id,
+    debt_id: session.debt_id,
+    offer_id: input.offer_id,
+    origin: `n8n flow session ${session.id}`,
+    channel: "n8n",
+  })
+  if (!result.ok) return jsonError(result.status, result.error)
+
+  await updateSession(session.id, {
+    outcome: "agreement_closed",
+    agreement_id: result.agreement_id,
+  }).catch((err) => console.error("[webhooks:n8n] outcome do close:", err.message))
+
+  return NextResponse.json({
+    success: true,
+    agreement_id: result.agreement_id,
+    message: result.message,
+    terms: result.terms,
+    hint: "links de pagamento chegam async — consultar session.status",
+  })
+}
+
+async function handleRedirect(input: z.infer<typeof redirectSchema>) {
+  const session = await loadSessionById(input.session_id)
+  if (!session) return jsonError(404, "sessão não encontrada")
+  if (!session.consent_lgpd_at) return jsonError(403, "consentimento LGPD pendente")
+
+  const tenant = await loadTenantConfig(session.company_id)
+  if (!tenant?.official_channel_url) {
+    return jsonError(409, "canal oficial não configurado para este tenant")
+  }
+
+  const context = await loadSessionDebtContext(session)
+  const supabase = createServiceClient()
+  const { data, error } = await supabase
+    .from("redirect_events")
+    .insert({
+      session_id: session.id,
+      company_id: session.company_id, // sempre da sessão, nunca do fluxo
+      debt_id: session.debt_id,
+      customer_id: session.customer_id,
+      debt_amount_at_redirect: context?.amount ?? 0,
+      offer_presented: input.offer_presented ?? null,
+      official_channel_url: tenant.official_channel_url,
+      confirmed_intent: input.confirmed_intent ?? true,
+    })
+    .select()
+    .single()
+  if (error || !data) {
+    console.error("[webhooks:n8n] redirect:", error?.message)
+    return jsonError(500, "falha ao registrar redirect")
+  }
+
+  if (session.outcome === "in_progress") {
+    await updateSession(session.id, { outcome: "redirected_official" }).catch((err) =>
+      console.error("[webhooks:n8n] outcome do redirect:", err.message),
+    )
+  }
+
+  return NextResponse.json({
+    success: true,
+    redirect_event_id: data.id,
+    official_channel_url: tenant.official_channel_url,
+    official_channel_label: tenant.official_channel_label,
+  })
 }
 
 async function handleStatus(input: z.infer<typeof statusSchema>) {
@@ -341,11 +523,17 @@ export async function POST(request: Request) {
   try {
     switch (parsed.data.action) {
       case "ping":
-        return NextResponse.json({ success: true, service: "alteapay-chatbot", agent: await agentHealth() })
+        return NextResponse.json({ success: true, service: "alteapay-chatbot", engine: await engineHealth() })
       case "session.create":
         return await handleCreate(parsed.data)
       case "session.message":
         return await handleMessage(parsed.data)
+      case "session.record":
+        return await handleRecord(parsed.data)
+      case "agreement.close":
+        return await handleClose(parsed.data)
+      case "session.redirect":
+        return await handleRedirect(parsed.data)
       case "session.status":
         return await handleStatus(parsed.data)
     }

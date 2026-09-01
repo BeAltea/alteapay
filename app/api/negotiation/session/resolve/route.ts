@@ -6,7 +6,7 @@ import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { z } from "zod"
 
-import { agentSessionInit } from "@/lib/negotiation/agent-client"
+import { engineSessionInit } from "@/lib/negotiation/engine"
 import { appUrl } from "@/lib/negotiation/config"
 import { corsHeaders, isOriginAllowed } from "@/lib/negotiation/cors"
 import { CHAT_COOKIE_NAME, CHAT_JWT_TTL_SECONDS, sha256Hex, signChatJwt } from "@/lib/negotiation/crypto"
@@ -84,7 +84,7 @@ export async function POST(request: Request) {
   // repassada SOMENTE se o gate já passou (ex.: WhatsApp) — nunca do client.
   if (session.thread_id && context) {
     try {
-      await agentSessionInit({
+      await engineSessionInit({
         thread_id: session.thread_id,
         company_id: session.company_id,
         customer_name: context.customer_name,

@@ -51,17 +51,24 @@ web, considerar migrar o turno para fila em fase 2).
 
 ## 3. Checklist de go-live (nada disso foi executado)
 
-1. **Hospedar o agente de negociação** (`alteapay-agents/agents/negotiation`,
-   FastAPI/LangGraph) — ex.: Fargate — com `ANTHROPIC_API_KEY`,
-   `LLM_PROVIDER=anthropic`, Postgres para checkpoints, `TRAINING_MODE=0`.
-   Apontar `NEGOTIATION_AGENT_URL` (Netlify) para ele, com
-   `APP_SHARED_TOKEN`/`AGENT_APP_TOKEN` idênticos dos dois lados e
-   `REQUIRE_APP_TOKEN=1` no agente.
+> **Pivô 2026-09-01:** o cérebro da conversa são FLUXOS DO N8N
+> (`NEGOTIATION_ENGINE=n8n`, padrão) — o agente LangGraph interno saiu do
+> caminho de produto (fica como engine legado do rig de treino local). O
+> item 1 abaixo substitui o antigo "hospedar o agente".
+
+1. **n8n em produção**: instância própria/privada com o fluxo-cérebro
+   publicado (contrato em `docs/N8N_INTEGRATION.md` §4/§6.1). Configurar
+   `N8N_CHAT_FLOW_URL` + `N8N_WEBHOOK_SECRET` no Netlify e
+   `ALTEAPAY_N8N_SECRET` no n8n. O fluxo deve validar assinatura, aplicar o
+   identity gate quando `identity_verified=false` e respeitar o
+   `fulfillment_mode` do tenant.
 2. **Aplicar as 2 migrations** no Supabase de produção (SQL editor) e semear
    `tenant_chat_config` por tenant (modo A/B/C, allowed_origins, branding).
-3. **Configurar envs no Netlify** (seção nova do `.env.example`): sobretudo
-   `N8N_WEBHOOK_SECRET` (openssl rand -hex 32), `NEGOTIATION_JWT_SECRET`,
-   `NEGOTIATION_AGENT_URL`, tokens do agente. `WHATSAPP_CHANNEL_ENABLED=0`.
+3. **Configurar envs no Netlify** (seções novas do `.env.example`): sobretudo
+   `NEGOTIATION_ENGINE=n8n`, `N8N_CHAT_FLOW_URL`, `N8N_WEBHOOK_SECRET`
+   (openssl rand -hex 32) e `NEGOTIATION_JWT_SECRET`.
+   `WHATSAPP_CHANNEL_ENABLED=0`. Envs do agente (`NEGOTIATION_AGENT_URL`,
+   tokens) só se algum dia reativar o engine legado.
 4. **Rebuildar e redeployar os workers Fargate** (imagem passa a incluir
    whatsapp+n8n workers e o fix do charge write-back).
 5. **Identidade real (bloqueante para go-live do canal WhatsApp):** o fluxo

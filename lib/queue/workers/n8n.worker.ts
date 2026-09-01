@@ -1,10 +1,11 @@
 /**
  * n8n async worker — consome alteapay-n8n. Executa o turno do chatbot
- * (lib/negotiation/n8n.ts) e entrega o resultado no callback_url do fluxo
- * n8n, assinado com o MESMO esquema HMAC do webhook inbound.
+ * (lib/negotiation/turn.ts → engine, fluxo n8n por padrão) e entrega o
+ * resultado no callback_url do fluxo, assinado com o MESMO esquema HMAC
+ * do webhook inbound.
  *
  * O resultado do turno é cacheado por event_id/job antes do callback:
- * um retry (callback fora do ar) NUNCA re-executa o LLM.
+ * um retry (callback fora do ar) NUNCA re-executa o turno.
  */
 
 import type { Job } from 'bullmq';
@@ -14,10 +15,9 @@ import {
   N8N_TIMESTAMP_HEADER,
   cacheTurnResult,
   getCachedTurnResult,
-  runN8nTurn,
   signN8nPayload,
-  type N8nTurnResult,
 } from '@/lib/negotiation/n8n';
+import { runChatbotTurn, type EngineTurnResult } from '@/lib/negotiation/turn';
 import { createServiceClient } from '@/lib/supabase/service';
 import type { NegotiationSession } from '@/lib/negotiation/types';
 import { QUEUE_CONFIG } from '../config';
@@ -31,7 +31,7 @@ export interface N8nJobData {
   metadata?: Record<string, unknown>;
 }
 
-type StoredResult = (N8nTurnResult & { error?: never }) | { error: string };
+type StoredResult = (EngineTurnResult & { error?: never }) | { error: string };
 
 const CALLBACK_TIMEOUT_MS = 15_000;
 
@@ -54,10 +54,10 @@ export const n8nWorker = WorkerManager.registerWorker<N8nJobData>(
         result = { error: 'sessão não encontrada' };
       } else {
         try {
-          result = await runN8nTurn(session as NegotiationSession, message);
+          result = await runChatbotTurn(session as NegotiationSession, message, 'n8n');
         } catch (err) {
           console.error('[N8N] turno falhou:', err instanceof Error ? err.message : err);
-          result = { error: 'agente indisponível' };
+          result = { error: 'engine indisponível' };
         }
       }
       await cacheTurnResult(cacheKey, result);
