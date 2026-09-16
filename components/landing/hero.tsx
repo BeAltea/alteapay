@@ -1,9 +1,10 @@
 import Link from "next/link"
 import { CheckCircle } from "lucide-react"
-import { hero, siteConfig } from "@/content/home"
+import { hero } from "@/content/home"
+import { whatsappHref } from "@/content/site"
 
 export function Hero() {
-  const whatsappHref = siteConfig.whatsappNumber ? `https://wa.me/${siteConfig.whatsappNumber}` : null
+  const whatsapp = whatsappHref()
 
   return (
     <section aria-labelledby="hero-title" className="bg-altea-navy px-4 py-14 text-white sm:py-20 lg:py-24">
@@ -21,9 +22,9 @@ export function Hero() {
             >
               {hero.ctaPrimary.label}
             </a>
-            {whatsappHref ? (
+            {whatsapp ? (
               <a
-                href={whatsappHref}
+                href={whatsapp}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="rounded-lg border border-white/60 px-6 py-3 text-center font-medium text-white transition-colors hover:border-altea-gold hover:text-altea-gold"

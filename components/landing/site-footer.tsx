@@ -1,16 +1,15 @@
 import Link from "next/link"
 import { Linkedin } from "lucide-react"
-import { footer, siteConfig } from "@/content/home"
+import { footer } from "@/content/home"
+import { CNPJ, CONTACT_EMAIL, addressLine, site, whatsappHref } from "@/content/site"
 
 export function SiteFooter() {
   const year = new Date().getFullYear()
 
   // Linha legal renderiza apenas os campos preenchidos (C.1/C.3 pendentes) + CNPJ fixo
-  const legalLine = [siteConfig.legalName, `CNPJ ${siteConfig.cnpj}`, siteConfig.address]
-    .filter(Boolean)
-    .join(" · ")
+  const legalLine = [site.legalName, `CNPJ ${CNPJ}`, addressLine()].filter(Boolean).join(" · ")
 
-  const whatsappHref = siteConfig.whatsappNumber ? `https://wa.me/${siteConfig.whatsappNumber}` : null
+  const whatsapp = whatsappHref()
 
   return (
     <footer className="bg-altea-navy px-4 py-12 text-white">
@@ -26,9 +25,9 @@ export function SiteFooter() {
               <span className="text-lg font-semibold">AlteaPay</span>
             </Link>
             <p className="mt-4 max-w-sm text-sm text-blue-100">{footer.description}</p>
-            {siteConfig.linkedin ? (
+            {site.linkedinUrl ? (
               <a
-                href={siteConfig.linkedin}
+                href={site.linkedinUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="mt-4 inline-flex items-center gap-2 text-sm text-blue-100 transition-colors hover:text-altea-gold"
@@ -81,14 +80,14 @@ export function SiteFooter() {
             <h2 className="mb-4 mt-6 font-semibold">{footer.contactTitle}</h2>
             <ul className="space-y-2 text-sm">
               <li>
-                <a href={`mailto:${siteConfig.email}`} className="text-blue-100 transition-colors hover:text-altea-gold">
-                  {siteConfig.email}
+                <a href={`mailto:${CONTACT_EMAIL}`} className="text-blue-100 transition-colors hover:text-altea-gold">
+                  {CONTACT_EMAIL}
                 </a>
               </li>
-              {whatsappHref ? (
+              {whatsapp ? (
                 <li>
                   <a
-                    href={whatsappHref}
+                    href={whatsapp}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-blue-100 transition-colors hover:text-altea-gold"

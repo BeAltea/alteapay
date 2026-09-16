@@ -5,7 +5,8 @@ import type React from "react"
 import Link from "next/link"
 import { Mail, MessageCircle } from "lucide-react"
 import { submitContactLead } from "@/app/actions/contact-lead"
-import { citizenNotice, contact, siteConfig } from "@/content/home"
+import { citizenNotice, contact } from "@/content/home"
+import { CONTACT_EMAIL, PRIVACY_URL, whatsappHref as buildWhatsappHref } from "@/content/site"
 
 type ContactType = "empresa" | "orgao_publico" | "recebi_cobranca"
 
@@ -56,7 +57,7 @@ export function Contact() {
     }
   }, [])
 
-  const whatsappHref = siteConfig.whatsappNumber ? `https://wa.me/${siteConfig.whatsappNumber}` : null
+  const whatsappHref = buildWhatsappHref()
   const isCitizen = form.tipo === "recebi_cobranca"
 
   const setField = <K extends keyof FormState>(field: K, value: FormState[K]) => {
@@ -246,10 +247,10 @@ export function Contact() {
                     {citizenNotice.ctaPortal.label}
                   </Link>
                   <a
-                    href={`mailto:${siteConfig.email}`}
+                    href={`mailto:${CONTACT_EMAIL}`}
                     className="rounded-lg border border-gray-300 px-5 py-2.5 text-center font-medium text-altea-navy transition-colors hover:border-altea-navy"
                   >
-                    {siteConfig.email}
+                    {CONTACT_EMAIL}
                   </a>
                   {whatsappHref ? (
                     <a
@@ -302,7 +303,7 @@ export function Contact() {
                     <label htmlFor="contato-lgpd" className="text-sm text-gray-600">
                       Li e concordo com a{" "}
                       <a
-                        href="/politica-de-privacidade"
+                        href={PRIVACY_URL}
                         className="font-medium text-altea-navy underline underline-offset-4"
                       >
                         Política de Privacidade
@@ -337,11 +338,11 @@ export function Contact() {
                     </a>
                   ) : null}
                   <a
-                    href={`mailto:${siteConfig.email}`}
+                    href={`mailto:${CONTACT_EMAIL}`}
                     className="inline-flex items-center gap-2 font-medium text-altea-navy underline underline-offset-4 transition-colors hover:text-altea-navy-light"
                   >
                     <Mail className="h-4 w-4" aria-hidden="true" />
-                    {siteConfig.email}
+                    {CONTACT_EMAIL}
                   </a>
                 </div>
               </>

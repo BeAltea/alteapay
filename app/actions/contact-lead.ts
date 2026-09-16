@@ -3,8 +3,7 @@
 import { headers } from "next/headers"
 import { z } from "zod"
 import { sendEmailViaSendGrid } from "@/lib/notifications/sendgrid"
-
-const CONTACT_EMAIL = "relacionamento@alteapay.com"
+import { CONTACT_EMAIL } from "@/content/site"
 
 const TIPO_LABELS: Record<string, string> = {
   empresa: "Empresa",

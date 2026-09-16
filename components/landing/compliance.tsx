@@ -1,6 +1,7 @@
 import { ShieldCheck } from "lucide-react"
 import { Section } from "./section"
-import { compliance, siteConfig } from "@/content/home"
+import { compliance } from "@/content/home"
+import { site } from "@/content/site"
 
 export function Compliance() {
   return (
@@ -18,7 +19,7 @@ export function Compliance() {
             <p className="mt-2 text-gray-600">
               {item.description}
               {/* C.11: mencao ao encarregado so renderiza com o DPO preenchido */}
-              {item.title === "LGPD" && siteConfig.dpo ? ` Encarregado nomeado: ${siteConfig.dpo}.` : null}
+              {item.title === "LGPD" && site.dpo ? ` Encarregado nomeado: ${site.dpo.name} (${site.dpo.email}).` : null}
             </p>
             {"link" in item && item.link ? (
               <a

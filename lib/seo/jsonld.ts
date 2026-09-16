@@ -1,45 +1,50 @@
 import { createElement } from "react"
-import { faq, seo, siteConfig } from "@/content/home"
+import { faq, seo } from "@/content/home"
+import { CNPJ, CONTACT_EMAIL, SITE_NAME, SITE_URL, site } from "@/content/site"
 
 type JsonLdObject = Record<string, unknown>
 
 /**
  * Organization: campos opcionais (legalName, address, telephone, sameAs)
- * so entram quando preenchidos em siteConfig (pendencias C.1/C.2/C.3/C.10).
+ * so entram quando preenchidos em content/site.ts (pendencias C.1/C.2/C.3/C.10).
  */
 export function organizationJsonLd(): JsonLdObject {
   const data: JsonLdObject = {
     "@context": "https://schema.org",
     "@type": "Organization",
-    name: siteConfig.name,
-    url: siteConfig.url,
-    taxID: siteConfig.cnpj,
-    email: siteConfig.email,
+    name: SITE_NAME,
+    url: SITE_URL,
+    taxID: CNPJ,
+    email: CONTACT_EMAIL,
   }
 
-  if (siteConfig.legalName) {
-    data.legalName = siteConfig.legalName
+  if (site.legalName) {
+    data.legalName = site.legalName
   }
 
-  if (siteConfig.address) {
+  if (site.address) {
     data.address = {
       "@type": "PostalAddress",
-      streetAddress: siteConfig.address,
+      streetAddress: site.address.street,
+      addressLocality: site.address.city,
+      addressRegion: site.address.region,
+      ...(site.address.postalCode ? { postalCode: site.address.postalCode } : {}),
       addressCountry: "BR",
     }
   }
 
-  if (siteConfig.whatsappNumber) {
+  // contactPoint.telephone so existe com o WhatsApp configurado (C.2)
+  if (site.whatsapp) {
     data.contactPoint = {
       "@type": "ContactPoint",
       contactType: "sales",
-      telephone: `+${siteConfig.whatsappNumber}`,
+      telephone: `+${site.whatsapp.number}`,
       availableLanguage: "Portuguese",
     }
   }
 
-  if (siteConfig.linkedin) {
-    data.sameAs = [siteConfig.linkedin]
+  if (site.linkedinUrl) {
+    data.sameAs = [site.linkedinUrl]
   }
 
   return data
@@ -49,8 +54,8 @@ export function webSiteJsonLd(): JsonLdObject {
   return {
     "@context": "https://schema.org",
     "@type": "WebSite",
-    name: siteConfig.name,
-    url: siteConfig.url,
+    name: SITE_NAME,
+    url: SITE_URL,
     inLanguage: "pt-BR",
   }
 }
@@ -59,8 +64,8 @@ export function softwareApplicationJsonLd(): JsonLdObject {
   return {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
-    name: siteConfig.name,
-    url: siteConfig.url,
+    name: SITE_NAME,
+    url: SITE_URL,
     description: seo.description,
     applicationCategory: "BusinessApplication",
     operatingSystem: "Web",

@@ -1,36 +1,10 @@
 /**
  * Copy final da home (fonte: ops/home-seo-2026-09/reports/F1_copy.md).
- * Campos vazios em siteConfig sao pendencias (TODO_FABIO) e NAO renderizam.
+ * Config institucional (URLs, contatos, dados legais) vive em content/site.ts;
+ * campos opcionais ausentes la NAO renderizam nada (nem placeholder).
  */
 
-export interface SiteConfig {
-  name: string
-  url: string
-  cnpj: string
-  email: string
-  /** TODO_FABIO C.2 — numero de WhatsApp (formato E.164, ex.: 5511999999999). Vazio = CTAs de WhatsApp viram link para #contato. */
-  whatsappNumber: string
-  /** TODO_FABIO C.1 — razao social. Vazio = linha legal mostra so o CNPJ. */
-  legalName: string
-  /** TODO_FABIO C.3 — endereco. Vazio = nao renderiza. */
-  address: string
-  /** TODO_FABIO C.10 — URL do LinkedIn. Vazio = sem sameAs no JSON-LD e sem link no footer. */
-  linkedin: string
-  /** TODO_FABIO C.11 — nome do encarregado (DPO). Vazio = sem mencao a "encarregado nomeado". */
-  dpo: string
-}
-
-export const siteConfig: SiteConfig = {
-  name: "AlteaPay",
-  url: "https://alteapay.com",
-  cnpj: "65.041.795/0001-21",
-  email: "relacionamento@alteapay.com",
-  whatsappNumber: "", // TODO_FABIO C.2
-  legalName: "", // TODO_FABIO C.1
-  address: "", // TODO_FABIO C.3
-  linkedin: "", // TODO_FABIO C.10
-  dpo: "", // TODO_FABIO C.11
-}
+import { CONTACT_EMAIL, LOGIN_URL, PORTAL_URL, PRIVACY_URL, REGISTER_URL, TERMS_URL, site } from "./site"
 
 export const hero = {
   h1: "Cobrança inteligente e recuperação de crédito para empresas e para o setor público",
@@ -39,7 +13,7 @@ export const hero = {
   ctaPrimary: { label: "Agendar demonstração", href: "#contato" },
   ctaWhatsAppLabel: "Falar no WhatsApp",
   ctaFallback: { label: "Falar com a gente", href: "#contato" },
-  loginLink: { label: "Já é cliente? Entrar", href: "/auth/login" },
+  loginLink: { label: "Já é cliente? Entrar", href: LOGIN_URL },
   trustBand: [
     "Pix, boleto e cartão",
     "LGPD em todo contato",
@@ -197,7 +171,7 @@ export const compliance = {
       title: "LGPD",
       description:
         "Finalidade e base legal definidas em contrato e direitos do titular atendidos.",
-      link: { label: "Política de privacidade", href: "/politica-de-privacidade" },
+      link: { label: "Política de privacidade", href: PRIVACY_URL },
     },
     {
       title: "Cobrança respeitosa",
@@ -238,7 +212,7 @@ export const citizenNotice = {
     "Negociar desconto ou parcelamento e pagar por Pix, boleto ou cartão.",
     "Falar com nosso atendimento se não reconhecer o débito.",
   ],
-  ctaPortal: { label: "Acessar o Portal do Cliente", href: "/auth/portal-register" },
+  ctaPortal: { label: "Acessar o Portal do Cliente", href: PORTAL_URL },
   ctaSupport: { label: "Falar com atendimento", href: "#contato" },
 }
 
@@ -298,8 +272,7 @@ export const faq = {
 
 export const contact = {
   h2: "Fale com a AlteaPay",
-  intro:
-    "Conte em poucas linhas sobre a sua carteira ou o seu município. Respondemos em até 1 dia útil.",
+  intro: `Conte em poucas linhas sobre a sua carteira ou o seu município. Respondemos em até ${site.responseTime}.`,
   typeOptions: [
     { value: "empresa", label: "Empresa" },
     { value: "orgao_publico", label: "Órgão público" },
@@ -308,8 +281,8 @@ export const contact = {
   lgpdLabel: "Li e concordo com a Política de Privacidade.",
   submitLabel: "Enviar",
   whatsappLabel: "Falar no WhatsApp",
-  successMessage: "Mensagem enviada. Respondemos em até 1 dia útil.",
-  errorMessage: "Não foi possível enviar sua mensagem. Tente novamente ou escreva para relacionamento@alteapay.com.",
+  successMessage: `Mensagem enviada. Respondemos em até ${site.responseTime}.`,
+  errorMessage: `Não foi possível enviar sua mensagem. Tente novamente ou escreva para ${CONTACT_EMAIL}.`,
   citizenGuidance:
     "Se você recebeu uma cobrança, não precisa preencher o formulário. Consulte o débito e negocie direto no Portal do Cliente, ou fale com nosso atendimento pelos canais abaixo.",
 }
@@ -331,16 +304,16 @@ export const footer = {
   access: {
     title: "Acesso",
     links: [
-      { label: "Entrar", href: "/auth/login" },
-      { label: "Criar conta", href: "/auth/register" },
-      { label: "Portal do Cliente", href: "/auth/portal-register" },
+      { label: "Entrar", href: LOGIN_URL },
+      { label: "Criar conta", href: REGISTER_URL },
+      { label: "Portal do Cliente", href: PORTAL_URL },
     ],
   },
   legal: {
     title: "Legal",
     links: [
-      { label: "Política de Privacidade", href: "/politica-de-privacidade" },
-      { label: "Termos de Uso", href: "/termos-de-uso" },
+      { label: "Política de Privacidade", href: PRIVACY_URL },
+      { label: "Termos de Uso", href: TERMS_URL },
     ],
   },
   contactTitle: "Contato",
