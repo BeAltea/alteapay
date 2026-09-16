@@ -1,0 +1,67 @@
+# Default-deny ingress + egress; explicit allows only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: alteapay-app }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns, namespace: alteapay-app }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to: []
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-web-ingress, namespace: alteapay-app }
+spec:
+  podSelector: { matchLabels: { app: alteapay-web } }
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ protocol: TCP, port: 3000 }]
+---
+# Egress to local-only destinations: cluster services (redis, cross-namespace
+# agents) and the host machine (local Supabase on 54321/54322, Ollama 11434).
+# Public internet stays blocked by default-deny — a structural guarantee that
+# training traffic (with production-seeded data) never leaves this machine.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-egress-local-only, namespace: alteapay-app }
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/8 }
+        - ipBlock: { cidr: 172.16.0.0/12 }
+        - ipBlock: { cidr: 192.168.0.0/16 }
+        - ipBlock: { cidr: 198.19.0.0/16 }
+---
+# Workers health endpoint (kubelet probes + observability).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-workers-health-ingress, namespace: alteapay-app }
+spec:
+  podSelector: { matchLabels: { app: alteapay-workers } }
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ protocol: TCP, port: 3001 }]
+---
+# Redis reachable from app pods (same namespace).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-redis-ingress, namespace: alteapay-app }
+spec:
+  podSelector: { matchLabels: { app: redis } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports: [{ protocol: TCP, port: 6379 }]

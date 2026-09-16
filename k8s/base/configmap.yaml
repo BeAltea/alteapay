@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: alteapay-app-config, namespace: alteapay-app }
+data:
+  NODE_ENV: "production"
+  NEXT_TELEMETRY_DISABLED: "1"
+  # TRAINING MODE — every outbound integration is mocked at the HTTP boundary
+  # (lib/integrations/mock-mode.ts). Real customers are never contacted.
+  MOCK_ALL_INTEGRATIONS: "1"
+  WHATSAPP_BSP_PROVIDER: "mock"
+  ASAAS_MODE: "mock"
+  SENDGRID_MODE: "mock"
+  ASSERTIVA_MODE: "mock"
+  TWILIO_MODE: "mock"
+  REDIS_URL: "redis://redis.alteapay-app.svc:6379"
+  # Server-side Supabase address (pods -> host); the browser uses the
+  # NEXT_PUBLIC_SUPABASE_URL baked into the image at build time.
+  SUPABASE_URL: "http://host.orb.internal:54321"
+  NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+  WORKER_HEALTH_PORT: "3001"
+  # Chatbot de negociação. Em PRODUTO o engine padrão são fluxos n8n
+  # (NEGOTIATION_ENGINE=n8n + N8N_CHAT_FLOW_URL); no cluster LOCAL mantemos o
+  # engine legado de agente para o rig de treino (trainer/redteam) funcionar.
+  NEGOTIATION_ENGINE: "agent"
+  NEGOTIATION_AGENT_URL: "http://negotiation-agent.alteapay-negotiation.svc.cluster.local"
+  NEGOTIATION_MODEL: "qwen2.5:14b"
+  # Canal WhatsApp DORMANTE (§7 do plano): webhook responde, worker processa,
+  # mas provider real nunca é selecionado enquanto a flag for "0".
+  WHATSAPP_CHANNEL_ENABLED: "0"
+  WHATSAPP_APP_SECRET: "mock-app-secret"
+  WHATSAPP_VERIFY_TOKEN: "mock-verify-token"
