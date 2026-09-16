@@ -10,7 +10,9 @@ import {
   updateAsaasNotification,
   createAsaasPayment,
   resendAsaasPaymentNotification,
+  getAsaasPaymentsForCustomer,
 } from '@/lib/asaas';
+import { findBlockingAgreement, findBlockingPayment } from '@/lib/asaas-idempotency';
 
 export interface BulkNegotiationsJobData {
   companyId: string;
@@ -22,6 +24,8 @@ export interface BulkNegotiationsJobData {
   userId: string;
   attendantName: string;
   createdAt: string;
+  /** Dias até o vencimento da cobrança (default 30). */
+  dueDateDays?: number;
 }
 
 type NegotiationStep =
@@ -29,6 +33,7 @@ type NegotiationStep =
   | 'create_customer_db'
   | 'create_debt_db'
   | 'create_asaas_customer'
+  | 'check_existing_charge'
   | 'create_asaas_payment'
   | 'create_agreement_db'
   | 'update_agreement_db'
@@ -47,7 +52,8 @@ interface NegotiationResult {
   vmaxId: string;
   customerName: string;
   cpfCnpj: string;
-  status: 'success' | 'failed' | 'recovered';
+  status: 'success' | 'failed' | 'recovered' | 'skipped';
+  skipReason?: string;
   failedAtStep?: NegotiationStep;
   error?: ErrorDetails;
   asaasCustomerCreated?: boolean;
@@ -69,6 +75,7 @@ export interface BulkNegotiationsProgress {
   percentage: number;
   sent: number;
   failed: number;
+  skipped: number;
   currentCustomer?: string;
 }
 
@@ -76,6 +83,7 @@ export interface BulkNegotiationsResult {
   success: boolean;
   sent: number;
   failed: number;
+  skipped: number;
   total: number;
   results: NegotiationResult[];
   errors?: string[];
@@ -89,6 +97,7 @@ const STEP_LABELS: Record<NegotiationStep, string> = {
   create_customer_db: 'Criar cliente no banco',
   create_debt_db: 'Criar dívida no banco',
   create_asaas_customer: 'Criar cliente no ASAAS',
+  check_existing_charge: 'Verificar cobrança existente (idempotência)',
   create_asaas_payment: 'Criar cobrança no ASAAS',
   create_agreement_db: 'Criar acordo no banco',
   update_agreement_db: 'Atualizar acordo no banco',
@@ -402,6 +411,29 @@ async function processSingleNegotiation(
       customerId = newCustomer.id;
     }
 
+    // Guard de idempotência (local): acordo vivo/pago para este cliente bloqueia nova cobrança
+    currentStep = 'check_existing_charge';
+    const { data: liveAgreements } = await supabase
+      .from('agreements')
+      .select('id, asaas_payment_id, payment_status, asaas_status')
+      .eq('customer_id', customerId)
+      .eq('company_id', params.companyId)
+      .not('asaas_payment_id', 'is', null);
+    const blockingAgreement = findBlockingAgreement(liveAgreements || []);
+    if (blockingAgreement) {
+      const skipReason = `SKIP_JA_COBRADO_LOCAL: payment ${blockingAgreement.asaas_payment_id} (${blockingAgreement.payment_status ?? ''}/${blockingAgreement.asaas_status ?? ''})`;
+      console.log(`[BULK-NEGOTIATIONS] ${skipReason} - ${customerName}`);
+      return {
+        vmaxId,
+        customerName,
+        cpfCnpj,
+        status: 'skipped',
+        skipReason,
+        notificationChannel,
+        phoneValidation: { original: customerPhone, isValid: phoneValidation.isValid, reason: phoneValidation.reason },
+      };
+    }
+
     // Create or get debt
     currentStep = 'create_debt_db';
 
@@ -420,7 +452,7 @@ async function processSingleNegotiation(
       await supabase.from('debts').update({ amount: originalAmount, status: 'in_negotiation' }).eq('id', existingDebt.id);
     } else {
       const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + 30);
+      dueDate.setDate(dueDate.getDate() + (params.dueDateDays ?? 30));
 
       const { data: newDebt, error: debtError } = await supabase
         .from('debts')
@@ -500,10 +532,30 @@ async function processSingleNegotiation(
       };
     }
 
+    // Guard de idempotência (ASAAS, fonte da verdade): qualquer cobrança não-encerrada bloqueia
+    currentStep = 'check_existing_charge';
+    const existingPayments = await getAsaasPaymentsForCustomer(asaasCustomerId!);
+    const blockingPayment = findBlockingPayment(existingPayments);
+    if (blockingPayment) {
+      const skipReason = `SKIP_JA_COBRADO_ASAAS: payment ${blockingPayment.id} status ${blockingPayment.status}`;
+      console.log(`[BULK-NEGOTIATIONS] ${skipReason} - ${customerName}`);
+      return {
+        vmaxId,
+        customerName,
+        cpfCnpj,
+        status: 'skipped',
+        skipReason,
+        asaasCustomerCreated: true,
+        asaasCustomerId: asaasCustomerId || undefined,
+        notificationChannel,
+        phoneValidation: { original: customerPhone, isValid: phoneValidation.isValid, reason: phoneValidation.reason },
+      };
+    }
+
     // Create agreement in DB
     currentStep = 'create_agreement_db';
     const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + 30);
+    dueDate.setDate(dueDate.getDate() + (params.dueDateDays ?? 30));
     const dueDateStr = dueDate.toISOString().split('T')[0];
 
     const { data: agreement, error: agreementError } = await supabase
@@ -780,6 +832,7 @@ export const bulkNegotiationsWorker = WorkerManager.registerWorker<BulkNegotiati
       percentage: 0,
       sent: 0,
       failed: 0,
+      skipped: 0,
     };
 
     const allResults: NegotiationResult[] = [];
@@ -802,6 +855,8 @@ export const bulkNegotiationsWorker = WorkerManager.registerWorker<BulkNegotiati
           allResults.push(result.value);
           if (result.value.status === 'success') {
             progress.sent++;
+          } else if (result.value.status === 'skipped') {
+            progress.skipped++;
           } else {
             progress.failed++;
           }
@@ -851,6 +906,7 @@ export const bulkNegotiationsWorker = WorkerManager.registerWorker<BulkNegotiati
       success: progress.sent > 0,
       sent: progress.sent,
       failed: progress.failed,
+      skipped: progress.skipped,
       total: params.customerIds.length,
       results: allResults,
       errors: errors.length > 0 ? errors : undefined,
@@ -859,7 +915,7 @@ export const bulkNegotiationsWorker = WorkerManager.registerWorker<BulkNegotiati
       completedAt: new Date().toISOString(),
     };
 
-    console.log(`[BULK-NEGOTIATIONS] Job ${job.id} completed: ${progress.sent} sent, ${progress.failed} failed`);
+    console.log(`[BULK-NEGOTIATIONS] Job ${job.id} completed: ${progress.sent} sent, ${progress.skipped} skipped, ${progress.failed} failed`);
 
     return finalResult;
   },

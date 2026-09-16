@@ -9,7 +9,9 @@ import {
   updateAsaasNotification,
   createAsaasPayment,
   resendAsaasPaymentNotification,
+  getAsaasPaymentsForCustomer,
 } from "@/lib/asaas"
+import { findBlockingAgreement, findBlockingPayment } from "@/lib/asaas-idempotency"
 import { bulkNegotiationsQueue } from "@/lib/queue/queues"
 import { randomUUID } from "crypto"
 
@@ -48,7 +50,8 @@ interface NegotiationResult {
   vmaxId: string
   customerName: string
   cpfCnpj: string
-  status: "success" | "failed" | "recovered"
+  status: "success" | "failed" | "recovered" | "skipped"
+  skipReason?: string
   failedAtStep?: NegotiationStep
   error?: ErrorDetails
   asaasCustomerCreated?: boolean
@@ -370,6 +373,26 @@ async function processSingleNegotiation(
       customerId = newCustomer.id
     }
 
+    // Guard de idempotência (local): acordo vivo/pago para este cliente bloqueia nova cobrança
+    const { data: liveAgreements } = await supabase
+      .from("agreements")
+      .select("id, asaas_payment_id, payment_status, asaas_status")
+      .eq("customer_id", customerId)
+      .eq("company_id", params.companyId)
+      .not("asaas_payment_id", "is", null)
+    const blockingAgreement = findBlockingAgreement(liveAgreements || [])
+    if (blockingAgreement) {
+      const skipReason = `SKIP_JA_COBRADO_LOCAL: payment ${blockingAgreement.asaas_payment_id} (${blockingAgreement.payment_status ?? ""}/${blockingAgreement.asaas_status ?? ""})`
+      console.log(`[sendBulkNegotiations] ${skipReason} - ${customerName}`)
+      return {
+        vmaxId,
+        customerName,
+        cpfCnpj,
+        status: "skipped",
+        skipReason,
+      }
+    }
+
     // === STEP: Create or get debt ===
     currentStep = "create_debt_db"
 
@@ -479,6 +502,23 @@ async function processSingleNegotiation(
           isValid: phoneValidation.isValid,
           reason: phoneValidation.reason,
         },
+      }
+    }
+
+    // Guard de idempotência (ASAAS, fonte da verdade): qualquer cobrança não-encerrada bloqueia
+    const existingPayments = await getAsaasPaymentsForCustomer(asaasCustomerId!)
+    const blockingPayment = findBlockingPayment(existingPayments)
+    if (blockingPayment) {
+      const skipReason = `SKIP_JA_COBRADO_ASAAS: payment ${blockingPayment.id} status ${blockingPayment.status}`
+      console.log(`[sendBulkNegotiations] ${skipReason} - ${customerName}`)
+      return {
+        vmaxId,
+        customerName,
+        cpfCnpj,
+        status: "skipped",
+        skipReason,
+        asaasCustomerCreated: true,
+        asaasCustomerId: asaasCustomerId || undefined,
       }
     }
 

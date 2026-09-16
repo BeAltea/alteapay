@@ -255,6 +255,12 @@ export async function GET(request: NextRequest) {
         !docsWithActiveAgreements.has(cpfCnpj) &&
         !docsWithPaidAgreements.has(cpfCnpj)
 
+      // Removed from the creditor's portfolio: batch import marks CANCELADA on
+      // customers the creditor dropped and that never had an ASAAS negotiation.
+      // These are not pending sends - they must never be charged.
+      const isRemovedFromPortfolio =
+        vmax.negotiation_status === "CANCELADA" && !docsWithAnyNegotiation.has(cpfCnpj)
+
       // Check if paid (VMAX status or agreement status)
       const isPaid =
         docsWithPaidAgreements.has(cpfCnpj) ||
@@ -310,6 +316,7 @@ export async function GET(request: NextRequest) {
         hasActiveNegotiation: !!hasActiveNegotiation, // Active (non-paid) negotiation
         isPaid: !!isPaid,
         isCancelled: !!isCancelled, // Was cancelled (can send new negotiation)
+        isRemovedFromPortfolio, // Dropped by the creditor; excluded from pending sends
         cancelledCount: docToCancelledCount.get(cpfCnpj) || 0, // Number of cancelled negotiations
         paymentStatus: paymentInfo?.paymentStatus || null,
         asaasStatus: paymentInfo?.asaasStatus || null,

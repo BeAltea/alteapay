@@ -53,6 +53,7 @@ type VmaxCustomer = {
   hasActiveNegotiation: boolean // Active (non-paid) negotiation
   isPaid?: boolean
   isCancelled?: boolean // Was cancelled (can send new negotiation)
+  isRemovedFromPortfolio?: boolean // Dropped by the creditor; not a pending send
   cancelledCount?: number // Number of cancelled negotiations for this customer
   email: string | null
   phone: string | null
@@ -77,7 +78,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
   const [customers, setCustomers] = useState<VmaxCustomer[]>([])
   const [loading, setLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState("")
-  const [negotiationFilter, setNegotiationFilter] = useState<"all" | "enviada" | "sem_negociacao">("all")
+  const [negotiationFilter, setNegotiationFilter] = useState<"all" | "enviada" | "sem_negociacao" | "removido">("all")
   const [debtStatusFilter, setDebtStatusFilter] = useState<"all" | "em_aberto" | "aguardando" | "paga" | "vencida">("all")
   const [dueDateFrom, setDueDateFrom] = useState<string>("")
   const [dueDateTo, setDueDateTo] = useState<string>("")
@@ -406,7 +407,8 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
     let result = customers.filter((c) => {
       // Status Negociação filter
       if (negotiationFilter === "enviada" && !c.hasNegotiation) return false
-      if (negotiationFilter === "sem_negociacao" && c.hasNegotiation) return false
+      if (negotiationFilter === "sem_negociacao" && (c.hasNegotiation || c.isRemovedFromPortfolio)) return false
+      if (negotiationFilter === "removido" && !c.isRemovedFromPortfolio) return false
 
       // Status Dívida filter
       // Uses centralized isPaidStatus() to check all paid indicators including pago_ao_cliente
@@ -1054,9 +1056,15 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
     // Cancelled negotiations don't count as "Enviada"
     const withNegotiation = customers.filter((c) => c.hasNegotiation && !c.isCancelled).length
 
+    // Customers the creditor removed from the portfolio - never chargeable, not pending
+    const removedFromPortfolio = customers.filter((c) => c.isRemovedFromPortfolio).length
+
     // Customers without any negotiation OR with cancelled - "Pendentes de Envio"
-    // Cancelled customers can send new negotiation, so they count as pending
-    const withoutNegotiation = customers.filter((c) => !c.hasNegotiation || c.isCancelled).length
+    // Cancelled customers can send new negotiation, so they count as pending.
+    // Customers removed by the creditor are excluded - they are not pending sends.
+    const withoutNegotiation = customers.filter(
+      (c) => (!c.hasNegotiation || c.isCancelled) && !c.isRemovedFromPortfolio
+    ).length
 
     // Customers with viewed notifications (only counts active, non-cancelled negotiations)
     const viewedCount = customers.filter((c) => c.hasNegotiation && !c.isCancelled && c.notificationViewed).length
@@ -1077,6 +1085,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
       total,
       withNegotiation,
       withoutNegotiation,
+      removedFromPortfolio,
       totalDebt,
       recoveredDebt,
       pendingDebt,
@@ -1155,6 +1164,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                   <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{kpiStats.withoutNegotiation}</p>
                   <p className="text-xs text-muted-foreground mt-1">
                     {kpiStats.total > 0 ? ((kpiStats.withoutNegotiation / kpiStats.total) * 100).toFixed(1) : 0}% do total
+                    {kpiStats.removedFromPortfolio > 0 && ` · ${kpiStats.removedFromPortfolio} removidos da carteira`}
                   </p>
                 </div>
                 <div className="h-10 w-10 rounded-full bg-amber-100 dark:bg-amber-950 flex items-center justify-center">
@@ -1355,6 +1365,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                     <SelectItem value="all">Todos</SelectItem>
                     <SelectItem value="enviada">Enviada</SelectItem>
                     <SelectItem value="sem_negociacao">Sem negociação</SelectItem>
+                    <SelectItem value="removido">Removidos da carteira</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
