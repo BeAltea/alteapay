@@ -14,13 +14,15 @@
  * - MOCK_ALL_INTEGRATIONS=1 forces mock for all services.
  */
 
-export type MockableService = "asaas" | "sendgrid" | "twilio" | "assertiva"
+export type MockableService = "asaas" | "sendgrid" | "twilio" | "assertiva" | "voxuy" | "n8n"
 
 const MODE_ENV_VAR: Record<MockableService, string> = {
   asaas: "ASAAS_MODE",
   sendgrid: "SENDGRID_MODE",
   twilio: "TWILIO_MODE",
   assertiva: "ASSERTIVA_MODE",
+  voxuy: "VOXUY_MODE",
+  n8n: "N8N_MODE",
 }
 
 export function isMockMode(service: MockableService): boolean {

@@ -24,10 +24,22 @@ import { N8N_SIGNATURE_HEADER, N8N_TIMESTAMP_HEADER, signN8nPayload, n8nWebhookS
 import type { SessionDebtContext } from "./sessions"
 import type { NegotiationSession, TenantChatConfig } from "./types"
 
-export type EngineName = "n8n" | "agent"
+export type EngineName = "n8n" | "agent" | "disabled"
 
+/**
+ * D14: default em produção é DISABLED (chat assistido determinístico).
+ * "n8n" sem N8N_CHAT_FLOW_URL e "agent" sem AGENT_URL degradam para
+ * disabled (nunca expõem erro ao cliente; o turno loga chat.engine_error).
+ */
 export function engineName(): EngineName {
-  return process.env.NEGOTIATION_ENGINE === "agent" ? "agent" : "n8n"
+  const raw = process.env.NEGOTIATION_ENGINE
+  if (raw === "agent") {
+    return process.env.AGENT_URL && process.env.AGENT_APP_TOKEN ? "agent" : "disabled"
+  }
+  if (raw === "n8n") {
+    return process.env.N8N_CHAT_FLOW_URL ? "n8n" : "disabled"
+  }
+  return "disabled"
 }
 
 function chatFlowUrl(): string {

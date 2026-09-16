@@ -20,6 +20,13 @@ export interface WhatsAppJobData {
 export const whatsappWorker = WorkerManager.registerWorker<WhatsAppJobData>(
   QUEUE_CONFIG.whatsapp.name,
   async (job: Job<WhatsAppJobData>) => {
+    // Despacho por tipo: jobs de CAMPANHA (jornada) convivem com o fluxo
+    // inbound Cloud API na mesma fila, discriminados pelo nome/kind do job.
+    if (job.name === 'campaign-message' || (job.data as unknown as { kind?: string }).kind === 'campaign-message') {
+      const { processCampaignMessage } = await import('@/lib/journey/campaign-send');
+      const outcome = await processCampaignMessage((job.data as unknown as { messageId: string }).messageId);
+      return { campaign: true, outcome };
+    }
     const supabase = createServiceClient();
     const { data: event } = await supabase
       .from('whatsapp_inbound_events')
