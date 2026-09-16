@@ -1,7 +1,9 @@
 // Geração e validação de ofertas a partir da matriz (D8: servidor decide).
 // Funções puras (testáveis) + persistência em negotiation_offers.
-// Invariante ASAAS: PIX não parcela — parcelado só BOLETO/CREDIT_CARD.
-// Arredondamento em centavos; a última parcela absorve a diferença.
+// Invariantes ASAAS: PIX não parcela; parcelamento = N parcelas IGUAIS
+// (installmentCount/installmentValue). A "entrada mínima" da matriz é
+// satisfeita pela 1ª parcela (total/N >= min_entry_pct exige N <= 1/pct;
+// com max_installments 3 e entrada 20%, sempre vale). entry_value = 1ª parcela.
 
 import { createServiceClient } from "@/lib/supabase/service"
 import type { MatrixRow } from "./matrix"
@@ -48,24 +50,25 @@ export function generateOfferTerms(
     first_due_date: firstDueDate,
   })
 
-  // 2) Parcelado: 2..max_installments (PIX fora), desconto reduzido, entrada mínima
+  // 2) Parcelado: 2..max_installments (PIX fora), desconto reduzido,
+  //    N parcelas IGUAIS (modelo installmentCount do ASAAS)
   const installBilling = (["BOLETO", "CREDIT_CARD"] as BillingType[]).filter((b) => allowed.includes(b))
   if (installBilling.length > 0) {
     for (let n = 2; n <= row.max_installments; n++) {
-      const discount = round2(originalValue * (row.installment_discount_pct / 100))
-      const total = round2(originalValue - discount)
-      const entry = round2(total * (row.min_entry_pct / 100))
-      const remaining = round2(total - entry)
-      const base = Math.floor((remaining / n) * 100) / 100
-      const last = round2(remaining - base * (n - 1))
-      if (Math.min(base, last) < row.min_installment_value) continue
+      const discountTarget = round2(originalValue * (row.installment_discount_pct / 100))
+      const iv = round2((originalValue - discountTarget) / n)
+      if (iv < row.min_installment_value) continue
+      const total = round2(iv * n)
+      const discount = round2(originalValue - total)
+      // 1ª parcela deve cumprir a entrada mínima da matriz
+      if (iv + 0.01 < round2(total * (row.min_entry_pct / 100))) continue
       offers.push({
         original_value: round2(originalValue),
-        discount_pct: row.installment_discount_pct,
+        discount_pct: round2((discount / originalValue) * 100),
         discount_value: discount,
-        entry_value: entry,
+        entry_value: iv, // = 1ª parcela (parcelas iguais)
         installments: n,
-        installment_value: base, // última parcela = base + diferença (informado no resumo)
+        installment_value: iv,
         total_value: total,
         billing_type: installBilling[0],
         first_due_date: firstDueDate,
@@ -89,7 +92,7 @@ export function validateProposedTerms(
   row: MatrixRow,
 ): { ok: true } | { ok: false; error: TermsValidationError } {
   const maxPct = terms.installments > 1 ? row.installment_discount_pct : row.max_discount_pct
-  if (terms.discount_pct > maxPct + 0.001) return { ok: false, error: "DISCOUNT_ABOVE_MAX" }
+  if (terms.discount_pct > maxPct + 0.05) return { ok: false, error: "DISCOUNT_ABOVE_MAX" }
   if (!row.allowed_billing_types.includes(terms.billing_type))
     return { ok: false, error: "BILLING_TYPE_NOT_ALLOWED" }
   if (terms.installments > 1 && terms.billing_type === "PIX")
@@ -97,8 +100,9 @@ export function validateProposedTerms(
   if (terms.installments > row.max_installments)
     return { ok: false, error: "INSTALLMENTS_ABOVE_MAX" }
   if (terms.installments > 1) {
+    // entrada = 1ª parcela (parcelas iguais)
     const minEntry = round2(terms.total_value * (row.min_entry_pct / 100))
-    if (terms.entry_value + 0.01 < minEntry) return { ok: false, error: "ENTRY_BELOW_MIN" }
+    if (terms.installment_value + 0.01 < minEntry) return { ok: false, error: "ENTRY_BELOW_MIN" }
     if (terms.installment_value + 0.001 < row.min_installment_value)
       return { ok: false, error: "INSTALLMENT_BELOW_MIN" }
   }
@@ -106,11 +110,8 @@ export function validateProposedTerms(
   if (Math.abs(expectedTotal - terms.total_value) > 0.01)
     return { ok: false, error: "TOTAL_MISMATCH" }
   if (terms.installments > 1) {
-    // installment_value é a parcela-base; a ÚLTIMA absorve a diferença de
-    // centavos. Consistência: 0 <= (total - entrada) - base*n < n centavos.
-    const remaining = round2(terms.total_value - terms.entry_value)
-    const resto = round2(remaining - terms.installment_value * terms.installments)
-    if (resto < -0.01 || resto >= terms.installments * 0.01 + 0.01)
+    // parcelas IGUAIS: total = parcela × N (tolerância de 1 centavo)
+    if (Math.abs(round2(terms.installment_value * terms.installments) - terms.total_value) > 0.011)
       return { ok: false, error: "TOTAL_MISMATCH" }
   }
   return { ok: true }

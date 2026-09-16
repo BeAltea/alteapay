@@ -391,6 +391,21 @@ export async function POST(request: NextRequest) {
         .eq("id", webhookEvent.id)
     }
 
+    // Jornada (D14, aditivo e isolado): efeitos pós-pagamento da negociação.
+    // Erro aqui NUNCA altera a resposta do webhook nem o que já foi escrito.
+    if (process.env.CHAT_JOURNEY_ENABLED === "true") {
+      try {
+        const { journeyOnPaymentEvent } = await import("@/lib/journey/reconciliation")
+        await journeyOnPaymentEvent({
+          eventType: event,
+          paymentId: payment.id,
+          agreementId: agreement.id,
+        })
+      } catch (journeyErr) {
+        console.error("[ASAAS Webhook] journey hook error (isolado):", (journeyErr as Error).message)
+      }
+    }
+
     const duration = Date.now() - startTime
     console.log("[ASAAS Webhook] Processed successfully in", duration, "ms:", {
       event,

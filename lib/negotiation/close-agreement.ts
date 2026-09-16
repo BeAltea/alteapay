@@ -56,6 +56,19 @@ export function deriveTerms(offerId: string, currentAmount: number, aging: numbe
   return null
 }
 
+export interface JourneyClose {
+  session_id: string
+  offer_row_id: string // negotiation_offers.id
+  terms: {
+    total_value: number
+    installments: number
+    installment_value: number
+    billing_type: "PIX" | "BOLETO" | "CREDIT_CARD"
+    first_due_date: string
+  }
+  valid_until: string | null
+}
+
 export interface CloseAgreementInput {
   company_id: string
   debt_id: string
@@ -63,6 +76,8 @@ export interface CloseAgreementInput {
   /** Identificação da origem para auditoria (ex.: "negotiation-agent thread X", "n8n flow"). */
   origin: string
   channel?: string
+  /** Jornada (D8): termos JÁ validados pela matriz substituem deriveTerms. */
+  journey?: JourneyClose
 }
 
 export type CloseAgreementResult =
@@ -92,7 +107,17 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   const currentAmount = Number(debt.current_amount ?? debt.amount) || 0
   if (currentAmount <= 0) return { ok: false, status: 422, error: "Dívida sem valor em aberto" }
 
-  const terms = deriveTerms(offer_id, currentAmount, debt.due_date ? agingDays(debt.due_date) : 0)
+  const terms = input.journey
+    ? {
+        agreedAmount: input.journey.terms.total_value,
+        installments: input.journey.terms.installments,
+        installmentAmount: input.journey.terms.installment_value,
+        summary:
+          input.journey.terms.installments === 1
+            ? `pagamento à vista de R$ ${input.journey.terms.total_value.toFixed(2)}`
+            : `${input.journey.terms.installments}x de R$ ${input.journey.terms.installment_value.toFixed(2)}`,
+      }
+    : deriveTerms(offer_id, currentAmount, debt.due_date ? agingDays(debt.due_date) : 0)
   if (!terms) {
     return { ok: false, status: 400, error: `offer_id inválido: ${offer_id} (use 'avista' ou 'parc_N')` }
   }
@@ -106,8 +131,10 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   if (customerError) throw customerError
   if (!customer) return { ok: false, status: 404, error: "Cliente da dívida não encontrado" }
 
-  // Primeiro vencimento: 7 dias a partir de hoje (YYYY-MM-DD)
-  const firstDueDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0]
+  // Primeiro vencimento: da oferta (jornada) ou 7 dias a partir de hoje
+  const firstDueDate =
+    input.journey?.terms.first_due_date ??
+    new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0]
 
   // user_id omitido de propósito: nullable e não há usuário autenticado aqui.
   const agreementData: Record<string, any> = {
@@ -123,9 +150,15 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
     installment_amount: terms.installmentAmount,
     due_date: firstDueDate,
     status: "active",
-    attendant_name: "negotiation-agent",
+    attendant_name: input.journey ? "chat-journey" : "negotiation-agent",
     terms: channel ? `${origin} (canal: ${channel})` : origin,
     payment_status: "pending",
+  }
+  if (input.journey) {
+    agreementData.origin = "chat_journey"
+    agreementData.negotiation_session_id = input.journey.session_id
+    agreementData.offer_id = input.journey.offer_row_id
+    agreementData.proposal_valid_until = input.journey.valid_until
   }
 
   const { data: agreement, error: agreementError } = await supabase
@@ -164,15 +197,21 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
         mobilePhone: customerPhone || undefined,
       },
       payment: {
-        billingType: "UNDEFINED",
+        billingType: input.journey ? input.journey.terms.billing_type : "UNDEFINED",
         value: terms.installments === 1 ? terms.agreedAmount : terms.installmentAmount,
         dueDate: firstDueDate,
         description: chargeDescription,
-        externalReference: agreement.id,
+        externalReference: input.journey
+          ? `journey_${input.journey.session_id}_${input.journey.offer_row_id}`
+          : agreement.id,
+        ...(terms.installments > 1
+          ? { installmentCount: terms.installments, installmentValue: terms.installmentAmount }
+          : {}),
       },
       metadata: {
         companyId: company_id,
         source: origin,
+        agreementId: agreement.id,
       },
     })
   } catch (queueError: any) {

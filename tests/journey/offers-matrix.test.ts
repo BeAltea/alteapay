@@ -58,20 +58,18 @@ describe("generateOfferTerms", () => {
     const parc = offers.filter((o) => o.installments > 1)
     expect(parc.map((o) => o.installments)).toEqual([2, 3])
     for (const o of parc) {
-      expect(o.discount_pct).toBe(7.5)
+      expect(o.discount_pct).toBeCloseTo(7.5, 1)
       expect(o.billing_type).toBe("BOLETO") // PIX não parcela
-      expect(o.entry_value).toBeCloseTo(o.total_value * 0.2, 2)
+      expect(o.entry_value).toBe(o.installment_value) // parcelas iguais: entrada = 1ª
+      expect(o.installment_value * o.installments).toBeCloseTo(o.total_value, 2)
     }
   })
 
-  it("centavos: entrada + parcelas fecham o total (última absorve diferença)", () => {
+  it("centavos: parcelas iguais fecham o total exato (desconto absorve o ajuste)", () => {
     const offers = generateOfferTerms(100.01, row({ min_installment_value: 1 }), "2026-09-23")
     for (const o of offers.filter((x) => x.installments > 1)) {
-      const remaining = Math.round((o.total_value - o.entry_value) * 100) / 100
-      const last = Math.round((remaining - o.installment_value * (o.installments - 1)) * 100) / 100
-      expect(last).toBeGreaterThanOrEqual(o.installment_value) // última absorve
-      const soma = o.entry_value + o.installment_value * (o.installments - 1) + last
-      expect(Math.abs(soma - o.total_value)).toBeLessThanOrEqual(0.011)
+      expect(Math.round(o.installment_value * o.installments * 100) / 100).toBe(o.total_value)
+      expect(Math.round((o.original_value - o.discount_value) * 100) / 100).toBe(o.total_value)
     }
   })
 
@@ -97,8 +95,8 @@ describe("validateProposedTerms", () => {
   it.each([
     [{ ...base, discount_pct: 40, discount_value: 400, total_value: 600, installment_value: 600 }, "DISCOUNT_ABOVE_MAX"],
     [{ ...base, billing_type: "CREDIT_CARD" as const }, undefined], // permitido
-    [{ ...base, installments: 2, billing_type: "PIX" as const, discount_pct: 7.5, discount_value: 75, total_value: 925, entry_value: 185, installment_value: 370 }, "PIX_CANNOT_INSTALL"],
-    [{ ...base, installments: 5, billing_type: "BOLETO" as const, discount_pct: 7.5, discount_value: 75, total_value: 925, entry_value: 185, installment_value: 148 }, "INSTALLMENTS_ABOVE_MAX"],
+    [{ ...base, installments: 2, billing_type: "PIX" as const, discount_pct: 7.5, discount_value: 75, total_value: 925, entry_value: 462.5, installment_value: 462.5 }, "PIX_CANNOT_INSTALL"],
+    [{ ...base, installments: 5, billing_type: "BOLETO" as const, discount_pct: 7.5, discount_value: 75, total_value: 925, entry_value: 185, installment_value: 185 }, "INSTALLMENTS_ABOVE_MAX"],
     [{ ...base, total_value: 700 }, "TOTAL_MISMATCH"],
   ])("caso %#", (terms, expectedError) => {
     const r = validateProposedTerms(terms, row())
@@ -109,11 +107,16 @@ describe("validateProposedTerms", () => {
     }
   })
 
-  it("entrada abaixo do mínimo e parcela abaixo do mínimo", () => {
-    const parc = generateOfferTerms(1000, row(), "2026-09-23").find((o) => o.installments === 2)!
-    expect(validateProposedTerms({ ...parc, entry_value: 10 }, row())).toMatchObject({ ok: false, error: "ENTRY_BELOW_MIN" })
-    const low = { ...parc, entry_value: parc.total_value - 20, installment_value: 20 }
-    expect(validateProposedTerms(low, row())).toMatchObject({ ok: false, error: "INSTALLMENT_BELOW_MIN" })
+  it("1ª parcela abaixo da entrada mínima e parcela abaixo do mínimo", () => {
+    // 6 parcelas iguais de 1000: 1ª = 16,6% < 20% → ENTRY_BELOW_MIN (com max_installments alto)
+    const r6 = row({ max_installments: 6, min_installment_value: 1 })
+    const seis = generateOfferTerms(1000, r6, "2026-09-23").find((o) => o.installments === 6)
+    expect(seis).toBeUndefined() // gerador já suprime por entrada mínima
+    const manual = { ...generateOfferTerms(1000, r6, "2026-09-23")[0], installments: 6, billing_type: "BOLETO" as const, discount_pct: 7.5, discount_value: 75, total_value: 925, entry_value: 154.17, installment_value: 154.17 }
+    expect(validateProposedTerms(manual, r6)).toMatchObject({ ok: false, error: "ENTRY_BELOW_MIN" })
+    const low = row({ min_installment_value: 500 })
+    const parc2 = { ...generateOfferTerms(1000, row(), "2026-09-23").find((o) => o.installments === 2)! }
+    expect(validateProposedTerms(parc2, low)).toMatchObject({ ok: false, error: "INSTALLMENT_BELOW_MIN" })
   })
 })
 
