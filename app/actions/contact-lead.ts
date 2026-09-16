@@ -1,36 +1,13 @@
 "use server"
 
 import { headers } from "next/headers"
-import { z } from "zod"
 import { sendEmailViaSendGrid } from "@/lib/notifications/sendgrid"
 import { CONTACT_EMAIL } from "@/content/site"
+import { contactLeadSchema, type ContactLeadFormValues } from "@/lib/contact/schema"
 
 const TIPO_LABELS: Record<string, string> = {
   empresa: "Empresa",
   orgao_publico: "Órgão público",
-}
-
-const contactLeadSchema = z.object({
-  nome: z.string().trim().min(2, "Informe seu nome.").max(200),
-  email: z.string().trim().email("Informe um e-mail válido.").max(200),
-  telefone: z.string().trim().max(50).optional().default(""),
-  organizacao: z.string().trim().max(200).optional().default(""),
-  tipo: z.enum(["empresa", "orgao_publico", "recebi_cobranca"]),
-  mensagem: z.string().trim().min(1, "Escreva uma mensagem.").max(5000),
-  lgpd: z.literal(true),
-  // Honeypot: humanos nunca preenchem este campo
-  campo_site: z.string().optional().default(""),
-})
-
-export interface ContactLeadInput {
-  nome: string
-  email: string
-  telefone?: string
-  organizacao?: string
-  tipo: string
-  mensagem: string
-  lgpd: boolean
-  campo_site?: string
 }
 
 export interface ContactLeadResult {
@@ -73,7 +50,7 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;")
 }
 
-export async function submitContactLead(input: ContactLeadInput): Promise<ContactLeadResult> {
+export async function submitContactLead(input: ContactLeadFormValues): Promise<ContactLeadResult> {
   const startedAt = Date.now()
   const log = (tipo: string, ok: boolean) => {
     // Sem PII nos logs: apenas tipo, resultado e duracao
@@ -88,7 +65,8 @@ export async function submitContactLead(input: ContactLeadInput): Promise<Contac
 
   const lead = parsed.data
 
-  // Honeypot preenchido: responde ok silencioso, sem enviar nada
+  // Honeypot preenchido (verificado DEPOIS do parse): responde sucesso falso,
+  // sem enviar nada, para nao dar sinal ao bot
   if (lead.campo_site) {
     log(lead.tipo, true)
     return { ok: true }

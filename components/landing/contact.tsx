@@ -1,40 +1,27 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import type React from "react"
 import Link from "next/link"
+import { useForm, type Resolver } from "react-hook-form"
+import { zodResolver } from "@hookform/resolvers/zod"
 import { Mail, MessageCircle } from "lucide-react"
 import { submitContactLead } from "@/app/actions/contact-lead"
 import { citizenNotice, contact } from "@/content/home"
 import { CONTACT_EMAIL, PRIVACY_URL, whatsappHref as buildWhatsappHref } from "@/content/site"
+import { contactLeadSchema, type ContactLeadFormValues, type ContactTipo } from "@/lib/contact/schema"
 
-type ContactType = "empresa" | "orgao_publico" | "recebi_cobranca"
-
-interface FormState {
-  nome: string
-  email: string
-  telefone: string
-  organizacao: string
-  tipo: ContactType
-  mensagem: string
-  lgpd: boolean
-  campo_site: string
-}
-
-const INITIAL_FORM: FormState = {
+const DEFAULT_VALUES: ContactLeadFormValues = {
   nome: "",
   email: "",
   telefone: "",
   organizacao: "",
   tipo: "empresa",
   mensagem: "",
-  lgpd: false,
+  consentimento: false,
   campo_site: "",
 }
 
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-
-function tipoFromQuery(value: string | null): ContactType | null {
+function tipoFromQuery(value: string | null): ContactTipo | null {
   if (!value) return null
   if (value === "publico" || value === "orgao_publico") return "orgao_publico"
   if (value === "empresa") return "empresa"
@@ -43,63 +30,45 @@ function tipoFromQuery(value: string | null): ContactType | null {
 }
 
 export function Contact() {
-  const [form, setForm] = useState<FormState>(INITIAL_FORM)
-  const [errors, setErrors] = useState<Partial<Record<keyof FormState, string>>>({})
-  const [status, setStatus] = useState<"idle" | "sending" | "success" | "error">("idle")
+  const {
+    register,
+    handleSubmit,
+    reset,
+    setValue,
+    watch,
+    formState: { errors, isSubmitting },
+  } = useForm<ContactLeadFormValues>({
+    resolver: zodResolver(contactLeadSchema) as Resolver<ContactLeadFormValues>,
+    defaultValues: DEFAULT_VALUES,
+  })
+
+  const [status, setStatus] = useState<"idle" | "success" | "error">("idle")
   const [serverError, setServerError] = useState("")
 
-  // Le ?tipo= da URL para pre-selecionar (sem useSearchParams para nao
-  // quebrar a renderizacao estatica da pagina)
+  // Le ?tipo= da URL para pre-selecionar (window.location.search em useEffect;
+  // NUNCA useSearchParams, para nao quebrar a renderizacao estatica da pagina)
   useEffect(() => {
     const tipo = tipoFromQuery(new URLSearchParams(window.location.search).get("tipo"))
     if (tipo) {
-      setForm((current) => ({ ...current, tipo }))
+      setValue("tipo", tipo)
     }
-  }, [])
+  }, [setValue])
 
   const whatsappHref = buildWhatsappHref()
-  const isCitizen = form.tipo === "recebi_cobranca"
+  const isCitizen = watch("tipo") === "recebi_cobranca"
 
-  const setField = <K extends keyof FormState>(field: K, value: FormState[K]) => {
-    setForm((current) => ({ ...current, [field]: value }))
-    setErrors((current) => ({ ...current, [field]: undefined }))
-  }
+  const onSubmit = handleSubmit(async (values) => {
+    if (isCitizen) return
 
-  const validate = (): boolean => {
-    const nextErrors: Partial<Record<keyof FormState, string>> = {}
-
-    if (form.nome.trim().length < 2) nextErrors.nome = "Informe seu nome."
-    if (!EMAIL_REGEX.test(form.email.trim())) nextErrors.email = "Informe um e-mail válido."
-    if (!form.mensagem.trim()) nextErrors.mensagem = "Escreva uma mensagem."
-    if (!form.lgpd) nextErrors.lgpd = "É preciso concordar com a Política de Privacidade."
-
-    setErrors(nextErrors)
-    return Object.keys(nextErrors).length === 0
-  }
-
-  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (isCitizen || status === "sending") return
-    if (!validate()) return
-
-    setStatus("sending")
+    setStatus("idle")
     setServerError("")
 
     try {
-      const result = await submitContactLead({
-        nome: form.nome.trim(),
-        email: form.email.trim(),
-        telefone: form.telefone.trim(),
-        organizacao: form.organizacao.trim(),
-        tipo: form.tipo,
-        mensagem: form.mensagem.trim(),
-        lgpd: form.lgpd,
-        campo_site: form.campo_site,
-      })
+      const result = await submitContactLead(values)
 
       if (result.ok) {
         setStatus("success")
-        setForm(INITIAL_FORM)
+        reset(DEFAULT_VALUES)
       } else {
         setStatus("error")
         setServerError(result.error || contact.errorMessage)
@@ -108,7 +77,7 @@ export function Contact() {
       setStatus("error")
       setServerError(contact.errorMessage)
     }
-  }
+  })
 
   const inputClass =
     "w-full rounded-lg border border-gray-300 bg-white px-4 py-2.5 text-altea-navy focus:border-altea-navy focus:outline-none focus:ring-2 focus:ring-altea-navy/30"
@@ -122,17 +91,15 @@ export function Contact() {
           </h2>
           <p className="mt-4 text-center text-lg text-gray-600">{contact.intro}</p>
 
-          <form className="mt-10 space-y-5" onSubmit={handleSubmit} noValidate>
-            {/* Honeypot: campo invisivel para pessoas, iscas para bots */}
+          <form className="mt-10 space-y-5" onSubmit={onSubmit} noValidate>
+            {/* Honeypot: campo invisivel para pessoas, isca para bots */}
             <input
               type="text"
-              name="campo_site"
-              value={form.campo_site}
-              onChange={(event) => setField("campo_site", event.target.value)}
               tabIndex={-1}
               autoComplete="off"
               aria-hidden="true"
               className="hidden"
+              {...register("campo_site")}
             />
 
             <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
@@ -142,19 +109,17 @@ export function Contact() {
                 </label>
                 <input
                   id="contato-nome"
-                  name="nome"
                   type="text"
                   autoComplete="name"
                   required
-                  value={form.nome}
-                  onChange={(event) => setField("nome", event.target.value)}
                   aria-invalid={Boolean(errors.nome)}
                   aria-describedby={errors.nome ? "contato-nome-erro" : undefined}
                   className={inputClass}
+                  {...register("nome")}
                 />
                 {errors.nome ? (
                   <p id="contato-nome-erro" className="mt-1 text-sm text-red-600">
-                    {errors.nome}
+                    {errors.nome.message}
                   </p>
                 ) : null}
               </div>
@@ -165,19 +130,17 @@ export function Contact() {
                 </label>
                 <input
                   id="contato-email"
-                  name="email"
                   type="email"
                   autoComplete="email"
                   required
-                  value={form.email}
-                  onChange={(event) => setField("email", event.target.value)}
                   aria-invalid={Boolean(errors.email)}
                   aria-describedby={errors.email ? "contato-email-erro" : undefined}
                   className={inputClass}
+                  {...register("email")}
                 />
                 {errors.email ? (
                   <p id="contato-email-erro" className="mt-1 text-sm text-red-600">
-                    {errors.email}
+                    {errors.email.message}
                   </p>
                 ) : null}
               </div>
@@ -188,28 +151,39 @@ export function Contact() {
                 </label>
                 <input
                   id="contato-telefone"
-                  name="telefone"
                   type="tel"
                   autoComplete="tel"
-                  value={form.telefone}
-                  onChange={(event) => setField("telefone", event.target.value)}
+                  aria-invalid={Boolean(errors.telefone)}
+                  aria-describedby={errors.telefone ? "contato-telefone-erro" : undefined}
                   className={inputClass}
+                  {...register("telefone")}
                 />
+                {errors.telefone ? (
+                  <p id="contato-telefone-erro" className="mt-1 text-sm text-red-600">
+                    {errors.telefone.message}
+                  </p>
+                ) : null}
               </div>
 
               <div>
                 <label htmlFor="contato-organizacao" className="mb-1.5 block font-medium text-altea-navy">
-                  Organização <span className="font-normal text-gray-500">(opcional)</span>
+                  Organização
                 </label>
                 <input
                   id="contato-organizacao"
-                  name="organizacao"
                   type="text"
                   autoComplete="organization"
-                  value={form.organizacao}
-                  onChange={(event) => setField("organizacao", event.target.value)}
+                  required
+                  aria-invalid={Boolean(errors.organizacao)}
+                  aria-describedby={errors.organizacao ? "contato-organizacao-erro" : undefined}
                   className={inputClass}
+                  {...register("organizacao")}
                 />
+                {errors.organizacao ? (
+                  <p id="contato-organizacao-erro" className="mt-1 text-sm text-red-600">
+                    {errors.organizacao.message}
+                  </p>
+                ) : null}
               </div>
             </div>
 
@@ -217,13 +191,7 @@ export function Contact() {
               <label htmlFor="contato-tipo" className="mb-1.5 block font-medium text-altea-navy">
                 Sou
               </label>
-              <select
-                id="contato-tipo"
-                name="tipo"
-                value={form.tipo}
-                onChange={(event) => setField("tipo", event.target.value as ContactType)}
-                className={inputClass}
-              >
+              <select id="contato-tipo" className={inputClass} {...register("tipo")}>
                 {contact.typeOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
@@ -272,18 +240,16 @@ export function Contact() {
                   </label>
                   <textarea
                     id="contato-mensagem"
-                    name="mensagem"
                     required
                     rows={5}
-                    value={form.mensagem}
-                    onChange={(event) => setField("mensagem", event.target.value)}
                     aria-invalid={Boolean(errors.mensagem)}
                     aria-describedby={errors.mensagem ? "contato-mensagem-erro" : undefined}
                     className={inputClass}
+                    {...register("mensagem")}
                   />
                   {errors.mensagem ? (
                     <p id="contato-mensagem-erro" className="mt-1 text-sm text-red-600">
-                      {errors.mensagem}
+                      {errors.mensagem.message}
                     </p>
                   ) : null}
                 </div>
@@ -291,29 +257,24 @@ export function Contact() {
                 <div>
                   <div className="flex items-start gap-2.5">
                     <input
-                      id="contato-lgpd"
-                      name="lgpd"
+                      id="contato-consentimento"
                       type="checkbox"
-                      checked={form.lgpd}
-                      onChange={(event) => setField("lgpd", event.target.checked)}
-                      aria-invalid={Boolean(errors.lgpd)}
-                      aria-describedby={errors.lgpd ? "contato-lgpd-erro" : undefined}
+                      aria-invalid={Boolean(errors.consentimento)}
+                      aria-describedby={errors.consentimento ? "contato-consentimento-erro" : undefined}
                       className="mt-1 h-4 w-4 accent-[var(--color-altea-navy)]"
+                      {...register("consentimento")}
                     />
-                    <label htmlFor="contato-lgpd" className="text-sm text-gray-600">
+                    <label htmlFor="contato-consentimento" className="text-sm text-gray-600">
                       Li e concordo com a{" "}
-                      <a
-                        href={PRIVACY_URL}
-                        className="font-medium text-altea-navy underline underline-offset-4"
-                      >
+                      <a href={PRIVACY_URL} className="font-medium text-altea-navy underline underline-offset-4">
                         Política de Privacidade
                       </a>
                       .
                     </label>
                   </div>
-                  {errors.lgpd ? (
-                    <p id="contato-lgpd-erro" className="mt-1 text-sm text-red-600">
-                      {errors.lgpd}
+                  {errors.consentimento ? (
+                    <p id="contato-consentimento-erro" className="mt-1 text-sm text-red-600">
+                      {errors.consentimento.message}
                     </p>
                   ) : null}
                 </div>
@@ -321,10 +282,10 @@ export function Contact() {
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
                   <button
                     type="submit"
-                    disabled={status === "sending"}
+                    disabled={isSubmitting}
                     className="rounded-lg bg-altea-navy px-6 py-3 font-semibold text-white transition-colors hover:bg-altea-navy-light disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {status === "sending" ? "Enviando..." : contact.submitLabel}
+                    {isSubmitting ? "Enviando..." : contact.submitLabel}
                   </button>
                   {whatsappHref ? (
                     <a
