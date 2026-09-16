@@ -848,3 +848,55 @@
     padding: 0.5rem;
   }
 }
+
+/* ===== Landing page (home SEO) — classes lp-* (apenas adicoes) ===== */
+html:has(.lp-root) {
+  scroll-behavior: smooth;
+}
+
+.lp-skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background-color: var(--color-altea-gold);
+  color: var(--color-altea-navy);
+  padding: 0.75rem 1.25rem;
+  border-radius: 0 0 0.5rem 0.5rem;
+  font-weight: 600;
+}
+
+.lp-skip-link:focus {
+  left: 1rem;
+}
+
+.lp-details summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.lp-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.lp-details summary .lp-details-icon {
+  transition: transform 0.2s ease;
+}
+
+.lp-details[open] summary .lp-details-icon {
+  transform: rotate(180deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:has(.lp-root) {
+    scroll-behavior: auto;
+  }
+
+  .lp-root *,
+  .lp-root *::before,
+  .lp-root *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
