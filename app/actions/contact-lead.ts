@@ -1,0 +1,158 @@
+"use server"
+
+import { headers } from "next/headers"
+import { z } from "zod"
+import { sendEmailViaSendGrid } from "@/lib/notifications/sendgrid"
+
+const CONTACT_EMAIL = "relacionamento@alteapay.com"
+
+const TIPO_LABELS: Record<string, string> = {
+  empresa: "Empresa",
+  orgao_publico: "Órgão público",
+}
+
+const contactLeadSchema = z.object({
+  nome: z.string().trim().min(2, "Informe seu nome.").max(200),
+  email: z.string().trim().email("Informe um e-mail válido.").max(200),
+  telefone: z.string().trim().max(50).optional().default(""),
+  organizacao: z.string().trim().max(200).optional().default(""),
+  tipo: z.enum(["empresa", "orgao_publico", "recebi_cobranca"]),
+  mensagem: z.string().trim().min(1, "Escreva uma mensagem.").max(5000),
+  lgpd: z.literal(true),
+  // Honeypot: humanos nunca preenchem este campo
+  campo_site: z.string().optional().default(""),
+})
+
+export interface ContactLeadInput {
+  nome: string
+  email: string
+  telefone?: string
+  organizacao?: string
+  tipo: string
+  mensagem: string
+  lgpd: boolean
+  campo_site?: string
+}
+
+export interface ContactLeadResult {
+  ok: boolean
+  error?: string
+}
+
+/**
+ * Rate limit best-effort em memoria por IP (5 envios/minuto).
+ * Limitacao documentada: o Map vive por instancia de funcao/processo; em
+ * ambiente serverless (Netlify) cada instancia tem seu proprio contador e o
+ * estado zera em cold start. Serve como barreira leve contra rajadas, nao
+ * como protecao definitiva.
+ */
+const RATE_LIMIT_MAX = 5
+const RATE_LIMIT_WINDOW_MS = 60_000
+const rateLimitByIp: Map<string, number[]> = new Map()
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now()
+  const windowStart = now - RATE_LIMIT_WINDOW_MS
+  const recent = (rateLimitByIp.get(ip) || []).filter((timestamp) => timestamp > windowStart)
+
+  if (recent.length >= RATE_LIMIT_MAX) {
+    rateLimitByIp.set(ip, recent)
+    return true
+  }
+
+  recent.push(now)
+  rateLimitByIp.set(ip, recent)
+  return false
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+}
+
+export async function submitContactLead(input: ContactLeadInput): Promise<ContactLeadResult> {
+  const startedAt = Date.now()
+  const log = (tipo: string, ok: boolean) => {
+    // Sem PII nos logs: apenas tipo, resultado e duracao
+    console.log("[contact-lead]", { tipo, ok, durationMs: Date.now() - startedAt })
+  }
+
+  const parsed = contactLeadSchema.safeParse(input)
+  if (!parsed.success) {
+    log(typeof input?.tipo === "string" ? input.tipo : "invalido", false)
+    return { ok: false, error: "Dados inválidos. Verifique os campos e tente novamente." }
+  }
+
+  const lead = parsed.data
+
+  // Honeypot preenchido: responde ok silencioso, sem enviar nada
+  if (lead.campo_site) {
+    log(lead.tipo, true)
+    return { ok: true }
+  }
+
+  // Este tipo nunca deve chegar aqui (o cliente mostra orientacao e nao envia)
+  if (lead.tipo === "recebi_cobranca") {
+    log(lead.tipo, false)
+    return {
+      ok: false,
+      error: "Para consultar ou negociar uma cobrança, acesse o Portal do Cliente.",
+    }
+  }
+
+  const requestHeaders = headers()
+  const forwardedFor = requestHeaders.get("x-forwarded-for") || ""
+  const ip = forwardedFor.split(",")[0]?.trim() || requestHeaders.get("x-real-ip") || "desconhecido"
+
+  if (isRateLimited(ip)) {
+    log(lead.tipo, false)
+    return { ok: false, error: "Muitas tentativas. Aguarde um minuto e tente novamente." }
+  }
+
+  const tipoLabel = TIPO_LABELS[lead.tipo] || lead.tipo
+  const subject = `[Site] Novo contato: ${tipoLabel}${lead.organizacao ? ` · ${lead.organizacao}` : ""}`
+
+  const lines = [
+    `Nome: ${lead.nome}`,
+    `E-mail: ${lead.email}`,
+    `Telefone/WhatsApp: ${lead.telefone || "(nao informado)"}`,
+    `Organizacao: ${lead.organizacao || "(nao informada)"}`,
+    `Tipo: ${tipoLabel}`,
+    "",
+    "Mensagem:",
+    lead.mensagem,
+  ]
+  const text = lines.join("\n")
+  const html = `<pre style="font-family: inherit; white-space: pre-wrap;">${escapeHtml(text)}</pre>`
+
+  if (process.env.CONTACT_FORM_DRY_RUN === "true") {
+    console.log("[contact-lead] dry-run", { tipo: lead.tipo, ok: true })
+    log(lead.tipo, true)
+    return { ok: true }
+  }
+
+  try {
+    const result = await sendEmailViaSendGrid({
+      to: CONTACT_EMAIL,
+      subject,
+      html,
+      text,
+      replyTo: lead.email,
+    })
+
+    log(lead.tipo, result.success)
+
+    if (!result.success) {
+      return { ok: false, error: "Não foi possível enviar sua mensagem. Tente novamente em instantes." }
+    }
+
+    return { ok: true }
+  } catch {
+    log(lead.tipo, false)
+    return { ok: false, error: "Não foi possível enviar sua mensagem. Tente novamente em instantes." }
+  }
+}
