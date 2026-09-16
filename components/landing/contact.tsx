@@ -1,9 +1,10 @@
 import { contact } from "@/content/home"
-import { ContactForm } from "./contact-form"
+import { ContactFormLazy as ContactForm } from "./contact-form-lazy"
 
 /**
  * Secao de contato (server): titulo e texto renderizados no servidor;
- * o formulario (client, react-hook-form) fica em contact-form.tsx.
+ * o formulario (client, react-hook-form) fica em contact-form.tsx e carrega
+ * em chunk proprio via contact-form-lazy.tsx.
  */
 export function Contact() {
   return (
