@@ -19,7 +19,7 @@ import { SiteFooter } from "./site-footer"
  */
 export function LandingPage() {
   return (
-    <div className="lp-root min-h-screen bg-white">
+    <div className="lp-root min-h-screen bg-white text-altea-navy">
       <SiteHeader />
       <main id="conteudo">
         <Hero />

@@ -3,7 +3,7 @@ import { howItWorks } from "@/content/home"
 
 export function HowItWorks() {
   return (
-    <Section id="como-funciona" labelledBy="como-funciona-title" className="bg-gray-50">
+    <Section id="como-funciona" labelledBy="como-funciona-title" className="bg-gray-50 text-altea-navy">
       <h2 id="como-funciona-title" className="text-center text-3xl font-bold text-altea-navy sm:text-4xl">
         {howItWorks.h2}
       </h2>

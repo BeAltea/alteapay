@@ -3,7 +3,7 @@ import { pricingModels } from "@/content/home"
 
 export function PricingModels() {
   return (
-    <Section id="modelos" labelledBy="modelos-title" className="bg-white">
+    <Section id="modelos" labelledBy="modelos-title" className="bg-white text-altea-navy">
       <h2 id="modelos-title" className="text-center text-3xl font-bold text-altea-navy sm:text-4xl">
         {pricingModels.h2}
       </h2>

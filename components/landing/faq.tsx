@@ -4,7 +4,7 @@ import { faq } from "@/content/home"
 
 export function Faq() {
   return (
-    <Section id="faq" labelledBy="faq-title" className="bg-white">
+    <Section id="faq" labelledBy="faq-title" className="bg-white text-altea-navy">
       <h2 id="faq-title" className="text-center text-3xl font-bold text-altea-navy sm:text-4xl">
         {faq.h2}
       </h2>

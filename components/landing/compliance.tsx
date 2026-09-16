@@ -5,7 +5,7 @@ import { site } from "@/content/site"
 
 export function Compliance() {
   return (
-    <Section id="conformidade" labelledBy="conformidade-title" className="bg-gray-50">
+    <Section id="conformidade" labelledBy="conformidade-title" className="bg-gray-50 text-altea-navy">
       <h2 id="conformidade-title" className="text-center text-3xl font-bold text-altea-navy sm:text-4xl">
         {compliance.h2}
       </h2>

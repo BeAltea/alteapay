@@ -4,7 +4,7 @@ import { publicSector } from "@/content/home"
 
 export function PublicSector() {
   return (
-    <Section id="setor-publico" labelledBy="setor-publico-title" className="bg-gray-50">
+    <Section id="setor-publico" labelledBy="setor-publico-title" className="bg-gray-50 text-altea-navy">
       <div className="max-w-3xl">
         <h2 id="setor-publico-title" className="text-3xl font-bold text-altea-navy sm:text-4xl">
           {publicSector.h2}

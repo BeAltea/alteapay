@@ -4,7 +4,7 @@ import { audiences } from "@/content/home"
 
 export function Audiences() {
   return (
-    <Section id="para-quem" labelledBy="para-quem-title" className="bg-white">
+    <Section id="para-quem" labelledBy="para-quem-title" className="bg-white text-altea-navy">
       <h2 id="para-quem-title" className="text-center text-3xl font-bold text-altea-navy sm:text-4xl">
         {audiences.h2}
       </h2>

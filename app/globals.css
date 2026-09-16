@@ -854,6 +854,21 @@ html:has(.lp-root) {
   scroll-behavior: smooth;
 }
 
+/*
+ * Invariancia ao dark mode: a landing usa apenas tokens estaticos (altea-* e
+ * paleta neutra), mas o tema aplica border/ring/background semanticos via
+ * seletor universal e o next-themes seta color-scheme no html. Re-fixamos os
+ * valores light dentro de .lp-root para <html class="dark"> nao vazar.
+ */
+.lp-root {
+  color-scheme: light;
+  --background: oklch(0.99 0 0);
+  --foreground: oklch(0.12 0.05 240);
+  --border: oklch(0.9 0 0);
+  --input: oklch(0.96 0 0);
+  --ring: oklch(0.78 0.15 85);
+}
+
 .lp-skip-link {
   position: absolute;
   left: -9999px;

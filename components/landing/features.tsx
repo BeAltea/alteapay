@@ -15,7 +15,7 @@ const icons: Record<(typeof features.items)[number]["icon"], LucideIcon> = {
 
 export function Features() {
   return (
-    <Section id="solucoes" labelledBy="solucoes-title" className="bg-white">
+    <Section id="solucoes" labelledBy="solucoes-title" className="bg-white text-altea-navy">
       <h2 id="solucoes-title" className="text-center text-3xl font-bold text-altea-navy sm:text-4xl">
         {features.h2}
       </h2>
