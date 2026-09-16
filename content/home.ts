@@ -12,7 +12,8 @@ export const hero = {
     "A AlteaPay contata, negocia e concilia por você. Régua de cobrança por WhatsApp, SMS e e-mail, pagamento por Pix, boleto ou cartão na própria conversa e painel com cada real recuperado. Remuneração por resultado, LGPD e contratação pública desde o desenho.",
   ctaPrimary: { label: "Agendar demonstração", href: "#contato" },
   ctaWhatsAppLabel: "Falar no WhatsApp",
-  ctaFallback: { label: "Falar com a gente", href: "#contato" },
+  // Fallback do CTA secundario sem WhatsApp configurado (C.2): e-mail direto
+  ctaFallback: { label: "Enviar e-mail", href: `mailto:${CONTACT_EMAIL}` },
   loginLink: { label: "Já é cliente? Entrar", href: LOGIN_URL },
   trustBand: [
     "Pix, boleto e cartão",
