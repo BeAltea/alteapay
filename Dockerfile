@@ -22,7 +22,12 @@ ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY \
     NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL \
     NEXT_TELEMETRY_DISABLED=1
-RUN pnpm build
+# Dummy server secrets so module-scope clients survive `next build`'s page
+# data collection; real values come from the runtime environment.
+RUN SUPABASE_SERVICE_ROLE_KEY=build-dummy \
+    SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
+    SUPABASE_JWT_SECRET=build-dummy-jwt-secret-32-characters \
+    pnpm build
 
 FROM build AS runtime
 ENV NODE_ENV=production \
