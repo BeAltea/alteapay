@@ -118,14 +118,30 @@ const redirectSchema = z.object({
   confirmed_intent: z.boolean().optional(),
 })
 
-const bodySchema = z.discriminatedUnion("action", [
-  pingSchema,
-  createSchema,
-  messageSchema,
-  statusSchema,
-  recordSchema,
-  closeSchema,
-  redirectSchema,
+const JOURNEY_ACTIONS = [
+  "debt.summary", "offer.list", "offer.propose", "offer.accept", "offer.reject",
+  "dispute.register", "payment_claim.register", "human.transfer",
+  "session.close", "journey.timeline",
+] as const
+
+const journeySchema = z.object({
+  action: z.enum(JOURNEY_ACTIONS),
+  event_id: z.string().min(8).max(128).optional(),
+  session_id: z.string().uuid(),
+  args: z.record(z.unknown()).optional(),
+})
+
+const bodySchema = z.union([
+  z.discriminatedUnion("action", [
+    pingSchema,
+    createSchema,
+    messageSchema,
+    statusSchema,
+    recordSchema,
+    closeSchema,
+    redirectSchema,
+  ]),
+  journeySchema,
 ])
 
 function jsonError(status: number, error: string, extra: Record<string, unknown> = {}) {
@@ -536,9 +552,79 @@ export async function POST(request: Request) {
         return await handleRedirect(parsed.data)
       case "session.status":
         return await handleStatus(parsed.data)
+      default:
+        return await handleJourneyAction(parsed.data as z.infer<typeof journeySchema>)
     }
   } catch (err) {
     console.error("[webhooks:n8n] erro:", err instanceof Error ? err.message : err)
     return jsonError(500, "erro interno")
+  }
+}
+
+
+// ---------- Ações de domínio da JORNADA (papel B ampliado) ----------
+// Mesma segurança (HMAC/anti-replay) do POST; validação da matriz no servidor;
+// erros de validação retornam 4xx com código estável.
+async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
+  const { loadSessionCtx, debtSummary, listOffers, proposeOffer, rejectOffer,
+    registerDispute, registerPaymentClaim, transferToHuman, closeSession } =
+    await import("@/lib/journey/actions")
+  const ctx = await loadSessionCtx(input.session_id)
+  if (!ctx) return jsonError(404, "sessão não encontrada")
+  const args = (input.args ?? {}) as Record<string, unknown>
+
+  switch (input.action) {
+    case "debt.summary":
+      return NextResponse.json({ success: true, summary: await debtSummary(ctx) })
+    case "offer.list":
+      return NextResponse.json({ success: true, offers: await listOffers(ctx) })
+    case "offer.propose": {
+      const terms = args.terms as Parameters<typeof proposeOffer>[1] | undefined
+      if (!terms) return jsonError(422, "args.terms obrigatório")
+      const r = await proposeOffer(ctx, terms, "n8n", input.event_id)
+      if (!r.ok) return jsonError(422, r.error ?? "OFFER_INVALID", { offer_id: r.offerId })
+      return NextResponse.json({ success: true, offer_id: r.offerId })
+    }
+    case "offer.accept": {
+      const offerId = args.offer_id as string | undefined
+      if (!offerId) return jsonError(422, "args.offer_id obrigatório")
+      const { buildAcceptSummary, confirmAccept } = await import("@/lib/journey/closing")
+      const pre = await buildAcceptSummary(ctx, offerId)
+      if (!pre.ok) return jsonError(409, pre.error)
+      const r = await confirmAccept({
+        ctx, offerId, termsHash: pre.summary.termsHash, eventId: input.event_id,
+      })
+      if (!r.ok) return jsonError(409, r.error)
+      return NextResponse.json({ success: true, agreement_id: r.agreementId })
+    }
+    case "offer.reject": {
+      const offerId = args.offer_id as string | undefined
+      if (!offerId) return jsonError(422, "args.offer_id obrigatório")
+      await rejectOffer(ctx, offerId, "n8n", args.reason as string | undefined, input.event_id)
+      return NextResponse.json({ success: true })
+    }
+    case "dispute.register": {
+      const caseId = await registerDispute(ctx, args, "n8n", input.event_id)
+      return NextResponse.json({ success: true, case_id: caseId })
+    }
+    case "payment_claim.register": {
+      const caseId = await registerPaymentClaim(
+        ctx, args as { paidAt?: string; amount?: number; channel?: string; note?: string },
+        "n8n", input.event_id,
+      )
+      return NextResponse.json({ success: true, case_id: caseId })
+    }
+    case "human.transfer": {
+      const caseId = await transferToHuman(ctx, String(args.reason ?? ""), "n8n", input.event_id)
+      return NextResponse.json({ success: true, case_id: caseId })
+    }
+    case "session.close":
+      await closeSession(ctx, String(args.outcome ?? "closed_by_flow"), "n8n", input.event_id)
+      return NextResponse.json({ success: true })
+    case "journey.timeline": {
+      const { getTimeline } = await import("@/lib/journey/events")
+      const timeline = await getTimeline({ companyId: ctx.companyId, sessionId: ctx.sessionId, limit: 100 })
+      return NextResponse.json({ success: true, timeline })
+    }
   }
 }
