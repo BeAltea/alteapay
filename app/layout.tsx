@@ -1,5 +1,5 @@
 import type React from "react"
-import type { Metadata } from "next"
+import type { Metadata, Viewport } from "next"
 import { Inter, JetBrains_Mono } from "next/font/google"
 import { ThemeProvider } from "@/components/theme-provider"
 import { Toaster } from "@/components/ui/toaster"
@@ -20,36 +20,73 @@ const jetbrainsMono = JetBrains_Mono({
 })
 
 export const metadata: Metadata = {
-  title: "Altea Pay - Soluções de Cobrança Inteligente",
+  metadataBase: new URL("https://alteapay.com"),
+  title: {
+    default: "AlteaPay | Cobrança inteligente e recuperação de crédito",
+    template: "%s | AlteaPay",
+  },
   description:
-    "Com IA e dados comportamentais, orquestramos Pix, cartão, débito, recorrência, crédito via fatura e cashback de forma personalizada para elevar a taxa de recuperação com compliance total.",
+    "Plataforma de cobrança e recuperação de crédito para empresas e dívida ativa municipal. WhatsApp, Pix e boleto, remuneração por resultado e LGPD.",
   generator: "v0.app",
   keywords: ["cobrança", "pagamentos", "pix", "cartão", "recorrência", "inadimplência", "IA", "altea pay"],
   authors: [{ name: "Altea Pay" }],
   creator: "Altea Pay",
   publisher: "Altea Pay",
+  alternates: {
+    canonical: "/",
+  },
   openGraph: {
-    title: "Altea Pay - Soluções de Cobrança Inteligente",
+    title: "AlteaPay | Cobrança inteligente e recuperação de crédito",
     description:
-      "Análise que prevê, experiências que pagam, do seu jeito. Soluções de crédito para recuperação de inadimplência e premiação de adimplência.",
+      "Plataforma de cobrança e recuperação de crédito para empresas e dívida ativa municipal. WhatsApp, Pix e boleto, remuneração por resultado e LGPD.",
     type: "website",
     locale: "pt_BR",
-    siteName: "Altea Pay",
+    url: "/",
+    siteName: "AlteaPay",
+    images: [
+      {
+        url: "/opengraph-image",
+        width: 1200,
+        height: 630,
+        alt: "AlteaPay | Cobrança inteligente e recuperação de crédito",
+      },
+    ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Altea Pay - Soluções de Cobrança Inteligente",
-    description: "Análise que prevê, experiências que pagam, do seu jeito.",
+    title: "AlteaPay | Cobrança inteligente e recuperação de crédito",
+    description:
+      "Plataforma de cobrança e recuperação de crédito para empresas e dívida ativa municipal. WhatsApp, Pix e boleto, remuneração por resultado e LGPD.",
   },
   robots: {
     index: true,
     follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-image-preview": "large",
+    },
   },
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon-light-32x32.png", sizes: "32x32", type: "image/png" },
+    ],
+    apple: [{ url: "/apple-icon.png", sizes: "180x180", type: "image/png" }],
+  },
+  manifest: "/manifest.webmanifest",
   verification: {
+    ...(process.env.NEXT_PUBLIC_GSC_VERIFICATION
+      ? { google: process.env.NEXT_PUBLIC_GSC_VERIFICATION }
+      : {}),
     other: {
       "facebook-domain-verification": "kg3bjx228dgl9nw25er0j6ugor7x7q",
     },
   },
+}
+
+export const viewport: Viewport = {
+  themeColor: "#0A0F1E",
 }
 
 export default function RootLayout({
