@@ -2,6 +2,7 @@
 
 import { createClient } from "@supabase/supabase-js"
 import { PAID_ASAAS_STATUSES, PAID_PAYMENT_STATUSES, PAID_AGREEMENT_STATUSES } from "@/lib/constants/payment-status"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 
 // Types
 interface SetupRule {
@@ -66,7 +67,7 @@ export async function generateAdminMonthlyReport(
   try {
     // Use service role client
     const supabaseAdmin = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      getServerSupabaseUrl(),
       process.env.SUPABASE_SERVICE_ROLE_KEY!
     )
 

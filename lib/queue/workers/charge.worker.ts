@@ -2,6 +2,8 @@ import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG, ASAAS_NOTIFICATION_DEFAULTS } from '../config';
 import { emailQueue } from '../queues';
+import { isMockMode } from '../../integrations/mock-mode';
+import { mockAsaasRequest } from '../../integrations/asaas-mock';
 import { createServiceClient } from '../../supabase/service';
 
 const ASAAS_BASE_URL = 'https://api.asaas.com/v3';
@@ -52,6 +54,10 @@ async function asaasRequest(
   method: string = 'GET',
   body?: unknown
 ): Promise<AsaasResponse> {
+  if (isMockMode('asaas')) {
+    return { success: true, data: mockAsaasRequest(endpoint, method, body) };
+  }
+
   const apiKey = process.env.ASAAS_API_KEY;
 
   if (!apiKey) {

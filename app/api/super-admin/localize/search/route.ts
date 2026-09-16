@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js"
 import { consultarDocumento, LocalizeResult } from "@/services/assertivaLocalizeService"
 import { assertivaLocalizeQueue } from "@/lib/queue/queues"
 import { randomUUID } from "crypto"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 300 // 5 minutes max for small batch processing
@@ -48,7 +49,7 @@ interface SearchResultItem {
 export async function POST(request: NextRequest) {
   try {
     const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      getServerSupabaseUrl(),
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     )

@@ -2,6 +2,8 @@ import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG } from '../config';
 import { createClient } from '@supabase/supabase-js';
+import { getServerSupabaseUrl } from '../../supabase/url';
+import { isMockMode, mockHex } from '../../integrations/mock-mode';
 
 export interface BulkEmailRecipient {
   id: string;
@@ -44,7 +46,7 @@ export interface BulkEmailResult {
 
 function getSupabaseAdmin() {
   return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    getServerSupabaseUrl(),
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
@@ -56,6 +58,12 @@ async function sendEmailViaSendGrid(params: {
   html: string;
   text: string;
 }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  if (isMockMode('sendgrid')) {
+    const messageId = `mock-sg-${mockHex(`${params.to}:${params.subject}`)}`;
+    console.log('[mock:sendgrid] send', `recipients=1 messageId=${messageId}`);
+    return { success: true, messageId };
+  }
+
   const apiKey = process.env.SENDGRID_API_KEY;
   const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'cobranca@alteapay.com';
   const fromName = process.env.SENDGRID_FROM_NAME || 'AlteaPay';

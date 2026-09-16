@@ -1,5 +1,7 @@
 "use server"
 
+import { isMockMode, mockHex } from "@/lib/integrations/mock-mode"
+
 /**
  * Assertiva Localize Service
  *
@@ -365,6 +367,53 @@ function selectBestPhone(telefones: AssertivaTelefones): LocalizeResult['phones'
 }
 
 // ============================================================================
+// MOCK MODE
+// ============================================================================
+
+/**
+ * Builds a deterministic, realistic LocalizeResult without calling the API.
+ * Contact info is derived from a hash of the document and is intentionally
+ * undeliverable (example.invalid email, synthetic phone number).
+ */
+function buildMockLocalizeResult(cleanDoc: string, documentType: 'cpf' | 'cnpj'): LocalizeResult {
+  const hex = mockHex(cleanDoc, 8)
+  const digits = String(parseInt(hex, 16) % 100000000).padStart(8, "0")
+  const email = `mock.${hex}@example.invalid`
+  const numero = `(11) 9${digits.slice(0, 4)}-${digits.slice(4)}`
+
+  console.log(`[mock:assertiva] localize.${documentType}`, `doc=***${cleanDoc.slice(-4)}`)
+
+  return {
+    success: true,
+    document: cleanDoc,
+    documentType,
+    name: documentType === 'cpf' ? `Cliente Mock ${hex.slice(0, 4).toUpperCase()}` : `Empresa Mock ${hex.slice(0, 4).toUpperCase()} LTDA`,
+    protocolo: `mock-${mockHex(cleanDoc, 16)}`,
+    emails: [email],
+    bestEmail: email,
+    phones: {
+      best: {
+        numero,
+        tipo: 'movel',
+        whatsapp: true,
+        hotphone: true,
+        relacao: 'Direto',
+      },
+      allMoveis: [
+        {
+          numero,
+          whatsapp: true,
+          hotphone: true,
+          relacao: 'Direto',
+          naoPerturbe: false,
+        },
+      ],
+      allFixos: [],
+    },
+  }
+}
+
+// ============================================================================
 // MAIN API FUNCTIONS
 // ============================================================================
 
@@ -384,6 +433,10 @@ export async function consultarCPF(cpf: string): Promise<LocalizeResult> {
       phones: { best: null, allMoveis: [], allFixos: [] },
       error: 'CPF inválido: deve ter 11 dígitos',
     }
+  }
+
+  if (isMockMode("assertiva")) {
+    return buildMockLocalizeResult(cleanDoc, 'cpf')
   }
 
   try {
@@ -495,6 +548,10 @@ export async function consultarCNPJ(cnpj: string): Promise<LocalizeResult> {
       phones: { best: null, allMoveis: [], allFixos: [] },
       error: 'CNPJ inválido: deve ter 14 dígitos',
     }
+  }
+
+  if (isMockMode("assertiva")) {
+    return buildMockLocalizeResult(cleanDoc, 'cnpj')
   }
 
   try {

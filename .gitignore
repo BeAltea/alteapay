@@ -36,3 +36,6 @@ reports/
 
 # macOS
 .DS_Store
+
+# local supabase
+supabase/.temp

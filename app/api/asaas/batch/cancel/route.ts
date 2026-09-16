@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 import { asaasChargeCancelQueue } from "@/lib/queue"
 import type { AsaasChargeCancelJobData } from "@/lib/queue"
 
@@ -20,7 +21,7 @@ interface BatchCancelRequest {
 
 export async function POST(request: NextRequest) {
   try {
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+    const supabaseUrl = getServerSupabaseUrl()
     const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
 
     if (!supabaseUrl || !supabaseServiceKey) {

@@ -1,5 +1,7 @@
 "use server"
 
+import { isMockMode, mockHex } from "@/lib/integrations/mock-mode"
+
 interface SendSMSParams {
   to: string
   body: string
@@ -26,6 +28,16 @@ export async function sendSMS({ to, body }: SendSMSParams) {
     if (phoneDigits.length < 12) {
       console.error("[Twilio] ERROR: Phone too short:", phoneDigits.length)
       return { success: false, error: `Telefone inválido: ${phoneDigits.length} dígitos (mínimo 12 dígitos)` }
+    }
+
+    if (isMockMode("twilio")) {
+      const messageId = `SMmock${mockHex(`sms:${to}:${body}`, 28)}`
+      console.log("[mock:twilio] sendSMS", `to=***${phoneDigits.slice(-4)} messageId=${messageId}`)
+      return {
+        success: true,
+        messageId,
+        message: `SMS enviado com sucesso (SID: ${messageId})`,
+      }
     }
 
     console.log("[Twilio] Phone validation passed")
@@ -140,6 +152,16 @@ export async function sendWhatsApp(to: string, body: string) {
     if (phoneDigits.length < 12) {
       console.error("[Twilio WhatsApp] ERROR: Phone too short:", phoneDigits.length)
       return { success: false, error: `Telefone inválido: ${phoneDigits.length} dígitos (mínimo 12 dígitos)` }
+    }
+
+    if (isMockMode("twilio")) {
+      const messageId = `SMmock${mockHex(`whatsapp:${to}:${body}`, 28)}`
+      console.log("[mock:twilio] sendWhatsApp", `to=***${phoneDigits.slice(-4)} messageId=${messageId}`)
+      return {
+        success: true,
+        messageId,
+        message: `WhatsApp enviado com sucesso (SID: ${messageId})`,
+      }
     }
 
     console.log("[Twilio WhatsApp] Phone validation passed")

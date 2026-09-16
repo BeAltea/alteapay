@@ -1,5 +1,7 @@
 "use server"
 
+import { isMockMode, mockHex } from "@/lib/integrations/mock-mode"
+
 interface SendGridEmailParams {
   to: string | string[]
   subject: string
@@ -63,6 +65,13 @@ export async function sendEmailViaSendGrid({
     console.log("[SendGrid] Starting email send")
     console.log("[SendGrid] To:", Array.isArray(to) ? to.length + " recipients" : to)
     console.log("[SendGrid] Subject:", subject)
+
+    if (isMockMode("sendgrid")) {
+      const mockRecipients = Array.isArray(to) ? to : [to]
+      const messageId = `mock-sg-${mockHex(`${mockRecipients.join(",")}:${subject}`)}`
+      console.log("[mock:sendgrid] send", `recipients=${mockRecipients.length} messageId=${messageId}`)
+      return { success: true, messageId }
+    }
 
     const config = getConfig()
 
@@ -227,6 +236,16 @@ export async function sendIndividualEmailsWithTracking({
   html: string
 }): Promise<BulkSendResponse> {
   console.log("[SendGrid] Sending individual emails to", recipients.length, "recipients with tracking")
+
+  if (isMockMode("sendgrid")) {
+    console.log("[mock:sendgrid] sendIndividual", `recipients=${recipients.length}`)
+    return {
+      success: true,
+      totalSent: recipients.length,
+      totalFailed: 0,
+      results: recipients.map((r) => ({ email: r.email, success: true })),
+    }
+  }
 
   const config = getConfig()
 

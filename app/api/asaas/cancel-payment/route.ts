@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 
 /**
  * ROBUST Cancel ASAAS Payment API
@@ -17,7 +18,7 @@ import { createClient } from "@supabase/supabase-js"
  */
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  getServerSupabaseUrl(),
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 )
 

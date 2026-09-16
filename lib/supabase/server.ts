@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr"
 import { cookies } from "next/headers"
+import { getServerSupabaseUrl } from "./url"
 
 /**
  * Especially important if using Fluid compute: Don't put this client in a
@@ -10,11 +11,11 @@ export async function createClient() {
   try {
     const cookieStore = await cookies()
 
-    if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
+    if (!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
       throw new Error("Missing Supabase environment variables")
     }
 
-    const client = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
+    const client = createServerClient(getServerSupabaseUrl(), process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
       cookies: {
         getAll() {
           return cookieStore.getAll()
@@ -40,11 +41,7 @@ export function createAdminClient() {
     throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY environment variable")
   }
 
-  if (!process.env.NEXT_PUBLIC_SUPABASE_URL) {
-    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL environment variable")
-  }
-
-  return createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+  return createServerClient(getServerSupabaseUrl(), process.env.SUPABASE_SERVICE_ROLE_KEY, {
     cookies: {
       getAll() {
         return []
