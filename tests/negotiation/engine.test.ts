@@ -84,10 +84,25 @@ beforeEach(() => {
 })
 
 describe("engine n8n", () => {
-  it("padrão é n8n; agent só por env explícita", () => {
+  it("D14: default é disabled; n8n exige URL; agent exige URL+token", () => {
+    // beforeEach configura NEGOTIATION_ENGINE=n8n + N8N_CHAT_FLOW_URL → n8n
     expect(engineName()).toBe("n8n")
+    // n8n sem URL degrada para disabled
+    delete process.env.N8N_CHAT_FLOW_URL
+    expect(engineName()).toBe("disabled")
+    // agent sem AGENT_URL/AGENT_APP_TOKEN degrada para disabled
     process.env.NEGOTIATION_ENGINE = "agent"
+    delete process.env.AGENT_URL
+    delete process.env.AGENT_APP_TOKEN
+    expect(engineName()).toBe("disabled")
+    process.env.AGENT_URL = "http://127.0.0.1:9"
+    process.env.AGENT_APP_TOKEN = "t"
     expect(engineName()).toBe("agent")
+    delete process.env.AGENT_URL
+    delete process.env.AGENT_APP_TOKEN
+    // sem env nenhuma → disabled
+    delete process.env.NEGOTIATION_ENGINE
+    expect(engineName()).toBe("disabled")
   })
 
   it("POSTa o turno assinado e o stub valida o HMAC", async () => {
