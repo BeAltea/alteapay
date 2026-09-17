@@ -45,7 +45,7 @@ export const metadata: Metadata = {
     siteName: "AlteaPay",
     images: [
       {
-        url: "/opengraph-image",
+        url: "/og/home.png",
         width: 1200,
         height: 630,
         alt: "AlteaPay | Cobrança inteligente e recuperação de crédito",
@@ -57,6 +57,7 @@ export const metadata: Metadata = {
     title: "AlteaPay | Cobrança inteligente e recuperação de crédito",
     description:
       "Plataforma de cobrança e recuperação de crédito para empresas e dívida ativa municipal. WhatsApp, Pix e boleto, remuneração por resultado e LGPD.",
+    images: ["/og/home.png"],
   },
   robots: {
     index: true,

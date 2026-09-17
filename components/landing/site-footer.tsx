@@ -80,7 +80,7 @@ export function SiteFooter() {
             <h2 className="mb-4 mt-6 font-semibold">{footer.contactTitle}</h2>
             <ul className="space-y-2 text-sm">
               <li>
-                <a href={`mailto:${CONTACT_EMAIL}`} className="text-blue-100 transition-colors hover:text-altea-gold">
+                <a href={`mailto:${CONTACT_EMAIL}`} className="break-all text-blue-100 transition-colors hover:text-altea-gold">
                   {CONTACT_EMAIL}
                 </a>
               </li>
