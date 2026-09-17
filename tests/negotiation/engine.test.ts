@@ -169,18 +169,17 @@ describe("engine n8n", () => {
     ).rejects.toThrow(/500/)
   })
 
-  it("falha claro sem N8N_CHAT_FLOW_URL", async () => {
+  it("D14: sem N8N_CHAT_FLOW_URL o engine degrada para disabled (nao erra)", async () => {
     delete process.env.N8N_CHAT_FLOW_URL
-    await expect(
-      engineChat({ session: fakeSession(), message: "oi", channel: "n8n", debtor: null, tenant: null }),
-    ).rejects.toThrow(/N8N_CHAT_FLOW_URL/)
+    expect(engineName()).toBe("disabled")
+    const health = await engineHealth()
+    expect(health.ok).toBe(true)
+    expect(health.engine).toBe("disabled")
   })
 
-  it("engineHealth reflete configuração do engine n8n", async () => {
-    expect((await engineHealth()).ok).toBe(true)
-    delete process.env.N8N_CHAT_FLOW_URL
+  it("engineHealth reflete n8n configurado (URL presente)", async () => {
     const health = await engineHealth()
-    expect(health.ok).toBe(false)
+    expect(health.ok).toBe(true)
     expect(health.engine).toBe("n8n")
   })
 })

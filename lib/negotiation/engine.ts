@@ -191,7 +191,13 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
 }
 
 export async function engineChat(input: EngineTurnInput): Promise<EngineTurnResult> {
-  if (engineName() === "agent") {
+  const name = engineName()
+  if (name === "disabled") {
+    // D13: chat assistido determinístico (menu servido pelo servidor, sem IA)
+    const { assistedChat } = await import("./assisted")
+    return assistedChat(input)
+  }
+  if (name === "agent") {
     if (!input.session.thread_id) throw new Error("sessão sem thread_id")
     return agentChat(input.session.thread_id, input.message, input.session.company_id)
   }
@@ -218,6 +224,9 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
 }
 
 export async function engineHealth(): Promise<{ ok: boolean; engine: EngineName; detail?: string }> {
+  if (engineName() === "disabled") {
+    return { ok: true, engine: "disabled", detail: "modo assistido determinístico" }
+  }
   if (engineName() === "agent") {
     const health = await agentHealth()
     return { ...health, engine: "agent" }
