@@ -17,9 +17,12 @@ function maskCpf(digits: string): string {
 export function JourneyAuthForm({
   token,
   requireBirthDate,
+  successHref = "./chat",
 }: {
   token: string
   requireBirthDate: boolean
+  /** Para onde ir após autenticar. Default relativo à página de auth. */
+  successHref?: string
 }) {
   const router = useRouter()
   const [cpf, setCpf] = useState("")
@@ -50,7 +53,7 @@ export function JourneyAuthForm({
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data?.ok) {
-        router.replace("./chat")
+        router.replace(successHref)
         return
       }
       // Mensagem sempre genérica (410 = link; demais = credencial).

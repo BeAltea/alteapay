@@ -42,6 +42,11 @@ async function applyEvent(ev: NormalizedWhatsAppEvent, provider: string): Promis
       }
       if (col) patch[col] = now
       if (ev.type === "failed") patch.error = ev.error ?? "provider_failed"
+      // V7: só marcamos delivered/read a partir de uma FONTE real; registramos
+      // a procedência para o painel distinguir de status inventado.
+      if (ev.type === "delivered" || ev.type === "read") {
+        patch.provider_status_source = provider === "voxuy" ? "voxuy_webhook" : "manual"
+      }
       await supabase.from("whatsapp_messages").update(patch).eq("id", msg.id)
       await recordEvent({
         companyId: msg.company_id, campaignId: msg.campaign_id, messageId: msg.id,

@@ -23,6 +23,8 @@ export type JourneyEventType =
   | "receipt.issued" | "creditor.notified" | "payment.sync_error"
   | "dispute.registered" | "payment_claim.registered" | "human.transfer"
   | "optout.received" | "block.received"
+  | "contact.stopped" | "contact.stop_failed"
+  | "message.accepted"
   | "session.closed" | "retry.available"
 
 export interface RecordEventInput {

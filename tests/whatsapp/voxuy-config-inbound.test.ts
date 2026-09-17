@@ -13,7 +13,7 @@ describe("loadVoxuyConfig (V1 — zod, sem logar valor)", () => {
     const cfg = loadVoxuyConfig({
       VOXUY_WEBHOOK_URL: "https://sistema.voxuy.com/api/abc/webhooks/voxuy/transaction",
       VOXUY_API_TOKEN: "tok",
-    } as NodeJS.ProcessEnv)
+    } as unknown as NodeJS.ProcessEnv)
     expect(cfg.webhookUrl).toContain("voxuy.com")
     expect(cfg.timeoutMs).toBe(10_000)
   })
@@ -22,7 +22,7 @@ describe("loadVoxuyConfig (V1 — zod, sem logar valor)", () => {
     try {
       // valor de token presente porém URL faltando: a msg cita só o NOME da
       // variável faltante, nunca o valor do token fornecido.
-      loadVoxuyConfig({ VOXUY_API_TOKEN: "SECRET_TOKEN_VALUE_123" } as NodeJS.ProcessEnv)
+      loadVoxuyConfig({ VOXUY_API_TOKEN: "SECRET_TOKEN_VALUE_123" } as unknown as NodeJS.ProcessEnv)
       throw new Error("deveria ter lançado")
     } catch (err) {
       expect(err).toBeInstanceOf(VoxuyConfigError)
@@ -35,14 +35,14 @@ describe("loadVoxuyConfig (V1 — zod, sem logar valor)", () => {
 
   it("rejeita URL não-https / não montada corretamente", () => {
     expect(() =>
-      loadVoxuyConfig({ VOXUY_WEBHOOK_URL: "ftp://x", VOXUY_API_TOKEN: "t" } as NodeJS.ProcessEnv),
+      loadVoxuyConfig({ VOXUY_WEBHOOK_URL: "ftp://x", VOXUY_API_TOKEN: "t" } as unknown as NodeJS.ProcessEnv),
     ).toThrow(VoxuyConfigError)
   })
 
   it("rate limit default 5, respeita override positivo", () => {
-    expect(voxuyRateLimitPerSec({} as NodeJS.ProcessEnv)).toBe(5)
-    expect(voxuyRateLimitPerSec({ WHATSAPP_RATE_LIMIT_PER_SEC: "8" } as NodeJS.ProcessEnv)).toBe(8)
-    expect(voxuyRateLimitPerSec({ WHATSAPP_RATE_LIMIT_PER_SEC: "-1" } as NodeJS.ProcessEnv)).toBe(5)
+    expect(voxuyRateLimitPerSec({} as unknown as NodeJS.ProcessEnv)).toBe(5)
+    expect(voxuyRateLimitPerSec({ WHATSAPP_RATE_LIMIT_PER_SEC: "8" } as unknown as NodeJS.ProcessEnv)).toBe(8)
+    expect(voxuyRateLimitPerSec({ WHATSAPP_RATE_LIMIT_PER_SEC: "-1" } as unknown as NodeJS.ProcessEnv)).toBe(5)
   })
 })
 
