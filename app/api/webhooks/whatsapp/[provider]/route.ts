@@ -5,7 +5,8 @@
 import { createHash } from "node:crypto"
 import { NextRequest, NextResponse } from "next/server"
 import { createServiceClient } from "@/lib/supabase/service"
-import { getWhatsAppProvider, type NormalizedWhatsAppEvent } from "@/lib/whatsapp"
+import { parseInboundFor, type NormalizedWhatsAppEvent } from "@/lib/whatsapp"
+import { voxuyInboundSecret } from "@/lib/whatsapp/voxuy/config"
 import { recordEvent } from "@/lib/journey/events"
 import { addSuppression } from "@/lib/journey/suppressions"
 
@@ -97,16 +98,22 @@ export async function POST(req: NextRequest, ctx: { params: { provider: string }
   const supabase = createServiceClient()
   const eventHash = hash(`${providerName}:${rawBody}`)
 
-  // autenticação delegada ao provider (voxuy exige segredo; mock não)
-  const provider = getWhatsAppProvider(providerName)
-  let events: NormalizedWhatsAppEvent[] = []
-  try {
-    events = await provider.parseInboundEvent(rawBody, req.headers)
-  } catch (err) {
-    const status = (err as { status?: number }).status ?? 400
-    if (status === 401) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
-    events = []
+  // Autenticação: voxuy exige VOXUY_INBOUND_SECRET (header ou ?s=); mock não.
+  // NB: a rota canônica da Voxuy é a estática /api/webhooks/whatsapp/voxuy
+  // (V5). Este handler dinâmico mantém compat e o mesmo contrato de auth.
+  if (providerName === "voxuy") {
+    const secret = voxuyInboundSecret()
+    const given =
+      req.headers.get("x-alteapay-webhook-secret") ??
+      new URL(req.url).searchParams.get("s") ??
+      ""
+    if (!secret || given !== secret) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+    }
   }
+
+  // Parse do inbound SEM exigir credenciais de envio (captura funciona antes).
+  const events: NormalizedWhatsAppEvent[] = await parseInboundFor(providerName, rawBody, req.headers)
 
   // captura bruta SEMPRE (dedupe por hash)
   const { error: insErr } = await supabase.from("whatsapp_provider_events").insert({

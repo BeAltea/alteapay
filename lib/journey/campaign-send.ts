@@ -57,14 +57,20 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
   }
 
   // ---- dados do cliente + config do tenant
-  const { data: customer } = await supabase
-    .from("customers").select("name, document").eq("id", msg.customer_id).single()
-  const { data: cfg } = await supabase
-    .from("tenant_chat_config")
-    .select("link_ttl_hours, whatsapp_sender_label, branding")
-    .eq("company_id", companyId)
-    .maybeSingle()
-  const branding = (cfg?.branding ?? {}) as { brand_name?: string }
+  const [{ data: customer }, { data: cfg }, { data: company }] = await Promise.all([
+    supabase.from("customers").select("name, document").eq("id", msg.customer_id).single(),
+    supabase
+      .from("tenant_chat_config")
+      .select("link_ttl_hours, whatsapp_sender_label, branding, voxuy_plan_id, voxuy_events")
+      .eq("company_id", companyId)
+      .maybeSingle(),
+    supabase.from("companies").select("name").eq("id", companyId).maybeSingle(),
+  ])
+  const branding = (cfg?.branding ?? {}) as { brand_name?: string; creditor_name?: string }
+  const voxuyEvents = (cfg?.voxuy_events ?? {}) as { approach?: number | null; stop?: number | null; receipt?: number | null }
+  const firstName = (customer?.name ?? "").trim().split(/\s+/)[0] ?? ""
+  const brandName = branding.brand_name ?? "AlteaPay"
+  const creditorName = branding.creditor_name ?? company?.name ?? brandName
 
   // ---- token na hora do envio
   const { data: tokenExisting } = await supabase
@@ -101,9 +107,13 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
     templateKey: campaign.template_key,
     variables: {
       consult_url: `${appBaseUrl()}/c/${token.token}`,
-      brand_name: branding.brand_name ?? "AlteaPay",
+      brand_name: brandName,
       sender_label: cfg?.whatsapp_sender_label ?? "AlteaPay",
+      creditor_name: creditorName,
+      first_name: firstName,
     },
+    voxuyPlanId: cfg?.voxuy_plan_id ?? null,
+    voxuyEvent: typeof voxuyEvents.approach === "number" ? voxuyEvents.approach : null,
   })
 
   const now = new Date().toISOString()
