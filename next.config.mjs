@@ -19,6 +19,15 @@ const nextConfig = {
   async headers() {
     return [
       {
+        // Security headers (HSTS/nosniff ja enviados pelo Netlify)
+        source: "/(.*)",
+        headers: [
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+          { key: "X-Frame-Options", value: "SAMEORIGIN" },
+        ],
+      },
+      {
         source: "/api/:path*",
         headers: [
           { key: "Cache-Control", value: "no-store, no-cache, must-revalidate, max-age=0" },
