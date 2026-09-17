@@ -1,4 +1,4 @@
-import { updateSession } from "@/lib/supabase/middleware"
+import { journeyGate, updateSession } from "@/lib/supabase/middleware"
 import type { NextRequest } from "next/server"
 import { NextResponse } from "next/server"
 
@@ -35,6 +35,18 @@ export async function middleware(request: NextRequest) {
   // Páginas legais públicas: sem auth, sem redirect (exigência Meta/ANPD)
   if (currentPath === "/politica-de-privacidade" || currentPath === "/termos-de-uso") {
     return NextResponse.next()
+  }
+
+  // Gate D13: jornada pública white-label /c/[token]. Bloqueia (404) quando a
+  // flag está off ou quando o tenant está em modo admin-only sem sessão admin.
+  if (currentPath.startsWith("/c/")) {
+    const blocked = await journeyGate(request)
+    if (blocked) return blocked
+    // Autenticado por token (não por usuário Supabase): não passa por updateSession
+    // para não sofrer redirect de rota protegida. Nunca em iframe de terceiros.
+    const response = NextResponse.next()
+    response.headers.set("X-Frame-Options", "SAMEORIGIN")
+    return response
   }
 
   if (currentPath.startsWith("/negociar/embed/")) {
