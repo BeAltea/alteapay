@@ -21,10 +21,8 @@ export async function POST(request: NextRequest) {
   try {
     const expectedToken = process.env.AGENT_APP_TOKEN
     if (!expectedToken) {
-      return NextResponse.json(
-        { success: false, error: "AGENT_APP_TOKEN não configurado" },
-        { status: 503 },
-      )
+      // Agente adormecido (D2'): sem AGENT_APP_TOKEN a rota "não existe".
+      return NextResponse.json({ error: "not found" }, { status: 404 })
     }
 
     const providedToken = request.headers.get("x-agent-token")
