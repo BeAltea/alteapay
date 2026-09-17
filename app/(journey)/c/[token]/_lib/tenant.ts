@@ -1,7 +1,7 @@
 // Carregamento server-side do contexto white-label a partir do token do link.
 // Nunca expõe PII: só nome/branding/políticas do tenant e as flags de auth.
 import "server-only"
-import { validateToken, type TokenValidation } from "@/lib/journey/tokens"
+import { validateToken } from "@/lib/journey/tokens"
 import { createServiceClient } from "@/lib/supabase/service"
 
 export interface JourneyBranding {
@@ -26,9 +26,11 @@ export interface JourneyTenantContext {
 const DEFAULT_PRIMARY = "#0f172a"
 const DEFAULT_SECONDARY = "#2563eb"
 
+export type TokenFailReason = "not_found" | "expired" | "revoked" | "exhausted"
+
 export type LoadTenantResult =
   | { ok: true; tenant: JourneyTenantContext }
-  | { ok: false; reason: TokenValidation extends { ok: false; reason: infer R } ? R : never }
+  | { ok: false; reason: TokenFailReason }
 
 /**
  * Valida o token e resolve o contexto do tenant para a UI white-label.
