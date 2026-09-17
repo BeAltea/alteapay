@@ -13,13 +13,23 @@ export const dynamic = "force-dynamic"
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex")
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 async function applyEvent(ev: NormalizedWhatsAppEvent, provider: string): Promise<void> {
   const supabase = createServiceClient()
   if ("providerMessageId" in ev && ev.providerMessageId) {
+    // Provider message ids são strings do provider (ex.: "mock-wa-...", ids da
+    // Voxuy) — NÃO são UUID. Só casamos por whatsapp_messages.id quando o valor
+    // é de fato um UUID (caso o provider ecoe nosso id interno); senão o filtro
+    // `id.eq.<não-uuid>` estoura "invalid input syntax for type uuid" e o
+    // registro nunca é encontrado (clicks/delivery/read eram descartados).
+    const orClause = UUID_RE.test(ev.providerMessageId)
+      ? `provider_message_id.eq.${ev.providerMessageId},id.eq.${ev.providerMessageId}`
+      : `provider_message_id.eq.${ev.providerMessageId}`
     const { data: msg } = await supabase
       .from("whatsapp_messages")
       .select("id, company_id, campaign_id, customer_id, status, status_history, phone_e164")
-      .or(`provider_message_id.eq.${ev.providerMessageId},id.eq.${ev.providerMessageId}`)
+      .or(orClause)
       .maybeSingle()
     if (!msg) return
     const now = ev.at

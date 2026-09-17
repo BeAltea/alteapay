@@ -69,17 +69,21 @@ export type ConfirmAcceptResult =
 export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmAcceptResult> {
   const { ctx } = input
   const supabase = createServiceClient()
-  const pre = await buildAcceptSummary(ctx, input.offerId)
-  if (!pre.ok) return { ok: false, error: pre.error as "OFFER_NOT_AVAILABLE" | "OFFER_EXPIRED" }
-  if (pre.summary.termsHash !== input.termsHash) return { ok: false, error: "TERMS_CHANGED" }
 
-  // idempotência de reenvio do confirm: aceite já registrado para esta oferta
+  // idempotência de reenvio do confirm: se JÁ existe aceite para esta oferta,
+  // devolve o mesmo agreement. Precisa vir ANTES de buildAcceptSummary porque o
+  // 1º confirm marca a oferta como 'accepted' — aí buildAcceptSummary passaria a
+  // devolver OFFER_NOT_AVAILABLE (409) e o reenvio nunca chegaria aqui.
   const { data: prevAccept } = await supabase
     .from("negotiation_acceptances")
     .select("agreement_id")
     .eq("offer_id", input.offerId)
     .maybeSingle()
   if (prevAccept?.agreement_id) return { ok: true, agreementId: prevAccept.agreement_id }
+
+  const pre = await buildAcceptSummary(ctx, input.offerId)
+  if (!pre.ok) return { ok: false, error: pre.error as "OFFER_NOT_AVAILABLE" | "OFFER_EXPIRED" }
+  if (pre.summary.termsHash !== input.termsHash) return { ok: false, error: "TERMS_CHANGED" }
 
   // ---- guard D7, nível local
   const { data: agreements } = await supabase

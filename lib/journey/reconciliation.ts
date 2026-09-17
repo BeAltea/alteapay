@@ -46,9 +46,12 @@ export async function journeyOnPaymentEvent(ev: JourneyPaymentEvent): Promise<vo
         eventId: `journey-paid-${ev.paymentId}`,
         payload: { installment_index: ev.installmentIndex ?? null },
       })
-      // primeiro pagamento fecha a negociação
+      // primeiro pagamento fecha a negociação. O CHECK de negotiation_sessions
+      // (migration 20260702) só admite 'agreement_closed' — 'agreement_paid'
+      // violava a constraint e a sessão nunca fechava (erro engolido pelo
+      // try/catch como payment.sync_error).
       await supabase.from("negotiation_sessions")
-        .update({ outcome: "agreement_paid", updated_at: new Date().toISOString() })
+        .update({ outcome: "agreement_closed", updated_at: new Date().toISOString() })
         .eq("id", ag.negotiation_session_id)
         .eq("outcome", "in_progress")
       await recordEvent({ ...base, type: "session.closed", actor: "system", payload: { outcome: "paid" } })
