@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alteapay-web
+  namespace: alteapay-app
+  labels: { app: alteapay-web, tier: frontend }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: alteapay-web } }
+  template:
+    metadata:
+      labels: { app: alteapay-web, tier: frontend }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 1001 }
+      containers:
+        - name: web
+          image: alteapay/app:local
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3000 }]
+          envFrom:
+            - secretRef: { name: alteapay-app-secrets }
+            - configMapRef: { name: alteapay-app-config }
+          readinessProbe:
+            httpGet: { path: /api/ready, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 768Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: alteapay-web, namespace: alteapay-app }
+spec:
+  # LoadBalancer: OrbStack exposes this on the host so the browser can reach
+  # the app directly (fallback: kubectl port-forward svc/alteapay-web 3000).
+  type: LoadBalancer
+  selector: { app: alteapay-web }
+  ports: [{ port: 3000, targetPort: 3000 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: alteapay-web, namespace: alteapay-app }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: alteapay-web }
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 75 } }

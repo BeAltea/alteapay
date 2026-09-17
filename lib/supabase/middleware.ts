@@ -1,5 +1,108 @@
 import { createServerClient } from "@supabase/ssr"
 import { NextResponse, type NextRequest } from "next/server"
+import { getServerSupabaseUrl } from "./url"
+
+// --- Gate D13 da jornada pública /c/[token] ---------------------------------
+// Regras:
+//   - CHAT_JOURNEY_ENABLED !== "true"  → 404 (rota "não existe").
+//   - flag on + tenant.journey_public_enabled = true  → passa (o layout decide).
+//   - flag on + journey_public_enabled = false (modo admin-only) → exige sessão
+//     Supabase autenticada com role admin/super_admin; sem ela → 404 (não 403).
+// O lookup usa PostgREST com service role (mesmo padrão de embedFrameAncestors
+// em middleware.ts) e é uma única leitura indexada por token_hash.
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input)
+  const digest = await crypto.subtle.digest("SHA-256", data)
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
+/** Resolve journey_public_enabled do tenant dono do token. null = desconhecido. */
+async function journeyPublicEnabledForToken(token: string): Promise<boolean | null> {
+  try {
+    const base = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+    if (!base || !key) return null
+    const headers = { apikey: key, Authorization: `Bearer ${key}` }
+    const tokenHash = await sha256Hex(token)
+    const tokRes = await fetch(
+      `${base}/rest/v1/chat_access_tokens?token_hash=eq.${tokenHash}&select=company_id&limit=1`,
+      { headers },
+    )
+    if (!tokRes.ok) return null
+    const toks = (await tokRes.json()) as Array<{ company_id: string }>
+    const companyId = toks[0]?.company_id
+    if (!companyId) return null
+    const cfgRes = await fetch(
+      `${base}/rest/v1/tenant_chat_config?company_id=eq.${companyId}&select=journey_public_enabled&limit=1`,
+      { headers },
+    )
+    if (!cfgRes.ok) return null
+    const cfgs = (await cfgRes.json()) as Array<{ journey_public_enabled: boolean }>
+    return Boolean(cfgs[0]?.journey_public_enabled)
+  } catch {
+    return null
+  }
+}
+
+/** true se o usuário autenticado tem role admin/super_admin (para o modo admin-only). */
+async function requestUserIsAdmin(request: NextRequest): Promise<boolean> {
+  try {
+    const supabase = createServerClient(
+      getServerSupabaseUrl(),
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          getAll() {
+            return request.cookies.getAll()
+          },
+          setAll() {
+            /* read-only aqui */
+          },
+        },
+      },
+    )
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
+    if (!user) return false
+    const service = createServerClient(
+      getServerSupabaseUrl(),
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { cookies: { getAll: () => [], setAll: () => {} } },
+    )
+    const { data: profile } = await service
+      .from("profiles")
+      .select("role")
+      .eq("id", user.id)
+      .single()
+    return profile?.role === "super_admin" || profile?.role === "admin"
+  } catch {
+    return false
+  }
+}
+
+/** Aplica o gate D13. Retorna NextResponse (404) para bloquear, ou null p/ seguir. */
+export async function journeyGate(request: NextRequest): Promise<NextResponse | null> {
+  const currentPath = request.nextUrl.pathname
+  if (!currentPath.startsWith("/c/")) return null
+
+  if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
+    return new NextResponse(null, { status: 404 })
+  }
+
+  const token = currentPath.split("/")[2] ?? ""
+  const publicEnabled = token ? await journeyPublicEnabledForToken(token) : null
+
+  // Modo público explicitamente ligado → segue (o layout valida o token).
+  if (publicEnabled === true) return null
+
+  // Público desligado ou indeterminado → só passa para admin/super_admin logado.
+  const isAdmin = await requestUserIsAdmin(request)
+  if (isAdmin) return null
+  return new NextResponse(null, { status: 404 })
+}
 
 export async function updateSession(request: NextRequest) {
   const currentPath = request.nextUrl.pathname
@@ -46,7 +149,7 @@ export async function updateSession(request: NextRequest) {
 
   try {
     const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      getServerSupabaseUrl(),
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
       {
         cookies: {
@@ -65,7 +168,14 @@ export async function updateSession(request: NextRequest) {
     )
 
     const publicPaths = ["/", "/auth/login", "/auth/register", "/auth/portal-register", "/auth/verify-email", "/auth/callback", "/auth/error", "/auth/reset-password", "/auth/forgot-password", "/auth/confirm"]
-    const isPublicPath = publicPaths.includes(currentPath) || currentPath.startsWith("/auth/")
+    // /negociar: chat público do devedor (auth pelo token de handoff, não por
+    // usuário Supabase). /demo e /dev: páginas locais de validação mock.
+    const isPublicPath =
+      publicPaths.includes(currentPath) ||
+      currentPath.startsWith("/auth/") ||
+      currentPath.startsWith("/negociar") ||
+      currentPath.startsWith("/demo") ||
+      currentPath.startsWith("/dev")
 
     let user = null
     let userError = null
@@ -94,7 +204,7 @@ export async function updateSession(request: NextRequest) {
     if (user && !userError) {
       try {
         const serviceSupabase = createServerClient(
-          process.env.NEXT_PUBLIC_SUPABASE_URL!,
+          getServerSupabaseUrl(),
           process.env.SUPABASE_SERVICE_ROLE_KEY!,
           {
             cookies: {

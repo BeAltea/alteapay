@@ -1,5 +1,7 @@
 "use server"
 
+import { isMockMode, mockHex } from "@/lib/integrations/mock-mode"
+
 // Cache de token em memória (em produção, usar Redis)
 const tokenCache: {
   token: string | null
@@ -128,6 +130,17 @@ async function getAssertivaData(
   documento: string,
   endpoint: "acoes" | "credito" | "recupere",
 ): Promise<AssertivaScoreResponse> {
+  if (isMockMode("assertiva")) {
+    const cleanDoc = documento.replace(/\D/g, "")
+    const score = 300 + (parseInt(mockHex(`${cleanDoc}:${endpoint}`, 6), 16) % 601)
+    console.log(`[mock:assertiva] score.${endpoint}`, `doc=***${cleanDoc.slice(-4)} score=${score}`)
+    return {
+      score,
+      faixa: score >= 700 ? "BAIXO RISCO" : score >= 500 ? "MEDIO RISCO" : "ALTO RISCO",
+      probabilidade: Math.round(score / 10),
+    }
+  }
+
   try {
     const token = await getAssertivaToken()
     const baseUrl = process.env.ASSERTIVA_BASE_URL || "https://api.assertivasolucoes.com.br"
@@ -170,6 +183,13 @@ async function postAssertivaComportamental(
   documento: string,
   identificador?: string,
 ): Promise<AssertivaAnaliseComportamentalResponse> {
+  if (isMockMode("assertiva")) {
+    const cleanDoc = documento.replace(/\D/g, "")
+    const idConsulta = `mock_${mockHex(`${tipo}:${cleanDoc}`, 16)}`
+    console.log("[mock:assertiva] comportamental", `tipo=${tipo} doc=***${cleanDoc.slice(-4)} idConsulta=${idConsulta}`)
+    return { idConsulta, status: "EM_PROCESSAMENTO" }
+  }
+
   try {
     const token = await getAssertivaToken()
     const baseUrl = process.env.ASSERTIVA_BASE_URL || "https://api.assertivasolucoes.com.br"

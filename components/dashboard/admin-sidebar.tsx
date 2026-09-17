@@ -12,7 +12,9 @@ import {
   BarChart3,
   Settings,
   LogOut,
-  MessageSquarePlus
+  MessageSquarePlus,
+  Bot,
+  ExternalLink
 } from "lucide-react"
 
 interface NavItem {
@@ -38,6 +40,8 @@ const navigation: NavSection[] = [
     items: [
       { name: "Clientes", href: "/dashboard/clientes", icon: Users },
       { name: "Acordos", href: "/dashboard/agreements", icon: Handshake },
+      { name: "Negociações Chat", href: "/dashboard/negociacoes-chat", icon: Bot },
+      { name: "Redirecionamentos", href: "/dashboard/redirecionamentos", icon: ExternalLink },
       { name: "Solicitacoes", href: "/dashboard/solicitacoes", icon: MessageSquarePlus },
     ]
   },

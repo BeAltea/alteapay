@@ -2,6 +2,7 @@ import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG } from '../config';
 import { createClient } from '@supabase/supabase-js';
+import { getServerSupabaseUrl } from '../../supabase/url';
 import {
   getAsaasCustomerByCpfCnpj,
   createAsaasCustomer,
@@ -117,7 +118,7 @@ function sleep(ms: number): Promise<void> {
 
 function getSupabaseAdmin() {
   return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    getServerSupabaseUrl(),
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );

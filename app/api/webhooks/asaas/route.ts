@@ -1,12 +1,13 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 
 /**
  * @deprecated This endpoint is kept for backward compatibility.
  * New integrations should use: POST /api/asaas/webhook/payments
  */
 
-const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+const supabase = createClient(getServerSupabaseUrl(), process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 export async function POST(request: NextRequest) {
   try {

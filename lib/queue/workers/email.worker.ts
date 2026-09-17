@@ -1,6 +1,7 @@
 import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG } from '../config';
+import { isMockMode, mockHex } from '../../integrations/mock-mode';
 
 export interface EmailJobData {
   to: string | string[];
@@ -22,6 +23,13 @@ interface SendGridResponse {
 }
 
 async function sendEmailViaSendGrid(params: EmailJobData): Promise<SendGridResponse> {
+  if (isMockMode('sendgrid')) {
+    const mockRecipients = Array.isArray(params.to) ? params.to : [params.to];
+    const messageId = `mock-sg-${mockHex(`${mockRecipients.join(',')}:${params.subject}`)}`;
+    console.log('[mock:sendgrid] send', `recipients=${mockRecipients.length} messageId=${messageId}`);
+    return { success: true, messageId };
+  }
+
   const apiKey = process.env.SENDGRID_API_KEY;
   const fromEmail = process.env.SENDGRID_FROM_EMAIL || 'cobranca@alteapay.com';
   const fromName = process.env.SENDGRID_FROM_NAME || 'AlteaPay';

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -15,7 +16,7 @@ export const fetchCache = "force-no-store"
 export async function GET(request: NextRequest) {
   try {
     const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      getServerSupabaseUrl(),
       process.env.SUPABASE_SERVICE_ROLE_KEY!,
       { auth: { persistSession: false } }
     )

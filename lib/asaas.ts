@@ -11,6 +11,9 @@
  * Workers MUST use direct mode because there's no Next.js server to proxy through.
  */
 
+import { isMockMode } from "./integrations/mock-mode"
+import { mockAsaasRequest } from "./integrations/asaas-mock"
+
 let headersModule: typeof import("next/headers") | null = null
 try {
   // Dynamic import to avoid errors in worker context
@@ -220,6 +223,9 @@ async function asaasRequestProxy(endpoint: string, method = "GET", body?: unknow
 }
 
 async function asaasRequest(endpoint: string, method = "GET", body?: unknown): Promise<any> {
+  if (isMockMode("asaas")) {
+    return mockAsaasRequest(endpoint, method, body)
+  }
   if (canUseDirectMode()) {
     return asaasRequestDirect(endpoint, method, body)
   }

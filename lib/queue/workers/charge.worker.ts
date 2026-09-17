@@ -2,6 +2,9 @@ import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG, ASAAS_NOTIFICATION_DEFAULTS } from '../config';
 import { emailQueue } from '../queues';
+import { isMockMode } from '../../integrations/mock-mode';
+import { mockAsaasRequest } from '../../integrations/asaas-mock';
+import { createServiceClient } from '../../supabase/service';
 
 const ASAAS_BASE_URL = 'https://api.asaas.com/v3';
 
@@ -25,6 +28,8 @@ export interface ChargeJobData {
     dueDate: string; // YYYY-MM-DD
     description?: string;
     externalReference?: string;
+    installmentCount?: number;
+    installmentValue?: number;
   };
   // Email notification
   sendEmail?: boolean;
@@ -37,6 +42,7 @@ export interface ChargeJobData {
     companyId?: string;
     userId?: string;
     source?: string;
+    agreementId?: string; // write-back direto (jornada usa externalReference nao-uuid)
   };
 }
 
@@ -51,6 +57,10 @@ async function asaasRequest(
   method: string = 'GET',
   body?: unknown
 ): Promise<AsaasResponse> {
+  if (isMockMode('asaas')) {
+    return { success: true, data: mockAsaasRequest(endpoint, method, body) };
+  }
+
   const apiKey = process.env.ASAAS_API_KEY;
 
   if (!apiKey) {
@@ -166,7 +176,7 @@ export const chargeWorker = WorkerManager.registerWorker<ChargeJobData>(
     await configureNotifications(asaasCustomerId);
 
     // Step 3: Create payment
-    const paymentData = {
+    const paymentData: Record<string, unknown> = {
       customer: asaasCustomerId,
       billingType: payment.billingType,
       value: payment.value,
@@ -174,6 +184,10 @@ export const chargeWorker = WorkerManager.registerWorker<ChargeJobData>(
       description: payment.description,
       externalReference: payment.externalReference,
     };
+    if (payment.installmentCount && payment.installmentCount > 1) {
+      paymentData.installmentCount = payment.installmentCount;
+      paymentData.installmentValue = payment.installmentValue;
+    }
 
     const paymentResult = await asaasRequest('/payments', 'POST', paymentData);
 
@@ -185,6 +199,37 @@ export const chargeWorker = WorkerManager.registerWorker<ChargeJobData>(
     const asaasPayment = paymentResult.data;
     console.log(`[CHARGE] Payment created: ${asaasPayment.id}`);
     console.log(`[CHARGE] Invoice URL: ${asaasPayment.invoiceUrl}`);
+
+    // Write-back no acordo: quando o externalReference é um agreement (fluxo
+    // negociação-primeiro/chatbot), grava ids e URLs do ASAAS para a UI do chat
+    // exibir os links (antes disso, agreements.asaas_* ficava sempre nulo).
+    const agreementRef =
+      metadata?.agreementId ??
+      (payment.externalReference && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(payment.externalReference)
+        ? payment.externalReference
+        : null);
+    if (agreementRef) {
+      const supabase = createServiceClient();
+      const { data: updatedAgreement, error: agreementUpdateError } = await supabase
+        .from('agreements')
+        .update({
+          asaas_customer_id: asaasCustomerId,
+          asaas_payment_id: asaasPayment.id,
+          asaas_status: asaasPayment.status ?? 'PENDING',
+          asaas_billing_type: asaasPayment.billingType ?? payment.billingType,
+          asaas_payment_url: asaasPayment.invoiceUrl ?? null,
+          asaas_invoice_url: asaasPayment.invoiceUrl ?? null,
+          asaas_boleto_url: asaasPayment.bankSlipUrl ?? null,
+          asaas_pix_qrcode_url: asaasPayment.pixQrCodeUrl ?? null,
+        })
+        .eq('id', agreementRef)
+        .select('id');
+      if (agreementUpdateError || !updatedAgreement?.length) {
+        console.warn(`[CHARGE] Agreement write-back skipped (${agreementRef}):`, agreementUpdateError?.message ?? '0 rows');
+      } else {
+        console.log(`[CHARGE] Agreement ${agreementRef} updated with ASAAS links`);
+      }
+    }
 
     // Step 4: Queue email notification if requested
     if (sendEmail && emailTemplate && customer.email) {

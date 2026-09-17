@@ -3,6 +3,9 @@
  */
 
 import { createClient } from '@supabase/supabase-js';
+import { getServerSupabaseUrl } from '../../supabase/url';
+import { isMockMode } from '../../integrations/mock-mode';
+import { mockAsaasRequest } from '../../integrations/asaas-mock';
 
 const ASAAS_BASE_URL = process.env.ASAAS_API_URL || 'https://api.asaas.com/v3';
 
@@ -17,6 +20,10 @@ export async function asaasRequest(
   method: string = 'GET',
   body?: unknown
 ): Promise<AsaasResponse> {
+  if (isMockMode('asaas')) {
+    return { success: true, data: mockAsaasRequest(endpoint, method, body) };
+  }
+
   const apiKey = process.env.ASAAS_API_KEY;
 
   if (!apiKey) {
@@ -60,7 +67,7 @@ let _supabase: ReturnType<typeof createClient> | null = null;
 
 export function getSupabaseAdmin() {
   if (!_supabase) {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const url = getServerSupabaseUrl();
     const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
     if (!url || !serviceKey) {

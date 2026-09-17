@@ -147,6 +147,32 @@ export const QUEUE_CONFIG = {
     removeOnComplete: { age: 86400 }, // Keep for 24h for status polling
     removeOnFail: { age: 604800 }, // Keep failures for 7 days
   },
+  whatsapp: {
+    name: 'alteapay-whatsapp',
+    retries: {
+      attempts: 3,
+      backoff: {
+        type: 'exponential' as const,
+        delay: 2000,
+      },
+    },
+    removeOnComplete: { count: 200 },
+    removeOnFail: { count: 500 },
+  },
+  // n8n async: executa turno do chatbot e entrega callback assinado ao fluxo.
+  // O resultado do turno é cacheado — retries só re-tentam o callback.
+  n8n: {
+    name: 'alteapay-n8n',
+    retries: {
+      attempts: 3,
+      backoff: {
+        type: 'exponential' as const,
+        delay: 5000,
+      },
+    },
+    removeOnComplete: { count: 200 },
+    removeOnFail: { count: 500 },
+  },
 } as const;
 
 // ASAAS notification defaults - WhatsApp + SMS enabled, email disabled (we use SendGrid)

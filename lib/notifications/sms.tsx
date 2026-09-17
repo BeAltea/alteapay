@@ -1,5 +1,7 @@
 "use server"
 
+import { isMockMode, mockHex } from "@/lib/integrations/mock-mode"
+
 interface SendSMSParams {
   to: string
   body: string
@@ -26,6 +28,16 @@ export async function sendSMS({ to, body }: SendSMSParams) {
     if (phoneDigits.length < 12) {
       console.error("[Twilio] ERROR: Phone too short:", phoneDigits.length)
       return { success: false, error: `Telefone inválido: ${phoneDigits.length} dígitos (mínimo 12 dígitos)` }
+    }
+
+    if (isMockMode("twilio")) {
+      const messageId = `SMmock${mockHex(`sms:${to}:${body}`, 28)}`
+      console.log("[mock:twilio] sendSMS", `to=***${phoneDigits.slice(-4)} messageId=${messageId}`)
+      return {
+        success: true,
+        messageId,
+        message: `SMS enviado com sucesso (SID: ${messageId})`,
+      }
     }
 
     console.log("[Twilio] Phone validation passed")
@@ -125,6 +137,31 @@ ${companyName}`
 }
 
 export async function sendWhatsApp(to: string, body: string) {
+  // Jornada (aditivo): telefone suprimido nunca recebe WhatsApp por NENHUM
+  // caminho da plataforma. Falha na checagem não bloqueia o envio legado
+  // (try/catch), mas supressão encontrada bloqueia sempre.
+  try {
+    const { isSuppressed } = await import("@/lib/journey/suppressions")
+    const digits = to.replace(/\D/g, "")
+    const e164 = digits.startsWith("55") ? `+${digits}` : `+55${digits}`
+    const { createServiceClient } = await import("@/lib/supabase/service")
+    const supa = createServiceClient()
+    const { data: sup } = await supa
+      .from("contact_suppressions")
+      .select("id, company_id, channel, expires_at")
+      .eq("active", true)
+      .eq("phone_e164", e164)
+      .in("channel", ["whatsapp", "all"])
+      .limit(1)
+    if (sup && sup.length > 0 && (!sup[0].expires_at || new Date(sup[0].expires_at) > new Date())) {
+      console.log(`[WHATSAPP] envio suprimido para ***${digits.slice(-4)} (contact_suppressions)`)
+      return { success: false, suppressed: true, error: "suppressed" }
+    }
+    void isSuppressed // referência estável p/ tree-shaking não remover o módulo
+  } catch (gateErr) {
+    console.warn("[WHATSAPP] checagem de supressão falhou (segue envio legado):", (gateErr as Error).message)
+  }
+
   try {
     console.log("=".repeat(50))
     console.log("[Twilio WhatsApp] Starting WhatsApp send")
@@ -140,6 +177,16 @@ export async function sendWhatsApp(to: string, body: string) {
     if (phoneDigits.length < 12) {
       console.error("[Twilio WhatsApp] ERROR: Phone too short:", phoneDigits.length)
       return { success: false, error: `Telefone inválido: ${phoneDigits.length} dígitos (mínimo 12 dígitos)` }
+    }
+
+    if (isMockMode("twilio")) {
+      const messageId = `SMmock${mockHex(`whatsapp:${to}:${body}`, 28)}`
+      console.log("[mock:twilio] sendWhatsApp", `to=***${phoneDigits.slice(-4)} messageId=${messageId}`)
+      return {
+        success: true,
+        messageId,
+        message: `WhatsApp enviado com sucesso (SID: ${messageId})`,
+      }
     }
 
     console.log("[Twilio WhatsApp] Phone validation passed")

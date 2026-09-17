@@ -1,10 +1,11 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createServerClient } from "@supabase/ssr"
 import { propensityEngine, type DebtData } from "@/lib/propensity-engine"
+import { getServerSupabaseUrl } from "@/lib/supabase/url"
 
 export async function POST(request: NextRequest) {
   try {
-    const supabase = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+    const supabase = createServerClient(getServerSupabaseUrl(), process.env.SUPABASE_SERVICE_ROLE_KEY!, {
       cookies: {
         getAll() {
           return request.cookies.getAll()
@@ -144,7 +145,7 @@ export async function POST(request: NextRequest) {
 // GET endpoint to retrieve current scores
 export async function GET(request: NextRequest) {
   try {
-    const supabase = createServerClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, {
+    const supabase = createServerClient(getServerSupabaseUrl(), process.env.SUPABASE_SERVICE_ROLE_KEY!, {
       cookies: {
         getAll() {
           return request.cookies.getAll()

@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: alteapay-app
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.template.yaml
+  - redis.yaml
+  - web.yaml
+  - workers.yaml
+  - networkpolicy.yaml

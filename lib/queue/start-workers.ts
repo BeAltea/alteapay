@@ -11,6 +11,8 @@ import './workers/asaas-sync.worker';
 import './workers/assertiva-localize.worker';
 import './workers/bulk-email.worker';
 import './workers/bulk-negotiations.worker';
+import './workers/whatsapp.worker';
+import './workers/n8n.worker';
 
 import {
   emailQueue,

@@ -2,6 +2,7 @@ import { Job } from 'bullmq';
 import { WorkerManager } from '../worker-manager';
 import { QUEUE_CONFIG } from '../config';
 import { createClient } from '@supabase/supabase-js';
+import { getServerSupabaseUrl } from '../../supabase/url';
 
 // Import the service (needs to be dynamic to avoid "use server" issues)
 // The consultarDocumento function handles token management internally
@@ -31,7 +32,7 @@ export interface AssertivaLocalizeProgress {
 
 function getSupabaseAdmin() {
   return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    getServerSupabaseUrl(),
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
     { auth: { persistSession: false } }
   );
