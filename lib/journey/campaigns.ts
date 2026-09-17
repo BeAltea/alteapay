@@ -19,6 +19,7 @@ export type IneligibilityReason =
   | "caso_aberto"
   | "cooldown"
   | "valor_minimo"
+  | "telefone_duplicado" // V10: mesmo telefone em >1 cliente da seleção
 
 export interface EligibilityResult {
   customerId: string
@@ -105,12 +106,15 @@ export async function evaluateEligibility(input: {
       results.push({ customerId, eligible: false, reason: "caso_aberto" })
       continue
     }
+    // V10: cooldown avaliado POR CLIENTE **e** POR TELEFONE. Uma segunda
+    // transação para o mesmo número cancelaria o funil anterior (V3/L4), então
+    // um contato recente naquele telefone (mesmo de outro cliente) barra.
     const since = new Date(Date.now() - input.cooldownDays * 86400_000).toISOString()
     const { data: recent } = await supabase
       .from("whatsapp_messages")
       .select("id")
-      .eq("customer_id", customerId)
       .eq("company_id", input.companyId)
+      .or(`customer_id.eq.${customerId},phone_e164.eq.${phone}`)
       .gte("queued_at", since)
       .limit(1)
     if (recent && recent.length > 0) {
@@ -121,6 +125,28 @@ export async function evaluateEligibility(input: {
       customerId, eligible: true, phoneE164: phone,
       debtIds: openDebts.map((d) => d.id), totalValue: total,
     })
+  }
+
+  // V10: dedupe POR TELEFONE dentro da própria seleção.
+  return dedupeByPhone(results)
+}
+
+/**
+ * V10 (puro/testável): uma campanha nunca tem dois destinos com o mesmo
+ * clientPhoneNumber — senão o funil de um cancelaria o do outro (V3/L4). O
+ * PRIMEIRO fica elegível; os demais viram `telefone_duplicado`.
+ */
+export function dedupeByPhone(results: EligibilityResult[]): EligibilityResult[] {
+  const seenPhones = new Set<string>()
+  for (const r of results) {
+    if (!r.eligible || !r.phoneE164) continue
+    if (seenPhones.has(r.phoneE164)) {
+      r.eligible = false
+      r.reason = "telefone_duplicado"
+      r.phoneE164 = undefined
+    } else {
+      seenPhones.add(r.phoneE164)
+    }
   }
   return results
 }
