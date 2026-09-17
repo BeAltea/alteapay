@@ -2,6 +2,16 @@ import { createServerClient } from "@supabase/ssr"
 import { NextResponse, type NextRequest } from "next/server"
 import { getServerSupabaseUrl } from "./url"
 
+// Primeiro segmento das rotas REAIS do app (app/*). Usado para distinguir uma
+// rota protegida existente (usuário anônimo → redirect p/ "/") de um path que
+// simplesmente NÃO existe (usuário anônimo → deixa o Next renderizar o
+// not-found = 404 real, em vez do "soft-404" 307→/ que prejudica o SEO).
+// Manter em sincronia ao adicionar novas rotas top-level em app/.
+const KNOWN_ROUTE_SEGMENTS = new Set([
+  "api", "auth", "create-users", "dashboard", "demo", "dev", "empresa",
+  "localize", "negociar", "portal", "super-admin", "test-dark", "user-dashboard", "c",
+])
+
 // --- Gate D13 da jornada pública /c/[token] ---------------------------------
 // Regras:
 //   - CHAT_JOURNEY_ENABLED !== "true"  → 404 (rota "não existe").
@@ -196,9 +206,16 @@ export async function updateSession(request: NextRequest) {
     }
 
     if ((!user || userError) && !isPublicPath) {
-      const url = request.nextUrl.clone()
-      url.pathname = "/"
-      return NextResponse.redirect(url)
+      const seg = currentPath.split("/")[1] ?? ""
+      // Rota protegida existente: mantém o portão de login (redirect p/ "/").
+      if (KNOWN_ROUTE_SEGMENTS.has(seg)) {
+        const url = request.nextUrl.clone()
+        url.pathname = "/"
+        return NextResponse.redirect(url)
+      }
+      // Path inexistente: NÃO redireciona — segue para o Next renderizar o
+      // not-found (404 real + página amigável), evitando o soft-404.
+      return supabaseResponse
     }
 
     if (user && !userError) {
