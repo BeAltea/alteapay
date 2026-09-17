@@ -87,3 +87,42 @@ Nenhuma rota, action, worker ou tela existente foi alterada além dos três
 pontos cirúrgicos: middleware (rotas novas), sidebars (2 itens de menu) e o
 write-back aditivo no charge worker (só age quando `externalReference` é UUID
 de agreement — cobranças legadas usam outros formatos e passam intocadas).
+
+---
+
+## 5. Onda Voxuy (2026-09-17, `feature/chatbot-journey`)
+
+Integração WhatsApp via Voxuy com **contrato real e verificado** (a doc oficial
+substituiu o contrato hipotético anterior). Detalhes em
+`docs/WHATSAPP_VOXUY_INTEGRATION.md`, `docs/VOXUY_ACCOUNT_SETUP.md`,
+`docs/VOXUY_SMOKE_TEST.md`. Escopo executado: V0–V7 e V9 (V8 = smoke test real
+depende de conta/credenciais e é o gate GV1 do Fabio).
+
+**Postura de produção:** INTOCADA. `WHATSAPP_PROVIDER=mock` é o default em todos os
+tenants reais; a migration desta onda é **aditiva e NÃO aplicada** em produção;
+nenhuma credencial Voxuy real é usada; nenhum deploy/push feito.
+
+| Área | Conteúdo |
+|---|---|
+| Adapter | `lib/whatsapp/voxuy/{config,enums,provider,inbound}.ts` — payload canônico (A.4) com zod de saída (`paymentType/status=99`, `date/value/totalValue=null`, **sem `clientDocument`**), `buildMetadata` que rejeita chave não prevista, classificação de resposta (§1.5), `sendStopSignal`, `syncSuppression`=stop |
+| Interface | `lib/whatsapp/provider.ts` estendida de forma aditiva (metadata, `voxuyPlanId/voxuyEvent`, `sendStopSignal`) |
+| Tokens/ações | `issueActionTokens` (consult/optout/block); páginas `/c/[token]` (escolha), `/consultar` (auth), `/cancelar`, `/bloquear` (POST + CSRF, prefetch-safe); `POST /api/chat/optout` |
+| Supressão | `lib/journey/stop-signal.ts`; `addSuppression` dispara stop para optout/block/paid |
+| Inbound | `POST /api/webhooks/whatsapp/voxuy` (auth `VOXUY_INBOUND_SECRET`, grava tudo, 200 sempre, nunca 500); `lib/whatsapp/inbound-apply.ts` compartilhado |
+| Painel | colunas honestas (aceitas/cliques/autenticações/acordos/suprimidas/falhas), aviso de telefone duplicado bloqueando início, contador de eventos não processados |
+| V10 | dedupe e cooldown por telefone |
+| Migration | `supabase/migrations/20260917_voxuy_journey_additions.sql` (aditiva; **não aplicada**) |
+| Testes | `tests/whatsapp/*` + `tests/journey/{action-tokens,dedupe-phone}.test.ts` — suíte 139 verdes |
+
+**Novas envs (Netlify/ECS) — só quando for ativar Voxuy:** `VOXUY_WEBHOOK_URL`,
+`VOXUY_API_TOKEN`, `VOXUY_INBOUND_SECRET`, `VOXUY_TIMEOUT_MS`,
+`WHATSAPP_RATE_LIMIT_PER_SEC`. Por tenant: `voxuy_plan_id`, `voxuy_events`,
+`whatsapp_provider`.
+
+**Pré-requisito de worker:** o Fargate precisa de **rebuild** com a imagem desta
+onda antes do canário (o adapter e o `campaign-send` novos não estão na imagem antiga).
+
+**Pendências para o Fabio (não bloqueiam o merge desta onda):** conta Voxuy do
+Apêndice C + credenciais; execução do V8/GV1; contagem exata de telefones
+duplicados por tenant; respostas do Apêndice E (webhook de saída, blacklist,
+botões, canal Meta, limites). Ver `ops/chatbot-journey-2026-09/reports/V0_voxuy_diagnostico.md`.
