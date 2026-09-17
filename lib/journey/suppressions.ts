@@ -104,6 +104,23 @@ export async function addSuppression(input: AddSuppressionInput): Promise<{ ok: 
     console.error("[journey] addSuppression falhou:", error.message)
     return { ok: false }
   }
+
+  // V4.4/V5: ao suprimir por optout/block/paid, SEMPRE disparar o sinal de
+  // encerramento na Voxuy (interrompe o funil). Falha NÃO desfaz a supressão
+  // local — fireStopSignal registra contact.stop_failed para reprocesso.
+  const STOP_REASONS = new Set<SuppressionReason>(["optout", "blocked", "paid"])
+  if (STOP_REASONS.has(input.reason) && input.companyId && input.phoneE164 && input.customerId) {
+    try {
+      const { fireStopSignal } = await import("./stop-signal")
+      await fireStopSignal({
+        companyId: input.companyId,
+        phoneE164: input.phoneE164,
+        customerId: input.customerId,
+      })
+    } catch (err) {
+      console.error("[journey] fireStopSignal (não-fatal):", (err as Error).message)
+    }
+  }
   return { ok: true, id: data.id }
 }
 

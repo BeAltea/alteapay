@@ -43,6 +43,16 @@ export interface CampaignView {
   template_key: string
   eligible: number | null
   queued: number | null
+  accepted: number
+  clicks: number
+  auths: number
+  agreements: number
+  suppressed: number
+  failed: number
+  /** true só quando há fonte real de entrega/leitura (V7). */
+  hasDeliverySource: boolean
+  /** telefones duplicados na seleção (V10) — bloqueia início até resolver. */
+  duplicatePhones: number
   created_at: string
 }
 export interface CompanyOption {
@@ -53,9 +63,11 @@ export interface CompanyOption {
 export function CampaignsAdmin({
   companies,
   campaigns,
+  unprocessedProviderEvents = 0,
 }: {
   companies: CompanyOption[]
   campaigns: CampaignView[]
+  unprocessedProviderEvents?: number
 }) {
   const router = useRouter()
   const [open, setOpen] = useState(false)
@@ -93,10 +105,18 @@ export function CampaignsAdmin({
     router.refresh()
   }
 
-  async function start(id: string) {
+  async function start(c: CampaignView) {
+    // V6.3/V10: bloqueia o início enquanto houver telefone duplicado na seleção.
+    if (c.duplicatePhones > 0) {
+      setError(
+        `Início bloqueado: ${c.duplicatePhones} telefone(s) aparecem em mais de um cliente da seleção. ` +
+          `Uma nova transação para o mesmo número cancela o funil anterior — resolva a duplicidade antes de disparar.`,
+      )
+      return
+    }
     setBusy(true)
     setError(null)
-    const res = await startJourneyCampaign(id)
+    const res = await startJourneyCampaign(c.id)
     setBusy(false)
     if (!res.ok) {
       setError(res.error ?? "Falha ao iniciar.")
@@ -167,14 +187,28 @@ export function CampaignsAdmin({
       <CardContent>
         {info ? <p className="mb-3 text-sm text-green-700">{info}</p> : null}
         {error && !open ? <p className="mb-3 text-sm text-red-600">{error}</p> : null}
+        {unprocessedProviderEvents > 0 ? (
+          <p className="mb-3 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            {unprocessedProviderEvents} evento(s) do provedor sem processar — formato não reconhecido.
+            Verifique em Auditoria (o payload bruto foi guardado).
+          </p>
+        ) : null}
+        <p className="mb-3 text-xs text-muted-foreground">
+          &quot;Aceitas pelo provedor&quot; = a Voxuy aceitou agendar (não é entrega). Entregue/Lido só
+          aparecem se o provedor informar; caso contrário: &quot;não informado pelo provedor&quot;.
+        </p>
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Empresa</TableHead>
               <TableHead>Nome</TableHead>
-              <TableHead>Template</TableHead>
-              <TableHead>Elegíveis</TableHead>
-              <TableHead>Enfileirados</TableHead>
+              <TableHead>Aceitas p/ provedor</TableHead>
+              <TableHead>Entregue/Lido</TableHead>
+              <TableHead>Cliques</TableHead>
+              <TableHead>Autenticações</TableHead>
+              <TableHead>Acordos</TableHead>
+              <TableHead>Suprimidas</TableHead>
+              <TableHead>Falhas</TableHead>
               <TableHead>Status</TableHead>
               <TableHead className="text-right">Ações</TableHead>
             </TableRow>
@@ -182,7 +216,7 @@ export function CampaignsAdmin({
           <TableBody>
             {campaigns.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="text-center text-muted-foreground">
+                <TableCell colSpan={11} className="text-center text-muted-foreground">
                   Nenhuma campanha.
                 </TableCell>
               </TableRow>
@@ -190,10 +224,23 @@ export function CampaignsAdmin({
               campaigns.map((c) => (
                 <TableRow key={c.id}>
                   <TableCell>{c.company_name}</TableCell>
-                  <TableCell className="font-medium">{c.name}</TableCell>
-                  <TableCell className="text-xs">{c.template_key}</TableCell>
-                  <TableCell>{c.eligible ?? "—"}</TableCell>
-                  <TableCell>{c.queued ?? "—"}</TableCell>
+                  <TableCell className="font-medium">
+                    {c.name}
+                    {c.duplicatePhones > 0 ? (
+                      <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                        {c.duplicatePhones} tel. duplicado
+                      </span>
+                    ) : null}
+                  </TableCell>
+                  <TableCell>{c.accepted}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {c.hasDeliverySource ? "com fonte" : "não informado"}
+                  </TableCell>
+                  <TableCell>{c.clicks}</TableCell>
+                  <TableCell>{c.auths}</TableCell>
+                  <TableCell>{c.agreements}</TableCell>
+                  <TableCell>{c.suppressed}</TableCell>
+                  <TableCell>{c.failed}</TableCell>
                   <TableCell>
                     <Badge variant="secondary">{c.status}</Badge>
                   </TableCell>
@@ -201,8 +248,13 @@ export function CampaignsAdmin({
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={busy || !["draft", "scheduled", "paused"].includes(c.status)}
-                      onClick={() => start(c.id)}
+                      disabled={
+                        busy ||
+                        c.duplicatePhones > 0 ||
+                        !["draft", "scheduled", "paused"].includes(c.status)
+                      }
+                      title={c.duplicatePhones > 0 ? "Resolva os telefones duplicados antes de iniciar" : undefined}
+                      onClick={() => start(c)}
                     >
                       Iniciar
                     </Button>
