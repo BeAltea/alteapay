@@ -256,3 +256,96 @@ curl -s "$URL" -H "content-type: application/json" \
 | `403` em `agreement.close` | sessão sem consentimento ou sem identidade verificada |
 | `409` em `session.redirect` | tenant sem `official_channel_url` configurado |
 | Links ASAAS `null` | fila de cobrança processando — poll `session.status` |
+
+---
+
+## 11. Onda "Chat genérico + auth CPF/CNPJ + contratos n8n" (2026-09-18)
+
+Adição preparatória. Tudo atrás de flags OFF (produção idêntica). Ver
+`docs/N8N_FLOW_REQUIREMENTS.md` (o que o fluxo n8n precisa fazer) e
+`docs/CHAT_AUTH_SECURITY.md` (segurança da autenticação).
+
+### 11.1 Novo caminho de chat da plataforma (papel A ampliado)
+
+- Endpoint de campanha `/c/{token}` **e** endpoint genérico
+  `/t/{tenantSlug}/negociar` (admin-only enquanto `journey_public_enabled=false`).
+- Turno canônico: `POST /api/chat/message` (cookie de sessão). Grava
+  `chat_messages`, roda o engine (`n8n|stub|disabled`), grava a resposta com
+  `n8n_execution_id` + `latency_ms`, devolve `{reply, offers, action}`.
+- Engine `stub` (`NEGOTIATION_ENGINE=stub`, só fora de prod / `MOCK_ALL_INTEGRATIONS=1`):
+  roteiro determinístico que exercita todas as ações, sem n8n nem LLM.
+- Timeout `N8N_TIMEOUT_MS` (default 20000) → modo assíncrono: o cliente vê
+  "estou verificando" e o fluxo devolve depois via `session.message` async.
+
+### 11.2 Contrato `chat.turn` (plataforma → n8n) — Apêndice A.1
+
+Montado **exclusivamente** por `lib/journey/context.ts`. Valores monetários em
+**centavos** (Integer). Documento **mascarado** por padrão; em claro só quando
+`tenant_chat_config.send_document_to_engine=true` **E** `payment_origin='n8n'`.
+
+```json
+{ "event":"chat.turn","event_id":"uuid","timestamp":"ISO",
+  "session":{"id":"uuid","channel":"web_campaign|web_generic|admin_preview","verified":true,"verified_at":"ISO","consent":true,"turn_index":3,"engine":"n8n","locale":"pt-BR"},
+  "tenant":{"id":"uuid","slug":"vmax","brand_name":"VMAX","creditor_name":"VMAX","fulfillment_mode":"A","payment_origin":"platform"},
+  "customer":{"id":"uuid","first_name":"Fabio","document_type":"cpf","document_masked":"***.456.789-**","document_hash":"sha256...","document":null},
+  "debt":{"id":"uuid-primary","ids":["uuid-primary","uuid-2"],"original_value":4189000,"updated_value":4189000,"oldest_due_date":"2025-03-10","aging_days":557,"invoice_count":3,"invoices":[{"invoice":"FAT...","due_date":"2025-03-10","value":1399000}]},
+  "matrix":{"id":"uuid","max_discount_pct":35,"min_entry_pct":20,"max_installments":3,"allowed_billing_types":["PIX","BOLETO","CREDIT_CARD"],"proposal_validity_days":7},
+  "offers":[{"id":"uuid","terms":{"discount_pct":35,"entry_value":0,"installments":1,"installment_value":2722900,"total_value":2722900,"billing_type":"PIX","first_due_date":"2026-09-25"},"valid_until":"ISO"}],
+  "agreement":null }
+```
+
+Resposta esperada do fluxo (Apêndice A.2) — `reply` é obrigatório; `action`
+opcional e sempre validada pelo servidor; `n8n_execution_id` rastreado por turno:
+
+```json
+{ "reply":"Posso fazer em 2x no boleto, com 18% de desconto. Fecha assim?",
+  "action":{"type":"offer.propose","args":{"discount_pct":18,"installments":2,"entry_value":0,"billing_type":"BOLETO"}},
+  "n8n_execution_id":"exec_123", "close_offer_id":null }
+```
+
+### 11.3 Novas ações de domínio no `POST /api/webhooks/n8n` (papel B)
+
+Mesma segurança (HMAC `${timestamp}.${body}`, janela ±300s, anti-replay por
+`event_id`). Sessão precisa estar **aberta + verificada + do tenant** para as
+ações de pagamento.
+
+| Ação | Efeito | Resposta |
+|---|---|---|
+| `payment.create` | **Variante A (default):** guard SEMPRE → `agreements` → cobrança ASAAS pelo caminho existente (`close-agreement` + chargeQueue) → aceite + eventos | `{agreement_id, payment_id, billing_type, pix_copy_paste, boleto_url, invoice_url, due_date, total_value, installments}` ou `{status:"processing", poll_after_ms:3000}` (worker 0/0) |
+| `payment.record` | **Variante B (off):** guard antes; registra cobrança PENDING + URLs do n8n; **NUNCA aceita status pago** (D6 → `payment_claim` + `payment.claim_from_engine`) | `{code:"recorded", agreement_id}` \| `{code:"claim", case_id}` |
+| `payment.status` | estado atual da cobrança do acordo (fonte = base local; a verdade do pagamento é o webhook ASAAS) | `{agreement_id, payment, payment_status, asaas_status}` |
+| `negotiation.note` | anota observação estruturada no funil | `{success:true}` |
+
+Códigos de erro: `401` assinatura/janela; `409` `already_charged` /
+`payment_origin_n8n`; `422` código de validação de oferta
+(`DISCOUNT_ABOVE_MAX`, `INSTALLMENTS_ABOVE_MAX`, `ENTRY_BELOW_MIN`,
+`INSTALLMENT_BELOW_MIN`, `BILLING_TYPE_NOT_ALLOWED`, `PIX_CANNOT_INSTALL`,
+`TOTAL_MISMATCH`); `404` sessão. Sempre `{success:false, error, code}` sem PII.
+
+**D6 inegociável:** o n8n registra cobrança criada (`pending`) e URLs, **não
+declara pagamento**. `payment.record` com status pago vira
+`negotiation_cases(type='payment_claim')`; o acordo só muda via webhook ASAAS/sync.
+
+### 11.4 Envs novas (todas com default seguro)
+
+| Env | Default | Papel |
+|---|---|---|
+| `NEGOTIATION_ENGINE` | `disabled` | `n8n` \| `stub` \| `disabled` |
+| `N8N_CHAT_FLOW_URL` | — | URL do fluxo-cérebro (papel A) |
+| `N8N_WEBHOOK_SECRET` | — | HMAC dos dois sentidos |
+| `N8N_TIMEOUT_MS` | `20000` | timeout do turno → modo assíncrono |
+| `CHAT_SESSION_SECRET` | (usa `NEGOTIATION_JWT_SECRET`/`SUPABASE_JWT_SECRET`) | cookie de sessão |
+| `CHAT_CAPTCHA_ENABLED` / `CHAT_CAPTCHA_PROVIDER` / `CHAT_CAPTCHA_SECRET` | `false` / `turnstile` / — | captcha do auth genérico |
+| `CHAT_AUTH_IP_MAX_ATTEMPTS` / `CHAT_AUTH_IP_WINDOW_MIN` | `5` / `10` | lock por IP (§3.4) |
+
+Por tenant (`tenant_chat_config`): `n8n_chat_flow_url`, `payment_origin`,
+`send_document_to_engine`, `debt_selection`, `auth_require_otp`,
+`journey_public_enabled`, `auth_max_attempts`, `auth_lock_minutes`,
+`session_ttl_minutes`.
+
+### 11.5 Endpoint de laboratório
+
+`POST /api/dev/n8n-stub` — fluxo n8n **falso** para E2E: verifica a assinatura
+HMAC do nosso lado e devolve uma resposta no contrato de A.2. **404 em produção**
+(só existe fora de prod ou com `MOCK_ALL_INTEGRATIONS=1`). Uso:
+`NEGOTIATION_ENGINE=n8n` + `N8N_CHAT_FLOW_URL=<origin>/api/dev/n8n-stub`.
