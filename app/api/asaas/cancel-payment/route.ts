@@ -447,6 +447,7 @@ export async function POST(request: NextRequest) {
             )
             const paymentsData = await paymentsRes.json()
 
+            let hasSettledPayment = false
             for (const payment of (paymentsData.data || [])) {
               if (payment.status !== "RECEIVED" && payment.status !== "CONFIRMED") {
                 await fetch(`${asaasUrl}/payments/${payment.id}`, {
@@ -454,7 +455,19 @@ export async function POST(request: NextRequest) {
                   headers: { "access_token": apiKey },
                 })
                 console.log("[Cancel] Deleted remaining ASAAS payment:", payment.id)
+              } else {
+                // Pagamento liquidado nunca é deletado (guard acima).
+                hasSettledPayment = true
+                console.log("[Cancel] Kept settled ASAAS payment:", payment.id, payment.status)
               }
+            }
+
+            // Guard anti-órfão: só deleta o customer se NÃO restar pagamento
+            // liquidado (RECEIVED/CONFIRMED). Deletar um customer que ainda tem
+            // pagamento pago deixaria esse pagamento órfão no ASAAS.
+            if (hasSettledPayment) {
+              console.log("[Cancel] Skipping customer delete (has settled payment):", asaasCust.id)
+              continue
             }
 
             // Then delete the customer
