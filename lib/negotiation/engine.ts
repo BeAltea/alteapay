@@ -26,14 +26,17 @@ import type { NegotiationSession, TenantChatConfig } from "./types"
 
 export type EngineName = "n8n" | "agent" | "stub" | "disabled"
 
-const IS_PROD = process.env.NODE_ENV === "production" && process.env.MOCK_ALL_INTEGRATIONS !== "1"
+const IS_PROD = () => process.env.NODE_ENV === "production" && process.env.MOCK_ALL_INTEGRATIONS !== "1"
+const IS_LAB = () => process.env.MOCK_ALL_INTEGRATIONS === "1"
 
 /**
  * D14: default em produção é DISABLED (chat assistido determinístico).
  * "n8n" sem N8N_CHAT_FLOW_URL e "agent" sem AGENT_URL degradam para
- * disabled (nunca expõem erro ao cliente; o turno loga chat.engine_error).
- * "stub" (N3) é o roteiro determinístico de laboratório: só fora de produção
- * ou com MOCK_ALL_INTEGRATIONS=1; em produção degrada para disabled.
+ * disabled (nunca expõem erro ao cliente; o turno loga chat.engine_error) —
+ * EXCETO no laboratório (MOCK_ALL_INTEGRATIONS=1), onde "n8n" sem URL cai para
+ * o "stub" para permitir o E2E sem servidor n8n.
+ * "stub" (N3) explícito é o roteiro determinístico de laboratório: fora de
+ * produção vale "stub"; em produção degrada para disabled.
  */
 export function engineName(): EngineName {
   const raw = process.env.NEGOTIATION_ENGINE
@@ -41,10 +44,11 @@ export function engineName(): EngineName {
     return process.env.AGENT_URL && process.env.AGENT_APP_TOKEN ? "agent" : "disabled"
   }
   if (raw === "n8n") {
-    return process.env.N8N_CHAT_FLOW_URL ? "n8n" : IS_PROD ? "disabled" : "stub"
+    if (process.env.N8N_CHAT_FLOW_URL) return "n8n"
+    return IS_LAB() ? "stub" : "disabled"
   }
   if (raw === "stub") {
-    return IS_PROD ? "disabled" : "stub"
+    return IS_PROD() ? "disabled" : "stub"
   }
   return "disabled"
 }

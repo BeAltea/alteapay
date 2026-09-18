@@ -44,37 +44,8 @@ export async function stubChat(input: EngineTurnInput): Promise<EngineTurnResult
     )
   }
 
-  // resumo da dívida
-  if (/fatura|detalhe|resumo|quanto|valor|dívida|divida|deve/.test(text)) {
-    return res(
-      "Aqui está o resumo da sua dívida ao lado. Quando quiser, veja as opções de pagamento.",
-      [{ name: "debt.summary", args: {} }],
-    )
-  }
-
-  // ofertas (offer.list — gera da matriz)
-  if (/opç|opc|pagar|parcel|desconto|à vista|a vista|acordo|negoci|condiç/.test(text)) {
-    const offers = await listOffers(ctx)
-    if (offers.length === 0) {
-      return res(
-        "Não há condição automática agora. Vou transferir você para um atendente.",
-        [{ name: "human.transfer", args: { reason: "sem_oferta" } }],
-        "handoff",
-      )
-    }
-    return res(
-      "Estas são as condições disponíveis. Escolha uma ao lado para gerar o pagamento.",
-      [{ name: "offer.list", args: { count: offers.length } }],
-    )
-  }
-
-  // proposta específica do cliente → offer.propose (validada no servidor)
-  if (/proposta|contraproposta|consigo pagar|posso pagar|quero pagar em/.test(text)) {
-    return res(
-      "Vou verificar essa condição para você.",
-      [{ name: "offer.propose", args: { intent: "customer_proposal" } }],
-    )
-  }
+  // Intenções ESPECÍFICAS primeiro (algumas contêm "dívida"/"pagar" e não podem
+  // cair no resumo/ofertas genéricos).
 
   // "já paguei" → payment_claim.register
   if (/já paguei|ja paguei|paguei|quitei|comprovante/.test(text)) {
@@ -107,6 +78,38 @@ export async function stubChat(input: EngineTurnInput): Promise<EngineTurnResult
     return res(
       "Obrigado pelo contato! Qualquer coisa, é só voltar por aqui.",
       [{ name: "session.close", args: { outcome: "closed_by_customer" } }],
+    )
+  }
+
+  // proposta específica do cliente → offer.propose (validada no servidor)
+  if (/proposta|contraproposta|consigo pagar|posso pagar|pagar em \d|em \d+x|parcel/.test(text)) {
+    return res(
+      "Vou verificar essa condição para você.",
+      [{ name: "offer.propose", args: { intent: "customer_proposal" } }],
+    )
+  }
+
+  // ofertas (offer.list — gera da matriz)
+  if (/opç|opc|pagamento|desconto|à vista|a vista|acordo|negoci|condiç/.test(text)) {
+    const offers = await listOffers(ctx)
+    if (offers.length === 0) {
+      return res(
+        "Não há condição automática agora. Vou transferir você para um atendente.",
+        [{ name: "human.transfer", args: { reason: "sem_oferta" } }],
+        "handoff",
+      )
+    }
+    return res(
+      "Estas são as condições disponíveis. Escolha uma ao lado para gerar o pagamento.",
+      [{ name: "offer.list", args: { count: offers.length } }],
+    )
+  }
+
+  // resumo da dívida
+  if (/fatura|detalhe|resumo|quanto|valor|dívida|divida|deve/.test(text)) {
+    return res(
+      "Aqui está o resumo da sua dívida ao lado. Quando quiser, veja as opções de pagamento.",
+      [{ name: "debt.summary", args: {} }],
     )
   }
 

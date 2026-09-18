@@ -28,9 +28,10 @@ const sha256 = (s: string) => createHash("sha256").update(s).digest("hex")
 const docHash = (doc: string) => sha256(normalizeDocument(doc))
 const ipHash = (ip: string | null) => (ip ? sha256(ip).slice(0, 32) : null)
 
-// Defaults do §3.4 (podem ser sobrepostos por tenant_chat_config).
-const IP_MAX_ATTEMPTS = Number(process.env.CHAT_AUTH_IP_MAX_ATTEMPTS || "5")
-const IP_WINDOW_MIN = Number(process.env.CHAT_AUTH_IP_WINDOW_MIN || "10")
+// Defaults do §3.4 (podem ser sobrepostos por env). Lidos em tempo de chamada
+// para respeitar a configuração por deploy (e permitir testes determinísticos).
+const ipMaxAttempts = () => Number(process.env.CHAT_AUTH_IP_MAX_ATTEMPTS || "5")
+const ipWindowMin = () => Number(process.env.CHAT_AUTH_IP_WINDOW_MIN || "10")
 const IP_LOCK_MIN = 30
 const DOC_MAX_ATTEMPTS_DEFAULT = 3
 const DOC_LOCK_MIN_DEFAULT = 30
@@ -168,7 +169,7 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   const fail = async (reason: string): Promise<GenericAuthResult> => {
     await recordAttempt(supabase, input.companyId, dHash, ipH, false, reason)
     await maybeLock(supabase, input.companyId, "document", dHash, docLockMin, docMax, docLockMin)
-    if (ipH) await maybeLock(supabase, input.companyId, "ip", ipH, IP_WINDOW_MIN, IP_MAX_ATTEMPTS, IP_LOCK_MIN)
+    if (ipH) await maybeLock(supabase, input.companyId, "ip", ipH, ipWindowMin(), ipMaxAttempts(), IP_LOCK_MIN)
     await recordEvent({ companyId: input.companyId, type: "auth.failed", actor: "customer", payload: {} })
     return { ok: false, message: GENERIC_AUTH_MESSAGE }
   }
