@@ -46,6 +46,7 @@ import { runChatbotTurn, type EngineTurnResult } from "@/lib/negotiation/turn"
 import type { NegotiationSession } from "@/lib/negotiation/types"
 import { n8nQueue } from "@/lib/queue/queues"
 import { createServiceClient } from "@/lib/supabase/service"
+import type { PaymentRecordArgs } from "@/lib/journey/payment-actions"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 300
@@ -120,6 +121,7 @@ const redirectSchema = z.object({
 
 const JOURNEY_ACTIONS = [
   "debt.summary", "offer.list", "offer.propose", "offer.accept", "offer.reject",
+  "payment.create", "payment.record", "payment.status", "negotiation.note",
   "dispute.register", "payment_claim.register", "human.transfer",
   "session.close", "journey.timeline",
 ] as const
@@ -618,6 +620,38 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       const caseId = await transferToHuman(ctx, String(args.reason ?? ""), "n8n", input.event_id)
       return NextResponse.json({ success: true, case_id: caseId })
     }
+    case "payment.create": {
+      // Papel A: a plataforma executa (guard SEMPRE). Exige sessão verificada.
+      if (!(await sessionIsVerified(input.session_id))) return jsonError(403, "sessão não verificada")
+      const offerId = args.offer_id as string | undefined
+      if (!offerId) return jsonError(422, "args.offer_id obrigatório")
+      const { paymentCreate } = await import("@/lib/journey/payment-actions")
+      const r = await paymentCreate(ctx, offerId, input.event_id)
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
+      if (r.status === "processing") {
+        return NextResponse.json({ ok: true, status: "processing", agreement_id: r.agreement_id, poll_after_ms: r.poll_after_ms })
+      }
+      return NextResponse.json({ ok: true, agreement_id: r.payment.agreement_id, payment_id: r.payment.payment_id, billing_type: r.payment.billing_type, pix_copy_paste: r.payment.pix_copy_paste, boleto_url: r.payment.boleto_url, invoice_url: r.payment.invoice_url, due_date: r.payment.due_date, total_value: r.payment.total_value, installments: r.payment.installments })
+    }
+    case "payment.record": {
+      // Papel B (variante B): n8n criou a cobrança e registra aqui. Guard antes;
+      // NUNCA aceita status pago (D6). Exige sessão verificada.
+      if (!(await sessionIsVerified(input.session_id))) return jsonError(403, "sessão não verificada")
+      const { paymentRecord } = await import("@/lib/journey/payment-actions")
+      const r = await paymentRecord(ctx, args as PaymentRecordArgs, input.event_id)
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
+      return NextResponse.json(r.code === "claim" ? { ok: true, code: "claim", case_id: r.case_id } : { ok: true, code: "recorded", agreement_id: r.agreement_id })
+    }
+    case "payment.status": {
+      const { paymentStatus } = await import("@/lib/journey/payment-actions")
+      const status = await paymentStatus(ctx)
+      return NextResponse.json({ ok: true, ...status })
+    }
+    case "negotiation.note": {
+      const { negotiationNote } = await import("@/lib/journey/payment-actions")
+      await negotiationNote(ctx, args, input.event_id)
+      return NextResponse.json({ success: true })
+    }
     case "session.close":
       await closeSession(ctx, String(args.outcome ?? "closed_by_flow"), "n8n", input.event_id)
       return NextResponse.json({ success: true })
@@ -627,4 +661,17 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       return NextResponse.json({ success: true, timeline })
     }
   }
+}
+
+/** true se a sessão está verificada (identity_verified_at) — exigido p/ pagamento. */
+async function sessionIsVerified(sessionId: string): Promise<boolean> {
+  const supabase = createServiceClient()
+  const { data } = await supabase
+    .from("negotiation_sessions")
+    .select("identity_verified_at, status, outcome")
+    .eq("id", sessionId)
+    .maybeSingle()
+  if (!data) return false
+  if (data.status === "closed" || data.outcome === "expired") return false
+  return Boolean(data.identity_verified_at)
 }
