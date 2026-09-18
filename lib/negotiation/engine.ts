@@ -24,12 +24,16 @@ import { N8N_SIGNATURE_HEADER, N8N_TIMESTAMP_HEADER, signN8nPayload, n8nWebhookS
 import type { SessionDebtContext } from "./sessions"
 import type { NegotiationSession, TenantChatConfig } from "./types"
 
-export type EngineName = "n8n" | "agent" | "disabled"
+export type EngineName = "n8n" | "agent" | "stub" | "disabled"
+
+const IS_PROD = process.env.NODE_ENV === "production" && process.env.MOCK_ALL_INTEGRATIONS !== "1"
 
 /**
  * D14: default em produção é DISABLED (chat assistido determinístico).
  * "n8n" sem N8N_CHAT_FLOW_URL e "agent" sem AGENT_URL degradam para
  * disabled (nunca expõem erro ao cliente; o turno loga chat.engine_error).
+ * "stub" (N3) é o roteiro determinístico de laboratório: só fora de produção
+ * ou com MOCK_ALL_INTEGRATIONS=1; em produção degrada para disabled.
  */
 export function engineName(): EngineName {
   const raw = process.env.NEGOTIATION_ENGINE
@@ -37,7 +41,10 @@ export function engineName(): EngineName {
     return process.env.AGENT_URL && process.env.AGENT_APP_TOKEN ? "agent" : "disabled"
   }
   if (raw === "n8n") {
-    return process.env.N8N_CHAT_FLOW_URL ? "n8n" : "disabled"
+    return process.env.N8N_CHAT_FLOW_URL ? "n8n" : IS_PROD ? "disabled" : "stub"
+  }
+  if (raw === "stub") {
+    return IS_PROD ? "disabled" : "stub"
   }
   return "disabled"
 }
@@ -62,6 +69,10 @@ export interface EngineTurnResult {
   verified: boolean
   agreement_id: string | null
   action: "agreement_closed" | "redirect_payment" | "redirect_attendance" | "handoff" | null
+  /** N3: id da execução do fluxo n8n (quando o engine é n8n). Rastreado por turno. */
+  n8n_execution_id?: string | null
+  /** N3: nome do engine que respondeu (n8n|stub|disabled|agent). */
+  engine?: EngineName
 }
 
 export interface EngineTurnInput {
@@ -85,6 +96,7 @@ const flowResponseSchema = z.object({
   // desconto ('avista' | 'parc_N') — caminho preferido vs. o fluxo chamar
   // agreement.close em separado.
   close_offer_id: z.string().nullish(),
+  n8n_execution_id: z.string().nullish(),
   tool_calls: z.array(z.object({ name: z.string(), args: z.unknown() })).default([]),
   prompt_version: z.string().default("n8n-flow"),
 })
@@ -187,6 +199,8 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
     verified: flow.verified,
     agreement_id: agreementId,
     action,
+    n8n_execution_id: flow.n8n_execution_id ?? null,
+    engine: "n8n",
   }
 }
 
@@ -195,11 +209,16 @@ export async function engineChat(input: EngineTurnInput): Promise<EngineTurnResu
   if (name === "disabled") {
     // D13: chat assistido determinístico (menu servido pelo servidor, sem IA)
     const { assistedChat } = await import("./assisted")
-    return assistedChat(input)
+    return { ...(await assistedChat(input)), engine: "disabled" }
+  }
+  if (name === "stub") {
+    // N3: roteiro determinístico de laboratório (exercita todas as ações).
+    const { stubChat } = await import("./engines/stub")
+    return { ...(await stubChat(input)), engine: "stub" }
   }
   if (name === "agent") {
     if (!input.session.thread_id) throw new Error("sessão sem thread_id")
-    return agentChat(input.session.thread_id, input.message, input.session.company_id)
+    return { ...(await agentChat(input.session.thread_id, input.message, input.session.company_id)), engine: "agent" }
   }
   return n8nEngineChat(input)
 }
@@ -226,6 +245,9 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
 export async function engineHealth(): Promise<{ ok: boolean; engine: EngineName; detail?: string }> {
   if (engineName() === "disabled") {
     return { ok: true, engine: "disabled", detail: "modo assistido determinístico" }
+  }
+  if (engineName() === "stub") {
+    return { ok: true, engine: "stub", detail: "roteiro determinístico de laboratório" }
   }
   if (engineName() === "agent") {
     const health = await agentHealth()
