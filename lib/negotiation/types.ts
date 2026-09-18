@@ -98,6 +98,12 @@ export interface TenantChatConfig {
   widget_enabled: boolean
   privacy_policy_url: string | null
   dpo_contact: string | null
+  // N2 (chat/n8n): origem do pagamento e envio do documento ao engine.
+  payment_origin: "platform" | "n8n"
+  send_document_to_engine: boolean
+  debt_selection: "consolidated" | "choose"
+  n8n_chat_flow_url: string | null
+  auth_require_otp: boolean
   created_at: string
   updated_at: string
 }

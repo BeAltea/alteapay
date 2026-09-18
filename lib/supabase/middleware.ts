@@ -9,7 +9,7 @@ import { getServerSupabaseUrl } from "./url"
 // Manter em sincronia ao adicionar novas rotas top-level em app/.
 const KNOWN_ROUTE_SEGMENTS = new Set([
   "api", "auth", "create-users", "dashboard", "demo", "dev", "empresa",
-  "localize", "negociar", "portal", "super-admin", "test-dark", "user-dashboard", "c",
+  "localize", "negociar", "portal", "super-admin", "test-dark", "user-dashboard", "c", "t",
 ])
 
 // --- Gate D13 da jornada pública /c/[token] ---------------------------------
@@ -56,6 +56,48 @@ async function journeyPublicEnabledForToken(token: string): Promise<boolean | nu
   }
 }
 
+/** Resolve journey_public_enabled do tenant dono do SLUG genérico. null = desconhecido.
+ *  Match por branding->>'slug'; fallback: nome da empresa slugificado. */
+async function journeyPublicEnabledForSlug(slug: string): Promise<boolean | null> {
+  try {
+    const base = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+    if (!base || !key) return null
+    const headers = { apikey: key, Authorization: `Bearer ${key}` }
+    const clean = slug.trim().toLowerCase()
+
+    // 1) branding->>'slug' explícito
+    const bySlug = await fetch(
+      `${base}/rest/v1/tenant_chat_config?branding->>slug=eq.${encodeURIComponent(clean)}&select=journey_public_enabled&limit=1`,
+      { headers },
+    )
+    if (bySlug.ok) {
+      const rows = (await bySlug.json()) as Array<{ journey_public_enabled: boolean }>
+      if (rows.length > 0) return Boolean(rows[0].journey_public_enabled)
+    }
+
+    // 2) fallback pelo nome da empresa slugificado
+    const companiesRes = await fetch(`${base}/rest/v1/companies?select=id,name`, { headers })
+    if (!companiesRes.ok) return null
+    const companies = (await companiesRes.json()) as Array<{ id: string; name: string }>
+    const slugify = (n: string) =>
+      (n ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")
+    const match = companies.find((c) => slugify(c.name) === clean)
+    if (!match) return null
+    const cfgRes = await fetch(
+      `${base}/rest/v1/tenant_chat_config?company_id=eq.${match.id}&select=journey_public_enabled&limit=1`,
+      { headers },
+    )
+    if (!cfgRes.ok) return null
+    const cfgs = (await cfgRes.json()) as Array<{ journey_public_enabled: boolean }>
+    // sem config = público desligado por padrão (indeterminado seguro)
+    return cfgs.length > 0 ? Boolean(cfgs[0].journey_public_enabled) : false
+  } catch {
+    return null
+  }
+}
+
 /** true se o usuário autenticado tem role admin/super_admin (para o modo admin-only). */
 async function requestUserIsAdmin(request: NextRequest): Promise<boolean> {
   try {
@@ -93,19 +135,29 @@ async function requestUserIsAdmin(request: NextRequest): Promise<boolean> {
   }
 }
 
-/** Aplica o gate D13. Retorna NextResponse (404) para bloquear, ou null p/ seguir. */
+/** Aplica o gate D13 (jornada /c/{token} e endpoint genérico /t/{slug}/negociar).
+ *  Retorna NextResponse (404) para bloquear, ou null p/ seguir. */
 export async function journeyGate(request: NextRequest): Promise<NextResponse | null> {
   const currentPath = request.nextUrl.pathname
-  if (!currentPath.startsWith("/c/")) return null
+  const isCampaign = currentPath.startsWith("/c/")
+  const isGeneric = currentPath.startsWith("/t/")
+  if (!isCampaign && !isGeneric) return null
 
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return new NextResponse(null, { status: 404 })
   }
 
-  const token = currentPath.split("/")[2] ?? ""
-  const publicEnabled = token ? await journeyPublicEnabledForToken(token) : null
+  let publicEnabled: boolean | null = null
+  if (isCampaign) {
+    const token = currentPath.split("/")[2] ?? ""
+    publicEnabled = token ? await journeyPublicEnabledForToken(token) : null
+  } else {
+    // /t/{slug}/negociar — o slug é o 2º segmento
+    const slug = currentPath.split("/")[2] ?? ""
+    publicEnabled = slug ? await journeyPublicEnabledForSlug(slug) : null
+  }
 
-  // Modo público explicitamente ligado → segue (o layout valida o token).
+  // Modo público explicitamente ligado → segue (o layout valida token/slug).
   if (publicEnabled === true) return null
 
   // Público desligado ou indeterminado → só passa para admin/super_admin logado.

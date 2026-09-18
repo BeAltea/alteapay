@@ -18,6 +18,11 @@ const SECTIONS = [
     desc: "Disparo por lista explícita de clientes e contadores de elegibilidade.",
   },
   {
+    href: "/super-admin/negociacao-ia/sessoes",
+    title: "Sessões",
+    desc: "Sessões de chat: canal, engine, desfecho, transcrição e n8n_execution_id.",
+  },
+  {
     href: "/super-admin/negociacao-ia/jornada",
     title: "Jornada",
     desc: "Busca por documento mascarado e linha do tempo dos eventos.",

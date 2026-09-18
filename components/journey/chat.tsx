@@ -94,10 +94,10 @@ export function JourneyChat() {
     setSending(true)
     setEnginePreparing(true)
     try {
-      const res = await fetch("/api/chat/session", {
+      const res = await fetch("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "message", text: clean }),
+        body: JSON.stringify({ text: clean }),
       })
       const data = await res.json().catch(() => ({}))
       const reply =
@@ -105,8 +105,9 @@ export function JourneyChat() {
           ? data.reply
           : "Nosso assistente está preparando sua resposta. Enquanto isso, veja as opções disponíveis abaixo."
       setMessages((m) => [...m, { id: nextId(), from: "assistant", text: reply }])
-      // qualquer turno pode ter gerado/atualizado ofertas
-      loadOffers()
+      // o próprio turno já devolve as ofertas atuais; recarrega como fallback
+      if (Array.isArray(data?.offers)) setOffers(data.offers)
+      else loadOffers()
     } catch {
       setMessages((m) => [
         ...m,

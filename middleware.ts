@@ -37,15 +37,18 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // Gate D13: jornada pública white-label /c/[token]. Bloqueia (404) quando a
-  // flag está off ou quando o tenant está em modo admin-only sem sessão admin.
-  if (currentPath.startsWith("/c/")) {
+  // Gate D13: jornada pública white-label /c/[token] e endpoint genérico
+  // /t/{slug}/negociar. Bloqueia (404) quando a flag está off ou quando o tenant
+  // está em modo admin-only sem sessão admin. noindex garantido pelo layout.
+  if (currentPath.startsWith("/c/") || currentPath.startsWith("/t/")) {
     const blocked = await journeyGate(request)
     if (blocked) return blocked
-    // Autenticado por token (não por usuário Supabase): não passa por updateSession
-    // para não sofrer redirect de rota protegida. Nunca em iframe de terceiros.
+    // Autenticado por token/cookie de chat (não por usuário Supabase): não passa
+    // por updateSession para não sofrer redirect de rota protegida. Nunca em
+    // iframe de terceiros.
     const response = NextResponse.next()
     response.headers.set("X-Frame-Options", "SAMEORIGIN")
+    response.headers.set("X-Robots-Tag", "noindex, nofollow")
     return response
   }
 
