@@ -233,3 +233,71 @@ Para fechar a integração ponta a ponta (ver também `docs/N8N_FLOW_REQUIREMENT
 - Endpoint de chat fechado ao público (`journey_public_enabled=false`) até o gate de abertura com 2º fator. Detalhes em `docs/CHAT_AUTH_SECURITY.md`.
 - Guard de idempotência sempre no `payment.create`/`record`; ASAAS é a fonte da verdade.
 - HMAC nos dois sentidos; `event_id` idempotente; `company_id` sempre derivado no servidor.
+
+---
+
+## 7. Supabase (camada de dados) — como o n8n se relaciona com ela
+
+**Projeto:** `https://hpjzlmurljxzwjtwcbkz.supabase.co` · REST base `…/rest/v1/` · Realtime `wss://…/realtime/v1`.
+
+> **Caminho recomendado (e o desenho aprovado — variante A): o n8n NÃO acessa o Supabase diretamente.** Todo o dado que o fluxo precisa **chega no `chat.turn`** (§2.1: dívida, matriz, ofertas, `history_tail`) e **toda mudança de estado passa por `/api/webhooks/n8n`** (§3), que aplica o guard de idempotência, valida a matriz e deriva o `company_id` no servidor. Isso é o que garante "nunca cobrar 2x", isolamento entre tenants e PII mascarada.
+
+**Por que não ler/escrever o Supabase direto do n8n:**
+- **RLS ligada em tudo** (por `company_id` + `service_role`). Uma `anon key` sem sessão de usuário autenticada **não enxerga** as tabelas protegidas (retorna vazio) — o n8n não tem essa sessão.
+- A **`service_role` key ignora a RLS** e **NUNCA pode ir para o n8n**: quem edita fluxos passaria a ler PII de qualquer tenant e a escrever cobranças sem o guard (o problema que custou caro no VMAX). É segredo de servidor, fica só no Netlify/ECS.
+- Escrever direto em `agreements`/`negotiation_offers`/`negotiation_sessions`/pagamentos **bypassa o guard** → risco de cobrança dupla e de estado inconsistente. **Proibido.**
+
+**Modelo de dados (referência — para entender o que a API devolve e onde cada coisa vive; não é endpoint de integração):**
+
+| Tabela | Papel | Colunas-chave |
+|---|---|---|
+| `negotiation_sessions` | a sessão do chat | `id, company_id, customer_id, debt_id, debt_ids[], primary_debt_id, thread_id, channel, engine, status ('open'\|'closed'), outcome, identity_verified_at, consent_at, agreement_id` |
+| `chat_messages` | histórico legível | `id, company_id, session_id, role ('customer'\|'assistant'\|'system'), text, offers_snapshot, n8n_execution_id, engine, latency_ms, created_at` |
+| `negotiation_condition_matrix` | regras de oferta (D8/D11) | `company_id, max_discount_pct, min_entry_pct, max_installments, allowed_billing_types, proposal_validity_days, active` |
+| `negotiation_offers` | ofertas apresentadas | `id, session_id, terms(jsonb), status ('presented'\|'accepted'\|'rejected'\|'superseded'\|'expired'), valid_until` |
+| `agreements` | acordo fechado + cobrança ASAAS | `id, company_id, customer_id, debt_id, negotiation_session_id, origin, agreed_amount, installments, asaas_payment_id, asaas_status, payment_status, asaas_boleto_url, asaas_pix_qrcode_url, proposal_valid_until` |
+| `debts` / `customers` | dívida / devedor | `debts: id, company_id, customer_id, amount, due_date, status ('pending'\|'in_negotiation'\|'paid'\|'cancelled')` · `customers: id, company_id, name, document, phone` |
+| `journey_events` | auditoria (PII mascarada) | `company_id, session_id, event_type, actor, payload, event_id (UNIQUE), created_at` |
+| `negotiation_cases` | contestação / "já paguei" | `company_id, session_id, type ('dispute'\|'payment_claim'), ...` |
+
+**Se o time REALMENTE precisar de acesso direto** (ex.: memória de conversa via node Supabase/Postgres do n8n):
+1. Preferir o **store próprio do n8n** com chave `thread_id` (a app já manda `thread_id` no `chat.turn`).
+2. Se precisar persistir no nosso lado, **pedir à AlteaPay uma tabela dedicada + credencial escopada** (uma role/policy só para essa tabela — **nunca** a `service_role`), com RLS própria e **sem PII**.
+3. Para "status atualizado em tempo real" (em vez de `payment.status` por polling), dá para assinar `chat_messages`/`journey_events` via **Supabase Realtime** com setup escopado — fora de escopo desta fase; hoje a app usa polling curto na tela de pagamento.
+
+**Resumo:** Supabase é o datastore da plataforma; o n8n integra pela **API da AlteaPay** (§2 e §3), não pelo banco.
+
+---
+
+## 8. Tudo para a integração fluir (checklist do time do n8n)
+
+**Ambiente & URLs**
+- Produção: `https://alteapay.com`. Slug do tenant VMAX: **`vmax`** (endpoint genérico `/t/vmax/negociar`).
+- Ligar o chat (feito pela AlteaPay quando vocês entregarem o fluxo): `NEGOTIATION_ENGINE=n8n` + `N8N_CHAT_FLOW_URL=<url do fluxo>` (ou por tenant em `tenant_chat_config.n8n_chat_flow_url`).
+
+**Segredo compartilhado**
+- `N8N_WEBHOOK_SECRET` — o **mesmo** segredo assina os dois sentidos. A AlteaPay já gerou o dela; combinar a troca por canal seguro (nunca em chat/commit/issue). Guardar no credential store do n8n.
+
+**Receita da assinatura HMAC (idêntica nos 2 sentidos)**
+```
+timestamp = epoch_em_segundos()            // ex.: "1758240000"
+base      = `${timestamp}.${raw_body}`     // raw_body = corpo JSON EXATO enviado (não re-serializar)
+signature = hex( HMAC_SHA256(N8N_WEBHOOK_SECRET, base) )
+headers:  x-alteapay-timestamp: <timestamp>
+          x-alteapay-signature: <signature>
+```
+Validação: rejeitar se `|agora - timestamp| > 300s` ou assinatura divergente → `401`. **Usar o corpo cru** (o mesmo bytes-a-bytes que foi assinado); re-serializar o JSON quebra a assinatura.
+
+**Idempotência**: enviar `event_id` único por ação/turno. Reenvio com o mesmo `event_id` devolve o mesmo efeito (não duplica).
+
+**Timeout & assíncrono**: a AlteaPay espera a resposta do fluxo por `N8N_TIMEOUT_MS` (20s). Acima disso, o cliente vê "só um instante" e o fluxo pode devolver depois via `session.message` async (callback assinado).
+
+**Unidades & formatos**: **valores monetários no `chat.turn` (`debt.amount`) e nas respostas de pagamento (`total_value`) estão em REAIS (decimal), como no banco** — confiar no que o payload envia. Datas em `ISO-8601`; vencimentos no fuso `America/Sao_Paulo`.
+
+**Como testar SEM produção**: a AlteaPay tem um **stub determinístico** do fluxo (engine `stub` + `POST /api/dev/n8n-stub`) que roda no laboratório (`MOCK_ALL_INTEGRATIONS=1`) e exercita todas as ações — útil para validar a assinatura e o contrato antes do fluxo real. Em produção o stub responde `404`.
+
+**Erros e o que dizer ao cliente**: `409 already_charged` (já existe cobrança viva → oferecer a 2ª via/o link existente, não recriar); `422` + código (`DISCOUNT_ABOVE_MAX`, `INSTALLMENTS_ABOVE_MAX`, `ENTRY_BELOW_MIN`, `VALUE_BELOW_MIN`, `BILLING_TYPE_NOT_ALLOWED` → propor dentro da matriz); `403` sessão não verificada; `404` sessão inexistente/fechada. Sempre responder ao cliente com uma fala neutra, sem expor o erro técnico.
+
+**Observabilidade**: incluir `n8n_execution_id` na resposta ao `chat.turn` — a AlteaPay grava por turno em `chat_messages` para correlacionar com o log do n8n no painel super-admin.
+
+**PII**: o `chat.turn` traz o documento **mascarado** (`document_masked` + `document_hash`); o documento em claro só chega se a AlteaPay habilitar as 2 flags (`send_document_to_engine=true` E `payment_origin='n8n'`). O fluxo **não deve** logar/persistir o documento em claro.
