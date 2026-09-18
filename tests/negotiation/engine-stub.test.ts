@@ -43,46 +43,44 @@ describe("stubChat — cobre todas as ações", () => {
 })
 
 describe("engineName", () => {
-  const OLD = { ...process.env }
-  beforeEach(() => vi.resetModules())
-  afterEach(() => {
-    process.env = { ...OLD }
+  beforeEach(() => {
+    vi.resetModules()
+    vi.unstubAllEnvs()
   })
+  afterEach(() => vi.unstubAllEnvs())
 
   it("stub fora de produção", async () => {
-    process.env.NODE_ENV = "test"
-    process.env.NEGOTIATION_ENGINE = "stub"
+    vi.stubEnv("NODE_ENV", "test")
+    vi.stubEnv("NEGOTIATION_ENGINE", "stub")
     const { engineName } = await import("@/lib/negotiation/engine")
     expect(engineName()).toBe("stub")
   })
 
   it("stub degrada para disabled em produção", async () => {
-    process.env.NODE_ENV = "production"
-    delete process.env.MOCK_ALL_INTEGRATIONS
-    process.env.NEGOTIATION_ENGINE = "stub"
+    vi.stubEnv("NODE_ENV", "production")
+    vi.stubEnv("MOCK_ALL_INTEGRATIONS", "")
+    vi.stubEnv("NEGOTIATION_ENGINE", "stub")
     const { engineName } = await import("@/lib/negotiation/engine")
     expect(engineName()).toBe("disabled")
   })
 
   it("n8n sem URL cai para stub SÓ no laboratório (MOCK_ALL_INTEGRATIONS=1)", async () => {
-    process.env.NODE_ENV = "test"
-    process.env.NEGOTIATION_ENGINE = "n8n"
-    delete process.env.N8N_CHAT_FLOW_URL
+    vi.stubEnv("NODE_ENV", "test")
+    vi.stubEnv("NEGOTIATION_ENGINE", "n8n")
+    vi.stubEnv("N8N_CHAT_FLOW_URL", "")
     // sem o flag de lab: mantém o default seguro disabled
-    delete process.env.MOCK_ALL_INTEGRATIONS
+    vi.stubEnv("MOCK_ALL_INTEGRATIONS", "")
     const mod1 = await import("@/lib/negotiation/engine")
     expect(mod1.engineName()).toBe("disabled")
     // com o flag de lab: cai para stub (E2E sem servidor n8n)
-    process.env.MOCK_ALL_INTEGRATIONS = "1"
-    vi.resetModules()
+    vi.stubEnv("MOCK_ALL_INTEGRATIONS", "1")
     const mod2 = await import("@/lib/negotiation/engine")
     expect(mod2.engineName()).toBe("stub")
-    delete process.env.MOCK_ALL_INTEGRATIONS
   })
 
   it("default disabled", async () => {
-    process.env.NODE_ENV = "test"
-    delete process.env.NEGOTIATION_ENGINE
+    vi.stubEnv("NODE_ENV", "test")
+    vi.stubEnv("NEGOTIATION_ENGINE", "")
     const { engineName } = await import("@/lib/negotiation/engine")
     expect(engineName()).toBe("disabled")
   })
