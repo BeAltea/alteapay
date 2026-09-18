@@ -16,8 +16,11 @@
 // URL de canal oficial são operações do SERVIDOR (close-agreement/charge-rules
 // e tenant_chat_config) — o fluxo/LLM apenas sinaliza a intenção.
 
+import { createHash } from "node:crypto"
+
 import { z } from "zod"
 
+import { maskDocument } from "@/lib/journey/document"
 import { agentChat, agentHealth, agentSessionInit, type AgentSessionInit } from "./agent-client"
 import { closeAgreement } from "./close-agreement"
 import { N8N_SIGNATURE_HEADER, N8N_TIMESTAMP_HEADER, signN8nPayload, n8nWebhookSecret } from "./n8n"
@@ -125,8 +128,12 @@ export async function callN8nFlow(url: string, payload: unknown, timeoutMs = flo
   return resp.json()
 }
 
-function buildTurnPayload(input: EngineTurnInput) {
+export function buildTurnPayload(input: EngineTurnInput) {
   const { session, debtor, tenant } = input
+  // Documento em CLARO só viaja com as 2 flags (send_document_to_engine=true E
+  // payment_origin='n8n'). Por padrão, o fluxo recebe só máscara + hash.
+  const sendPlainDoc =
+    tenant?.send_document_to_engine === true && tenant?.payment_origin === "n8n"
   return {
     type: "chat.turn",
     thread_id: session.thread_id,
@@ -141,7 +148,12 @@ function buildTurnPayload(input: EngineTurnInput) {
       outcome: session.outcome,
     },
     debtor: debtor
-      ? { name: debtor.customer_name, document: debtor.document }
+      ? {
+          name: debtor.customer_name,
+          document_masked: maskDocument(debtor.document),
+          document_hash: createHash("sha256").update(debtor.document).digest("hex"),
+          document: sendPlainDoc ? debtor.document : null,
+        }
       : null,
     debt: debtor
       ? {

@@ -20,7 +20,7 @@ export default async function GenericNegociarPage({
   return (
     <JourneyGenericAuthForm
       tenantSlug={result.tenant.slug}
-      successHref="./negociar/chat"
+      successHref="./chat"
       captchaEnabled={process.env.CHAT_CAPTCHA_ENABLED === "true"}
     />
   )
