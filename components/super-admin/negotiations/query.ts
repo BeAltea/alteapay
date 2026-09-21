@@ -8,9 +8,26 @@
 //   - contact_suppressions (flag "suprimido" para o filtro/coluna)
 //   - whatsapp_campaigns (nome da campanha)
 //
-// Sem N+1: usa os índices de negotiation_state
-//   (idx_neg_state_company_stage / _rank / _updated) e resolve os satélites em
-//   lote com `.in(...)`. Documento NUNCA sai em claro (maskDocument). Volume 3196.
+// PAGINAÇÃO REAL server-side (follow-up de performance): a página de dados NÃO
+// materializa mais o universo filtrado. Ela pede ao banco só a fatia
+// `range(offset, offset+limit-1)` de negotiation_state (ordenada por stage_rank/
+// updated_at no BANCO, usando idx_neg_state_company_rank / _updated) e resolve os
+// satélites SÓ para as linhas da página (em lote, sem N+1).
+//
+// Filtros classificam-se em dois grupos:
+//   • ESTADO (baratos, expressos no próprio negotiation_state): company, stage,
+//     channel, campaign, has_live_charge, janela de última atividade (updated_at).
+//   • SATÉLITE (dependem de customers/debts/contact_suppressions): contactProfile,
+//     suppressed, aging, valor, busca por documento mascarado. Quando ALGUM
+//     satélite está ativo, resolvemos PRIMEIRO o conjunto de customerIds que casa
+//     (varredura chunked das tabelas satélite) e restringimos negotiation_state a
+//     esses ids (`.in("customer_id", …)`). ESSE mesmo conjunto de ids alimenta a
+//     página, os contadores e o total — por isso os três SEMPRE fecham (§5).
+//
+// Contadores por estágio: consulta de AGREGAÇÃO separada que lê APENAS a coluna
+// `stage` (com os mesmos filtros / restrição de ids) — nunca materializa a linha
+// completa nem resolve satélite para o universo inteiro. Documento NUNCA sai em
+// claro (maskDocument). Volume 3196.
 
 import "server-only"
 import { createServiceClient } from "@/lib/supabase/service"
@@ -21,6 +38,7 @@ import type { ContactProfile } from "./stages"
 import type { NegotiationFilters } from "./filters"
 
 const PAGE_SIZE = 1000
+const IN_CHUNK = 300
 
 export interface NegotiationRow {
   customerId: string
@@ -63,30 +81,297 @@ function agingFrom(dueDate: string | null): number | null {
   return Math.max(0, Math.floor(diff / 86_400_000))
 }
 
+function chunk<T>(arr: T[], size = IN_CHUNK): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
+  return out
+}
+
+/** Intersecta um conjunto (possivelmente ainda-null = "sem restrição") com outro. */
+function intersect(base: Set<string> | null, add: Set<string>): Set<string> {
+  if (base === null) return add
+  const out = new Set<string>()
+  for (const id of add) if (base.has(id)) out.add(id)
+  return out
+}
+
+// ------------------------------------------------------------------
+// Filtros
+// ------------------------------------------------------------------
+
+/** Há algum filtro que só pode ser avaliado nos satélites (não em negotiation_state)? */
+function hasSatelliteFilter(f: NegotiationFilters): boolean {
+  return (
+    f.contactProfiles.length > 0 ||
+    f.suppressed != null ||
+    f.agingMin != null ||
+    f.agingMax != null ||
+    f.valueMin != null ||
+    f.valueMax != null ||
+    !!(f.search && f.search.trim())
+  )
+}
+
 /**
- * Carrega, em lote, os satélites por customer:
- *   - customers: nome, documento, contact_profile
- *   - debts: soma do valor em aberto (status != paid) + data de vencimento mais antiga
- *   - suppressions: existe supressão ativa?
+ * Aplica os filtros de ESTADO (baratos) a um builder de negotiation_state.
+ * Inclui a janela de última atividade (updated_at) — activitySince/activityUntil.
  */
-async function loadSatellites(
+function applyStateFilters(q: any, f: NegotiationFilters): any {
+  if (f.companyId) q = q.eq("company_id", f.companyId)
+  if (f.stages.length) q = q.in("stage", f.stages)
+  if (f.channel) q = q.eq("channel", f.channel)
+  if (f.campaignId) q = q.eq("campaign_id", f.campaignId)
+  if (f.hasLiveCharge != null) q = q.eq("has_live_charge", f.hasLiveCharge)
+  if (f.activitySince) q = q.gte("updated_at", f.activitySince)
+  if (f.activityUntil) q = q.lte("updated_at", `${f.activityUntil}T23:59:59.999Z`)
+  return q
+}
+
+// ------------------------------------------------------------------
+// Resolução do conjunto de customerIds que casa os filtros SATÉLITE
+// ------------------------------------------------------------------
+
+/**
+ * Restrição resolvida a partir dos filtros satélite:
+ *   - restrict: conjunto POSITIVO de customerIds elegíveis (null = sem restrição
+ *     positiva, i.e. o filtro não enumera um universo — ver `exclude`).
+ *   - exclude: conjunto NEGATIVO a remover (usado por `suppressed=false` sem um
+ *     universo positivo prévio — não dá para enumerar "todos menos estes" sem
+ *     varrer tudo, então excluímos os suprimidos do resultado de
+ *     negotiation_state em vez de materializar o complemento).
+ *
+ * Sem estado de módulo: tudo trafega no retorno (seguro sob concorrência).
+ */
+interface SatelliteRestriction {
+  restrict: Set<string> | null
+  exclude: Set<string> | null
+}
+
+/**
+ * Quando algum filtro satélite está ativo, resolve server-side o conjunto de
+ * customerIds que casa TODOS eles. Cada filtro restringe (interseção) o conjunto;
+ * `restrict=null` significa "ainda sem restrição positiva". Escopado por company
+ * quando informado.
+ *
+ * Este caminho PODE varrer as tabelas satélite (chunked/paginado), mas nunca
+ * materializa a linha completa da lista — resolve só ids. É a fonte única do
+ * universo satélite que alimenta página + contadores (por isso fecham).
+ *
+ * NOTA sobre aging/valor: dependem da AGREGAÇÃO de debts por customer (soma do
+ * aberto + vencimento mais antigo). Não dá para expressar isso numa única query
+ * PostgREST; então agregamos debts por customer (chunked pelo subconjunto já
+ * restrito, ou paginado por company quando ainda não há subconjunto) e filtramos
+ * o conjunto.
+ */
+async function resolveSatelliteCustomerIds(
+  f: NegotiationFilters,
+): Promise<SatelliteRestriction> {
+  const supabase = createServiceClient()
+  let acc: Set<string> | null = null
+  let exclude: Set<string> | null = null
+
+  const search = f.search?.trim() || null
+  const wantAgingOrValue =
+    f.agingMin != null || f.agingMax != null || f.valueMin != null || f.valueMax != null
+
+  // --- contact_profile (customers.contact_profile) ---
+  if (f.contactProfiles.length) {
+    const ids = new Set<string>()
+    let page = 0
+    for (;;) {
+      let q = (supabase as any)
+        .from("customers")
+        .select("id")
+        .in("contact_profile", f.contactProfiles)
+      if (f.companyId) q = q.eq("company_id", f.companyId)
+      q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+      const { data } = await q
+      const rows = (data ?? []) as Array<{ id: string }>
+      for (const r of rows) if (r.id) ids.add(r.id)
+      if (rows.length < PAGE_SIZE) break
+      page++
+    }
+    acc = intersect(acc, ids)
+  }
+
+  // --- suppressed (contact_suppressions.active) ---
+  if (f.suppressed != null) {
+    const suppressedIds = new Set<string>()
+    let page = 0
+    for (;;) {
+      let q = (supabase as any)
+        .from("contact_suppressions")
+        .select("customer_id")
+        .eq("active", true)
+      if (f.companyId) q = q.eq("company_id", f.companyId)
+      q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+      const { data } = await q
+      const rows = (data ?? []) as Array<{ customer_id: string | null }>
+      for (const r of rows) if (r.customer_id) suppressedIds.add(r.customer_id)
+      if (rows.length < PAGE_SIZE) break
+      page++
+    }
+    if (f.suppressed) {
+      // quer os suprimidos → restrição POSITIVA.
+      acc = intersect(acc, suppressedIds)
+    } else if (acc !== null) {
+      // quer os NÃO-suprimidos e já há universo positivo → remove os suprimidos.
+      const kept = new Set<string>()
+      for (const id of acc) if (!suppressedIds.has(id)) kept.add(id)
+      acc = kept
+    } else {
+      // NÃO-suprimidos sem universo positivo prévio → guarda como EXCLUSÃO.
+      exclude = suppressedIds
+    }
+  }
+
+  // --- aging / valor (agrega debts por customer) ---
+  if (wantAgingOrValue) {
+    const agg = await aggregateDebts(f.companyId, acc)
+    const ids = new Set<string>()
+    for (const [customerId, a] of agg) {
+      if (exclude && exclude.has(customerId)) continue
+      const aging = agingFrom(a.oldestDue)
+      if (f.agingMin != null && (aging == null || aging < f.agingMin)) continue
+      if (f.agingMax != null && (aging == null || aging > f.agingMax)) continue
+      if (f.valueMin != null && a.open < f.valueMin) continue
+      if (f.valueMax != null && a.open > f.valueMax) continue
+      ids.add(customerId)
+    }
+    // aging/valor produzem um universo POSITIVO — a exclusão já foi aplicada nele.
+    acc = intersect(acc, ids)
+    exclude = null
+  }
+
+  // --- busca por documento MASCARADO (customers.document → maskDocument) ---
+  // O documento é armazenado em claro no banco mas NUNCA sai em claro; a busca é
+  // sobre a forma mascarada. Como o mascaramento não é expresso em SQL,
+  // resolvemos sobre o universo já restringido (acc). Sem restrição prévia e com
+  // companyId, varremos os customers da company; sem companyId nem restrição,
+  // varremos por página (cap) — caso raro (busca global sem cedente).
+  if (search) {
+    const ids = new Set<string>()
+    const scanScope = acc ? Array.from(acc) : null
+    if (scanScope) {
+      for (const part of chunk(scanScope)) {
+        const { data } = await (supabase as any)
+          .from("customers")
+          .select("id, document")
+          .in("id", part)
+        for (const r of (data ?? []) as Array<{ id: string; document: string | null }>) {
+          if (maskDocument(r.document).includes(search)) ids.add(r.id)
+        }
+      }
+    } else {
+      let page = 0
+      for (;;) {
+        let q = (supabase as any).from("customers").select("id, document")
+        if (f.companyId) q = q.eq("company_id", f.companyId)
+        q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+        const { data } = await q
+        const rows = (data ?? []) as Array<{ id: string; document: string | null }>
+        for (const r of rows) if (maskDocument(r.document).includes(search)) ids.add(r.id)
+        if (rows.length < PAGE_SIZE) break
+        page++
+      }
+    }
+    // busca produz universo POSITIVO — aplica a exclusão pendente, se houver.
+    if (exclude) {
+      for (const id of exclude) ids.delete(id)
+      exclude = null
+    }
+    acc = intersect(acc, ids)
+  }
+
+  // acc=null + exclude!=null → só o pedido de NÃO-suprimidos: a página/contadores
+  // restringem negotiation_state removendo `exclude`.
+  return { restrict: acc, exclude }
+}
+
+/**
+ * Agrega debts (aberto + vencimento mais antigo) por customer. Escopado por
+ * company quando informado; restringido a `only` quando fornecido (chunked por
+ * ids — evita varrer a company inteira quando já há um subconjunto). Retorna só
+ * customers COM debt em aberto (aging/valor não fazem sentido sem debt).
+ */
+async function aggregateDebts(
+  companyId: string | null,
+  only: Set<string> | null,
+): Promise<Map<string, { open: number; oldestDue: string | null }>> {
+  const supabase = createServiceClient()
+  const debtAgg = new Map<string, { open: number; oldestDue: string | null }>()
+
+  const consume = (rows: Array<{
+    customer_id: string
+    amount: number | null
+    current_amount: number | null
+    due_date: string | null
+    status: string | null
+  }>) => {
+    for (const d of rows) {
+      const status = (d.status ?? "").toLowerCase()
+      if (status === "paid" || status === "written_off") continue
+      const open = Number(d.current_amount ?? d.amount ?? 0)
+      const prev = debtAgg.get(d.customer_id) ?? { open: 0, oldestDue: null }
+      prev.open += Number.isFinite(open) ? open : 0
+      if (d.due_date && (!prev.oldestDue || d.due_date < prev.oldestDue)) {
+        prev.oldestDue = d.due_date
+      }
+      debtAgg.set(d.customer_id, prev)
+    }
+  }
+
+  if (only) {
+    for (const part of chunk(Array.from(only))) {
+      const { data } = await (supabase as any)
+        .from("debts")
+        .select("customer_id, amount, current_amount, due_date, status")
+        .in("customer_id", part)
+      consume((data ?? []) as any)
+    }
+    return debtAgg
+  }
+
+  // sem subconjunto: pagina por company (obrigatório para não varrer tudo).
+  let page = 0
+  for (;;) {
+    let q = (supabase as any)
+      .from("debts")
+      .select("customer_id, amount, current_amount, due_date, status")
+    if (companyId) q = q.eq("company_id", companyId)
+    q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+    const { data } = await q
+    const rows = (data ?? []) as any[]
+    consume(rows)
+    if (rows.length < PAGE_SIZE) break
+    page++
+  }
+  return debtAgg
+}
+
+// ------------------------------------------------------------------
+// Satélites SÓ da página (nunca do universo inteiro)
+// ------------------------------------------------------------------
+
+/**
+ * Carrega, em lote, os satélites SÓ para os customers da página pedida:
+ *   - customers: nome, documento, contact_profile
+ *   - debts: soma do valor em aberto + vencimento mais antigo (chunked por ids)
+ *   - suppressions: existe supressão ativa?
+ *   - companies / tenant_chat_config / whatsapp_campaigns
+ */
+async function loadPageSatellites(
   companyIds: string[],
   customerIds: string[],
   campaignIds: string[],
 ) {
   const supabase = createServiceClient()
 
-  const chunks = <T,>(arr: T[], size = 300): T[][] => {
-    const out: T[][] = []
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
-    return out
-  }
-
   const customerById = new Map<
     string,
     { name: string | null; document: string | null; contact_profile: ContactProfile | null }
   >()
-  for (const part of chunks(customerIds)) {
+  for (const part of chunk(customerIds)) {
     const { data } = await (supabase as any)
       .from("customers")
       .select("id, name, document, contact_profile")
@@ -101,7 +386,7 @@ async function loadSatellites(
   }
 
   const companyById = new Map<string, string>()
-  for (const part of chunks(Array.from(new Set(companyIds)))) {
+  for (const part of chunk(Array.from(new Set(companyIds)))) {
     const { data } = await (supabase as any).from("companies").select("id, name").in("id", part)
     for (const c of data ?? []) companyById.set(c.id, c.name)
   }
@@ -110,7 +395,7 @@ async function loadSatellites(
   // está habilitado — senão o botão "Copiar link" fica desabilitado (sem link
   // quebrado). Isolado por company (uma linha de config por company).
   const publicLinkByCompany = new Map<string, string | null>()
-  for (const part of chunks(Array.from(new Set(companyIds)))) {
+  for (const part of chunk(Array.from(new Set(companyIds)))) {
     const { data } = await (supabase as any)
       .from("tenant_chat_config")
       .select("company_id, public_link_code, public_link_enabled")
@@ -124,7 +409,7 @@ async function loadSatellites(
   const campaignById = new Map<string, string>()
   const validCampaignIds = campaignIds.filter(Boolean)
   if (validCampaignIds.length) {
-    for (const part of chunks(Array.from(new Set(validCampaignIds)))) {
+    for (const part of chunk(Array.from(new Set(validCampaignIds)))) {
       const { data } = await (supabase as any)
         .from("whatsapp_campaigns")
         .select("id, name")
@@ -133,42 +418,12 @@ async function loadSatellites(
     }
   }
 
-  // debts: agrega valor em aberto + vencimento mais antigo por customer.
-  const debtAgg = new Map<string, { open: number; oldestDue: string | null }>()
-  for (const part of chunks(customerIds)) {
-    let page = 0
-    for (;;) {
-      const { data } = await (supabase as any)
-        .from("debts")
-        .select("customer_id, amount, current_amount, due_date, status")
-        .in("customer_id", part)
-        .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
-      const rows = (data ?? []) as Array<{
-        customer_id: string
-        amount: number | null
-        current_amount: number | null
-        due_date: string | null
-        status: string | null
-      }>
-      for (const d of rows) {
-        const status = (d.status ?? "").toLowerCase()
-        if (status === "paid" || status === "written_off") continue
-        const open = Number(d.current_amount ?? d.amount ?? 0)
-        const prev = debtAgg.get(d.customer_id) ?? { open: 0, oldestDue: null }
-        prev.open += Number.isFinite(open) ? open : 0
-        if (d.due_date && (!prev.oldestDue || d.due_date < prev.oldestDue)) {
-          prev.oldestDue = d.due_date
-        }
-        debtAgg.set(d.customer_id, prev)
-      }
-      if (rows.length < PAGE_SIZE) break
-      page++
-    }
-  }
+  // debts: agrega valor em aberto + vencimento mais antigo (SÓ a página).
+  const debtAgg = await aggregateDebts(null, new Set(customerIds))
 
-  // suppressions: customer com supressão ativa (scope customer). Isolado por company.
+  // suppressions: customer com supressão ativa (SÓ a página).
   const suppressed = new Set<string>()
-  for (const part of chunks(customerIds)) {
+  for (const part of chunk(customerIds)) {
     const { data } = await (supabase as any)
       .from("contact_suppressions")
       .select("customer_id, active")
@@ -180,17 +435,105 @@ async function loadSatellites(
   return { customerById, companyById, campaignById, debtAgg, suppressed, publicLinkByCompany }
 }
 
+function buildRow(
+  r: any,
+  sat: Awaited<ReturnType<typeof loadPageSatellites>>,
+): NegotiationRow {
+  const cust = sat.customerById.get(r.customer_id)
+  const agg = sat.debtAgg.get(r.customer_id) ?? { open: 0, oldestDue: null }
+  const aging = agingFrom(agg.oldestDue)
+  return {
+    customerId: r.customer_id,
+    companyId: r.company_id,
+    cedente: sat.companyById.get(r.company_id) ?? null,
+    nameMasked: maskName(cust?.name ?? null),
+    documentMasked: maskDocument(cust?.document ?? null),
+    contactProfile: cust?.contact_profile ?? null,
+    channel: r.channel ?? null,
+    stage: r.stage ?? "not_started",
+    stageRank: r.stage_rank ?? stageRank(r.stage ?? "not_started"),
+    stageAt: r.stage_at ?? null,
+    lastActivityAt: r.updated_at ?? null,
+    openAmount: agg.open,
+    agingDays: aging,
+    hasLiveCharge: !!r.has_live_charge,
+    providerStatusSource: r.provider_status_source ?? "none",
+    campaignId: r.campaign_id ?? null,
+    campaignName: r.campaign_id ? (sat.campaignById.get(r.campaign_id) ?? null) : null,
+    suppressed: sat.suppressed.has(r.customer_id),
+    publicLinkCode: sat.publicLinkByCompany.get(r.company_id) ?? null,
+  }
+}
+
+// ------------------------------------------------------------------
+// Contadores por estágio — AGREGAÇÃO sem materializar a linha
+// ------------------------------------------------------------------
+
 /**
- * Consulta principal. Duas fases:
- *  1. Carrega TODAS as linhas de negotiation_state que casam os filtros baratos
- *     (company, stage, channel, campaign, has_live_charge) usando os índices;
- *     resolve satélites em lote; aplica os filtros que dependem de satélites
- *     (contact_profile, aging, valor, supressão, busca por doc mascarado,
- *     período de última atividade) em memória.
- *  2. Calcula contadores por estágio sobre o TOTAL filtrado, ordena e pagina.
+ * Contadores por estágio sobre o universo filtrado, SEM materializar a linha
+ * completa. Lê APENAS a coluna `stage` de negotiation_state (com os mesmos
+ * filtros de estado + a mesma restrição de ids satélite), paginando. Como usa
+ * EXATAMENTE o mesmo predicado que a página, `sum(byStage) === total` por
+ * construção (o assert countersReconcile permanece verdadeiro).
  *
- * Contadores fecham por construção: byStage é derivado da MESMA lista filtrada
- * que produz `total` (§5).
+ * Ler só `stage` (uma coluna text indexada) é ordens de magnitude mais barato do
+ * que materializar as ~15 colunas + resolver satélites para cada linha, e não
+ * carrega documento/nome — nenhum PII trafega aqui.
+ */
+async function countByStage(
+  f: NegotiationFilters,
+  restrictIds: Set<string> | null,
+  excludeIds: Set<string> | null,
+): Promise<{ byStage: Record<string, number>; total: number }> {
+  const supabase = createServiceClient()
+  const byStage: Record<string, number> = {}
+  let total = 0
+
+  const idParts: (string[] | null)[] = restrictIds ? chunk(Array.from(restrictIds)) : [null]
+
+  for (const part of idParts) {
+    // conjunto vazio de ids restritos → zero linhas (não emite query "in ()").
+    if (restrictIds && part && part.length === 0) continue
+    let page = 0
+    for (;;) {
+      let q = (supabase as any).from("negotiation_state").select("stage, customer_id")
+      q = applyStateFilters(q, f)
+      if (part) q = q.in("customer_id", part)
+      q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+      const { data, error } = await q
+      if (error) throw new Error(`negotiation_state(count): ${error.message}`)
+      const rows = (data ?? []) as Array<{ stage: string | null; customer_id: string }>
+      for (const r of rows) {
+        if (excludeIds && excludeIds.has(r.customer_id)) continue
+        const stage = r.stage ?? "not_started"
+        byStage[stage] = (byStage[stage] ?? 0) + 1
+        total++
+      }
+      if (rows.length < PAGE_SIZE) break
+      page++
+    }
+  }
+
+  return { byStage, total }
+}
+
+// ------------------------------------------------------------------
+// Consulta principal (paginação REAL server-side)
+// ------------------------------------------------------------------
+
+/**
+ * Lista paginada de negociações. Passos:
+ *  1. Resolve o conjunto de customerIds que casa os filtros SATÉLITE (só quando
+ *     algum estiver ativo). Esse conjunto restringe TUDO abaixo.
+ *  2. Contadores por estágio + total: agregação lendo só `stage` (mesmos filtros
+ *     + mesma restrição) → fecham por construção.
+ *  3. Página de dados: pede ao banco só a fatia `range(offset,+limit)` de
+ *     negotiation_state (ordenada no BANCO por stage_rank/updated_at, usando os
+ *     índices), e resolve satélites SÓ para as linhas da página.
+ *
+ * `collectAll` (usado por resolveFilteredCustomerIds) devolve todas as linhas do
+ * universo filtrado — esse caminho PODE varrer (paginando negotiation_state), mas
+ * ainda restrito ao conjunto satélite quando houver.
  */
 export async function queryNegotiations(
   f: NegotiationFilters,
@@ -199,107 +542,134 @@ export async function queryNegotiations(
   const collectAll = opts.collectAll ?? false
   const supabase = createServiceClient()
 
-  // ---- fase 1: negotiation_state (índices de T1) ----
-  let stateRows: any[] = []
-  let page = 0
-  for (;;) {
-    let q = (supabase as any)
-      .from("negotiation_state")
-      .select(
-        "company_id, customer_id, stage, stage_rank, stage_at, channel, campaign_id, has_live_charge, provider_status_source, updated_at",
-      )
-    if (f.companyId) q = q.eq("company_id", f.companyId)
-    if (f.stages.length) q = q.in("stage", f.stages)
-    if (f.channel) q = q.eq("channel", f.channel)
-    if (f.campaignId) q = q.eq("campaign_id", f.campaignId)
-    if (f.hasLiveCharge != null) q = q.eq("has_live_charge", f.hasLiveCharge)
-    q = q.order("updated_at", { ascending: false }).range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
-
-    const { data, error } = await q
-    if (error) throw new Error(`negotiation_state: ${error.message}`)
-    const rows = data ?? []
-    stateRows = stateRows.concat(rows)
-    if (rows.length < PAGE_SIZE) break
-    page++
+  // ---- fase 0: restrição por filtros satélite ----
+  let restrictIds: Set<string> | null = null
+  let excludeIds: Set<string> | null = null
+  if (hasSatelliteFilter(f)) {
+    const res = await resolveSatelliteCustomerIds(f)
+    restrictIds = res.restrict
+    excludeIds = res.exclude
   }
 
+  // Restrição impossível (conjunto vazio) → resposta vazia coerente.
+  if (restrictIds !== null && restrictIds.size === 0) {
+    return { rows: [], total: 0, byStage: {}, page: f.page, pageSize: f.pageSize }
+  }
+
+  // ---- fase 1: contadores + total (agregação, sem materializar) ----
+  const { byStage, total } = await countByStage(f, restrictIds, excludeIds)
+
+  // ---- ordenação server-side ----
+  const orderCol = f.sort === "stage" ? "stage_rank" : "updated_at"
+  const ascending = f.dir === "asc"
+  const select =
+    "company_id, customer_id, stage, stage_rank, stage_at, channel, campaign_id, has_live_charge, provider_status_source, updated_at"
+
+  // ---- fase 2: página de dados ----
+  // Caminho COMUM (sem restrição de ids satélite): range direto no banco. Usa
+  // idx_neg_state_company_rank (sort=stage) / _updated (sort=last_activity).
+  let stateRows: any[] = []
+
+  if (collectAll) {
+    // varredura completa do universo filtrado (para resolveFilteredCustomerIds).
+    stateRows = await scanState(supabase, f, restrictIds, excludeIds, select, orderCol, ascending)
+  } else if (restrictIds === null && excludeIds === null) {
+    // paginação REAL: só a fatia pedida sai do banco.
+    let q = (supabase as any).from("negotiation_state").select(select)
+    q = applyStateFilters(q, f)
+    q = q.order(orderCol, { ascending }).order("updated_at", { ascending: false })
+    const offset = f.page * f.pageSize
+    q = q.range(offset, offset + f.pageSize - 1)
+    const { data, error } = await q
+    if (error) throw new Error(`negotiation_state(page): ${error.message}`)
+    stateRows = data ?? []
+  } else {
+    // Restrição por ids satélite: o range precisa ser sobre o conjunto ordenado
+    // já restrito. Como o `.in(customer_id)` pode exceder um chunk, varremos o
+    // universo restrito ordenado e fatiamos a página em memória — mas isso NÃO
+    // resolve satélites para tudo (só carrega o negotiation_state cru, leve), e a
+    // fatia pesada (satélites da linha) fica limitada à página.
+    const restricted = await scanState(
+      supabase, f, restrictIds, excludeIds, select, orderCol, ascending,
+    )
+    const offset = f.page * f.pageSize
+    stateRows = restricted.slice(offset, offset + f.pageSize)
+  }
+
+  // ---- satélites SÓ das linhas da página ----
   const companyIds = stateRows.map((r) => r.company_id)
   const customerIds = stateRows.map((r) => r.customer_id).filter(Boolean)
   const campaignIds = stateRows.map((r) => r.campaign_id).filter(Boolean)
-  const sat = await loadSatellites(companyIds, customerIds, campaignIds)
+  const sat = await loadPageSatellites(companyIds, customerIds, campaignIds)
 
-  // ---- monta linhas + aplica filtros dependentes de satélite ----
-  const search = f.search?.trim() || null
-  let all: NegotiationRow[] = stateRows.map((r) => {
-    const cust = sat.customerById.get(r.customer_id)
-    const agg = sat.debtAgg.get(r.customer_id) ?? { open: 0, oldestDue: null }
-    const aging = agingFrom(agg.oldestDue)
-    return {
-      customerId: r.customer_id,
-      companyId: r.company_id,
-      cedente: sat.companyById.get(r.company_id) ?? null,
-      nameMasked: maskName(cust?.name ?? null),
-      documentMasked: maskDocument(cust?.document ?? null),
-      contactProfile: cust?.contact_profile ?? null,
-      channel: r.channel ?? null,
-      stage: r.stage ?? "not_started",
-      stageRank: r.stage_rank ?? stageRank(r.stage ?? "not_started"),
-      stageAt: r.stage_at ?? null,
-      lastActivityAt: r.updated_at ?? null,
-      openAmount: agg.open,
-      agingDays: aging,
-      hasLiveCharge: !!r.has_live_charge,
-      providerStatusSource: r.provider_status_source ?? "none",
-      campaignId: r.campaign_id ?? null,
-      campaignName: r.campaign_id ? (sat.campaignById.get(r.campaign_id) ?? null) : null,
-      suppressed: sat.suppressed.has(r.customer_id),
-      publicLinkCode: sat.publicLinkByCompany.get(r.company_id) ?? null,
-    }
-  })
-
-  all = all.filter((row) => {
-    if (f.contactProfiles.length && !f.contactProfiles.includes(row.contactProfile as ContactProfile))
-      return false
-    if (f.suppressed != null && row.suppressed !== f.suppressed) return false
-    if (f.agingMin != null && (row.agingDays == null || row.agingDays < f.agingMin)) return false
-    if (f.agingMax != null && (row.agingDays == null || row.agingDays > f.agingMax)) return false
-    if (f.valueMin != null && row.openAmount < f.valueMin) return false
-    if (f.valueMax != null && row.openAmount > f.valueMax) return false
-    if (f.activitySince && (!row.lastActivityAt || row.lastActivityAt < f.activitySince)) return false
-    if (f.activityUntil && (!row.lastActivityAt || row.lastActivityAt > `${f.activityUntil}T23:59:59.999Z`))
-      return false
-    if (search && !row.documentMasked.includes(search)) return false
-    return true
-  })
-
-  // ---- contadores por estágio sobre o TOTAL filtrado (§5, fecham por construção) ----
-  const byStage: Record<string, number> = {}
-  for (const row of all) byStage[row.stage] = (byStage[row.stage] ?? 0) + 1
-  const total = all.length
-
-  // ---- ordenação server-side (estágio / última atividade) ----
-  const dirMul = f.dir === "asc" ? 1 : -1
-  all.sort((a, b) => {
-    if (f.sort === "stage") {
-      if (a.stageRank !== b.stageRank) return (a.stageRank - b.stageRank) * dirMul
-      // desempate estável por última atividade desc
-      return (a.lastActivityAt ?? "") < (b.lastActivityAt ?? "") ? 1 : -1
-    }
-    const av = a.lastActivityAt ?? ""
-    const bv = b.lastActivityAt ?? ""
-    if (av === bv) return 0
-    return (av < bv ? -1 : 1) * dirMul
-  })
-
-  // ---- paginação (opcional: collectAll devolve a lista inteira ordenada) ----
-  const rows = collectAll ? all : all.slice(f.page * f.pageSize, f.page * f.pageSize + f.pageSize)
+  const rows = stateRows.map((r) => buildRow(r, sat))
 
   return { rows, total, byStage, page: f.page, pageSize: f.pageSize }
 }
 
 /**
+ * Varredura completa (paginada) de negotiation_state sob os filtros de estado +
+ * restrição/exclusão de ids satélite, ordenada no banco. Carrega só as colunas
+ * de estado (sem satélite) — leve mesmo no universo inteiro. Usada pelo caminho
+ * `collectAll` e pela paginação com restrição satélite.
+ */
+async function scanState(
+  supabase: any,
+  f: NegotiationFilters,
+  restrictIds: Set<string> | null,
+  excludeIds: Set<string> | null,
+  select: string,
+  orderCol: string,
+  ascending: boolean,
+): Promise<any[]> {
+  const out: any[] = []
+  const idParts: (string[] | null)[] = restrictIds ? chunk(Array.from(restrictIds)) : [null]
+
+  for (const part of idParts) {
+    if (restrictIds && part && part.length === 0) continue
+    let page = 0
+    for (;;) {
+      let q = supabase.from("negotiation_state").select(select)
+      q = applyStateFilters(q, f)
+      if (part) q = q.in("customer_id", part)
+      q = q.order(orderCol, { ascending }).order("updated_at", { ascending: false })
+      q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+      const { data, error } = await q
+      if (error) throw new Error(`negotiation_state(scan): ${error.message}`)
+      const rows = (data ?? []) as any[]
+      for (const r of rows) {
+        if (excludeIds && excludeIds.has(r.customer_id)) continue
+        out.push(r)
+      }
+      if (rows.length < PAGE_SIZE) break
+      page++
+    }
+  }
+
+  // Ordenação estável final quando a varredura foi feita por múltiplos chunks de
+  // ids (cada chunk vem ordenado, mas a concatenação não está globalmente
+  // ordenada). Reordena in-memory pelos mesmos critérios do banco.
+  if (restrictIds && idParts.length > 1) {
+    const dirMul = ascending ? 1 : -1
+    out.sort((a, b) => {
+      const av = a[orderCol] ?? ""
+      const bv = b[orderCol] ?? ""
+      if (av !== bv) return (av < bv ? -1 : 1) * dirMul
+      // desempate estável por updated_at desc
+      const au = a.updated_at ?? ""
+      const bu = b.updated_at ?? ""
+      return au < bu ? 1 : au > bu ? -1 : 0
+    })
+  }
+
+  return out
+}
+
+/**
  * Resolve apenas os customerIds do total filtrado (para "selecionar todos os N").
- * Uma única passada (collectAll) — a mesma lógica/filtros da lista, sem re-query.
+ * Continua resolvendo o conjunto COMPLETO server-side: varre negotiation_state
+ * (paginado) sob os mesmos filtros/restrição satélite. Não quebra a seleção em
+ * lote — devolve todos os ids do universo filtrado, na ordem da lista.
  */
 export async function resolveFilteredCustomerIds(f: NegotiationFilters): Promise<string[]> {
   const full = await queryNegotiations(f, { collectAll: true })
