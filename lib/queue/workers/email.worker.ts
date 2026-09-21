@@ -9,6 +9,11 @@ export interface EmailJobData {
   html: string;
   text?: string;
   replyTo?: string;
+  /**
+   * Headers SMTP customizados incluídos no corpo do mail/send do SendGrid.
+   * Ex.: List-Unsubscribe / List-Unsubscribe-Post (RFC 2369/8058). Opcional.
+   */
+  headers?: Record<string, string>;
   metadata?: {
     chargeId?: string;
     customerId?: string;
@@ -20,6 +25,42 @@ interface SendGridResponse {
   success: boolean;
   messageId?: string;
   error?: string;
+}
+
+/**
+ * Monta o corpo do `POST /v3/mail/send`. Pura (sem I/O) para ser testável sem
+ * subir worker/Redis. Inclui `headers` custom no nível do envelope quando houver
+ * — o SendGrid aplica esses headers a todas as personalizations.
+ */
+export function buildSendGridRequestBody(
+  params: EmailJobData,
+  from: { email: string; name: string },
+): Record<string, unknown> {
+  const recipients = Array.isArray(params.to) ? params.to : [params.to];
+
+  const personalizations = recipients.map((email) => ({
+    to: [{ email }],
+  }));
+
+  const requestBody: Record<string, unknown> = {
+    personalizations,
+    from,
+    subject: params.subject,
+    content: [
+      ...(params.text ? [{ type: 'text/plain', value: params.text }] : []),
+      { type: 'text/html', value: params.html },
+    ],
+  };
+
+  if (params.replyTo) {
+    requestBody.reply_to = { email: params.replyTo };
+  }
+
+  if (params.headers && Object.keys(params.headers).length > 0) {
+    requestBody.headers = { ...params.headers };
+  }
+
+  return requestBody;
 }
 
 async function sendEmailViaSendGrid(params: EmailJobData): Promise<SendGridResponse> {
@@ -38,25 +79,7 @@ async function sendEmailViaSendGrid(params: EmailJobData): Promise<SendGridRespo
     return { success: false, error: 'SENDGRID_API_KEY not configured' };
   }
 
-  const recipients = Array.isArray(params.to) ? params.to : [params.to];
-
-  const personalizations = recipients.map((email) => ({
-    to: [{ email }],
-  }));
-
-  const requestBody: Record<string, unknown> = {
-    personalizations,
-    from: { email: fromEmail, name: fromName },
-    subject: params.subject,
-    content: [
-      ...(params.text ? [{ type: 'text/plain', value: params.text }] : []),
-      { type: 'text/html', value: params.html },
-    ],
-  };
-
-  if (params.replyTo) {
-    requestBody.reply_to = { email: params.replyTo };
-  }
+  const requestBody = buildSendGridRequestBody(params, { email: fromEmail, name: fromName });
 
   const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
     method: 'POST',

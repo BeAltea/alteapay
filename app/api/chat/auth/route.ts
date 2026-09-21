@@ -7,9 +7,10 @@
 import { NextRequest, NextResponse } from "next/server"
 import { validateToken } from "@/lib/journey/tokens"
 import { authenticateDebtor, GENERIC_AUTH_MESSAGE } from "@/lib/journey/auth"
-import { authenticateByDocument } from "@/lib/journey/generic-auth"
+import { authenticateByDocument, authenticateByPublicLink } from "@/lib/journey/generic-auth"
 import { normalizeDocument } from "@/lib/journey/document"
 import { resolveCompanyBySlug } from "@/lib/journey/resolver"
+import { resolvePublicLink } from "@/lib/journey/public-link"
 
 export const dynamic = "force-dynamic"
 
@@ -34,6 +35,7 @@ export async function POST(req: NextRequest) {
   let body: {
     token?: string
     tenantSlug?: string
+    code?: string
     document?: string
     birthDate?: string
     consent?: boolean
@@ -44,6 +46,39 @@ export async function POST(req: NextRequest) {
   } catch {
     await pad()
     return NextResponse.json({ ok: false, message: GENERIC_AUTH_MESSAGE }, { status: 400 })
+  }
+
+  // ---------- caminho LINK ÚNICO PÚBLICO (/n/{code}, sem token) ----------
+  // Resposta SEMPRE 200 nos casos de negócio (resolvido / no_debt / blocked) —
+  // MESMA mensagem e MESMO status para no_debt, com timing equalizado. Nada
+  // revela se o documento existe. O code endereça o tenant; o documento auth.
+  if (!body.token && !body.tenantSlug && body.code) {
+    const link = await resolvePublicLink(body.code)
+    if (!link.ok) {
+      await pad()
+      // code inválido/desligado/expirado: neutro (não enumera). Não é 404 que
+      // ajude a distinguir — mesma casca "indisponível" da página.
+      return NextResponse.json({ ok: false, reason: "unavailable", message: "not available" }, { status: 200 })
+    }
+    const result = await authenticateByPublicLink({
+      companyId: link.tenant.companyId,
+      document: normalizeDocument(body.document ?? ""),
+      consent: body.consent === true,
+      ip: clientIp(req),
+      userAgent: req.headers.get("user-agent"),
+      captchaToken: body.captchaToken ?? null,
+    })
+    await pad()
+    if (!result.ok) {
+      // HTTP 200 em todos os casos de negócio (no_debt/blocked/invalid): o
+      // status não distingue "documento existe" de "não existe".
+      return NextResponse.json({ ok: false, reason: result.reason, message: result.message }, { status: 200 })
+    }
+    const res = NextResponse.json({ ok: true, sessionId: result.sessionId })
+    res.cookies.set(result.cookieName, result.cookieValue, {
+      httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: result.cookieMaxAge,
+    })
+    return res
   }
 
   // ---------- caminho GENÉRICO (slug, sem token) ----------

@@ -42,5 +42,5 @@ export default async function JourneyChoicePage({
     }
   }
 
-  return <ChoiceScreen token={token} brandName={result.tenant.branding.brandName} />
+  return <ChoiceScreen token={token} />
 }

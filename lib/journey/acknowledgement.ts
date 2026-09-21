@@ -15,7 +15,7 @@
 //
 // IDs: 1=Sim reconhece, 0=Não reconhece. show_handoff_button liga o [99].
 
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { recordEvent } from "./events"
 import { BTN_HANDOFF, BTN_NO, BTN_YES, type Button } from "./buttons"
@@ -318,6 +318,65 @@ export async function recordAcknowledgement(input: {
   }
 
   return { ok: true, acknowledged: true, buttonId: input.buttonId }
+}
+
+export type StartN8nResult =
+  | { ok: true; owner: "n8n"; delivered: boolean }
+  | { ok: true; owner: "platform"; delivered: false } // fallback assistido (H8)
+
+/**
+ * H7: handoff ao n8n no reconhecimento "Sim" (button_id=1). Efeitos:
+ *   1) marca negotiation_sessions.engine_owner='n8n' (a partir daí, os turnos
+ *      vão ao fluxo);
+ *   2) emite negotiation.start ao n8n (Apêndice B, assinado; centavos, doc
+ *      mascarado);
+ *   3) journey_events: negotiation.start (entregue) OU engine_unavailable
+ *      (fallback assistido, H8) — auditoria.
+ *
+ * RESILIENTE (H8): se o n8n não estiver plugado/o disparo falhar, mantém
+ * engine_owner='platform' (assistido) e NUNCA lança — o cliente segue sem ver
+ * erro. O contrato negotiation.start é o MESMO nos dois casos.
+ */
+export async function startN8nNegotiation(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+}): Promise<StartN8nResult> {
+  const supabase = createServiceClient()
+  const eventId = randomUUID()
+
+  const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+  const emit = await emitNegotiationStart(input.sessionId, eventId)
+
+  const delivered = emit.ok === true && "delivered" in emit && emit.delivered === true
+  const owner: "n8n" | "platform" = delivered ? "n8n" : "platform"
+
+  // Só assume o dono n8n quando o disparo foi entregue. Sem entrega → assistido.
+  await supabase
+    .from("negotiation_sessions")
+    .update({ engine_owner: owner, updated_at: new Date().toISOString() })
+    .eq("id", input.sessionId)
+
+  await recordEvent({
+    companyId: input.companyId,
+    customerId: input.customerId,
+    debtId: input.debtId,
+    sessionId: input.sessionId,
+    // O funil não tem estágio próprio para negotiation.start; usamos um evento de
+    // timeline (chat.turn.assistant marca a transição de dono do engine na
+    // auditoria, com um payload explícito). engine_unavailable idem, no fallback.
+    type: "chat.turn.assistant",
+    actor: delivered ? "n8n" : "system",
+    eventId: delivered ? `neg_start:${eventId}` : `neg_start_unavailable:${eventId}`,
+    payload: delivered
+      ? { event: "negotiation.start", engine_owner: "n8n" }
+      : { event: "engine_unavailable", engine_owner: "platform", reason: "reason" in emit ? emit.reason : "unknown" },
+  })
+
+  return delivered
+    ? { ok: true, owner: "n8n", delivered: true }
+    : { ok: true, owner: "platform", delivered: false }
 }
 
 export type AckGuard =

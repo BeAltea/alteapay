@@ -4,7 +4,6 @@
 // data de nascimento condicional, consentimento LGPD obrigatório.
 // Nunca guarda PII em title/localStorage/query; erro SEMPRE genérico.
 import { useState } from "react"
-import { useRouter } from "next/navigation"
 
 function maskCpf(digits: string): string {
   const d = digits.replace(/\D/g, "").slice(0, 11)
@@ -21,10 +20,11 @@ export function JourneyAuthForm({
 }: {
   token: string
   requireBirthDate: boolean
-  /** Para onde ir após autenticar. Default relativo à página de auth. */
+  /** Para onde ir após autenticar. Idealmente ABSOLUTO (ex.: /c/{token}/chat):
+   *  a navegação é HARD (window.location) de propósito, para o layout
+   *  re-renderizar no servidor e revelar a marca do credor só após o login. */
   successHref?: string
 }) {
-  const router = useRouter()
   const [cpf, setCpf] = useState("")
   const [birthDate, setBirthDate] = useState("")
   const [consent, setConsent] = useState(false)
@@ -53,7 +53,9 @@ export function JourneyAuthForm({
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data?.ok) {
-        router.replace(successHref)
+        // Navegação HARD (não router.replace): força o layout server-side a
+        // re-renderizar já com o cookie de sessão → revela a marca do credor.
+        window.location.assign(successHref)
         return
       }
       // Mensagem sempre genérica (410 = link; demais = credencial).

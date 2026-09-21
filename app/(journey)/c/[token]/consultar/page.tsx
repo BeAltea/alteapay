@@ -18,11 +18,13 @@ export default async function JourneyConsultPage({
   if (!result.ok) notFound()
 
   // A partir de /c/{token}/consultar, o chat vive em /c/{token}/chat.
+  // successHref ABSOLUTO: o auth-form navega via window.location (hard) para o
+  // layout re-renderizar no servidor e revelar a marca do credor só pós-login.
   return (
     <JourneyAuthForm
       token={token}
       requireBirthDate={result.tenant.authRequireBirthDate}
-      successHref="../chat"
+      successHref={`/c/${token}/chat`}
     />
   )
 }
