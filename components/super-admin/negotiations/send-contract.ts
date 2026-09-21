@@ -37,6 +37,8 @@ export interface SendPreviewResponse {
   allowedModes: SendMode[]
   /** link /n/{code} a ser enviado (opaco por cedente). null = link único desabilitado. */
   publicLink: string | null
+  /** link único habilitado no cedente (o publicLink pode ser null mesmo assim se faltar code). */
+  linkEnabled?: boolean
 }
 
 export type SendOutcome = "sent" | "failed" | "suppressed" | "skipped"

@@ -41,6 +41,10 @@ export interface NegotiationRow {
   campaignId: string | null
   campaignName: string | null
   suppressed: boolean
+  /** código do link único do cedente (tenant_chat_config.public_link_code). null
+   * quando o cedente não tem code ou o link único está desabilitado. Usado para
+   * o botão "Copiar link" (nunca um link placeholder). */
+  publicLinkCode: string | null
 }
 
 export interface NegotiationListResult {
@@ -102,6 +106,21 @@ async function loadSatellites(
     for (const c of data ?? []) companyById.set(c.id, c.name)
   }
 
+  // link único por cedente (tenant_chat_config). code só é exposto quando o link
+  // está habilitado — senão o botão "Copiar link" fica desabilitado (sem link
+  // quebrado). Isolado por company (uma linha de config por company).
+  const publicLinkByCompany = new Map<string, string | null>()
+  for (const part of chunks(Array.from(new Set(companyIds)))) {
+    const { data } = await (supabase as any)
+      .from("tenant_chat_config")
+      .select("company_id, public_link_code, public_link_enabled")
+      .in("company_id", part)
+    for (const c of data ?? []) {
+      const enabled = c.public_link_enabled ?? false
+      publicLinkByCompany.set(c.company_id, enabled && c.public_link_code ? c.public_link_code : null)
+    }
+  }
+
   const campaignById = new Map<string, string>()
   const validCampaignIds = campaignIds.filter(Boolean)
   if (validCampaignIds.length) {
@@ -158,7 +177,7 @@ async function loadSatellites(
     for (const s of data ?? []) if (s.customer_id) suppressed.add(s.customer_id)
   }
 
-  return { customerById, companyById, campaignById, debtAgg, suppressed }
+  return { customerById, companyById, campaignById, debtAgg, suppressed, publicLinkByCompany }
 }
 
 /**
@@ -234,6 +253,7 @@ export async function queryNegotiations(
       campaignId: r.campaign_id ?? null,
       campaignName: r.campaign_id ? (sat.campaignById.get(r.campaign_id) ?? null) : null,
       suppressed: sat.suppressed.has(r.customer_id),
+      publicLinkCode: sat.publicLinkByCompany.get(r.company_id) ?? null,
     }
   })
 

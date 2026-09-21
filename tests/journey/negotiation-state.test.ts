@@ -240,3 +240,131 @@ describe("rebuild == incremental (diferença ZERO)", () => {
     expect(rebuilt.stage).toBe("charge_cancelled")
   })
 })
+
+// O bug latente que a validação vt-data apontou: o incremental aplica os eventos
+// na ordem de CHEGADA (não a cronológica). Antes da correção, um evento de
+// DOMÍNIO com occurred_at retroativo chegando por ÚLTIMO clobberava o estágio e
+// divergia do rebuild (que ordena por occurred_at). Aqui `incremental` recebe a
+// lista SEM ordenar — é a ordem de chegada de verdade — e deve igualar o rebuild.
+describe("rebuild == incremental para DOMÍNIO fora de ordem (ordem de CHEGADA)", () => {
+  const t1 = "2026-09-21T10:00:00.000Z" // payment.generated
+  const t2 = "2026-09-21T10:30:00.000Z" // payment.cancelled (retroativo)
+  const t3 = "2026-09-21T11:00:00.000Z" // payment.paid
+
+  it("payment.cancelled@t2 RETROATIVO chegando por último não diverge do rebuild", () => {
+    // Ordem de chegada: gerado(t1) → pago(t3) → cancelado(t2, retroativo)
+    const arrival: JourneyEventLike[] = [
+      ev("payment.generated", t1),
+      ev("payment.paid", t3),
+      ev("payment.cancelled", t2), // occurred_at anterior, mas chega por último
+    ]
+    const rebuilt = reduceEvents(arrival) // ordena por occurred_at internamente
+    const inc = incremental(arrival) // ordem de CHEGADA, SEM ordenar
+    expect(inc).toEqual(rebuilt)
+    // Cronologicamente o cancelamento vem ANTES do pagamento → estado final = paid.
+    expect(inc.stage).toBe("paid")
+    expect(inc.stage_rank).toBe(100)
+    expect(inc.stage_at).toBe(t3)
+    expect(inc.has_live_charge).toBe(false)
+    // marks guardam o menor occurred_at por marco, independente da chegada.
+    expect(inc.marks.charge_generated).toBe(t1)
+    expect(inc.marks.charge_cancelled).toBe(t2)
+    expect(inc.marks.paid).toBe(t3)
+  })
+
+  it("gate não super-suprime: cancelamento que É o mais recente ainda regride", () => {
+    // Ordem de chegada embaralhada, mas o cancelamento é o evento mais recente.
+    const arrival: JourneyEventLike[] = [
+      ev("payment.paid", t2), // pago em t2
+      ev("payment.generated", t1), // gerado em t1 (chega depois, retroativo)
+      ev("payment.cancelled", t3), // cancelado em t3 (o mais recente) chega por último
+    ]
+    const rebuilt = reduceEvents(arrival)
+    const inc = incremental(arrival)
+    expect(inc).toEqual(rebuilt)
+    // Cronologicamente o cancelamento é o último → regride para charge_cancelled.
+    expect(inc.stage).toBe("charge_cancelled")
+    expect(inc.stage_rank).toBe(75)
+    expect(inc.stage_at).toBe(t3)
+    expect(inc.has_live_charge).toBe(false)
+  })
+
+  it("optout retroativo chegando por último não derruba estado mais recente", () => {
+    // optout aconteceu cedo (t1) mas só chega depois do fluxo já ter avançado.
+    const arrival: JourneyEventLike[] = [
+      ev("auth.success", t2),
+      ev("chat.turn.customer", t3),
+      ev("optout.received", t1), // retroativo, chega por último
+    ]
+    const rebuilt = reduceEvents(arrival)
+    const inc = incremental(arrival)
+    expect(inc).toEqual(rebuilt)
+    // Cronologicamente: optout(t1) → auth(t2) → in_chat(t3) ⇒ estado final in_chat.
+    expect(inc.stage).toBe("in_chat")
+  })
+
+  it("cancel cronologicamente SOTERRADO (t2) por um paid posterior (t3): equivalência em toda permutação de chegada", () => {
+    // Neste conjunto o cancelamento é o do MEIO no tempo (t2), então o paid(t3)
+    // sempre o soterra tanto no rebuild quanto no incremental — logo TODAS as
+    // ordens de chegada convergem. (NÃO generalizar: ver teste da FRONTEIRA
+    // não-comutativa abaixo, onde o cancel é o último no tempo.)
+    const base: JourneyEventLike[] = [
+      ev("payment.generated", t1),
+      ev("payment.cancelled", t2),
+      ev("payment.paid", t3),
+    ]
+    const canonical = reduceEvents(base)
+    const permute = (arr: JourneyEventLike[]): JourneyEventLike[][] =>
+      arr.length <= 1
+        ? [arr]
+        : arr.flatMap((x, i) =>
+            permute([...arr.slice(0, i), ...arr.slice(i + 1)]).map((p) => [x, ...p]),
+          )
+    for (const order of permute(base)) {
+      expect(incremental(order)).toEqual(reduceEvents(order))
+      expect(incremental(order)).toEqual(canonical)
+    }
+    expect(canonical.stage).toBe("paid")
+  })
+})
+
+// FRONTEIRA HONESTA (Opção B): eventos de DOMÍNIO NÃO comutam em geral. Quando um
+// avanço de CANAL é cronologicamente ANTERIOR a uma regressão de DOMÍNIO mas chega
+// por último, o incremental (advance-only para canal, não bloqueia) avança e diverge
+// do rebuild. Este teste TRAVA esse contrato: rebuild é a FONTE DE VERDADE e regride;
+// o incremental pode divergir e por isso o módulo exige rebuild após domínio fora de
+// ordem. Se um dia o incremental virar totalmente comutativo (Opção A, requer coluna
+// nova), este teste deve ser reescrito para exigir igualdade.
+describe("fronteira não-comutativa de domínio — rebuild é a fonte de verdade", () => {
+  const t1 = "2026-09-21T10:00:00.000Z" // payment.generated
+  const t2 = "2026-09-21T10:30:00.000Z" // payment.paid (canal, rank 100)
+  const t3 = "2026-09-21T11:00:00.000Z" // payment.cancelled (domínio, o mais recente)
+
+  it("cancel É o último no tempo, mas paid (canal) chega por último: rebuild regride, incremental não", () => {
+    // Cronológico: gerado(t1) → pago(t2) → cancelado(t3). Rebuild = charge_cancelled(t3).
+    const arrival: JourneyEventLike[] = [
+      ev("payment.generated", t1),
+      ev("payment.cancelled", t3),
+      ev("payment.paid", t2), // canal de rank alto, cronologicamente ANTES do cancel, chega por último
+    ]
+    const rebuilt = reduceEvents(arrival)
+    const inc = incremental(arrival)
+
+    // Rebuild (fonte de verdade) aplica na ordem cronológica → cancel é o último → regride.
+    expect(rebuilt.stage).toBe("charge_cancelled")
+    expect(rebuilt.stage_rank).toBe(75)
+    expect(rebuilt.has_live_charge).toBe(false)
+
+    // Incremental: paid (canal) chega por último e AVANÇA (advance-only não é gated),
+    // divergindo. Documentado: por isso rode rebuild após domínio fora de ordem.
+    expect(inc.stage).toBe("paid")
+    expect(inc.stage_rank).toBe(100)
+    expect(inc).not.toEqual(rebuilt)
+
+    // marks são order-independent nos dois caminhos (menor occurred_at por marco).
+    expect(rebuilt.marks).toEqual(inc.marks)
+    expect(inc.marks.charge_cancelled).toBe(t3)
+    expect(inc.marks.paid).toBe(t2)
+    expect(inc.marks.charge_generated).toBe(t1)
+  })
+})

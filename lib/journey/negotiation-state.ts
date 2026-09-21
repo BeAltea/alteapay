@@ -11,7 +11,28 @@
 //     faz 'paid' regredir para 'dispatched').
 //   - Só eventos de DOMÍNIO regridem (cobrança cancelada / acordo desfeito): eles
 //     definem o estágio explicitamente, mesmo para baixo.
-//   - marks[<marco>] recebe o timestamp (occurred_at) da primeira ocorrência.
+//   - marks[<marco>] recebe o MENOR occurred_at observado para o marco (primeira
+//     ocorrência CRONOLÓGICA — independente da ordem de chegada).
+//
+// EQUIVALÊNCIA rebuild==incremental — ESCOPO EXATO (sem a lorota "diferença
+// zero para tudo"):
+//   • Eventos de CANAL (advance-only): a projeção incremental (ordem de CHEGADA)
+//     é PROVADAMENTE idêntica ao rebuild (ordena por occurred_at), porque o
+//     resultado depende só do max-rank + menor occurred_at por marco — ambos
+//     comutativos. Este é o ÚNICO caminho que o incremental exercita em produção
+//     hoje (message.queued/message.sent/…), logo a equivalência é REAL para o
+//     que está vivo.
+//   • Eventos de DOMÍNIO (podem regredir): NÃO comutam em geral. Para não deixar
+//     divergência LATENTE perigosa, o incremental aplica um CHRONOLOGY GATE — um
+//     domínio só regride se for cronologicamente igual/posterior ao stage_at
+//     corrente, então um cancelamento RETROATIVO chegando por último (ex.:
+//     payment.cancelled@t2 depois de payment.paid@t3, o caso realista de webhook
+//     atrasado) NÃO clobbera o estado. Isso NÃO garante igualdade byte-a-byte
+//     para toda permutação de domínio; para consistência EXATA após qualquer
+//     sequência de domínio fora de ordem, a fonte de verdade é
+//     rebuildNegotiationState (que ordena por occurred_at). Regra prática:
+//     domínio muda pouco e via webhook → rode o rebuild da empresa quando um
+//     domínio fora de ordem for possível.
 //
 // Módulo PURO no núcleo (reduceEvents/applyEventToState) — testável sem banco.
 // A leitura/gravação em Supabase fica isolada nas duas funções assíncronas.
@@ -158,8 +179,32 @@ export function initialState(): NegotiationStateProjection {
 const LIVE_CHARGE_STAGES = new Set<string>(["charge_generated", "overdue"])
 
 /**
- * Aplica um evento a um estado (função PURA). Nunca regride por evento de canal;
- * eventos de domínio definem o estágio explicitamente (podem baixar o rank).
+ * Aplica um evento a um estado (função PURA).
+ *
+ * ── EVENTOS DE CANAL (advance-only) ────────────────────────────────────────
+ * Só AVANÇAM o estágio (nunca regridem): assumem o estágio quando o rank sobe.
+ * Essa regra é INDEPENDENTE DE ORDEM (o resultado é o max-rank), então para um
+ * fluxo composto SÓ por eventos de canal o incremental (ordem de chegada) é
+ * PROVADAMENTE idêntico ao rebuild (ordenado por occurred_at). É este o único
+ * caminho que a projeção incremental exercita hoje em produção (message.queued/
+ * message.sent etc.), e por isso a equivalência é REAL para o que está vivo.
+ *
+ * ── EVENTOS DE DOMÍNIO (podem REGREDIR) ────────────────────────────────────
+ * Definem o estágio explicitamente, inclusive para baixo (cobrança cancelada,
+ * disputa, opt-out). Aqui a ordem IMPORTA: dois domínios (ou um domínio + um
+ * canal posterior de rank maior) não comutam em geral. Para não introduzir
+ * divergência LATENTE, aplicamos um CHRONOLOGY GATE: um evento de domínio só
+ * regride/assume o estágio se for cronologicamente igual/posterior ao stage_at
+ * corrente. Assim um domínio RETROATIVO chegando por último (ex.:
+ * payment.cancelled@t2 depois de payment.paid@t3) NÃO clobbera o estado — o
+ * caso mais provável em produção (cancel de webhook atrasado). Isso NÃO garante
+ * igualdade byte-a-byte com o rebuild para toda permutação de domínio (ex.: um
+ * avanço de canal cronologicamente ANTERIOR a um domínio regressivo): para
+ * consistência EXATA após qualquer sequência de domínio fora de ordem, rode
+ * `rebuildNegotiationState` (ordena por occurred_at). Ver comentário do cabeçalho.
+ *
+ * marks[<marco>] guardam sempre o MENOR occurred_at por marco — independente da
+ * ordem de chegada (primeira ocorrência CRONOLÓGICA).
  */
 export function applyEventToState(
   state: NegotiationStateProjection,
@@ -178,11 +223,26 @@ export function applyEventToState(
 
   const candidateRank = stageRank(mapping.stage)
   const markKey = mapping.mark ?? mapping.stage
-  // marco: primeira ocorrência vence (append-only na projeção).
-  if (next.marks[markKey] === undefined) next.marks[markKey] = event.occurred_at
+  // marco: MENOR occurred_at vence (primeira ocorrência CRONOLÓGICA, não a de
+  // chegada) — reconcilia eventos fora de ordem sem depender do histórico.
+  const prevMark = next.marks[markKey]
+  if (prevMark === undefined || event.occurred_at < prevMark) {
+    next.marks[markKey] = event.occurred_at
+  }
 
-  const advances = candidateRank > next.stage_rank
-  if (mapping.domain || advances) {
+  if (mapping.domain) {
+    // Domínio: regride/assume, mas só se cronologicamente igual/posterior ao
+    // estado corrente. stage_at === null = estado inicial (qualquer um assume).
+    // Bloqueia domínio RETROATIVO chegando por último (não clobbera).
+    const isChronologicallyCurrent =
+      next.stage_at === null || event.occurred_at >= next.stage_at
+    if (isChronologicallyCurrent) {
+      next.stage = mapping.stage
+      next.stage_rank = candidateRank
+      next.stage_at = event.occurred_at
+    }
+  } else if (candidateRank > next.stage_rank) {
+    // Canal: só avança (rank sobe). Independente de ordem → rebuild==incremental.
     next.stage = mapping.stage
     next.stage_rank = candidateRank
     next.stage_at = event.occurred_at
@@ -292,8 +352,11 @@ export async function applyJourneyEventToState(
 
 /**
  * Recomputo completo e idempotente da empresa a partir de journey_events.
- * Agrupa por customer_id e reduz cada grupo. Resultado IDÊNTICO à projeção
- * incremental (validado com diferença zero). Retorna { customers } processados.
+ * Agrupa por customer_id e reduz cada grupo em ordem de occurred_at. É a FONTE
+ * DE VERDADE do estágio: para fluxos só de CANAL bate byte-a-byte com a projeção
+ * incremental; para DOMÍNIO fora de ordem, é este rebuild que dá o resultado
+ * exato (o incremental só garante não-clobber de domínio retroativo). Rode-o
+ * após qualquer chegada de domínio fora de ordem. Retorna { customers } processados.
  */
 export async function rebuildNegotiationState(
   companyId: string,

@@ -33,7 +33,42 @@ O **modo de disparo** do tenant é `whatsapp_dispatch_mode`:
 
 ## 2. Dialeto `enterprise_v1` (contrato REAL verificado) — DEFAULT
 
-### 2.1 Disparo (API de entrada da Voxuy)
+### 2.1 Template (regras Meta obrigatórias)
+
+O texto da mensagem **não mora neste repo**: ele é uma **template aprovada na conta
+Voxuy/Meta**. A plataforma só injeta variáveis (§2.2) — quem escreve/aprova o texto
+tem de respeitar as regras da Meta abaixo, senão o canal quebra ou é bloqueado:
+
+- **Categoria `Utilidade` (Utility), NÃO `Marketing`.** É uma mensagem
+  transacional/de serviço (retomar uma relação existente), não promocional. Se a
+  Meta **reclassificar** a template para `Marketing`, o canal pode **bloquear** o
+  envio (janela/opt-in de marketing) — a template precisa ser reescrita e
+  reaprovada como Utilidade.
+- **NÃO conter, no texto:** valor, número de faturas, nem os termos
+  **"dívida", "atraso", "negativado", "SPC", "Serasa"** (ou equivalentes). O corpo
+  é **neutro de cobrança** — coerente com o payload, que já **não** carrega valor
+  nem `document` (§2.4, trava final). Constrangimento/ameaça reprova na Meta e
+  fere a LGPD.
+- **Não iniciar nem terminar a mensagem com variável.** Regra da Meta: a primeira
+  e a última "palavra" do corpo **não** podem ser um placeholder. Portanto
+  `{{link_negociacao}}` e `{{primeiro_nome}}` ficam **no MEIO do texto** ou, no caso
+  do link, dentro de um **botão de URL** — nunca colados na borda do corpo.
+- **Oferecer opt-out (descadastro).** A template DEVE trazer um caminho de saída:
+  um **botão** de "parar de receber" **ou** uma **instrução em texto** do tipo
+  *"responda SAIR para não receber mais"*. Isso é necessário porque o dialeto
+  default `enterprise_v1` envia **apenas 3 variáveis** (`link_negociacao`,
+  `primeiro_nome`, `credor`) e **NÃO** carrega `optout_url` — não há como injetar um
+  link de descadastro pelo payload. O descadastro do WhatsApp depende, então, de:
+  (1) a template dar o caminho ("responda SAIR"/botão), e (2) a Voxuy nos devolver
+  esse reply **"SAIR"** por callback (§7). Quando esse sinal chega, **a nossa
+  supressão é autoritativa** (`contact_suppressions`, fail-closed) e o contato não
+  recebe mais.
+
+> Resumo operacional: template = **Utilidade**, texto **neutro** (sem
+> valor/dívida/atraso/SPC/Serasa), **variável nunca na borda**, e **um opt-out
+> explícito**. Sem isso, a Meta reprova/reclassifica e o disparo para de sair.
+
+### 2.2 Disparo (API de entrada da Voxuy)
 
 - **Endpoint:** a URL vem do painel da Voxuy e **contém o companyId embutido** →
   **A URL É A CREDENCIAL.** Env `VOXUY_WEBHOOK_URL` (segredo). Só `https://`.
@@ -74,7 +109,7 @@ dispara. Onde ler o `flowId` no painel da Voxuy é **pergunta aberta** (§8).
 `VoxuyApiConfig.webhookUrl`. É a credencial — tratada como segredo em todo o
 código (nunca logada).
 
-### 2.2 Resposta e classificação
+### 2.3 Resposta e classificação
 
 - `{"success": true}` + HTTP 200 ⇒ `accepted`.
 - `{"success": false, "message": "..."}` + HTTP 400 (ou 200 com `success:false`)
@@ -96,7 +131,7 @@ código (nunca logada).
 Timeout: `VOXUY_TIMEOUT_MS` (default `10000`). **1 tentativa por job** (o BullMQ
 reagenda os retryáveis).
 
-### 2.3 Idempotência (é NOSSA)
+### 2.4 Idempotência (é NOSSA)
 
 O Enterprise **não tem chave de idempotência** neste caso: sem `transaction` não
 há `id`/`orderNumber` para reconciliar. O controle é **NOSSO**:
@@ -110,7 +145,7 @@ há `id`/`orderNumber` para reconciliar. O controle é **NOSSO**:
 chave de idempotência do lado deles, assumimos que sim — por isso o controle
 antiduplicação vive todo do nosso lado (§8).
 
-### 2.4 Trava final comum (`assertFinalPayloadSafe`)
+### 2.5 Trava final comum (`assertFinalPayloadSafe`)
 
 Vale para **todos os dialetos**. O corpo final é validado por zod:
 - **proíbe** `document`/`cpf` (topo **e** `contact.*`), `clientDocument`, e
@@ -212,6 +247,12 @@ Placeholders (resolvidos em corpo **e** headers): `{{link_negociacao}}`,
   (`error: "invalid_whatsapp"`) para marcar o número inválido. Sem sinal
   acionável ⇒ `[]` (a rota grava o bruto em `whatsapp_provider_events` com
   `processed=false` para análise).
+- **Opt-out ("SAIR"):** o descadastro do WhatsApp depende deste callback. A
+  template (§2.1) instrui o contato a responder **"SAIR"** (ou usar o botão de
+  opt-out); quando esse reply nos chega, gravamos a supressão — **a nossa
+  supressão (`contact_suppressions`, fail-closed) é autoritativa** e o contato não
+  recebe novos disparos. Não injetamos `optout_url` no payload (o `enterprise_v1`
+  só leva 3 variáveis, §2.2).
 - **Resiliência:** dedupe por `event_hash`; corpo ilegível/fuzz ⇒ captura bruta;
   **NUNCA 500** (um provedor que recebe 5xx pode desativar o webhook).
 

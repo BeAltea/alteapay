@@ -7,6 +7,22 @@
 //
 // O envio real passa pela fila SendGrid (lib/notifications/email.sendEmail). Em
 // dryRun/mock o corpo é montado mas nada é enfileirado. Nunca loga PII.
+//
+// Descadastro / direito de oposição (LGPD art. 18): o rodapé do convite traz um
+// link visível de opt-out (o PRÓPRIO /n/{code}, onde, pós-login, o titular se
+// opõe a novos contatos — não há rota de opt-out dedicada, então reusamos o
+// link do hub). Além do link visível, expomos o header `List-Unsubscribe`
+// (+ `List-Unsubscribe-Post: List-Unsubscribe=One-Click`), que melhora a
+// reputação do sender e atende o direito de oposição para clientes que o honram.
+//
+// LIMITAÇÃO CONHECIDA: o helper `sendEmail` (lib/notifications/email) e o worker
+// SendGrid (lib/queue/workers/email.worker) NÃO expõem headers customizados hoje
+// — o `requestBody` da API SendGrid é montado sem `headers`, e `metadata` é
+// descartado antes do envio. O mínimo viável DENTRO deste arquivo é montar o
+// valor do header e passá-lo em `metadata.listUnsubscribe` (documentado abaixo)
+// para que, quando o worker/helper ganhar suporte a headers, o encanamento já
+// entregue o valor certo sem tocar neste módulo. Enquanto isso, o opt-out
+// EFETIVO é o link visível do rodapé.
 
 import { sendEmail } from "@/lib/notifications/email"
 
@@ -82,7 +98,10 @@ export function buildEmailInviteHtml(input: {
             </tr>
             <tr>
               <td style="padding:20px 30px;border-top:1px solid #e5e7eb;text-align:center;">
-                <p style="margin:0;color:#9ca3af;font-size:12px;">Enviado por ${input.brandName}</p>
+                <p style="margin:0 0 8px;color:#9ca3af;font-size:12px;">Enviado por ${input.brandName}</p>
+                <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5;">
+                  Não quer mais receber estas mensagens? <a href="${input.link}" style="color:#6b7280;text-decoration:underline;">Clique aqui</a> e, após entrar, informe que deseja parar de receber contatos.
+                </p>
               </td>
             </tr>
           </table>
@@ -110,6 +129,17 @@ export async function dispatchEmailInvite(input: EmailInviteInput): Promise<Emai
   })
 
   if (input.dryRun) return { ok: true, previewed: true }
+
+  // Header List-Unsubscribe (RFC 2369) + List-Unsubscribe-Post One-Click (RFC
+  // 8058). O alvo de opt-out é o próprio link do hub (/n/{code}); não há rota
+  // dedicada. Montamos os valores aqui como "mínimo viável" (§ LIMITAÇÃO no topo:
+  // sendEmail/worker ainda não repassam headers ao SendGrid; quando passarem, é só
+  // ligar `unsubHeaders` na chamada). O opt-out EFETIVO hoje é o link do rodapé.
+  const unsubHeaders: Record<string, string> = {
+    "List-Unsubscribe": `<${input.link}>`,
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  }
+  void unsubHeaders // TODO: repassar a sendEmail/worker quando suportarem headers
 
   const res = await sendEmail({
     to,

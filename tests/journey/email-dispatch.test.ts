@@ -27,11 +27,30 @@ describe("buildEmailInviteHtml", () => {
     })
     expect(html).toContain("https://app.example.com/n/k7Qm3Xb9Rt")
     expect(html).toContain("VMAX")
-    // corpo neutro de dívida: não expõe valor/boleto
+    // corpo neutro de dívida: não expõe valor/boleto/dívida
     expect(html).not.toMatch(/R\$\s*\d/)
     expect(html.toLowerCase()).not.toContain("boleto")
+    expect(html.toLowerCase()).not.toContain("dívida")
     // usa o primeiro nome
     expect(html).toContain("Maria,")
+  })
+
+  it("traz opt-out visível no rodapé (descadastro) apontando para o mesmo link", async () => {
+    const { buildEmailInviteHtml } = await import("@/lib/journey/email-dispatch")
+    const html = buildEmailInviteHtml({
+      customerName: "Maria Silva",
+      brandName: "AlteaPay",
+      creditorName: "VMAX",
+      link: "https://app.example.com/n/k7Qm3Xb9Rt",
+    })
+    const lower = html.toLowerCase()
+    // deixa claro como parar de receber
+    expect(lower).toContain("não quer mais receber")
+    expect(lower).toContain("parar de receber")
+    // o opt-out reusa o próprio link do hub (sem rota nova)
+    const unsubLinks = html.match(/https:\/\/app\.example\.com\/n\/k7Qm3Xb9Rt/g) ?? []
+    // aparece ao menos 3x: botão, fallback "copie e cole" e link de descadastro
+    expect(unsubLinks.length).toBeGreaterThanOrEqual(3)
   })
 })
 

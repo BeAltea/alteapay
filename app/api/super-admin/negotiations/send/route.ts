@@ -13,6 +13,9 @@
 // getWhatsAppProvider com voxuy_flow_id do tenant); senão e-mail válido → e-mail
 // (mesmo link); senão no_contact (fora, listado).
 //
+// Fonte da verdade do FORMATO: components/super-admin/negotiations/send-contract.ts
+// (a rota emite { dryRun, mode, campaignId, counts, results } que o diálogo lê).
+//
 // DISPATCH_MODE=inline|queue (default queue). inline dispara na request, com teto
 // INLINE_DISPATCH_MAX_BATCH (25) + rate-limit e TRAVA em super_admin. dryRun =
 // resultado completo sem enviar.
@@ -22,8 +25,16 @@
 
 import { NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
+import { createServiceClient } from "@/lib/supabase/service"
+import { maskDocument } from "@/lib/journey/document"
 import { createHubCampaign, loadTenantHubConfig, type NegotiationSendMode } from "@/lib/journey/campaigns"
-import { runHubSend } from "@/lib/journey/campaign-send"
+import { runHubSend, type HubSendItem } from "@/lib/journey/campaign-send"
+import { resolveSelection, type SelectionBody } from "../selection"
+import type {
+  SendMode,
+  SendOutcome,
+  SendResultRow,
+} from "@/components/super-admin/negotiations/send-contract"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -33,9 +44,8 @@ const noCache = { "Cache-Control": "no-store, no-cache, must-revalidate, max-age
 
 const INLINE_DISPATCH_MAX_BATCH = Number(process.env.INLINE_DISPATCH_MAX_BATCH ?? "25")
 
-interface SendBody {
+interface SendBody extends SelectionBody {
   companyId?: string
-  customerIds?: string[]
   mode?: string
   dryRun?: boolean
 }
@@ -72,6 +82,38 @@ function resolveDispatch(): "inline" | "queue" {
   return (process.env.DISPATCH_MODE ?? "queue").toLowerCase() === "inline" ? "inline" : "queue"
 }
 
+/** status do item do hub → desfecho do contrato. São nomes iguais, mas o cast
+ * garante o tipo do contrato mesmo se os conjuntos divergirem no futuro. */
+function toOutcome(status: HubSendItem["status"]): SendOutcome {
+  switch (status) {
+    case "sent":
+    case "failed":
+    case "suppressed":
+    case "skipped":
+      return status
+    default:
+      return "skipped"
+  }
+}
+
+/** Mascara o documento de cada customer (nunca em claro). */
+async function maskedDocuments(companyId: string, customerIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  if (customerIds.length === 0) return out
+  const supabase = createServiceClient()
+  const chunk = 300
+  for (let i = 0; i < customerIds.length; i += chunk) {
+    const part = customerIds.slice(i, i + chunk)
+    const { data } = await (supabase as any)
+      .from("customers")
+      .select("id, document")
+      .eq("company_id", companyId)
+      .in("id", part)
+    for (const c of data ?? []) out.set(c.id, maskDocument(c.document ?? null))
+  }
+  return out
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json().catch(() => ({}))) as SendBody
@@ -79,10 +121,12 @@ export async function POST(request: NextRequest) {
     if ("error" in auth) return auth.error
     const { companyId, role, userId } = auth
 
-    const customerIds = Array.isArray(body.customerIds) ? body.customerIds : []
-    if (customerIds.length === 0) {
-      return NextResponse.json({ error: "customerIds obrigatório" }, { status: 400, headers: noCache })
+    // Aceita { customerIds } OU { allFiltered }. Resolve ids no servidor.
+    const selection = await resolveSelection(body, companyId)
+    if ("error" in selection) {
+      return NextResponse.json({ error: selection.error }, { status: selection.status, headers: noCache })
     }
+    const { customerIds } = selection
 
     const hub = await loadTenantHubConfig(companyId)
     const mode: NegotiationSendMode =
@@ -130,16 +174,27 @@ export async function POST(request: NextRequest) {
       hubResult = await runHubSend({ campaignId: cid, companyId, dispatchMode, dryRun })
     }
 
+    // counts (=summary) + results POR DEVEDOR com documento MASCARADO.
+    const items: HubSendItem[] = hubResult?.items ?? []
+    const docs = await maskedDocuments(companyId, items.map((i) => i.customerId))
+    const results: SendResultRow[] = items.map((i) => ({
+      customerId: i.customerId,
+      documentMasked: docs.get(i.customerId) ?? "***",
+      channel: i.channel ?? null,
+      outcome: toOutcome(i.status),
+      detail: i.reason ?? null,
+    }))
+    const counts = hubResult?.summary ?? { sent: 0, failed: 0, suppressed: 0, skipped: 0 }
+
     return NextResponse.json(
       {
-        mode,
-        dispatchMode,
         dryRun,
+        mode: mode as SendMode,
+        dispatchMode,
         campaignId,
         chargeEmail: chargeEmailDelegation,
-        ...(hubResult
-          ? { summary: hubResult.summary, items: hubResult.items }
-          : { summary: null, items: [] }),
+        counts,
+        results,
       },
       { headers: noCache },
     )

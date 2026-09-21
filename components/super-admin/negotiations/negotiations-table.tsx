@@ -153,7 +153,11 @@ export function NegotiationsTable({ companyOptions, campaignOptions, channelOpti
   const sortArrow = (field: "stage" | "last_activity") =>
     filters.sort === field ? (filters.dir === "asc" ? " ↑" : " ↓") : ""
 
-  const publicLinkFor = (companyId: string) => `/n/${companyId.slice(0, 8)}` // placeholder p/ copiar; link real vem do preview
+  // Link único REAL do cedente (tenant_chat_config.public_link_code, exposto pela
+  // query só quando habilitado). null → botão "Copiar link" desabilitado (nunca
+  // copiamos um link quebrado/placeholder).
+  const publicLinkFor = (code: string | null) =>
+    code ? `${window.location.origin}/n/${code}` : null
 
   return (
     <TooltipProvider>
@@ -330,13 +334,19 @@ export function NegotiationsTable({ companyOptions, campaignOptions, channelOpti
                         </button>
                         <button
                           type="button"
+                          disabled={!r.publicLinkCode}
                           onClick={() => {
-                            void navigator.clipboard?.writeText(
-                              `${window.location.origin}${publicLinkFor(r.companyId)}`,
-                            )
+                            const link = publicLinkFor(r.publicLinkCode)
+                            if (!link) return
+                            void navigator.clipboard?.writeText(link)
                             toast({ title: "Link copiado" })
                           }}
-                          className="text-primary underline underline-offset-2"
+                          className="text-primary underline underline-offset-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:no-underline"
+                          title={
+                            r.publicLinkCode
+                              ? "Copiar link único do cedente"
+                              : "Link único desabilitado para este cedente"
+                          }
                         >
                           Copiar link
                         </button>
