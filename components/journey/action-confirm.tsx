@@ -50,7 +50,7 @@ export function ActionConfirm({
           Você não receberá mais mensagens neste número.
         </p>
         <p className="text-sm text-neutral-500">
-          Se isso foi sem querer, fale com o atendimento da {brandName}
+          Se isso foi sem querer, fale com o nosso atendimento
           {officialChannelUrl ? (
             <>
               {" "}

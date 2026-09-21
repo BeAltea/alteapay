@@ -6,15 +6,16 @@
 // sempre, sob nosso controle e auditáveis.
 import { useRouter } from "next/navigation"
 
-export function ChoiceScreen({ token, brandName }: { token: string; brandName: string }) {
+export function ChoiceScreen({ token }: { token: string }) {
   const router = useRouter()
   return (
     <div className="flex flex-1 flex-col gap-6">
       <div>
         <h1 className="text-xl font-semibold">Há uma atualização em seu nome</h1>
         <p className="mt-2 text-sm text-neutral-600">
-          Existe uma atualização sobre um contrato registrado em seu nome junto à{" "}
-          <span className="font-medium">{brandName}</span>. Escolha uma opção abaixo.
+          Existe uma atualização sobre um contrato registrado em seu nome. Por segurança, o
+          credor e os detalhes só aparecem após a confirmação dos seus dados. Escolha uma opção
+          abaixo.
         </p>
       </div>
 
