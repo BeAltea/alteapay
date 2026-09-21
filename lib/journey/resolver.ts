@@ -43,6 +43,36 @@ interface DebtRow {
   due_date: string | null
 }
 
+interface CustomerRow {
+  id: string
+  name: string | null
+  document: string | null
+}
+
+/** Tamanho de página do scan de fallback (limite default do PostgREST). */
+const CUSTOMER_PAGE_SIZE = 1000
+
+/**
+ * Formatos candidatos de `customers.document` para um documento normalizado.
+ * A base guarda quase tudo como dígitos crus (11 ou 14) e poucos casos
+ * pontuados — então buscamos por [cru, pontuado] e deixamos o `.find()`
+ * normalizado no chamador cobrir pontuações parciais. Retorna um único valor
+ * (o cru) para comprimentos atípicos: o fallback paginado cobre esses casos.
+ */
+export function documentCandidates(doc: string): string[] {
+  if (doc.length === 11) {
+    // CPF pontuado: XXX.XXX.XXX-XX
+    const dotted = `${doc.slice(0, 3)}.${doc.slice(3, 6)}.${doc.slice(6, 9)}-${doc.slice(9, 11)}`
+    return [doc, dotted]
+  }
+  if (doc.length === 14) {
+    // CNPJ pontuado: XX.XXX.XXX/XXXX-XX
+    const dotted = `${doc.slice(0, 2)}.${doc.slice(2, 5)}.${doc.slice(5, 8)}/${doc.slice(8, 12)}-${doc.slice(12, 14)}`
+    return [doc, dotted]
+  }
+  return [doc]
+}
+
 /**
  * Resolve o devedor pelo documento no tenant. `null` = não há cliente em
  * `customers` com esse documento (inclui o caso "só VMAX") OU não há dívida
@@ -53,17 +83,49 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolvedDe
   if (!doc) return null
   const supabase = createServiceClient()
 
-  // 1) cliente por documento NORMALIZADO dos dois lados; company_id restringe.
-  //    A base pode ter o documento com ou sem pontuação (N0: 2 casos) — por isso
-  //    a comparação é sobre os dígitos, não sobre o texto cru.
-  const { data: customers, error: custErr } = await supabase
+  // 1) cliente por documento — query DIRETA por valor (indexável, SEM o limite
+  //    de 1000 linhas do PostgREST e sem o "carrega todos + find" que só
+  //    enxergava os 1000 primeiros de tenants grandes como a VMAX, 3196 clientes).
+  //    A base pode ter o documento com ou sem pontuação — buscamos os dois
+  //    formatos e confirmamos por dígitos (cobre pontuação parcial dos poucos
+  //    casos). company_id SEMPRE restringe (nunca cruza tenant).
+  const candidates = documentCandidates(doc)
+  const { data: direct, error: custErr } = await supabase
     .from("customers")
     .select("id, name, document")
     .eq("company_id", input.companyId)
-    .filter("document", "not.is", null)
+    .in("document", candidates)
+    .limit(5)
   if (custErr) throw new Error(`resolveByDocument/customers: ${custErr.message}`)
 
-  const customer = (customers ?? []).find((c) => normalizeDocument(c.document) === doc)
+  let customer =
+    (direct as CustomerRow[] | null ?? []).find((c) => normalizeDocument(c.document) === doc) ?? null
+
+  // Fallback RARO: documento gravado num formato atípico não coberto pelos
+  //   candidatos (ex.: pontuação parcial/espaços). Scan paginado por company_id
+  //   (páginas de 1000 via .range) até casar por dígitos ou esgotar. É caro, mas
+  //   raríssimo; o padding (~600ms) da rota pública absorve o timing extra.
+  if (!customer) {
+    let page = 0
+    for (;;) {
+      const { data: pageRows, error: pageErr } = await supabase
+        .from("customers")
+        .select("id, name, document")
+        .eq("company_id", input.companyId)
+        .filter("document", "not.is", null)
+        .range(page * CUSTOMER_PAGE_SIZE, (page + 1) * CUSTOMER_PAGE_SIZE - 1)
+      if (pageErr) throw new Error(`resolveByDocument/customers(scan): ${pageErr.message}`)
+      const rows = (pageRows as CustomerRow[] | null) ?? []
+      const hit = rows.find((c) => normalizeDocument(c.document) === doc)
+      if (hit) {
+        customer = hit
+        break
+      }
+      if (rows.length < CUSTOMER_PAGE_SIZE) break // última página
+      page++
+    }
+  }
+
   if (!customer) return null // inexistente OU só-VMAX → null (auth.unresolved no chamador)
 
   // 2) dívidas abertas (consolidado) — TODAS as pending/in_negotiation do cliente.
@@ -131,7 +193,12 @@ export async function resolveCompanyBySlug(slug: string): Promise<string | null>
     .limit(1)
   if (cfgs && cfgs.length > 0) return cfgs[0].company_id
 
-  // 2) fallback: nome da empresa slugificado (sem depender de coluna nova)
+  // 2) fallback: nome da empresa slugificado (sem depender de coluna nova).
+  //    NOTA: carrega TODAS as companies e faz find() em JS — o mesmo anti-padrão
+  //    "sem paginação" que quebrava resolveByDocument. Aqui é ACEITÁVEL porque
+  //    `companies` é uma tabela minúscula (2 linhas hoje, ordem de dezenas no
+  //    máximo) e o slug não é indexável de forma trivial (slugify em JS). Se um
+  //    dia companies passar de ~1000, este scan precisará de paginação/coluna slug.
   const { data: companies } = await supabase.from("companies").select("id, name")
   const match = (companies ?? []).find((c) => slugify(c.name) === clean)
   return match?.id ?? null

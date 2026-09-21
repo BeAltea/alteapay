@@ -1,18 +1,105 @@
 // N7: resolver por documento. Fonte primária = customers; consolidado; nunca
 // cruza company_id; só-VMAX-sem-customers → null; sem dívida aberta → null.
+//
+// BUG CRÍTICO corrigido aqui: a busca do customer NÃO pode "carregar todos +
+// find()" (limite de 1000 linhas do PostgREST deixava ~68% da VMAX invisível).
+// Agora: query DIRETA por `.in("document", candidates)` + fallback paginado
+// (.range) para formatos atípicos. Este arquivo usa um fake próprio que suporta
+// .in/.filter/.range/.order/.limit — o fake compartilhado não tem .range.
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { makeFakeSupabase, type FakeDb } from "./_fake-supabase"
+
+type Row = Record<string, any>
+interface Db {
+  customers: Row[]
+  debts: Row[]
+  vmax_invoices: Row[]
+}
 
 const CO_A = "aaaaaaaa-0000-0000-0000-000000000001"
 const CO_B = "bbbbbbbb-0000-0000-0000-000000000002"
 
-let db: FakeDb
-vi.mock("@/lib/supabase/service", () => ({
-  createServiceClient: () => makeFakeSupabase(db),
-}))
-
 // aging é relativo a hoje; usamos uma data bem antiga para garantir aging > 0.
 const OLD_DUE = "2020-01-01"
+
+// Contadores de observabilidade: provam qual caminho a busca do customer tomou.
+let calls: { customerIn: number; customerRange: number }
+
+let db: Db
+
+// Fake Supabase mínimo p/ o resolver: suporta a query direta (.in) e o fallback
+// paginado (.range). Cada builder resolve como thenable no final da cadeia.
+function makeFake(database: Db) {
+  return {
+    from(table: string) {
+      const filters: Array<(r: Row) => boolean> = []
+      let orderCol: string | null = null
+      let orderAsc = true
+      let limitN: number | null = null
+      let rangeFrom: number | null = null
+      let rangeTo: number | null = null
+
+      const builder: any = {
+        select() {
+          return builder
+        },
+        eq(col: string, val: any) {
+          filters.push((r) => r[col] === val)
+          return builder
+        },
+        in(col: string, vals: any[]) {
+          if (table === "customers" && col === "document") calls.customerIn++
+          filters.push((r) => vals.includes(r[col]))
+          return builder
+        },
+        filter(col: string, op: string, _val: any) {
+          if (op === "not.is") filters.push((r) => r[col] != null)
+          return builder
+        },
+        order(col: string, opts?: { ascending?: boolean }) {
+          orderCol = col
+          orderAsc = opts?.ascending !== false
+          return builder
+        },
+        limit(n: number) {
+          limitN = n
+          return builder
+        },
+        range(from: number, to: number) {
+          if (table === "customers") calls.customerRange++
+          rangeFrom = from
+          rangeTo = to
+          return builder
+        },
+        run() {
+          let out = (database[table as keyof Db] ?? []).filter((r) =>
+            filters.every((f) => f(r)),
+          )
+          if (orderCol) {
+            const col = orderCol
+            out = [...out].sort((a, b) => {
+              const av = a[col]
+              const bv = b[col]
+              if (av === bv) return 0
+              const cmp = av < bv ? -1 : 1
+              return orderAsc ? cmp : -cmp
+            })
+          }
+          if (rangeFrom != null && rangeTo != null) out = out.slice(rangeFrom, rangeTo + 1)
+          if (limitN != null) out = out.slice(0, limitN)
+          return { data: out, error: null }
+        },
+        then(resolve: (r: { data: Row[]; error: null }) => void) {
+          resolve(builder.run())
+        },
+      }
+      return builder
+    },
+  }
+}
+
+vi.mock("@/lib/supabase/service", () => ({
+  createServiceClient: () => makeFake(db),
+}))
 
 async function importResolver() {
   return await import("@/lib/journey/resolver")
@@ -20,9 +107,12 @@ async function importResolver() {
 
 describe("resolveByDocument", () => {
   beforeEach(() => {
+    calls = { customerIn: 0, customerRange: 0 }
     db = {
       customers: [
+        // doc PONTUADO na base (poucos casos reais)
         { id: "cust_a", company_id: CO_A, name: "Fabio Silva", document: "111.444.777-35" },
+        // doc CRU na base (a esmagadora maioria da VMAX)
         { id: "cust_b", company_id: CO_B, name: "Outro Cliente", document: "11144477735" },
       ],
       debts: [
@@ -49,16 +139,40 @@ describe("resolveByDocument", () => {
     expect(r!.invoiceCount).toBe(1)
   })
 
-  it("normaliza documento dos dois lados (pontuação irrelevante)", async () => {
+  it("resolve pela query DIRETA (.in), sem varrer todos os customers", async () => {
     const { resolveByDocument } = await importResolver()
+    // doc CRU no input casa com o cust_b (doc CRU na base) — mas em CO_B.
+    // Testamos em CO_A com input CRU → candidato pontuado casa o cust_a.
     const r = await resolveByDocument({ companyId: CO_A, document: "11144477735" })
     expect(r?.customerId).toBe("cust_a")
+    expect(calls.customerIn).toBe(1) // usou a query direta
+    expect(calls.customerRange).toBe(0) // NÃO precisou do fallback paginado
+  })
+
+  it("input pontuado + base CRUA resolve (normalização casa)", async () => {
+    // cust_b tem doc CRU; buscamos no CO_B com input PONTUADO
+    const { resolveByDocument } = await importResolver()
+    const r = await resolveByDocument({ companyId: CO_B, document: "111.444.777-35" })
+    expect(r?.customerId).toBe("cust_b")
+    expect(calls.customerRange).toBe(0)
+  })
+
+  it("input CRU + base CRUA resolve (candidato cru casa direto)", async () => {
+    const { resolveByDocument } = await importResolver()
+    const r = await resolveByDocument({ companyId: CO_B, document: "11144477735" })
+    expect(r?.customerId).toBe("cust_b")
   })
 
   it("NUNCA cruza company_id (mesmo doc em outro tenant não vaza)", async () => {
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
     expect(r?.debtIds).not.toContain("debt_b1")
+  })
+
+  it("documento inexistente → null", async () => {
+    const { resolveByDocument } = await importResolver()
+    const r = await resolveByDocument({ companyId: CO_A, document: "99999999999" })
+    expect(r).toBeNull()
   })
 
   it("só-VMAX-sem-customers → null (não cria registro)", async () => {
@@ -78,5 +192,57 @@ describe("resolveByDocument", () => {
   it("documento vazio → null", async () => {
     const { resolveByDocument } = await importResolver()
     expect(await resolveByDocument({ companyId: CO_A, document: "" })).toBeNull()
+  })
+
+  it("fallback paginado (.range) acha o customer em formato atípico", async () => {
+    // Documento gravado com espaços/pontuação PARCIAL não coberta pelos
+    // candidatos [cru, pontuado] → a query direta (.in) vem vazia e o fallback
+    // paginado casa por dígitos normalizados.
+    db.customers = [
+      { id: "cust_odd", company_id: CO_A, name: "Formato Atípico", document: "330 366 958 93" },
+    ]
+    db.debts = [
+      { id: "debt_odd", company_id: CO_A, customer_id: "cust_odd", status: "pending", amount: 42, current_amount: 42, due_date: OLD_DUE },
+    ]
+    db.vmax_invoices = []
+    const { resolveByDocument } = await importResolver()
+    const r = await resolveByDocument({ companyId: CO_A, document: "330.366.958-93" })
+    expect(r?.customerId).toBe("cust_odd")
+    expect(r?.debtIds).toEqual(["debt_odd"])
+    expect(calls.customerIn).toBe(1) // tentou a direta primeiro
+    expect(calls.customerRange).toBeGreaterThanOrEqual(1) // e caiu no fallback
+  })
+
+  it("status filter intacto: pending + in_negotiation contam; paid/cancelled não", async () => {
+    db.debts = [
+      { id: "d_pending", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 10, current_amount: 10, due_date: OLD_DUE },
+      { id: "d_inneg", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 20, current_amount: 20, due_date: "2021-01-01" },
+      { id: "d_paid", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 30, current_amount: 30, due_date: "2021-02-01" },
+      { id: "d_cancelled", company_id: CO_A, customer_id: "cust_a", status: "cancelled", amount: 40, current_amount: 40, due_date: "2021-03-01" },
+    ]
+    const { resolveByDocument } = await importResolver()
+    const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
+    expect(r!.debtIds.sort()).toEqual(["d_inneg", "d_pending"])
+    expect(r!.totalOpen).toBe(30)
+  })
+})
+
+describe("documentCandidates", () => {
+  it("CPF (11 díg) → [cru, pontuado XXX.XXX.XXX-XX]", async () => {
+    const { documentCandidates } = await importResolver()
+    expect(documentCandidates("33036695893")).toEqual(["33036695893", "330.366.958-93"])
+  })
+
+  it("CNPJ (14 díg) → [cru, pontuado XX.XXX.XXX/XXXX-XX]", async () => {
+    const { documentCandidates } = await importResolver()
+    expect(documentCandidates("11222333000181")).toEqual([
+      "11222333000181",
+      "11.222.333/0001-81",
+    ])
+  })
+
+  it("comprimento atípico → só o valor cru (fallback cobre o resto)", async () => {
+    const { documentCandidates } = await importResolver()
+    expect(documentCandidates("123")).toEqual(["123"])
   })
 })
