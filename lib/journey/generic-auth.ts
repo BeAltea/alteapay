@@ -22,8 +22,25 @@ import { GENERIC_AUTH_MESSAGE } from "./auth"
 import { isAcceptableDocument, normalizeDocument } from "./document"
 import { resolveByDocument } from "./resolver"
 import { bootstrapAckSafe } from "./acknowledgement"
+import { verifyCaptcha as verifyCaptchaFunctional } from "./captcha"
+import {
+  docHashOf,
+  ipHashOf,
+  registerPublicAttempt,
+  evaluatePublicRateLimit,
+  onPublicFailure,
+} from "./public-rate-limit"
 
 export { GENERIC_AUTH_MESSAGE }
+
+// Mensagem uniforme do link público /n/{code}: MESMO texto, MESMO status para
+// inexistente E sem-dívida (nunca revela se o documento existe na base).
+export const PUBLIC_NO_DEBT_MESSAGE =
+  "Não encontramos dívidas cadastradas para negociação com este documento. Se você recebeu uma mensagem nossa, confira se digitou o documento corretamente. Se preferir, fale com nosso atendimento."
+
+// Mensagem neutra de bloqueio (rate-limit/lock): não revela se o documento existe.
+export const PUBLIC_BLOCKED_MESSAGE =
+  "Muitas tentativas em sequência. Por segurança, tente novamente em alguns minutos."
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex")
 const docHash = (doc: string) => sha256(normalizeDocument(doc))
@@ -47,31 +64,22 @@ export interface GenericAuthInput {
   channel: "web_generic" | "admin_preview"
 }
 
-export type GenericAuthResult =
-  | { ok: true; sessionId: string; cookieName: string; cookieValue: string; cookieMaxAge: number }
-  | { ok: false; message: string }
+export interface SessionSuccess {
+  ok: true
+  sessionId: string
+  cookieName: string
+  cookieValue: string
+  cookieMaxAge: number
+}
+
+export type GenericAuthResult = SessionSuccess | { ok: false; message: string }
 
 type Supabase = ReturnType<typeof createServiceClient>
 
-/** Verificação de captcha (Turnstile) atrás de flag. OFF → sempre passa. */
+/** Verificação de captcha (Turnstile) atrás de flag. OFF → sempre passa.
+ *  Delega à implementação FUNCIONAL canônica (lib/journey/captcha.ts). */
 export async function verifyCaptcha(token: string | null | undefined): Promise<boolean> {
-  if (process.env.CHAT_CAPTCHA_ENABLED !== "true") return true
-  const provider = process.env.CHAT_CAPTCHA_PROVIDER || "turnstile"
-  const secret = process.env.CHAT_CAPTCHA_SECRET
-  if (!token || !secret) return false
-  if (provider !== "turnstile") return false
-  try {
-    const resp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ secret, response: token }),
-      signal: AbortSignal.timeout(5000),
-    })
-    const json = (await resp.json()) as { success?: boolean }
-    return Boolean(json.success)
-  } catch {
-    return false
-  }
+  return verifyCaptchaFunctional(token)
 }
 
 async function isIpLocked(supabase: Supabase, companyId: string, ipH: string | null): Promise<boolean> {
@@ -195,21 +203,50 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
 
   // sucesso: sessão consolidada (todas as dívidas abertas) via handoff helper.
   await recordAttempt(supabase, input.companyId, dHash, ipH, true, null)
+  return establishSession({
+    supabase,
+    companyId: input.companyId,
+    resolved,
+    document: doc,
+    channel: input.channel,
+    userAgent: input.userAgent,
+    ipHash: ipH,
+    sessionTtlMinutes: cfg?.session_ttl_minutes ?? 60,
+  })
+}
+
+// --- helper compartilhado: consolida sessão + cookie + eventos + ack ----------
+// Usado tanto pelo caminho genérico /t/{slug} quanto pelo link público /n/{code}.
+type ResolvedDebtor = NonNullable<Awaited<ReturnType<typeof resolveByDocument>>>
+
+interface EstablishSessionInput {
+  supabase: Supabase
+  companyId: string
+  resolved: ResolvedDebtor
+  document: string
+  channel: string
+  userAgent: string | null
+  ipHash: string | null
+  /** TTL efetivo da sessão em minutos (o chamador já aplicou o seu default). */
+  sessionTtlMinutes: number
+}
+
+async function establishSession(input: EstablishSessionInput): Promise<SessionSuccess> {
   const { createHandoffSession } = await import("@/lib/negotiation/sessions")
   const created = await createHandoffSession({
     company_id: input.companyId,
-    customer_id: resolved.customerId,
-    debt_id: resolved.primaryDebtId,
-    document: doc,
+    customer_id: input.resolved.customerId,
+    debt_id: input.resolved.primaryDebtId,
+    document: input.document,
     channel_origin: "direct",
     identity_verified: true,
     debt_acknowledged: false,
   })
   const sessionId = created.session.id
   const now = new Date().toISOString()
-  await supabase.from("negotiation_sessions").update({
-    debt_ids: resolved.debtIds,
-    primary_debt_id: resolved.primaryDebtId,
+  await input.supabase.from("negotiation_sessions").update({
+    debt_ids: input.resolved.debtIds,
+    primary_debt_id: input.resolved.primaryDebtId,
     channel: input.channel,
     status: "open",
     engine: process.env.NEGOTIATION_ENGINE || "disabled",
@@ -218,10 +255,10 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
     consent_at: now,
     last_activity_at: now,
     user_agent: input.userAgent,
-    ip_hash: ipH,
+    ip_hash: input.ipHash,
   }).eq("id", sessionId)
 
-  const base = { companyId: input.companyId, customerId: resolved.customerId, debtId: resolved.primaryDebtId, sessionId }
+  const base = { companyId: input.companyId, customerId: input.resolved.customerId, debtId: input.resolved.primaryDebtId, sessionId }
   await recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } })
   await recordEvent({ ...base, type: "auth.success", actor: "customer" })
   await recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } })
@@ -230,12 +267,123 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   await bootstrapAckSafe({
     companyId: input.companyId,
     sessionId,
-    customerId: resolved.customerId,
-    debtIds: resolved.debtIds,
-    primaryDebtId: resolved.primaryDebtId,
+    customerId: input.resolved.customerId,
+    debtIds: input.resolved.debtIds,
+    primaryDebtId: input.resolved.primaryDebtId,
   })
 
-  const ttlSeconds = (cfg?.session_ttl_minutes ?? 60) * 60
+  const ttlSeconds = input.sessionTtlMinutes * 60
   const cookieValue = signChatJwt({ sid: sessionId, cid: input.companyId }, ttlSeconds)
   return { ok: true, sessionId, cookieName: CHAT_COOKIE_NAME, cookieValue, cookieMaxAge: ttlSeconds }
+}
+
+// =============================================================================
+// LINK ÚNICO PÚBLICO /n/{code}  (Hub §3/§6)
+// =============================================================================
+//
+// O `companyId` JÁ vem resolvido pelo code (public-link.ts) — quem endereça o
+// tenant é o code; quem autentica é o DOCUMENTO. Ordem EXATA (decisão H4):
+//   formato+DV → captcha (se ligado) → rate-limit IP → rate-limit documento →
+//   teto do cedente/hora → resolveByDocument.
+//
+// Respostas (HTTP 200 em todos os casos de negócio, timing equalizado na rota):
+//   - resolvido c/ dívida        → { ok:true, ... }  (sessão + cookie)
+//   - inexistente OU sem dívida   → { ok:false, reason:'no_debt' } — MESMA msg
+//   - bloqueado (lock/rate-limit) → { ok:false, reason:'blocked' } — neutro
+//   - inválido (DV/consent/captcha) → { ok:false, reason:'invalid' }
+
+export interface PublicLinkAuthInput {
+  companyId: string
+  document: string
+  consent: boolean
+  ip: string | null
+  userAgent: string | null
+  captchaToken?: string | null
+}
+
+export type PublicLinkAuthReason = "no_debt" | "blocked" | "invalid"
+
+export type PublicLinkAuthResult =
+  | { ok: true; sessionId: string; cookieName: string; cookieValue: string; cookieMaxAge: number }
+  | { ok: false; reason: PublicLinkAuthReason; message: string }
+
+export async function authenticateByPublicLink(
+  input: PublicLinkAuthInput,
+): Promise<PublicLinkAuthResult> {
+  const supabase = createServiceClient()
+  const doc = normalizeDocument(input.document)
+  const dHash = docHashOf(doc)
+  const ipH = ipHashOf(input.ip)
+
+  const invalid = (_reason: string): PublicLinkAuthResult => ({
+    ok: false, reason: "invalid", message: GENERIC_AUTH_MESSAGE,
+  })
+  const noDebt = async (reason: string): Promise<PublicLinkAuthResult> => {
+    await registerPublicAttempt({ companyId: input.companyId, docHash: dHash, ipHash: ipH, success: false, reason })
+    await onPublicFailure({ companyId: input.companyId, docHash: dHash, ipHash: ipH })
+    // auditoria: doc_hash + ip_hash apenas; NUNCA o documento em claro.
+    // `auth.no_debt` é evento de auditoria (event_type é texto livre no schema;
+    // fora do union de JourneyEventType, daí o cast).
+    await recordEvent({
+      companyId: input.companyId,
+      type: "auth.no_debt" as unknown as Parameters<typeof recordEvent>[0]["type"],
+      actor: "customer",
+      payload: { doc_hash: dHash },
+    })
+    return { ok: false, reason: "no_debt", message: PUBLIC_NO_DEBT_MESSAGE }
+  }
+  const blocked = async (reason: string): Promise<PublicLinkAuthResult> => {
+    await recordEvent({ companyId: input.companyId, type: "auth.locked", actor: "system", payload: { doc_hash: dHash, scope: reason } })
+    return { ok: false, reason: "blocked", message: PUBLIC_BLOCKED_MESSAGE }
+  }
+
+  await recordEvent({ companyId: input.companyId, type: "auth.attempt", actor: "customer", payload: { doc_hash: dHash } })
+
+  // config do tenant (TTL da sessão; default 30min no link público).
+  const { data: cfg } = await supabase
+    .from("tenant_chat_config")
+    .select("session_ttl_minutes")
+    .eq("company_id", input.companyId)
+    .maybeSingle()
+
+  // 1) formato + DV (CPF e CNPJ). consent também é pré-condição de negócio.
+  if (!input.consent) return invalid("consent_missing")
+  if (!isAcceptableDocument(doc)) return invalid("doc_invalid")
+
+  // teto do cedente/hora → modo DEGRADADO: exige captcha SEMPRE (mesmo desligado).
+  const decision = await evaluatePublicRateLimit({ companyId: input.companyId, docHash: dHash, ipHash: ipH })
+  if (decision.blocked) return blocked(decision.scope)
+
+  // 2) captcha (se ligado) — no modo degradado, exigido mesmo com a flag OFF.
+  const captchaOk = await verifyCaptchaFunctional(input.captchaToken, input.ip)
+  if (decision.degraded) {
+    // alerta de operação (teto estourado) + captcha OBRIGATÓRIO.
+    await recordEvent({ companyId: input.companyId, type: "auth.locked", actor: "system", payload: { scope: "tenant_hourly_cap", degraded: true } })
+    if (!input.captchaToken || !captchaOk) return blocked("degraded")
+  } else if (!captchaOk) {
+    // captcha ligado e falhou → conta como tentativa (anti-brute) e responde neutro.
+    return blocked("captcha")
+  }
+
+  // 3+4) rate-limit IP e documento já avaliados em evaluatePublicRateLimit (locks).
+
+  // 5) resolução do devedor no tenant do code.
+  const resolved = await resolveByDocument({ companyId: input.companyId, document: doc })
+  if (!resolved) {
+    // inexistente OU só-VMAX OU sem dívida aberta → MESMA resposta no_debt.
+    return noDebt("unresolved")
+  }
+
+  // sucesso: registra e consolida sessão (reuso do helper do /t/).
+  await registerPublicAttempt({ companyId: input.companyId, docHash: dHash, ipHash: ipH, success: true, reason: "ok" })
+  return establishSession({
+    supabase,
+    companyId: input.companyId,
+    resolved,
+    document: doc,
+    channel: "web_public_link",
+    userAgent: input.userAgent,
+    ipHash: ipH,
+    sessionTtlMinutes: cfg?.session_ttl_minutes ?? 30,
+  })
 }

@@ -37,10 +37,12 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // Gate D13: jornada pública white-label /c/[token] e endpoint genérico
-  // /t/{slug}/negociar. Bloqueia (404) quando a flag está off ou quando o tenant
-  // está em modo admin-only sem sessão admin. noindex garantido pelo layout.
-  if (currentPath.startsWith("/c/") || currentPath.startsWith("/t/")) {
+  // Gate D13: jornada pública white-label /c/[token], endpoint genérico
+  // /t/{slug}/negociar e link único /n/{code}. Bloqueia (404) quando a flag está
+  // off ou (para /c e /t) quando o tenant está em modo admin-only sem sessão
+  // admin. Para /n a page.tsx renderiza a casca neutra quando o link está
+  // desligado (sem enumeração por status). noindex garantido pelo layout.
+  if (currentPath.startsWith("/c/") || currentPath.startsWith("/t/") || currentPath.startsWith("/n/")) {
     const blocked = await journeyGate(request)
     if (blocked) return blocked
     // Autenticado por token/cookie de chat (não por usuário Supabase): não passa

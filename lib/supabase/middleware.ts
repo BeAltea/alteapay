@@ -9,7 +9,7 @@ import { getServerSupabaseUrl } from "./url"
 // Manter em sincronia ao adicionar novas rotas top-level em app/.
 const KNOWN_ROUTE_SEGMENTS = new Set([
   "api", "auth", "create-users", "dashboard", "demo", "dev", "empresa",
-  "localize", "negociar", "portal", "super-admin", "test-dark", "user-dashboard", "c", "t",
+  "localize", "negociar", "portal", "super-admin", "test-dark", "user-dashboard", "c", "t", "n",
 ])
 
 // --- Gate D13 da jornada pública /c/[token] ---------------------------------
@@ -98,6 +98,40 @@ async function journeyPublicEnabledForSlug(slug: string): Promise<boolean | null
   }
 }
 
+/** Resolve o estado do LINK ÚNICO público /n/{code}: liga só se
+ *  public_link_enabled=true E (sem validade OU validade no futuro).
+ *  null = desconhecido/inválido → tratado como desligado (seguro). */
+async function publicLinkEnabledForCode(code: string): Promise<boolean | null> {
+  try {
+    const base = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+    if (!base || !key) return null
+    const clean = code.trim()
+    // 6–64 alfanuméricos: rejeita cedo lixo/injeção (mesma regra do public-link.ts).
+    if (!/^[A-Za-z0-9]{6,64}$/.test(clean)) return false
+    const headers = { apikey: key, Authorization: `Bearer ${key}` }
+    const res = await fetch(
+      `${base}/rest/v1/tenant_chat_config?public_link_code=eq.${encodeURIComponent(clean)}&select=public_link_enabled,public_link_valid_until&limit=1`,
+      { headers },
+    )
+    if (!res.ok) return null
+    const rows = (await res.json()) as Array<{
+      public_link_enabled: boolean
+      public_link_valid_until: string | null
+    }>
+    if (rows.length === 0) return false
+    if (!rows[0].public_link_enabled) return false
+    const until = rows[0].public_link_valid_until
+    if (until) {
+      const t = Date.parse(until)
+      if (Number.isFinite(t) && t < Date.now()) return false
+    }
+    return true
+  } catch {
+    return null
+  }
+}
+
 /** true se o usuário autenticado tem role admin/super_admin (para o modo admin-only). */
 async function requestUserIsAdmin(request: NextRequest): Promise<boolean> {
   try {
@@ -141,10 +175,28 @@ export async function journeyGate(request: NextRequest): Promise<NextResponse | 
   const currentPath = request.nextUrl.pathname
   const isCampaign = currentPath.startsWith("/c/")
   const isGeneric = currentPath.startsWith("/t/")
-  if (!isCampaign && !isGeneric) return null
+  const isPublicLink = currentPath.startsWith("/n/")
+  if (!isCampaign && !isGeneric && !isPublicLink) return null
 
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return new NextResponse(null, { status: 404 })
+  }
+
+  // --- LINK ÚNICO /n/{code} ---------------------------------------------------
+  // Espelha /c/ e /t/ (CHAT_JOURNEY_ENABLED + public_link_enabled). Diferença
+  // deliberada: quando o link está desligado/expirado/desconhecido, NÃO
+  // devolvemos 404 nem redirect — deixamos passar para a PÁGINA renderizar a
+  // casca neutra "não há negociação disponível", evitando enumeração por status.
+  // Admin/super_admin logado sempre passa (preview).
+  if (isPublicLink) {
+    const code = currentPath.split("/")[2] ?? ""
+    const enabled = code ? await publicLinkEnabledForCode(code) : false
+    if (enabled === true) return null
+    // desligado/indeterminado: admin passa (preview); público segue p/ a página
+    // neutra (a própria page.tsx só revela algo se resolvePublicLink der ok).
+    const isAdmin = await requestUserIsAdmin(request)
+    if (isAdmin) return null
+    return null
   }
 
   let publicEnabled: boolean | null = null
