@@ -133,6 +133,14 @@ export async function callN8nFlow(url: string, payload: unknown, timeoutMs = flo
 const toCents = (reais: number | null | undefined): number | null =>
   reais == null ? null : Math.round(reais * 100)
 
+// Ações de domínio que o fluxo n8n pode chamar de volta (papel B). Viaja em
+// `available_actions` no chat.turn para o fluxo saber o que pode acionar.
+export const N8N_AVAILABLE_ACTIONS = [
+  "debt.summary", "offer.list", "offer.propose", "offer.accept", "offer.reject",
+  "payment.create", "payment.status", "chat.send", "prompt.ask", "prompt.close",
+  "dispute.register", "payment_claim.register", "human.transfer", "negotiation.note", "session.close",
+] as const
+
 export function buildTurnPayload(input: EngineTurnInput) {
   const { session, debtor, tenant } = input
   // Documento em CLARO só viaja com as 2 flags (send_document_to_engine=true E
@@ -161,7 +169,9 @@ export function buildTurnPayload(input: EngineTurnInput) {
     },
     debtor: debtor
       ? {
-          name: debtor.customer_name,
+          // D1: só o PRIMEIRO nome viaja ao fluxo (minimização de PII); o nome
+          // completo nunca sai da plataforma.
+          first_name: (debtor.customer_name ?? "").trim().split(/\s+/)[0] ?? "",
           document_masked: maskDocument(debtor.document),
           document_hash: createHash("sha256").update(debtor.document).digest("hex"),
           document: sendPlainDoc ? debtor.document : null,
@@ -190,7 +200,24 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
   const url = chatFlowUrl()
   if (!url) throw new Error("N8N_CHAT_FLOW_URL não configurado")
 
-  const raw = await callN8nFlow(url, buildTurnPayload(input))
+  // D2: o payload REAL do turno é o `buildSessionContext` (o contrato rico e
+  // documentado: first_name, doc mascarado com flag-gate, offers, matrix,
+  // active_prompt, debt_acknowledgement — tudo em centavos). O `buildTurnPayload`
+  // fica só como fallback se o contexto não resolver.
+  let payload: unknown
+  try {
+    const { buildSessionContext } = await import("@/lib/journey/context")
+    const ctx = await buildSessionContext(input.session.id)
+    payload = ctx
+      ? { event: "chat.turn", ...ctx, message: input.message, available_actions: N8N_AVAILABLE_ACTIONS }
+      : buildTurnPayload(input)
+  } catch (err) {
+    // Resiliência: se o contexto rico não montar, manda o payload mínimo
+    // (mascarado, first_name) em vez de derrubar o turno.
+    console.warn("[engine:n8n] buildSessionContext falhou, usando fallback:", (err as Error).message)
+    payload = buildTurnPayload(input)
+  }
+  const raw = await callN8nFlow(url, payload)
   const parsed = flowResponseSchema.safeParse(raw)
   if (!parsed.success) {
     throw new Error(`resposta do fluxo n8n inválida: ${parsed.error.issues[0]?.message}`)
