@@ -136,17 +136,17 @@ export class ERPIntegrationService {
           .select("id")
           .eq("company_id", companyId)
           .eq("customer_id", customer.id)
-          .eq("original_amount", erpInvoice.amount)
+          .eq("amount", erpInvoice.amount)
           .eq("due_date", erpInvoice.due_date)
           .single()
 
         if (!existing) {
-          // Cria nova dívida
+          // Cria nova dívida (o schema real de `debts` usa `amount`; não existem
+          // as colunas original_amount/current_amount).
           const { error } = await supabase.from("debts").insert({
             company_id: companyId,
             customer_id: customer.id,
-            original_amount: erpInvoice.amount,
-            current_amount: erpInvoice.amount,
+            amount: erpInvoice.amount,
             due_date: erpInvoice.due_date,
             status: erpInvoice.status === "paid" ? "paid" : "pending",
             description: erpInvoice.description || `Fatura ${erpInvoice.external_id}`,
