@@ -1,6 +1,14 @@
 # O que o fluxo n8n precisa fazer (contrato do lado do n8n)
 
-**Última atualização:** 2026-09-18 · Complemento de `docs/N8N_INTEGRATION.md`.
+**Última atualização:** 2026-09-21 · Complemento de `docs/N8N_INTEGRATION.md`.
+
+> **Contrato v2 (onda R):** ver o guia completo em `docs/N8N_TEAM_INTEGRATION_GUIDE.md`.
+> Mudanças que o fluxo DEVE implementar: (1) tratar **valores em centavos** no
+> `chat.turn` e nas respostas de `payment.*`; (2) conduzir o **reconhecimento**
+> (não pagar antes; tratar `409 debt_not_acknowledged`); (3) usar as ações novas
+> `chat.send`/`prompt.ask`/`prompt.close` e o catálogo de botões (`1=Sim`,`0=Não`,
+> `2..N`,`98`,`99`); (4) `payment.create` idempotente por `(session_id, offer_id)`;
+> (5) `501 not_implemented` = variante B fora do escopo.
 
 Esta onda entrega a plataforma **pronta** para o fluxo n8n ser o cérebro da
 conversa, mas o fluxo ainda **não existe**. Este documento é o checklist do que o

@@ -1,0 +1,23 @@
+### offer.propose — sugere termos; validado contra a matriz
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{
+  "action": "offer.propose",
+  "session_id": "<UUID_SESSAO>",
+  "event_id": "<UUID_EVENTO>",
+  "args": {
+    "terms": {
+      "original_value": 45230, "discount_pct": 15, "discount_value": 6784,
+      "entry_value": 0, "installments": 1, "installment_value": 38446,
+      "total_value": 38446, "billing_type": "BOLETO", "first_due_date": "2026-09-28"
+    }
+  }
+}
+
+### Resposta esperada (ok)
+# 200 { "success": true, "offer_id": "<UUID>" }
+### Resposta esperada (inválida)
+# 422 { "success": false, "error": "DISCOUNT_ABOVE_MAX", "code": "DISCOUNT_ABOVE_MAX", "offer_id": "<UUID>" }

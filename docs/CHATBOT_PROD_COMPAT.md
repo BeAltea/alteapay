@@ -126,3 +126,21 @@ onda antes do canário (o adapter e o `campaign-send` novos não estão na image
 Apêndice C + credenciais; execução do V8/GV1; contagem exata de telefones
 duplicados por tenant; respostas do Apêndice E (webhook de saída, blacklist,
 botões, canal Meta, limites). Ver `ops/chatbot-journey-2026-09/reports/V0_voxuy_diagnostico.md`.
+
+---
+
+## Onda R — Reconhecimento da dívida com botões + pagamento variante A (2026-09-21)
+
+Adicionada nesta branch (`feature/chatbot-journey`), **atrás de `CHAT_JOURNEY_ENABLED` (OFF por padrão)** — comportamento de produção idêntico até ligar.
+
+**O que muda:**
+- **Reconhecimento é a 1ª interação do chat:** prompt de botões Sim/Não determinístico e local (não chama n8n antes da resposta), log append-only em `debt_acknowledgements` + view `debt_acknowledgement_latest`. `on_debt_not_recognized` default `continue` (não bloqueia navegação).
+- **Gate de pagamento:** `payment.create` recusa `409 debt_not_acknowledged` sem reconhecimento (salvo `allow_payment_without_acknowledgement=true`, default false).
+- **Variante A é o único caminho de pagamento:** `payment_origin != 'platform'` → `501 not_implemented`. Idempotência por `(session_id, offer_id)` (payload idêntico, `idempotent:true`, zero cobrança nova).
+- **Contrato n8n v2 (centavos):** `chat.turn` e respostas de `payment.*` em inteiros de centavos (colunas do banco seguem em reais; conversão só na borda). Novas ações papel B: `chat.send`, `prompt.ask`, `prompt.close`. Clique de botão via `POST /api/chat/button`; UI recebe mensagens por `GET /api/chat/messages?since=` (polling).
+
+**Migration aditiva:** `supabase/migrations/20260921_chat_prompts_ack.sql` (`chat_prompts`, `debt_acknowledgements`, colunas em `chat_messages`/`tenant_chat_config`, view, RLS service_role). **Aplicar no GATE R1 pelo orquestrador** (não em prod nesta onda).
+
+**Dependência de worker:** `payment.create` reutiliza `confirmAccept→closeAgreement→chargeQueue` (async). **Chat ligado exige worker Fargate ligado**; sem ele o `payment.create` fica em `processing` (n8n consulta `payment.status`).
+
+**Guias:** `docs/N8N_TEAM_INTEGRATION_GUIDE.md` (autossuficiente) + `docs/n8n/examples/*.http` + `docs/n8n/fixtures/*.json`.

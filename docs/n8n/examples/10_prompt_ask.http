@@ -1,0 +1,18 @@
+### prompt.ask — cria só um prompt de botões (sem mensagem). Booleano: só ids 1/0 (+99).
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{
+  "action": "prompt.ask",
+  "session_id": "<UUID_SESSAO>",
+  "args": {
+    "kind": "generic_yes_no",
+    "question": "Confirma a condição escolhida?",
+    "buttons": [ { "id": 1, "label": "Sim" }, { "id": 0, "label": "Não" } ]
+  }
+}
+
+### Resposta esperada
+# 200 { "ok": true, "prompt_id": "<UUID>" }

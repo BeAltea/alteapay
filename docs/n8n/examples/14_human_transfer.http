@@ -1,0 +1,10 @@
+### human.transfer — encaminha para atendimento humano
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{ "action": "human.transfer", "session_id": "<UUID_SESSAO>", "event_id": "<UUID_EVENTO>", "args": { "reason": "cliente pediu atendente" } }
+
+### Resposta esperada
+# 200 { "success": true, "case_id": "<UUID>" }

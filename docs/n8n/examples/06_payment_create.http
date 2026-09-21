@@ -1,0 +1,25 @@
+### payment.create — cria a cobrança (variante A). Valores da resposta em CENTAVOS.
+# Exige sessão verificada E reconhecimento da dívida (senão 409 debt_not_acknowledged).
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{ "action": "payment.create", "session_id": "<UUID_SESSAO>", "event_id": "<UUID_EVENTO>", "args": { "offer_id": "<UUID_OFERTA>", "billing_type": "PIX" } }
+
+### Resposta esperada (cobrança pronta)
+# 200 {
+#   "ok": true, "idempotent": false, "status": "created",
+#   "agreement_id": "<UUID>", "asaas_payment_id": "pay_123", "billing_type": "PIX",
+#   "total_value": 36184, "installments": 1, "due_date": "2026-09-28",
+#   "invoice_url": "https://www.asaas.com/i/...", "pix_copy_paste": "00020126...",
+#   "pix_qr_code_url": "00020126...", "boleto_url": null, "boleto_line": null
+# }
+### Resposta esperada (worker off)
+# 200 { "ok": true, "idempotent": false, "status": "processing", "agreement_id": "<UUID>", "poll_after_ms": 3000 }
+### Reenvio idempotente (mesma session+offer)
+# 200 { "ok": true, "idempotent": true, "status": "created", "...": "payload IDÊNTICO, 0 cobrança nova" }
+### Erros
+# 409 { "ok": false, "code": "debt_not_acknowledged", "message": "..." }
+# 409 { "ok": false, "code": "already_charged", "message": "..." }
+# 501 { "ok": false, "code": "not_implemented", "message": "..." }

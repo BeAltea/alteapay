@@ -1,0 +1,10 @@
+### offer.list — ofertas geradas/validadas pela matriz
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{ "action": "offer.list", "session_id": "<UUID_SESSAO>" }
+
+### Resposta esperada
+# 200 { "success": true, "offers": [ { "id": "<UUID_OFERTA>", "terms": { ... }, "valid_until": "..." } ] }
