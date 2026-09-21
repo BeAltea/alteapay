@@ -16,12 +16,14 @@ Formato §7.4. **Regra de subida:** nenhum BLOQUEANTE aberto passa ao GATE H1 �
 | 🟢 vn-cobranca | Não cobra 2x; caminho antigo intacto; ASAAS fonte da verdade; ofertas da matriz | T2/T6 | **APROVADO** |
 | 🟢 vt-security | PII, URL-credencial, resposta uniforme, RLS, rate-limit, captcha funcional, cookie, CPF-não-sai | todas | **APROVADO** (2 baixos cosméticos) |
 
-## Follow-ups NÃO-bloqueantes (registrados, não travam GATE H1)
-- **Paginação em memória** na lista de negociações: funciona no volume 3196 (documentado), mas full-scan filtrado + slice — não escala. `idx_neg_state_company_rank` não usado (ordenação em memória). Otimizar quando o volume crescer.
-- **`channel`/`provider_status_source` sempre nulos na projeção** (`FIX-T1-1.md`): exige `message.*` carregarem `channel` no payload (fora do arquivo do T1). Filtro "canal" da lista não casa até isso. Informativo, não afeta o funil.
-- **Rate-limit do link público** não conta tentativas de captcha/DV-inválido para o teto/hora (vt-security baixo): IP-lock já barra rajada antes; defesa redundante.
-- **`both` mode**: a parte de cobrança é uma nota não-executada (conservador — sem duplo disparo; produto decide se fecha o ciclo).
-- **`List-Unsubscribe` header**: `sendEmail`/worker SendGrid não expõem headers custom hoje; opt-out efetivo é o link do rodapé até o helper suportar.
+## Follow-ups NÃO-bloqueantes — IMPLEMENTADOS (commits `7e54374..093ef39`)
+- ✅ **Paginação server-side** na lista: `range()` no `negotiation_state` (usa `idx_company_rank`/`_updated`) + contadores por agregação separada (mesmo predicado → soma fecha); filtros satélite pré-resolvidos a ids. Não materializa mais as ~3196 linhas.
+- ✅ **`channel`/`provider_status_source`** na projeção: gancho global `applyJourneyEventToState` no `recordEvent` (best-effort) → projeção reflete TODOS os eventos ao vivo (resolve T1-1) e grava `channel` do payload dos `message.*` (resolve FIX-T1-1). `rebuild==incremental` preservado.
+- ✅ **Rate-limit captcha:** captcha falho no link público agora registra tentativa (alimenta o teto/cedente-hora) + comentário corrigido.
+- ✅ **`List-Unsubscribe`:** headers custom fim-a-fim (`sendEmail`→fila→worker→SendGrid); convite passa `List-Unsubscribe` + `-Post` one-click; corpo segue neutro.
+- ⏸️ **`both` mode**: parte de cobrança é nota não-executada (conservador, sem duplo disparo) — **decisão de produto**, não é bug.
+
+Estado: **444 testes verdes** (após follow-ups), build verde.
 
 ## Confirmações-chave (o que a validação PROVOU correto)
 - Botão "Enviar negociação" (`whatsapp_chat`) **não cria cobrança nem e-mail de cobrança**; `charge_email` (caminho antigo) intacto.
