@@ -2,13 +2,17 @@
 
 **Última atualização:** 2026-09-21 · Complemento de `docs/N8N_INTEGRATION.md`.
 
-> **Contrato v2 (onda R):** ver o guia completo em `docs/N8N_TEAM_INTEGRATION_GUIDE.md`.
+> **Contrato v2.1 (Hub/link único, H7–H9):** ver o guia completo em `docs/N8N_TEAM_INTEGRATION_GUIDE.md`.
 > Mudanças que o fluxo DEVE implementar: (1) tratar **valores em centavos** no
 > `chat.turn` e nas respostas de `payment.*`; (2) conduzir o **reconhecimento**
 > (não pagar antes; tratar `409 debt_not_acknowledged`); (3) usar as ações novas
 > `chat.send`/`prompt.ask`/`prompt.close` e o catálogo de botões (`1=Sim`,`0=Não`,
 > `2..N`,`98`,`99`); (4) `payment.create` idempotente por `(session_id, offer_id)`;
-> (5) `501 not_implemented` = variante B fora do escopo.
+> (5) `501 not_implemented` = variante B fora do escopo; (6) **receber o evento
+> `negotiation.start`** (disparado no clique "Sim" do reconhecimento — o
+> `engine_owner` vira `n8n` e o fluxo assume a conversa); (7) no `409 already_charged`,
+> chamar `payment.status` e **reenviar o link vivo** (`from_live_charge:true`), sem
+> gerar cobrança nova; (8) tratar o modo `processing` (worker off → `poll_after_ms`).
 
 Esta onda entrega a plataforma **pronta** para o fluxo n8n ser o cérebro da
 conversa, mas o fluxo ainda **não existe**. Este documento é o checklist do que o
@@ -19,6 +23,22 @@ Enquanto o fluxo não existe, use o **engine stub** (`NEGOTIATION_ENGINE=stub`,
 fora de produção) ou o endpoint de laboratório `/api/dev/n8n-stub`.
 
 ---
+
+## 0. Receber o `negotiation.start` (gatilho do reconhecimento "Sim")
+
+Antes do 1º turno, quando o cliente clica **`1` (Sim, reconheço)**, a plataforma
+POSTa um evento **`negotiation.start`** (mesmo endpoint do `chat.turn`, ou
+`N8N_EVENT_FLOW_URL` se configurado; mesma assinatura HMAC). A partir daí a
+sessão é `engine_owner='n8n'` e **todos os turnos vão ao fluxo**. O corpo traz o
+contexto completo (session/tenant/customer/debt/`acknowledgement`/matrix/offers/
+`available_actions`), centavos, documento mascarado. Ver o payload em
+`docs/N8N_TEAM_INTEGRATION_GUIDE.md` §4.1.
+
+- Clique em `0` (Não) **não** dispara `negotiation.start` — a conversa segue
+  assistida pela plataforma e `payment.create` fica bloqueado.
+- Idempotência por `event_id`. Resiliência: se o fluxo não estiver no ar, a
+  plataforma cai no assistido (o cliente não vê erro) — o payload é o mesmo no
+  dia do plug.
 
 ## 1. Receber o turno (papel A)
 

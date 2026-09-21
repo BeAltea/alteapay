@@ -1,6 +1,6 @@
 # Guia de Integração para o Time do n8n — AlteaPay (chat de negociação)
 
-**Versão do contrato:** **v2 (2026-09-21)** · **Estado:** implementado na branch `feature/chatbot-journey`, atrás de flags desligadas (produção sem mudança de comportamento). **Autossuficiente:** este documento basta para construir o fluxo do n8n de ponta a ponta.
+**Versão do contrato:** **v2.1 (2026-09-21, Hub/link único H7–H9)** · **Estado:** implementado na branch `feature/journey-neutral-prelogin`, atrás de flags desligadas (produção sem mudança de comportamento). **Autossuficiente:** este documento basta para construir o fluxo do n8n de ponta a ponta.
 
 > **Regra de ouro:** o fluxo do n8n é o **cérebro da conversa** (decide o que dizer e qual ação pedir). A AlteaPay é o **sistema de registro e de ações de domínio** (decide desconto/parcela/validade pela matriz, cria a cobrança, aplica os guards). O fluxo **nunca** fecha acordo, obtém link de pagamento ou declara pagamento por conta própria.
 
@@ -38,8 +38,9 @@ Dois canais entre n8n e AlteaPay, ambos assinados por HMAC (§3):
 | **Matriz (matrix)** | As regras do tenant (desconto máximo, entrada mínima, parcelas, formas, validade). O **servidor** decide; a matriz viaja no contexto só para o fluxo saber os limites. |
 | **Acordo (agreement)** | A oferta aceita e fechada, com a cobrança ASAAS vinculada. Criado pela AlteaPay. |
 | **Cobrança (charge)** | O pagamento no ASAAS (PIX / boleto / cartão) com link, gerada pela AlteaPay. |
-| **Reconhecimento (acknowledgement)** | A resposta Sim/Não à pergunta "você reconhece esta cobrança?", registrada em log append-only. Gate do `payment.create`. |
+| **Reconhecimento (acknowledgement)** | A resposta Sim/Não à pergunta "você reconhece esta cobrança?", registrada em log append-only. Gate do `payment.create`. **Ao clicar "Sim" (button_id=1), a AlteaPay emite `negotiation.start` ao fluxo e passa o dono do engine para o n8n** (§4.1). |
 | **Prompt** | Uma pergunta com botões numéricos exibida ao cliente (o reconhecimento é o 1º prompt). |
+| **`engine_owner`** | Quem conduz os turnos da sessão: `platform` (assistido/determinístico, default) ou `n8n` (o fluxo é o cérebro). Vira `n8n` no clique "Sim". Se o n8n não estiver plugado no dia, a sessão fica em `platform` (assistido) sem erro para o cliente — o **contrato `negotiation.start` é o mesmo** quando o fluxo entrar no ar. |
 
 ---
 
@@ -203,6 +204,47 @@ Campo a campo:
 
 ---
 
+## 4.1 negotiation.start — o gatilho do reconhecimento "Sim"
+
+Quando o cliente clica **`1` (Sim, reconheço)** no prompt de reconhecimento, a AlteaPay:
+1. registra o reconhecimento (append-only) e marca `debt.acknowledged`;
+2. **marca a sessão como `engine_owner='n8n'`** (a partir daí todos os turnos vão ao fluxo);
+3. **POSTa um evento `negotiation.start`** no seu fluxo (mesmo endpoint/HMAC do `chat.turn` — ou `N8N_EVENT_FLOW_URL` se configurado). É o **sinal de largada**: o fluxo pode dar as boas-vindas, resumir a dívida e conduzir a negociação.
+
+> Clique em **`0` (Não)**: gera `debt.not_recognized`, **NÃO** dispara `negotiation.start`, e a conversa segue **determinística/assistida** (a AlteaPay conduz). `payment.create` fica bloqueado com `409 debt_not_acknowledged`.
+
+**Resiliência (dia do plug):** se o fluxo ainda não estiver no ar, a AlteaPay registra `engine_unavailable`, mantém a sessão em `engine_owner='platform'` (assistido) e o cliente **não vê erro**. Quando o fluxo entrar, o **payload é exatamente o mesmo** — só muda a configuração (`N8N_CHAT_FLOW_URL`/`N8N_EVENT_FLOW_URL` + `N8N_WEBHOOK_SECRET`).
+
+**Idempotência:** trate por `event_id` (mesmo esquema dos demais eventos) — um retry traz o mesmo `event_id`.
+
+**Payload `negotiation.start`** (valores em **centavos**; documento **mascarado + hash**, claro só com as 2 flags do tenant — como `payment_origin` está travado em `platform` nesta onda, o **CPF nunca sai**):
+
+```json
+{
+  "event": "negotiation.start",
+  "event_id": "uuid-por-evento",
+  "session_id": "uuid-da-sessao",
+  "company_id": "uuid-do-tenant",
+  "session": { "id": "...", "channel": "web_campaign", "verified": true, "consent": true, "engine": "n8n", "locale": "pt-BR", "turn_index": 0 },
+  "tenant": { "id": "uuid", "slug": "vmax", "brand_name": "VMAX", "creditor_name": "VMAX", "fulfillment_mode": "A", "payment_origin": "platform" },
+  "customer": { "id": "uuid", "first_name": "Fabio", "document_type": "cpf", "document_masked": "***.444.777-**", "document_hash": "b1e2...sha256hex", "document": null },
+  "debt": {
+    "id": "uuid-da-divida", "ids": ["uuid-da-divida"],
+    "original_value": 41890, "updated_value": 45230,
+    "oldest_due_date": "2025-03-10", "aging_days": 557,
+    "invoice_count": 3, "invoices": [ { "invoice": "F123", "due_date": "2025-03-10", "value": 15000 } ]
+  },
+  "acknowledgement": { "acknowledged": true, "button_id": 1, "answered_at": "2026-09-21T12:00:00.000Z" },
+  "matrix": { "id": "uuid", "max_discount_pct": 20, "min_entry_pct": 20, "max_installments": 3, "allowed_billing_types": ["PIX","BOLETO"], "proposal_validity_days": 7 },
+  "offers": [],
+  "available_actions": ["debt.summary","offer.list","offer.propose","offer.accept","offer.reject","payment.create","payment.status","chat.send","prompt.ask","prompt.close","dispute.register","payment_claim.register","human.transfer","negotiation.note","session.close"]
+}
+```
+
+O que o fluxo faz ao receber `negotiation.start`: valide a assinatura (§3), leia o contexto e inicie a conversa (`chat.send` de boas-vindas, ou aguarde o 1º `chat.turn` do cliente — os dois chegam). A partir daqui, cada mensagem do cliente vira um `chat.turn` normal (§4).
+
+---
+
 ## 5. Resposta ao chat.turn
 
 Só `reply` é obrigatório. Campos desconhecidos são ignorados.
@@ -293,7 +335,9 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
 
 ### 7.7 `payment.status`
 - **Request:** `{ "action":"payment.status", "session_id":"uuid" }`
-- **Response:** `{ "ok":true, "agreement_id", "payment": { ..., "total_value":<centavos> }, "payment_status", "asaas_status" }`
+- **Response:** `{ "ok":true, "agreement_id", "payment": { ..., "total_value":<centavos>, "invoice_url", "pix_copy_paste", "boleto_url" }, "payment_status", "asaas_status", "from_live_charge?": true }`
+- **Reenvio no `already_charged` (§8):** quando `payment.create` devolveu `409 already_charged`, chame `payment.status`. Se a dívida já tinha uma **cobrança viva** (mesmo que não vinculada a esta sessão), a resposta traz `from_live_charge: true` e as **URLs do acordo existente** — **reenvie esse link** (`invoice_url`/`pix_copy_paste`/`boleto_url`) em vez de gerar cobrança nova.
+- **Modo `processing`:** quando `payment.create` devolveu `processing` (worker ainda gerando a cobrança), faça polling em `payment.status` a cada `poll_after_ms` até `payment.payment_id` (e as URLs) aparecerem.
 - **NUNCA** aceita status vindo do fluxo — a fonte é o ASAAS.
 
 ### 7.8 `chat.send`
@@ -364,6 +408,8 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
    { "ok": true, "idempotent": true, "status": "created", "agreement_id": "uuid", "asaas_payment_id": "pay_123", "total_value": 36184, "...": "idêntico" }
    ```
 8. Cliente paga → **ASAAS webhook** confirma → a AlteaPay atualiza o acordo. O fluxo não declara pagamento.
+
+**Caso `already_charged` (dívida já tinha cobrança viva):** o passo 3/4 devolve `409 { code: "already_charged" }`. Não é erro fatal — chame `payment.status` (§7.7): se vier `from_live_charge: true` + URLs, **reenvie o link existente** ao cliente. Nunca tente forçar uma cobrança nova.
 
 ---
 
@@ -453,7 +499,13 @@ Sempre `{ "ok":false, "code", "message" }` (ou `{ "success":false, "error", "cod
 **Glossário:** *tenant/credor* (empresa, isolada por `company_id`) · *cliente/devedor* · *dívida/fatura* · *sessão* (`thread_id` = memória) · *oferta* (da matriz) · *matriz* (regras do tenant) · *acordo* (oferta fechada) · *cobrança* (pagamento ASAAS) · *reconhecimento* (Sim/Não append-only) · *prompt* (pergunta com botões) · *guard* (proteção de idempotência da cobrança) · *variante A* (AlteaPay executa a cobrança — único caminho desta onda).
 
 **Changelog do contrato:**
-- **v2 — 2026-09-21 (onda R) — VERSÃO ATUAL:**
+- **v2.1 — 2026-09-21 (Hub/link único, H7–H9) — VERSÃO ATUAL:**
+  - Evento **`negotiation.start`** (§4.1): emitido no clique "Sim" do reconhecimento; passa a sessão para `engine_owner='n8n'`. Payload = contrato do Apêndice B (session/tenant/customer/debt/acknowledgement/matrix/offers/available_actions), centavos, doc mascarado.
+  - Conceito **`engine_owner`** (`platform`|`n8n`): quem conduz os turnos. Vira `n8n` no "Sim"; fallback assistido resiliente se o n8n não estiver plugado (mesmo contrato quando entrar).
+  - **`already_charged` → `payment.status`**: a resposta traz `from_live_charge: true` + URLs do acordo vivo para **reenvio do link existente**.
+  - Modo **`processing`** documentado no `payment.status` (polling até o link do worker aparecer).
+  - Endpoint de eventos: `N8N_EVENT_FLOW_URL` (opcional; senão reusa `N8N_CHAT_FLOW_URL`, distinguido pelo campo `event`).
+- **v2 — 2026-09-21 (onda R):**
   - Valores monetários **em centavos** em todas as interfaces n8n.
   - Reconhecimento da dívida como 1ª interação; `chat.turn.debt_acknowledgement`; bloqueio `409 debt_not_acknowledged` no `payment.create`.
   - Ações novas: `chat.send`, `prompt.ask`, `prompt.close`; clique de botão via `POST /api/chat/button`; polling via `GET /api/chat/messages?since=`.

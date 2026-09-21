@@ -56,6 +56,32 @@ export function engineName(): EngineName {
   return "disabled"
 }
 
+/**
+ * H7/H8: seleção do engine POR SESSÃO. Quando `session.engine_owner='n8n'`
+ * (setado no reconhecimento "Sim"), os turnos VÃO ao fluxo n8n — desde que o
+ * n8n esteja de fato configurado. Se o n8n não estiver disponível
+ * (N8N_CHAT_FLOW_URL ausente) ou o engine global degradar para disabled, o
+ * turno cai para o ASSISTIDO (fallback resiliente H8) e o cliente NUNCA vê erro.
+ *
+ * Quando `engine_owner` é 'platform'/null (default), respeita o
+ * NEGOTIATION_ENGINE global (assistido/determinístico por padrão).
+ *
+ * Nunca sobrescreve o global "agent"/"stub" de laboratório: essas são escolhas
+ * explícitas de ambiente e continuam valendo como fallback.
+ */
+export function resolveEngineForSession(owner: "platform" | "n8n" | null | undefined): EngineName {
+  const global = engineName()
+  if (owner === "n8n") {
+    // dono é n8n: se o n8n resolve (URL presente ou lab), roteia ao fluxo;
+    // senão, fallback assistido (disabled) — sem erro ao cliente (H8).
+    if (process.env.N8N_CHAT_FLOW_URL) return "n8n"
+    if (IS_LAB()) return "stub"
+    return "disabled"
+  }
+  // dono é a plataforma (default): o global manda (assistido por padrão).
+  return global
+}
+
 function chatFlowUrl(): string {
   return process.env.N8N_CHAT_FLOW_URL || ""
 }
@@ -261,7 +287,10 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
 }
 
 export async function engineChat(input: EngineTurnInput): Promise<EngineTurnResult> {
-  const name = engineName()
+  // H7/H8: o dono do engine da sessão decide o roteamento. engine_owner='n8n'
+  // (setado no reconhecimento "Sim") força o fluxo n8n; se ele não estiver
+  // configurado, cai no assistido sem erro. Default (platform/null) → global.
+  const name = resolveEngineForSession(input.session.engine_owner)
   if (name === "disabled") {
     // D13: chat assistido determinístico (menu servido pelo servidor, sem IA)
     const { assistedChat } = await import("./assisted")
@@ -295,6 +324,110 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
     await callN8nFlow(url, { type: "session.init", ...payload }, 15_000)
   } catch (err) {
     console.warn("[engine:n8n] session.init flow falhou (não-fatal):", err instanceof Error ? err.message : err)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// H7: evento negotiation.start (plataforma → n8n) no clique "Sim" (button_id=1).
+// A partir daqui, engine_owner='n8n' e todos os turnos vão ao fluxo. O payload é
+// o contrato do Apêndice B (session/tenant/customer/debt/acknowledgement/matrix/
+// offers/available_actions) — valores em CENTAVOS, documento MASCARADO + hash
+// (claro só com as 2 flags; como payment_origin está travado em 'platform' por
+// D17, o CPF nunca sai).
+
+/** URL do fluxo de eventos do n8n. Reusa N8N_CHAT_FLOW_URL se não houver um
+ * endpoint de eventos dedicado (N8N_EVENT_FLOW_URL) — o fluxo distingue pelo
+ * campo `event` do corpo. */
+function eventFlowUrl(): string {
+  return process.env.N8N_EVENT_FLOW_URL || process.env.N8N_CHAT_FLOW_URL || ""
+}
+
+export interface NegotiationStartPayload {
+  event: "negotiation.start"
+  event_id: string
+  session_id: string
+  company_id: string
+  session: unknown
+  tenant: unknown
+  customer: unknown
+  debt: unknown
+  acknowledgement: {
+    acknowledged: boolean
+    button_id: number | null
+    answered_at: string | null
+  }
+  matrix: unknown
+  offers: unknown
+  available_actions: readonly string[]
+}
+
+export type NegotiationStartResult =
+  | { ok: true; delivered: true; event_id: string }
+  | { ok: true; delivered: false; reason: "engine_unavailable" | "context_unresolved" }
+  | { ok: false; reason: "context_unresolved" }
+
+/**
+ * Monta o payload negotiation.start a partir do contexto rico da sessão
+ * (buildSessionContext já produz session/tenant/customer/debt/matrix/offers/
+ * debt_acknowledgement em CENTAVOS e mascarado). Retorna null se o contexto não
+ * resolver (sessão/cliente/dívida inconsistentes).
+ */
+export async function buildNegotiationStartPayload(
+  sessionId: string,
+  eventId: string,
+): Promise<NegotiationStartPayload | null> {
+  const { buildSessionContext } = await import("@/lib/journey/context")
+  const ctx = await buildSessionContext(sessionId)
+  if (!ctx) return null
+  return {
+    event: "negotiation.start",
+    event_id: eventId,
+    session_id: sessionId,
+    company_id: ctx.tenant.id,
+    session: ctx.session,
+    tenant: ctx.tenant,
+    customer: ctx.customer,
+    debt: ctx.debt,
+    acknowledgement: {
+      acknowledged: ctx.debt_acknowledgement.acknowledged === true,
+      button_id: ctx.debt_acknowledgement.button_id,
+      answered_at: ctx.debt_acknowledgement.answered_at,
+    },
+    matrix: ctx.matrix,
+    offers: ctx.offers,
+    available_actions: N8N_AVAILABLE_ACTIONS,
+  }
+}
+
+/**
+ * Emite negotiation.start ao n8n (assinado, mesmo esquema HMAC dos outros
+ * contratos). RESILIENTE (H8): se o n8n não estiver configurado ou o POST
+ * falhar, NÃO lança — devolve delivered:false/reason:'engine_unavailable' para
+ * o chamador registrar auditoria e seguir no assistido. Idempotência por
+ * event_id fica a cargo do fluxo n8n (o mesmo esquema dos demais eventos).
+ */
+export async function emitNegotiationStart(
+  sessionId: string,
+  eventId: string,
+): Promise<NegotiationStartResult> {
+  const payload = await buildNegotiationStartPayload(sessionId, eventId).catch(() => null)
+  if (!payload) return { ok: false, reason: "context_unresolved" }
+
+  const url = eventFlowUrl()
+  if (!url || !n8nWebhookSecret()) {
+    // H8: n8n não plugado ainda → cai no assistido. O contrato é o MESMO no dia
+    // do plug (só configuração muda).
+    return { ok: true, delivered: false, reason: "engine_unavailable" }
+  }
+  try {
+    await callN8nFlow(url, payload, flowTimeoutMs())
+    return { ok: true, delivered: true, event_id: eventId }
+  } catch (err) {
+    console.warn(
+      "[engine:n8n] negotiation.start falhou (fallback assistido):",
+      err instanceof Error ? err.message : err,
+    )
+    return { ok: true, delivered: false, reason: "engine_unavailable" }
   }
 }
 

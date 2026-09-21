@@ -36,6 +36,9 @@ export interface NegotiationSession {
   thread_id: string | null
   user_agent: string | null
   ip_hash: string | null
+  // T1: dono do engine desta sessão. 'platform' = assistido/determinístico (default);
+  // 'n8n' = os turnos vão ao fluxo n8n (setado no reconhecimento "Sim").
+  engine_owner: "platform" | "n8n" | null
   created_at: string
   updated_at: string
 }

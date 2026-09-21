@@ -13,7 +13,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
 import { getPrompt, answerPrompt } from "@/lib/journey/prompts"
-import { recordAcknowledgement } from "@/lib/journey/acknowledgement"
+import { recordAcknowledgement, startN8nNegotiation } from "@/lib/journey/acknowledgement"
 import { engineName } from "@/lib/negotiation/engine"
 import { BTN_HANDOFF } from "@/lib/journey/buttons"
 
@@ -76,7 +76,22 @@ export async function POST(req: NextRequest) {
         on_not_recognized: res.onNotRecognized ?? "continue",
       })
     }
-    return NextResponse.json({ ok: true, acknowledged: true, button_id: buttonId })
+    // "Sim, reconheço" (button 1): handoff ao n8n (engine_owner='n8n' + emite
+    // negotiation.start). RESILIENTE (H8): se o n8n não estiver plugado, mantém
+    // o assistido e o cliente NÃO vê erro. Nunca derruba a resposta do clique.
+    let engineOwner: "platform" | "n8n" = "platform"
+    try {
+      const start = await startN8nNegotiation({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        debtId: ctx.debtId,
+      })
+      engineOwner = start.owner
+    } catch (err) {
+      console.warn("[chat:button] negotiation.start falhou (fallback assistido):", (err as Error).message)
+    }
+    return NextResponse.json({ ok: true, acknowledged: true, button_id: buttonId, engine_owner: engineOwner })
   }
 
   // Handoff genérico ([99]) em qualquer prompt: transfere e responde.

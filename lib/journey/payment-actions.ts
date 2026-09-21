@@ -356,9 +356,20 @@ export interface PaymentStatusResult {
   payment: PaymentDetails | null
   payment_status: string | null
   asaas_status: string | null
+  /** true quando as URLs vêm de um acordo VIVO do cliente (não da sessão) —
+   * é o caso already_charged: o front/n8n REENVIA este link em vez de cobrar. */
+  from_live_charge?: boolean
 }
 
-/** payment.status: estado atual da cobrança do acordo da sessão (fonte = base local). */
+/**
+ * payment.status: estado + URLs da cobrança para a sessão (fonte = base local).
+ *
+ * §4: no caso `already_charged` a dívida já tem cobrança viva num acordo que
+ * pode NÃO estar vinculado à sessão. Aqui, se a sessão não tem acordo próprio,
+ * caímos no acordo VIVO do cliente (guard `findBlockingAgreement`) e devolvemos
+ * as URLs (PIX/boleto/invoice) para o fluxo REENVIAR o link existente — nunca
+ * gerar cobrança nova. ASAAS continua a fonte da verdade do pagamento.
+ */
 export async function paymentStatus(ctx: SessionCtx): Promise<PaymentStatusResult> {
   const supabase = createServiceClient()
   const { data: session } = await supabase
@@ -367,20 +378,44 @@ export async function paymentStatus(ctx: SessionCtx): Promise<PaymentStatusResul
     .eq("id", ctx.sessionId)
     .maybeSingle()
   const agreementId = session?.agreement_id ?? null
-  if (!agreementId) return { agreement_id: null, payment: null, payment_status: null, asaas_status: null }
 
-  const { data } = await supabase
+  if (agreementId) {
+    const { data } = await supabase
+      .from("agreements")
+      .select("payment_status, asaas_status")
+      .eq("id", agreementId)
+      .eq("company_id", ctx.companyId)
+      .maybeSingle()
+    const payment = await fetchPaymentDetails(agreementId, ctx.companyId)
+    return {
+      agreement_id: agreementId,
+      payment,
+      payment_status: data?.payment_status ?? null,
+      asaas_status: data?.asaas_status ?? null,
+    }
+  }
+
+  // Sem acordo na sessão: procura o acordo VIVO do cliente (already_charged) e
+  // devolve suas URLs para reenvio (§4). Isola por customer_id + company_id.
+  const { data: agreements } = await supabase
     .from("agreements")
-    .select("payment_status, asaas_status")
-    .eq("id", agreementId)
+    .select("id, asaas_payment_id, payment_status, asaas_status")
+    .eq("customer_id", ctx.customerId)
     .eq("company_id", ctx.companyId)
-    .maybeSingle()
-  const payment = await fetchPaymentDetails(agreementId, ctx.companyId)
+    .not("asaas_payment_id", "is", null)
+  const live = findBlockingAgreement(
+    (agreements ?? []) as Array<{ id: string; asaas_payment_id: string | null; payment_status: string | null; asaas_status: string | null }>,
+  ) as { id?: string; payment_status?: string | null; asaas_status?: string | null } | null
+  if (!live?.id) {
+    return { agreement_id: null, payment: null, payment_status: null, asaas_status: null }
+  }
+  const payment = await fetchPaymentDetails(live.id, ctx.companyId)
   return {
-    agreement_id: agreementId,
+    agreement_id: live.id,
     payment,
-    payment_status: data?.payment_status ?? null,
-    asaas_status: data?.asaas_status ?? null,
+    payment_status: live.payment_status ?? null,
+    asaas_status: live.asaas_status ?? null,
+    from_live_charge: true,
   }
 }
 
