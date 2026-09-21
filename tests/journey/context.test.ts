@@ -36,8 +36,8 @@ function seed(cfg: Record<string, any>) {
       { id: "cust1", company_id: CO, name: "Fabio Silva", document: "111.444.777-35", phone: "11999998888", email: "fabio@x.com" },
     ],
     debts: [
-      { id: "debt1", company_id: CO, amount: 100.5, current_amount: 100.5, due_date: "2020-01-01" },
-      { id: "debt2", company_id: CO, amount: 50, current_amount: 50, due_date: "2021-01-01" },
+      { id: "debt1", company_id: CO, amount: 100.5, due_date: "2020-01-01" },
+      { id: "debt2", company_id: CO, amount: 50, due_date: "2021-01-01" },
     ],
     vmax_invoices: [{ id_company: CO, doc: "11144477735", fatura: "F1", vencimento: "2020-01-01", saldo: 100.5 }],
     negotiation_offers: [],

@@ -60,8 +60,8 @@ function seedBase() {
       { id: CUST_CNPJ, company_id: CO, name: "Empresa X", document: CNPJ, phone: "1188", email: "e@x.com" },
     ],
     debts: [
-      { id: DEBT_CPF, company_id: CO, customer_id: CUST_CPF, status: "pending", amount: 1000, current_amount: 1000, due_date: "2020-01-01" },
-      { id: DEBT_CNPJ, company_id: CO, customer_id: CUST_CNPJ, status: "pending", amount: 2000, current_amount: 2000, due_date: "2020-01-01" },
+      { id: DEBT_CPF, company_id: CO, customer_id: CUST_CPF, status: "pending", amount: 1000, due_date: "2020-01-01" },
+      { id: DEBT_CNPJ, company_id: CO, customer_id: CUST_CNPJ, status: "pending", amount: 2000, due_date: "2020-01-01" },
     ],
     vmax_invoices: [
       { id_company: CO, doc: CPF, fatura: "F1", vencimento: "2020-01-01", saldo: 1000 },

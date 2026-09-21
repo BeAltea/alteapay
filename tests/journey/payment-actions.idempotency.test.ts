@@ -40,7 +40,7 @@ function reset() {
   db = {
     tenant_chat_config: [{ company_id: CO, payment_origin: "platform", allow_payment_without_acknowledgement: false, acknowledgement_enabled: true }],
     agreements: [],
-    debts: [{ id: "debt1", company_id: CO, current_amount: 100, amount: 100 }],
+    debts: [{ id: "debt1", company_id: CO, amount: 100 }],
     negotiation_sessions: [{ id: "s1", company_id: CO, agreement_id: null }],
     negotiation_acceptances: [],
     debt_acknowledgement_latest: [{ session_id: "s1", debt_id: "debt1", acknowledged: true, button_id: 1, created_at: new Date().toISOString() }],

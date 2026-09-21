@@ -116,10 +116,10 @@ describe("resolveByDocument", () => {
         { id: "cust_b", company_id: CO_B, name: "Outro Cliente", document: "11144477735" },
       ],
       debts: [
-        { id: "debt_a1", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 100, current_amount: 100, due_date: OLD_DUE },
-        { id: "debt_a2", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 200, current_amount: 200, due_date: "2021-06-01" },
-        { id: "debt_a3", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 50, current_amount: 50, due_date: "2022-01-01" },
-        { id: "debt_b1", company_id: CO_B, customer_id: "cust_b", status: "pending", amount: 999, current_amount: 999, due_date: OLD_DUE },
+        { id: "debt_a1", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 100, due_date: OLD_DUE },
+        { id: "debt_a2", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 200, due_date: "2021-06-01" },
+        { id: "debt_a3", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 50, due_date: "2022-01-01" },
+        { id: "debt_b1", company_id: CO_B, customer_id: "cust_b", status: "pending", amount: 999, due_date: OLD_DUE },
       ],
       vmax_invoices: [
         { id_company: CO_A, doc: "11144477735", fatura: "F1", vencimento: OLD_DUE, saldo: 100 },
@@ -202,7 +202,7 @@ describe("resolveByDocument", () => {
       { id: "cust_odd", company_id: CO_A, name: "Formato Atípico", document: "330 366 958 93" },
     ]
     db.debts = [
-      { id: "debt_odd", company_id: CO_A, customer_id: "cust_odd", status: "pending", amount: 42, current_amount: 42, due_date: OLD_DUE },
+      { id: "debt_odd", company_id: CO_A, customer_id: "cust_odd", status: "pending", amount: 42, due_date: OLD_DUE },
     ]
     db.vmax_invoices = []
     const { resolveByDocument } = await importResolver()
@@ -215,10 +215,10 @@ describe("resolveByDocument", () => {
 
   it("status filter intacto: pending + in_negotiation contam; paid/cancelled não", async () => {
     db.debts = [
-      { id: "d_pending", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 10, current_amount: 10, due_date: OLD_DUE },
-      { id: "d_inneg", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 20, current_amount: 20, due_date: "2021-01-01" },
-      { id: "d_paid", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 30, current_amount: 30, due_date: "2021-02-01" },
-      { id: "d_cancelled", company_id: CO_A, customer_id: "cust_a", status: "cancelled", amount: 40, current_amount: 40, due_date: "2021-03-01" },
+      { id: "d_pending", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 10, due_date: OLD_DUE },
+      { id: "d_inneg", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 20, due_date: "2021-01-01" },
+      { id: "d_paid", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 30, due_date: "2021-02-01" },
+      { id: "d_cancelled", company_id: CO_A, customer_id: "cust_a", status: "cancelled", amount: 40, due_date: "2021-03-01" },
     ]
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
