@@ -47,6 +47,8 @@ import type { NegotiationSession } from "@/lib/negotiation/types"
 import { n8nQueue } from "@/lib/queue/queues"
 import { createServiceClient } from "@/lib/supabase/service"
 import type { PaymentRecordArgs } from "@/lib/journey/payment-actions"
+import type { ChatSendArgs } from "@/lib/journey/chat-send"
+import type { Button } from "@/lib/journey/buttons"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 300
@@ -124,6 +126,8 @@ const JOURNEY_ACTIONS = [
   "payment.create", "payment.record", "payment.status", "negotiation.note",
   "dispute.register", "payment_claim.register", "human.transfer",
   "session.close", "journey.timeline",
+  // onda R: o n8n empurra mensagens/prompts para o chat do cliente.
+  "chat.send", "prompt.ask", "prompt.close",
 ] as const
 
 const journeySchema = z.object({
@@ -621,17 +625,17 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       return NextResponse.json({ success: true, case_id: caseId })
     }
     case "payment.create": {
-      // Papel A: a plataforma executa (guard SEMPRE). Exige sessão verificada.
+      // Papel A (variante A é o ÚNICO caminho): a plataforma executa (guard
+      // SEMPRE + guard de reconhecimento). Exige sessão verificada. Valores
+      // monetários da resposta em CENTAVOS (contrato v2, §6.4/Apêndice B.1).
       if (!(await sessionIsVerified(input.session_id))) return jsonError(403, "sessão não verificada")
       const offerId = args.offer_id as string | undefined
       if (!offerId) return jsonError(422, "args.offer_id obrigatório")
-      const { paymentCreate } = await import("@/lib/journey/payment-actions")
+      const billingType = (args.billing_type as string | undefined) ?? null
+      const { paymentCreate, paymentCreateResponseForN8n } = await import("@/lib/journey/payment-actions")
       const r = await paymentCreate(ctx, offerId, input.event_id)
       if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
-      if (r.status === "processing") {
-        return NextResponse.json({ ok: true, status: "processing", agreement_id: r.agreement_id, poll_after_ms: r.poll_after_ms })
-      }
-      return NextResponse.json({ ok: true, agreement_id: r.payment.agreement_id, payment_id: r.payment.payment_id, billing_type: r.payment.billing_type, pix_copy_paste: r.payment.pix_copy_paste, boleto_url: r.payment.boleto_url, invoice_url: r.payment.invoice_url, due_date: r.payment.due_date, total_value: r.payment.total_value, installments: r.payment.installments })
+      return NextResponse.json(paymentCreateResponseForN8n(r, billingType))
     }
     case "payment.record": {
       // Papel B (variante B): n8n criou a cobrança e registra aqui. Guard antes;
@@ -643,9 +647,34 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       return NextResponse.json(r.code === "claim" ? { ok: true, code: "claim", case_id: r.case_id } : { ok: true, code: "recorded", agreement_id: r.agreement_id })
     }
     case "payment.status": {
-      const { paymentStatus } = await import("@/lib/journey/payment-actions")
+      // Valores em CENTAVOS na borda n8n (§6.4). NUNCA aceita status do fluxo (B.3).
+      const { paymentStatus, reaisToCents } = await import("@/lib/journey/payment-actions")
       const status = await paymentStatus(ctx)
-      return NextResponse.json({ ok: true, ...status })
+      const payment = status.payment
+        ? {
+            ...status.payment,
+            total_value: reaisToCents(status.payment.total_value),
+          }
+        : null
+      return NextResponse.json({ ok: true, ...status, payment })
+    }
+    case "chat.send": {
+      // onda R: empurra mensagem (+opcional prompt +payment_ref) ao chat.
+      const { chatSend } = await import("@/lib/journey/chat-send")
+      const r = await chatSend(ctx, args as unknown as ChatSendArgs, input.event_id)
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
+      return NextResponse.json({ ok: true, message_id: r.message_id, prompt_id: r.prompt_id ?? null, duplicate: r.duplicate ?? false })
+    }
+    case "prompt.ask": {
+      const { promptAsk } = await import("@/lib/journey/chat-send")
+      const r = await promptAsk(ctx, args as unknown as { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string })
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
+      return NextResponse.json({ ok: true, prompt_id: r.prompt_id })
+    }
+    case "prompt.close": {
+      const { promptClose } = await import("@/lib/journey/chat-send")
+      const r = await promptClose(ctx)
+      return NextResponse.json({ ok: true, closed: r.closed })
     }
     case "negotiation.note": {
       const { negotiationNote } = await import("@/lib/journey/payment-actions")

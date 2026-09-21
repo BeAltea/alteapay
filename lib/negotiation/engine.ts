@@ -128,6 +128,11 @@ export async function callN8nFlow(url: string, payload: unknown, timeoutMs = flo
   return resp.json()
 }
 
+// Contrato v2 (onda R): valores monetários na interface n8n em INTEIROS de
+// CENTAVOS. A conversão é SÓ nesta borda; as colunas do banco seguem em reais.
+const toCents = (reais: number | null | undefined): number | null =>
+  reais == null ? null : Math.round(reais * 100)
+
 export function buildTurnPayload(input: EngineTurnInput) {
   const { session, debtor, tenant } = input
   // Documento em CLARO só viaja com as 2 flags (send_document_to_engine=true E
@@ -147,6 +152,13 @@ export function buildTurnPayload(input: EngineTurnInput) {
       fulfillment_mode: session.fulfillment_mode ?? tenant?.fulfillment_mode ?? "A",
       outcome: session.outcome,
     },
+    // Reconhecimento da dívida (onda R): o fluxo sabe se o cliente já respondeu.
+    // O detalhe fino (button_id, prompt_id, active_prompt) vive em
+    // buildSessionContext (context.ts); aqui viaja o mínimo do turno.
+    debt_acknowledgement: {
+      acknowledged: Boolean(session.debt_acknowledged_at),
+      answered_at: session.debt_acknowledged_at ?? null,
+    },
     debtor: debtor
       ? {
           name: debtor.customer_name,
@@ -158,7 +170,8 @@ export function buildTurnPayload(input: EngineTurnInput) {
     debt: debtor
       ? {
           id: debtor.debt_id,
-          amount: debtor.amount,
+          // v2: valor em CENTAVOS (inteiro). `amount` deixa de ser reais decimal.
+          amount: toCents(debtor.amount),
           due_date: debtor.due_date,
           description: debtor.description,
           aging_days: debtor.aging_days,

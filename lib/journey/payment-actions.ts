@@ -22,6 +22,7 @@ import { getAsaasPaymentsForCustomer } from "@/lib/asaas"
 import { buildAcceptSummary, confirmAccept } from "./closing"
 import { registerPaymentClaim, rejectOffer, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
+import { assertAcknowledgedForPayment } from "./acknowledgement"
 
 const PAID_STATUSES = new Set([
   "received", "confirmed", "paid", "RECEIVED", "CONFIRMED", "RECEIVED_IN_CASH",
@@ -35,15 +36,16 @@ export interface PaymentDetails {
   billing_type: string | null
   pix_copy_paste: string | null
   boleto_url: string | null
+  boleto_line: string | null
   invoice_url: string | null
   due_date: string | null
-  total_value: number | null
+  total_value: number | null // REAIS na base; a borda n8n converte p/ centavos
   installments: number | null
 }
 
 export type PaymentCreateResult =
-  | { ok: true; status: "created"; payment: PaymentDetails }
-  | { ok: true; status: "processing"; agreement_id: string; poll_after_ms: number }
+  | { ok: true; status: "created"; idempotent: boolean; payment: PaymentDetails }
+  | { ok: true; status: "processing"; idempotent: boolean; agreement_id: string; poll_after_ms: number }
   | { ok: false; status: number; code: string; message: string }
 
 async function loadTenantPaymentOrigin(companyId: string): Promise<"platform" | "n8n"> {
@@ -73,11 +75,33 @@ async function fetchPaymentDetails(agreementId: string, companyId: string): Prom
     billing_type: data?.asaas_billing_type ?? null,
     pix_copy_paste: data?.asaas_pix_qrcode_url ?? null,
     boleto_url: data?.asaas_boleto_url ?? null,
+    // A base não persiste a linha digitável do boleto; o cliente usa o boleto_url.
+    boleto_line: null,
     invoice_url: data?.asaas_invoice_url ?? data?.asaas_payment_url ?? null,
     due_date: data?.due_date ?? null,
     total_value: data?.agreed_amount != null ? Number(data.agreed_amount) : null,
     installments: data?.installments ?? null,
   }
+}
+
+/**
+ * Idempotência por (session_id, offer_id) (§4.2): se já houve payment.create
+ * para ESTA oferta nesta sessão, devolve o mesmo agreement/link. Reusa a prova
+ * de aceite (negotiation_acceptances: offer_id → agreement_id).
+ */
+async function findExistingPaymentForOffer(
+  ctx: SessionCtx,
+  offerId: string,
+): Promise<string | null> {
+  const supabase = createServiceClient()
+  const { data } = await supabase
+    .from("negotiation_acceptances")
+    .select("agreement_id")
+    .eq("company_id", ctx.companyId)
+    .eq("session_id", ctx.sessionId)
+    .eq("offer_id", offerId)
+    .maybeSingle()
+  return data?.agreement_id ?? null
 }
 
 /**
@@ -90,18 +114,51 @@ export async function paymentCreate(
   offerId: string,
   eventId?: string,
 ): Promise<PaymentCreateResult> {
+  // Variante A é o ÚNICO caminho (D17/GATE R0). payment_origin != 'platform' →
+  // 501 not_implemented (variante B fora do escopo desta onda).
   const origin = await loadTenantPaymentOrigin(ctx.companyId)
-  if (origin === "n8n") {
-    // Variante B ligada: a plataforma NÃO cria a cobrança — o n8n cria e
-    // registra via payment.record. payment.create fica indisponível.
-    return { ok: false, status: 409, code: "payment_origin_n8n", message: "payment.create indisponível em payment_origin=n8n; use payment.record" }
+  if (origin !== "platform") {
+    return {
+      ok: false,
+      status: 501,
+      code: "not_implemented",
+      message: "payment.create só opera com payment_origin='platform' (variante A)",
+    }
   }
 
-  // valida a oferta e termos (passo 1) para obter o termsHash
+  // Idempotência por (session_id, offer_id) (§4.2): 2ª chamada devolve payload
+  // IDÊNTICO (mesmo agreement/link) com idempotent:true, ZERO cobrança nova.
+  const existingAgreementId = await findExistingPaymentForOffer(ctx, offerId)
+  if (existingAgreementId) {
+    const details = await fetchPaymentDetails(existingAgreementId, ctx.companyId)
+    if (!details.payment_id) {
+      return { ok: true, status: "processing", idempotent: true, agreement_id: existingAgreementId, poll_after_ms: POLL_AFTER_MS }
+    }
+    return { ok: true, status: "created", idempotent: true, payment: details }
+  }
+
+  // Invariante do reconhecimento (§3): com acknowledged=false (ou sem resposta)
+  // recusa a menos que allow_payment_without_acknowledgement=true.
+  const ackGuard = await assertAcknowledgedForPayment({
+    companyId: ctx.companyId,
+    sessionId: ctx.sessionId,
+    debtId: ctx.debtId,
+  })
+  if (!ackGuard.ok) {
+    await rejectOffer(ctx, offerId, "system", "debt_not_acknowledged", eventId)
+    return {
+      ok: false,
+      status: 409,
+      code: "debt_not_acknowledged",
+      message: "dívida não reconhecida — pagamento bloqueado",
+    }
+  }
+
+  // valida a oferta e termos (passo 1) para obter o termsHash (revalida matriz
+  // vigente dentro de confirmAccept → closeAgreement).
   const pre = await buildAcceptSummary(ctx, offerId)
   if (!pre.ok) {
-    const status = pre.error === "OFFER_EXPIRED" ? 409 : 409
-    return { ok: false, status, code: pre.error, message: pre.error }
+    return { ok: false, status: 409, code: pre.error, message: pre.error }
   }
 
   const result = await confirmAccept({ ctx, offerId, termsHash: pre.summary.termsHash, eventId })
@@ -115,9 +172,55 @@ export async function paymentCreate(
   const details = await fetchPaymentDetails(result.agreementId, ctx.companyId)
   // Workers 0/0 (D5): sem link ainda → processing; a UI/n8n faz polling.
   if (!details.payment_id) {
-    return { ok: true, status: "processing", agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS }
+    return { ok: true, status: "processing", idempotent: false, agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS }
   }
-  return { ok: true, status: "created", payment: details }
+  return { ok: true, status: "created", idempotent: false, payment: details }
+}
+
+// ============================================================
+// Borda n8n (contrato v2): valores monetários em INTEIROS de CENTAVOS.
+// As colunas do banco permanecem em reais; a conversão é SÓ aqui.
+// ============================================================
+export const reaisToCents = (reais: number | null | undefined): number | null =>
+  reais == null ? null : Math.round(reais * 100)
+
+/**
+ * Serializa o resultado do payment.create para o formato da resposta ao n8n
+ * (Apêndice B.1). total_value em CENTAVOS. billing_type é opcional (args do n8n).
+ */
+export function paymentCreateResponseForN8n(
+  result: PaymentCreateResult,
+  billingType?: string | null,
+): Record<string, unknown> {
+  if (!result.ok) {
+    return { ok: false, code: result.code, message: result.message }
+  }
+  if (result.status === "processing") {
+    return {
+      ok: true,
+      idempotent: result.idempotent,
+      status: "processing",
+      agreement_id: result.agreement_id,
+      poll_after_ms: result.poll_after_ms,
+    }
+  }
+  const p = result.payment
+  return {
+    ok: true,
+    idempotent: result.idempotent,
+    status: "created",
+    agreement_id: p.agreement_id,
+    asaas_payment_id: p.payment_id,
+    billing_type: p.billing_type ?? billingType ?? null,
+    total_value: reaisToCents(p.total_value), // CENTAVOS
+    installments: p.installments,
+    due_date: p.due_date,
+    invoice_url: p.invoice_url,
+    pix_copy_paste: p.pix_copy_paste,
+    pix_qr_code_url: p.pix_copy_paste,
+    boleto_url: p.boleto_url,
+    boleto_line: p.boleto_line,
+  }
 }
 
 /**

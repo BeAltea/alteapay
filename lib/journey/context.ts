@@ -63,6 +63,22 @@ export interface SessionContext {
     proposal_validity_days: number
   } | null
   offers: Array<{ id: string; terms: OfferTermsCents; valid_until: string | null }>
+  // Reconhecimento da dívida (onda R): última resposta por (session, primary_debt).
+  debt_acknowledgement: {
+    answered: boolean
+    acknowledged: boolean | null
+    button_id: number | null
+    answered_at: string | null
+    prompt_id: string | null
+  }
+  // Prompt ATIVO da sessão (se houver) — para o fluxo saber que há uma pergunta
+  // pendente de clique (botões em ids; valores só na borda, sem PII).
+  active_prompt: {
+    id: string
+    kind: string
+    question: string
+    buttons: Array<{ id: number; label: string; value?: string }>
+  } | null
   agreement: null
 }
 
@@ -178,6 +194,24 @@ export async function buildSessionContext(
     .or(`valid_until.is.null,valid_until.gt.${now}`)
     .order("created_at", { ascending: true })
 
+  // reconhecimento da dívida (onda R): última resposta por (session, primary_debt)
+  const { data: ackLatest } = await supabase
+    .from("debt_acknowledgement_latest")
+    .select("acknowledged, button_id, created_at, prompt_id")
+    .eq("session_id", sessionId)
+    .eq("debt_id", primaryDebtId)
+    .maybeSingle()
+
+  // prompt ATIVO da sessão (se houver)
+  const { data: activePrompt } = await supabase
+    .from("chat_prompts")
+    .select("id, kind, question, buttons")
+    .eq("session_id", sessionId)
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
   return {
     session: {
       id: session.id,
@@ -234,6 +268,21 @@ export async function buildSessionContext(
       terms: offerTermsToCents(o.terms as OfferTerms),
       valid_until: o.valid_until,
     })),
+    debt_acknowledgement: {
+      answered: Boolean(ackLatest),
+      acknowledged: ackLatest ? Boolean(ackLatest.acknowledged) : null,
+      button_id: ackLatest?.button_id ?? null,
+      answered_at: ackLatest?.created_at ?? null,
+      prompt_id: ackLatest?.prompt_id ?? null,
+    },
+    active_prompt: activePrompt
+      ? {
+          id: activePrompt.id,
+          kind: activePrompt.kind,
+          question: activePrompt.question,
+          buttons: (activePrompt.buttons ?? []) as Array<{ id: number; label: string; value?: string }>,
+        }
+      : null,
     agreement: null,
   }
 }
