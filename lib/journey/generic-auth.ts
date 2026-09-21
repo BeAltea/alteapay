@@ -21,6 +21,7 @@ import { recordEvent } from "./events"
 import { GENERIC_AUTH_MESSAGE } from "./auth"
 import { isAcceptableDocument, normalizeDocument } from "./document"
 import { resolveByDocument } from "./resolver"
+import { bootstrapAckSafe } from "./acknowledgement"
 
 export { GENERIC_AUTH_MESSAGE }
 
@@ -224,6 +225,15 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   await recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } })
   await recordEvent({ ...base, type: "auth.success", actor: "customer" })
   await recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } })
+
+  // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
+  await bootstrapAckSafe({
+    companyId: input.companyId,
+    sessionId,
+    customerId: resolved.customerId,
+    debtIds: resolved.debtIds,
+    primaryDebtId: resolved.primaryDebtId,
+  })
 
   const ttlSeconds = (cfg?.session_ttl_minutes ?? 60) * 60
   const cookieValue = signChatJwt({ sid: sessionId, cid: input.companyId }, ttlSeconds)

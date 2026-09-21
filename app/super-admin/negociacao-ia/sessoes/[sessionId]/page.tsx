@@ -37,6 +37,7 @@ export default async function SessionDetailPage({
 
   const s = detail.session
   const a = detail.agreement
+  const ack = detail.acknowledgement
 
   return (
     <div className="space-y-6">
@@ -46,6 +47,38 @@ export default async function SessionDetailPage({
           {s.brand_name ?? "—"} · {s.channel ?? "—"} · {s.customer_name_masked} · {s.customer_masked}
         </p>
       </div>
+
+      {/* Reconhecimento da dívida em DESTAQUE (onda R). */}
+      <Card
+        className={
+          ack == null
+            ? "border-neutral-200"
+            : ack.acknowledged
+              ? "border-green-500 bg-green-50"
+              : "border-amber-500 bg-amber-50"
+        }
+      >
+        <CardHeader>
+          <CardTitle>Reconhecimento da dívida</CardTitle>
+        </CardHeader>
+        <CardContent className="text-sm">
+          {ack == null ? (
+            <p className="text-muted-foreground">Sem resposta de reconhecimento registrada.</p>
+          ) : (
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-base font-semibold">
+                {ack.acknowledged ? "Reconhece a dívida" : "NÃO reconhece a dívida"}
+              </span>
+              <span className="rounded bg-neutral-200 px-2 py-0.5 font-mono text-xs">
+                button_id: {ack.button_id}
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {new Date(ack.created_at).toLocaleString("pt-BR")}
+              </span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card>
@@ -100,6 +133,12 @@ export default async function SessionDetailPage({
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
                   <span className="font-medium">{m.role}</span>
                   <span className="flex gap-2">
+                    {/* badge do button_id: só no painel admin (esta rota é super_admin). */}
+                    {m.button_id != null ? (
+                      <span className="rounded bg-neutral-200 px-1.5 font-mono text-neutral-700">
+                        botão {m.button_id}
+                      </span>
+                    ) : null}
                     {m.engine ? <span>engine: {m.engine}</span> : null}
                     {m.latency_ms != null ? <span>{m.latency_ms}ms</span> : null}
                     {m.n8n_execution_id ? (
@@ -127,6 +166,40 @@ export default async function SessionDetailPage({
               <p key={o.id} className="font-mono">
                 {o.status} · {JSON.stringify(o.terms)}
               </p>
+            ))
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Prompts / botões ({detail.prompts.length})</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2 text-xs">
+          {detail.prompts.length === 0 ? (
+            <p className="text-sm text-muted-foreground">Sem prompts.</p>
+          ) : (
+            detail.prompts.map((p) => (
+              <div key={p.id} className="rounded-md border p-2">
+                <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                  <span className="rounded bg-neutral-200 px-1.5 font-mono">{p.kind}</span>
+                  <span>{p.status}</span>
+                  <span>por: {p.created_by}</span>
+                  {p.answered_button_id != null ? (
+                    <span className="rounded bg-blue-100 px-1.5 font-mono text-blue-800">
+                      resp. botão {p.answered_button_id}
+                      {p.answered_value ? ` (${p.answered_value})` : ""}
+                    </span>
+                  ) : null}
+                  {p.n8n_execution_id ? (
+                    <span className="font-mono">exec: {p.n8n_execution_id}</span>
+                  ) : null}
+                </div>
+                <p className="mt-1">{p.question}</p>
+                <p className="mt-1 font-mono text-neutral-500">
+                  {(p.buttons ?? []).map((b) => `[${b.id}] ${b.label}`).join("  ")}
+                </p>
+              </div>
             ))
           )}
         </CardContent>

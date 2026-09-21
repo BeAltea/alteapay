@@ -1,8 +1,10 @@
 # Integrações AlteaPay — Voxuy · n8n · ASAAS (guia para o time do n8n)
 
-**Estado:** implementado e validado na branch `feature/chatbot-journey`, **atrás de flags desligadas** (produção sem mudança de comportamento). Contratos abaixo refletem o **código real**. Última atualização: 2026-09-18.
+**Estado:** implementado e validado na branch `feature/chatbot-journey`, **atrás de flags desligadas** (produção sem mudança de comportamento). Contratos abaixo refletem o **código real**. Última atualização: 2026-09-21.
 
 > Convenção de assinatura (n8n ↔ AlteaPay, nos dois sentidos): **HMAC-SHA256** de `${timestamp}.${body}` com o segredo `N8N_WEBHOOK_SECRET`. Headers: `x-alteapay-signature` e `x-alteapay-timestamp` (epoch em segundos). Janela de tolerância **±300 s**. Idempotência por `event_id`.
+
+> **⚠️ CONTRATO v2 (2026-09-21):** todos os **valores monetários nas interfaces n8n** (`chat.turn` e respostas de `payment.*`) passam a ser **inteiros em CENTAVOS** — não mais reais decimais. Ex.: R$ 418,90 → `41890`. As colunas do banco continuam em reais; a conversão é só na borda. Ver o **changelog** ao final. Guia detalhado e autossuficiente: `docs/N8N_TEAM_INTEGRATION_GUIDE.md`.
 
 ---
 
@@ -75,6 +77,10 @@ A cada mensagem do cliente, a AlteaPay faz `POST` **assinado** para a URL do flu
     "fulfillment_mode": "A",
     "outcome": null
   },
+  "debt_acknowledgement": {
+    "acknowledged": false,
+    "answered_at": null
+  },
   "debtor": {
     "name": "Fabio",
     "document_masked": "390.***.**7-05",
@@ -83,7 +89,7 @@ A cada mensagem do cliente, a AlteaPay faz `POST` **assinado** para a URL do flu
   },
   "debt": {
     "id": "uuid-da-divida",
-    "amount": 418.90,
+    "amount": 41890,
     "due_date": "2025-03-10",
     "description": "Contrato ...",
     "aging_days": 557
@@ -95,7 +101,11 @@ A cada mensagem do cliente, a AlteaPay faz `POST` **assinado** para a URL do flu
 }
 ```
 
-> **PII:** `debtor.document` é **`null` por padrão** — o fluxo recebe só `document_masked` + `document_hash`. O documento em claro só viaja se o tenant tiver **as duas flags** `send_document_to_engine=true` **e** `payment_origin='n8n'` (variante B). `debt.amount` é o valor da dívida em **reais** (decimal), como armazenado. A URL do canal oficial **não** viaja (o servidor a resolve; o LLM nunca a manuseia).
+> **PII:** `debtor.document` é **`null` por padrão** — o fluxo recebe só `document_masked` + `document_hash`. O documento em claro só viaja se o tenant tiver **as duas flags** `send_document_to_engine=true` **e** `payment_origin='n8n'` (variante B). A URL do canal oficial **não** viaja (o servidor a resolve; o LLM nunca a manuseia).
+>
+> **v2 (centavos):** `debt.amount` agora é **inteiro em centavos** (`41890` = R$ 418,90), não mais reais decimais.
+>
+> **Reconhecimento da dívida (onda R):** `debt_acknowledgement` diz se o cliente já respondeu à pergunta "reconhece esta cobrança?" (`acknowledged` true/false; `answered_at` quando respondeu). O detalhe fino (button_id, prompt ativo, ofertas em centavos, matriz) vem no contexto completo da sessão (`buildSessionContext`). **Com `acknowledged=false`, `payment.create` é recusado com `409 debt_not_acknowledged`** (salvo tenant com `allow_payment_without_acknowledgement=true`).
 
 ### 2.2 Response — o que o n8n DEVE devolver
 
@@ -153,6 +163,11 @@ Quando o fluxo decide agir (listar ofertas, propor, **criar a cobrança**, etc.)
 | `negotiation.note` | `{...}` | nota na timeline | `{success:true}` |
 | `session.close` | `{ outcome? }` | encerra a sessão | `{success:true}` |
 | `journey.timeline` | — | timeline de eventos | `{success:true, timeline:[...]}` |
+| **`chat.send`** | `{ text, prompt?, payment_ref?, n8n_execution_id? }` | empurra mensagem (+prompt) ao chat | `{ok:true, message_id, prompt_id?, duplicate}` |
+| `prompt.ask` | `{ kind, question, buttons:[{id,label,value?}] }` | cria só um prompt de botões | `{ok:true, prompt_id}` |
+| `prompt.close` | — | fecha (supersede) o prompt ativo | `{ok:true, closed}` |
+
+> **Botões/IDs (onda R):** `1=Sim`, `0=Não` (booleano fixo); `2..N` itens de lista (`value`=offer_id/PIX/BOLETO/CREDIT_CARD, na ordem exibida); `98=Voltar`; `99=Atendente`. O servidor valida ids únicos/reservados. O cliente responde clicando; a AlteaPay recebe em `POST /api/chat/button` e devolve o clique ao fluxo como um turno de botão.
 
 ### 3.2 `payment.create` (o principal — variante A, padrão)
 
@@ -163,45 +178,51 @@ Request:
 { "action": "payment.create", "session_id": "uuid", "event_id": "uuid", "args": { "offer_id": "uuid-da-oferta" } }
 ```
 
-Resposta (cobrança pronta) — **é o link que o fluxo manda no chat**:
+Resposta (cobrança pronta) — **é o link que o fluxo manda no chat** (`total_value` em **CENTAVOS**):
 ```json
 {
   "ok": true,
+  "idempotent": false,
+  "status": "created",
   "agreement_id": "uuid",
-  "payment_id": "pay_123",
+  "asaas_payment_id": "pay_123",
   "billing_type": "PIX",
-  "pix_copy_paste": "00020126...",
-  "boleto_url": null,
-  "invoice_url": "https://www.asaas.com/i/...",
+  "total_value": 27229,
+  "installments": 1,
   "due_date": "2026-09-25",
-  "total_value": 272.29,
-  "installments": 1
+  "invoice_url": "https://www.asaas.com/i/...",
+  "pix_copy_paste": "00020126...",
+  "pix_qr_code_url": "00020126...",
+  "boleto_url": null,
+  "boleto_line": null
 }
 ```
 
 Resposta (worker de cobrança desligado — link ainda gerando):
 ```json
-{ "ok": true, "status": "processing", "agreement_id": "uuid", "poll_after_ms": 3000 }
+{ "ok": true, "idempotent": false, "status": "processing", "agreement_id": "uuid", "poll_after_ms": 3000 }
 ```
 Nesse caso o fluxo/UI faz polling e obtém o link no `payment.status` seguinte. **Para o chat operar de ponta a ponta, o worker de cobrança precisa estar ligado.**
 
-Notas: **PIX não parcela** (parcelado só boleto/cartão). Cartão devolve `invoice_url` do ASAAS (dados de cartão nunca passam pela AlteaPay nem pelo n8n). `externalReference` é determinístico `journey_{sessionId}_{offerId}`.
+**Idempotência por `(session_id, offer_id)`:** reenviar `payment.create` para a **mesma oferta na mesma sessão** devolve o payload **IDÊNTICO** (mesmo `agreement_id`/link) com `idempotent: true` e **zero cobrança nova**. Combine com o `guard` do ASAAS (fonte da verdade) — a cobrança nunca duplica.
+
+Notas: **variante A é o único caminho** — se o tenant não estiver com `payment_origin='platform'`, `payment.create` devolve `501 not_implemented`. **PIX não parcela** (parcelado só boleto/cartão). Cartão devolve `invoice_url` do ASAAS (dados de cartão nunca passam pela AlteaPay nem pelo n8n). `externalReference` é determinístico `journey_{sessionId}_{offerId}`. **`total_value` em centavos** (v2).
 
 ### 3.3 `payment.record` (variante B — só se o tenant usar `payment_origin='n8n'`)
 
 Se o fluxo criar a cobrança direto no ASAAS, registra aqui. **Guard antes** (recusa se a dívida já tem cobrança viva) e **NUNCA aceita status pago**.
 
-Request:
+Request (`total_value` em **centavos**):
 ```json
 { "action": "payment.record", "session_id": "uuid", "event_id": "uuid",
   "args": { "offer_id": "uuid", "asaas_customer_id": "cus_...", "asaas_payment_id": "pay_...",
     "billing_type": "BOLETO", "invoice_url": "https://...", "due_date": "2026-09-25",
-    "total_value": 272.29, "installments": 2, "status": "pending" } }
+    "total_value": 27229, "installments": 2, "status": "pending" } }
 ```
 Resposta: `{ok:true, code:"recorded", agreement_id}` · se vier com status pago → vira *claim*: `{ok:true, code:"claim", case_id}` · duplicidade → `409 already_charged`.
 
 ### 3.4 Erros (sempre `{ ok:false, code, message }`, sem PII)
-`401` assinatura/janela inválida · `403` sessão não verificada · `409` conflito (`already_charged`) · `422` validação de oferta (`DISCOUNT_ABOVE_MAX`, `INSTALLMENTS_ABOVE_MAX`, `ENTRY_BELOW_MIN`, `VALUE_BELOW_MIN`, `BILLING_TYPE_NOT_ALLOWED`) · `404` sessão inexistente/fechada.
+`401` assinatura/janela inválida · `403` sessão não verificada · `404` sessão/prompt inexistente (`prompt_not_found`) · `409` conflito (`already_charged`, `debt_not_acknowledged`, `prompt_not_active`) · `422` validação de oferta (`DISCOUNT_ABOVE_MAX`, `INSTALLMENTS_ABOVE_MAX`, `ENTRY_BELOW_MIN`, `INSTALLMENT_BELOW_MIN`, `BILLING_TYPE_NOT_ALLOWED`) ou de botões (`button_id_duplicate`, `boolean_button_id_invalid`) · `501` `not_implemented` (variante B / `payment_origin != 'platform'`).
 
 ---
 
@@ -252,7 +273,9 @@ Para fechar a integração ponta a ponta (ver também `docs/N8N_FLOW_REQUIREMENT
 | Tabela | Papel | Colunas-chave |
 |---|---|---|
 | `negotiation_sessions` | a sessão do chat | `id, company_id, customer_id, debt_id, debt_ids[], primary_debt_id, thread_id, channel, engine, status ('open'\|'closed'), outcome, identity_verified_at, consent_at, agreement_id` |
-| `chat_messages` | histórico legível | `id, company_id, session_id, role ('customer'\|'assistant'\|'system'), text, offers_snapshot, n8n_execution_id, engine, latency_ms, created_at` |
+| `chat_messages` | histórico legível | `id, company_id, session_id, role ('customer'\|'assistant'\|'system'), text, button_id, prompt_id, n8n_execution_id, n8n_event_id, engine, latency_ms, created_at` |
+| `chat_prompts` | perguntas com botões (onda R) | `id, company_id, session_id, kind, question, buttons(jsonb), status ('active'\|'answered'\|'expired'\|'superseded'), answered_button_id, created_by ('platform'\|'n8n'), n8n_execution_id` |
+| `debt_acknowledgements` | reconhecimento (append-only) | `id, company_id, session_id, customer_id, debt_id, prompt_id, acknowledged, button_id (0\|1), source, ip_hash, created_at` · view `debt_acknowledgement_latest` = última por (session, debt) |
 | `negotiation_condition_matrix` | regras de oferta (D8/D11) | `company_id, max_discount_pct, min_entry_pct, max_installments, allowed_billing_types, proposal_validity_days, active` |
 | `negotiation_offers` | ofertas apresentadas | `id, session_id, terms(jsonb), status ('presented'\|'accepted'\|'rejected'\|'superseded'\|'expired'), valid_until` |
 | `agreements` | acordo fechado + cobrança ASAAS | `id, company_id, customer_id, debt_id, negotiation_session_id, origin, agreed_amount, installments, asaas_payment_id, asaas_status, payment_status, asaas_boleto_url, asaas_pix_qrcode_url, proposal_valid_until` |
@@ -301,3 +324,15 @@ Validação: rejeitar se `|agora - timestamp| > 300s` ou assinatura divergente �
 **Observabilidade**: incluir `n8n_execution_id` na resposta ao `chat.turn` — a AlteaPay grava por turno em `chat_messages` para correlacionar com o log do n8n no painel super-admin.
 
 **PII**: o `chat.turn` traz o documento **mascarado** (`document_masked` + `document_hash`); o documento em claro só chega se a AlteaPay habilitar as 2 flags (`send_document_to_engine=true` E `payment_origin='n8n'`). O fluxo **não deve** logar/persistir o documento em claro.
+
+---
+
+## 9. Changelog do contrato n8n
+
+- **v2 — 2026-09-21 (onda R):**
+  - **Valores monetários em CENTAVOS** em todas as interfaces n8n (`chat.turn` → `debt.amount`, `offers[].terms.*`, `matrix`; respostas de `payment.create`/`payment.status` → `total_value`). Ex.: R$ 418,90 → `41890`. As colunas do banco seguem em reais; a conversão é só na borda.
+  - **Reconhecimento da dívida:** `chat.turn.debt_acknowledgement` (`acknowledged`, `answered_at`). Novo bloqueio: `payment.create` recusa `409 debt_not_acknowledged` quando o cliente não reconheceu (salvo `allow_payment_without_acknowledgement=true`).
+  - **Ações novas (papel B):** `chat.send`, `prompt.ask`, `prompt.close`. Cliente responde botões via `POST /api/chat/button`; UI recebe mensagens por `GET /api/chat/messages?since=`.
+  - **payment.create idempotente por `(session_id, offer_id)`** com `idempotent: true` e payload idêntico; `501 not_implemented` para `payment_origin != 'platform'` (variante B fora do escopo desta onda).
+  - **Catálogo de botões/IDs:** `1=Sim`, `0=Não`, `2..N` lista, `98=Voltar`, `99=Atendente`.
+- **v1 — 2026-09-18:** contrato inicial (valores em reais decimais). Substituído por v2.

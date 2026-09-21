@@ -1,0 +1,10 @@
+### session.close — encerra a sessão
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{ "action": "session.close", "session_id": "<UUID_SESSAO>", "event_id": "<UUID_EVENTO>", "args": { "outcome": "closed_by_flow" } }
+
+### Resposta esperada
+# 200 { "success": true }

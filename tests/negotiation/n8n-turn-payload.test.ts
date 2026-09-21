@@ -51,6 +51,16 @@ describe("buildTurnPayload — masking do documento (D-N3-1)", () => {
     expect(p.debtor.document_hash).toBe(createHash("sha256").update(DOC).digest("hex"))
   })
 
+  it("D1: envia só o primeiro nome, nunca o nome completo", () => {
+    const p = buildTurnPayload({
+      ...base,
+      debtor: { ...debtor, customer_name: "Fabio Sobrenome Da Silva" },
+      tenant: tenant({}),
+    }) as any
+    expect(p.debtor.first_name).toBe("Fabio")
+    expect(p.debtor.name).toBeUndefined()
+  })
+
   it("NÃO envia claro com só uma flag (send_document_to_engine sem n8n)", () => {
     const p = buildTurnPayload({
       ...base,

@@ -4,6 +4,7 @@
 // oferta (matriz). Aceite navega para o resumo. Sem termos técnicos ao cliente.
 import { useEffect, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
+import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 
 interface ChatMsg {
   id: string
@@ -65,11 +66,14 @@ export function JourneyChat() {
   const [sending, setSending] = useState(false)
   const [enginePreparing, setEnginePreparing] = useState(false)
   const [accepting, setAccepting] = useState<string | null>(null)
+  const [activePrompt, setActivePrompt] = useState<ActivePrompt | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const sinceRef = useRef<string | null>(null)
+  const seenIds = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
-  }, [messages, offers, enginePreparing])
+  }, [messages, offers, enginePreparing, activePrompt])
 
   async function loadOffers() {
     try {
@@ -82,9 +86,79 @@ export function JourneyChat() {
     }
   }
 
+  // Polling das mensagens empurradas pelo n8n (chat.send/prompt.ask) + prompt
+  // ativo (inclui o reconhecimento como 1ª interação). Para em visibilitychange
+  // e tem teto de 20min. Sem PII (chat_messages já é texto neutro).
+  async function pollMessages() {
+    try {
+      const url = sinceRef.current
+        ? `/api/chat/messages?since=${encodeURIComponent(sinceRef.current)}`
+        : "/api/chat/messages"
+      const res = await fetch(url)
+      if (!res.ok) return
+      const data = await res.json()
+      const pushed: Array<{ id: string; role: string; text: string; created_at: string; button_id: number | null }> =
+        Array.isArray(data?.messages) ? data.messages : []
+      for (const m of pushed) {
+        if (seenIds.current.has(m.id)) continue
+        seenIds.current.add(m.id)
+        sinceRef.current = m.created_at
+        // clique do cliente (button_id) também vem no histórico; renderiza como cliente.
+        setMessages((prev) => [
+          ...prev,
+          { id: m.id, from: m.role === "customer" ? "customer" : "assistant", text: m.text },
+        ])
+      }
+      setActivePrompt(data?.active_prompt ?? null)
+    } catch {
+      /* silencioso */
+    }
+  }
+
   useEffect(() => {
     loadOffers()
+    pollMessages()
+    const startedAt = Date.now()
+    const CAP_MS = 20 * 60 * 1000
+    const interval = setInterval(() => {
+      if (document.visibilityState !== "visible") return
+      if (Date.now() - startedAt > CAP_MS) {
+        clearInterval(interval)
+        return
+      }
+      pollMessages()
+    }, 2500)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Clique num botão de prompt (reconhecimento, escolha, etc.).
+  async function clickButton(promptId: string, buttonId: number): Promise<PromptClickResult> {
+    try {
+      const res = await fetch("/api/chat/button", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt_id: promptId, button_id: buttonId }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok) {
+        if (typeof data?.reply === "string" && data.reply.trim()) {
+          setMessages((m) => [...m, { id: nextId(), from: "assistant", text: data.reply }])
+        }
+        setActivePrompt(null)
+        await pollMessages()
+        await loadOffers()
+        return { ok: true }
+      }
+      // 409 prompt_not_active: recarrega o prompt ativo atual.
+      if (res.status === 409 && data?.code === "prompt_not_active") {
+        await pollMessages()
+      }
+      return { ok: false, code: data?.code }
+    } catch {
+      return { ok: false }
+    }
+  }
 
   async function sendMessage(text: string) {
     const clean = text.trim()
@@ -162,6 +236,10 @@ export function JourneyChat() {
     }
   }
 
+  // Enquanto o reconhecimento da dívida estiver pendente, o chat livre fica
+  // bloqueado (o cliente precisa responder Sim/Não primeiro).
+  const awaitingAck = activePrompt?.kind === "debt_acknowledgement"
+
   return (
     <div className="flex flex-1 flex-col gap-3">
       <div
@@ -196,6 +274,12 @@ export function JourneyChat() {
             <div className="rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm italic text-neutral-500">
               assistente em preparação…
             </div>
+          </div>
+        ) : null}
+
+        {activePrompt ? (
+          <div className="pt-1">
+            <PromptButtons prompt={activePrompt} onClick={clickButton} />
           </div>
         ) : null}
 
@@ -250,7 +334,7 @@ export function JourneyChat() {
             key={a.label}
             type="button"
             onClick={() => sendMessage(a.text)}
-            disabled={sending}
+            disabled={sending || awaitingAck}
             className="rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs text-neutral-700 disabled:opacity-40"
           >
             {a.label}
@@ -268,12 +352,13 @@ export function JourneyChat() {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Escreva sua mensagem"
-          className="h-11 flex-1 rounded-md border border-neutral-300 bg-white px-3 text-sm outline-none focus:border-[var(--brand-secondary)] focus:ring-2 focus:ring-[var(--brand-secondary)]/30"
+          disabled={awaitingAck}
+          placeholder={awaitingAck ? "Responda a pergunta acima para continuar" : "Escreva sua mensagem"}
+          className="h-11 flex-1 rounded-md border border-neutral-300 bg-white px-3 text-sm outline-none focus:border-[var(--brand-secondary)] focus:ring-2 focus:ring-[var(--brand-secondary)]/30 disabled:bg-neutral-50 disabled:text-neutral-400"
         />
         <button
           type="submit"
-          disabled={sending || !input.trim()}
+          disabled={sending || awaitingAck || !input.trim()}
           style={{ backgroundColor: "var(--brand-secondary)" }}
           className="h-11 rounded-md px-4 text-sm font-semibold text-white disabled:opacity-40"
         >

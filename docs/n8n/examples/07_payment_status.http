@@ -1,0 +1,15 @@
+### payment.status — estado atual da cobrança (fonte: ASAAS). total_value em CENTAVOS.
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{ "action": "payment.status", "session_id": "<UUID_SESSAO>" }
+
+### Resposta esperada
+# 200 {
+#   "ok": true, "agreement_id": "<UUID>",
+#   "payment": { "billing_type": "PIX", "total_value": 36184, "due_date": "2026-09-28", ... },
+#   "payment_status": "pending", "asaas_status": "PENDING"
+# }
+# Nunca aceita status vindo do fluxo — a verdade é o webhook do ASAAS.

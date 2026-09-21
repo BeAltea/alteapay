@@ -12,9 +12,31 @@ export interface ChatMessageView {
   id: string
   role: "customer" | "assistant" | "system"
   text: string
+  button_id: number | null
+  prompt_id: string | null
   n8n_execution_id: string | null
   engine: string | null
   latency_ms: number | null
+  created_at: string
+}
+
+export interface PromptView {
+  id: string
+  kind: string
+  question: string
+  buttons: Array<{ id: number; label: string; value?: string }>
+  status: string
+  answered_button_id: number | null
+  answered_value: string | null
+  answered_at: string | null
+  created_by: string
+  n8n_execution_id: string | null
+  created_at: string
+}
+
+export interface AckView {
+  acknowledged: boolean
+  button_id: number
   created_at: string
 }
 
@@ -78,7 +100,7 @@ export async function customerHistory(sessionId: string, companyId: string): Pro
   const supabase = createServiceClient()
   const { data: msgs } = await supabase
     .from("chat_messages")
-    .select("id, role, text, n8n_execution_id, engine, latency_ms, created_at")
+    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, latency_ms, created_at")
     .eq("session_id", sessionId)
     .eq("company_id", companyId)
     .order("created_at", { ascending: true })
@@ -176,10 +198,13 @@ export interface AdminSessionDetail {
   session: AdminSessionRow | null
   messages: ChatMessageView[]
   offers: Array<{ id: string; status: string; terms: unknown; valid_until: string | null }>
+  prompts: PromptView[]
+  acknowledgement: AckView | null
   agreement: AgreementCardView | null
 }
 
-/** Detalhe de uma sessão para o painel: transcrição + n8n_execution_id + ofertas + acordo. */
+/** Detalhe de uma sessão para o painel: transcrição + n8n_execution_id + botões +
+ * prompts + reconhecimento em destaque + ofertas + acordo. */
 export async function adminSessionDetail(sessionId: string): Promise<AdminSessionDetail> {
   const supabase = createServiceClient()
   const { data: session } = await supabase
@@ -189,25 +214,38 @@ export async function adminSessionDetail(sessionId: string): Promise<AdminSessio
     )
     .eq("id", sessionId)
     .maybeSingle()
-  if (!session) return { session: null, messages: [], offers: [], agreement: null }
+  if (!session) return { session: null, messages: [], offers: [], prompts: [], acknowledgement: null, agreement: null }
 
-  const [{ data: msgs }, { data: offers }, { data: company }, { data: customer }] = await Promise.all([
-    supabase
-      .from("chat_messages")
-      .select("id, role, text, n8n_execution_id, engine, latency_ms, created_at")
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: true })
-      .limit(500),
-    supabase
-      .from("negotiation_offers")
-      .select("id, status, terms, valid_until")
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: true }),
-    supabase.from("companies").select("name").eq("id", session.company_id).maybeSingle(),
-    session.customer_id
-      ? supabase.from("customers").select("name, document").eq("id", session.customer_id).maybeSingle()
-      : Promise.resolve({ data: null as { name: string; document: string } | null }),
-  ])
+  const [{ data: msgs }, { data: offers }, { data: prompts }, { data: ack }, { data: company }, { data: customer }] =
+    await Promise.all([
+      supabase
+        .from("chat_messages")
+        .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, latency_ms, created_at")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: true })
+        .limit(500),
+      supabase
+        .from("negotiation_offers")
+        .select("id, status, terms, valid_until")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: true }),
+      supabase
+        .from("chat_prompts")
+        .select("id, kind, question, buttons, status, answered_button_id, answered_value, answered_at, created_by, n8n_execution_id, created_at")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: true }),
+      supabase
+        .from("debt_acknowledgement_latest")
+        .select("acknowledged, button_id, created_at")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      supabase.from("companies").select("name").eq("id", session.company_id).maybeSingle(),
+      session.customer_id
+        ? supabase.from("customers").select("name, document").eq("id", session.customer_id).maybeSingle()
+        : Promise.resolve({ data: null as { name: string; document: string } | null }),
+    ])
 
   const start = new Date(session.created_at).getTime()
   const end = session.closed_at
@@ -240,6 +278,8 @@ export async function adminSessionDetail(sessionId: string): Promise<AdminSessio
     session: detailRow,
     messages: (msgs ?? []) as ChatMessageView[],
     offers: (offers ?? []) as AdminSessionDetail["offers"],
+    prompts: (prompts ?? []) as PromptView[],
+    acknowledgement: (ack as AckView | null) ?? null,
     agreement,
   }
 }

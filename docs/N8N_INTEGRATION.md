@@ -1,7 +1,17 @@
 # Integração n8n ⇄ Chatbot AlteaPay — n8n como cérebro da conversa
 
-**Última atualização:** 2026-09-01 (pivô: fluxos n8n conduzem a conversa; o
-agente LangGraph interno foi descontinuado do caminho de produto)
+**Última atualização:** 2026-09-21 (onda R: reconhecimento com botões + pagamento
+variante A + contrato v2 em centavos)
+
+> **📘 Guia autossuficiente para o time do n8n:** `docs/N8N_TEAM_INTEGRATION_GUIDE.md`
+> (14 seções, PT-BR) + exemplos `.http` em `docs/n8n/examples/` + fixtures em
+> `docs/n8n/fixtures/`. **Contrato v2 (2026-09-21):** valores monetários nas
+> interfaces n8n são **inteiros em CENTAVOS**; reconhecimento da dívida é a 1ª
+> interação (`chat.turn.debt_acknowledgement`); `payment.create` recusa
+> `409 debt_not_acknowledged` sem reconhecimento e é idempotente por
+> `(session_id, offer_id)` (`idempotent:true`); `501 not_implemented` para
+> `payment_origin != 'platform'`; novas ações `chat.send`/`prompt.ask`/`prompt.close`;
+> botões `1=Sim`/`0=Não`/`2..N` lista/`98`=Voltar/`99`=Atendente.
 
 O chatbot de negociação usa **fluxos do n8n como engine da conversa**
 (`NEGOTIATION_ENGINE=n8n`, padrão). A plataforma AlteaPay é o **sistema de

@@ -17,6 +17,7 @@ export type JourneyEventType =
   | "consent.given" | "session.started"
   | "chat.turn.customer" | "chat.turn.assistant" | "chat.engine_error"
   | "debt.viewed"
+  | "debt.acknowledged" | "debt.not_recognized"
   | "offer.presented" | "offer.invalid" | "offer.accepted" | "offer.rejected" | "offer.expired"
   | "agreement.created"
   | "payment.generated" | "payment.viewed" | "payment.paid" | "payment.overdue" | "payment.cancelled"

@@ -1,0 +1,10 @@
+### payment_claim.register — "já paguei" (NÃO muda o acordo; a verdade é o ASAAS). amount em CENTAVOS.
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{ "action": "payment_claim.register", "session_id": "<UUID_SESSAO>", "event_id": "<UUID_EVENTO>", "args": { "paidAt": "2026-09-20", "amount": 36184, "channel": "pix", "note": "comprovante enviado" } }
+
+### Resposta esperada
+# 200 { "success": true, "case_id": "<UUID>" }

@@ -7,6 +7,7 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { signChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createHandoffSession, loadTenantConfig } from "@/lib/negotiation/sessions"
 import { recordEvent } from "./events"
+import { bootstrapAckSafe } from "./acknowledgement"
 import type { AccessTokenRow } from "./tokens"
 
 export const GENERIC_AUTH_MESSAGE =
@@ -214,6 +215,16 @@ export async function authenticateDebtor(input: AuthenticateInput): Promise<Auth
   await recordEvent({
     companyId: tokenRow.company_id, customerId: tokenRow.customer_id, debtId,
     sessionId, type: "session.started", actor: "system",
+  })
+
+  // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
+  const debtIds = (tokenRow.debt_ids?.length ? tokenRow.debt_ids : debtId ? [debtId] : []) as string[]
+  await bootstrapAckSafe({
+    companyId: tokenRow.company_id,
+    sessionId,
+    customerId: tokenRow.customer_id,
+    debtIds,
+    primaryDebtId: debtId,
   })
 
   const ttlSeconds = (cfg?.session_ttl_minutes ?? 60) * 60

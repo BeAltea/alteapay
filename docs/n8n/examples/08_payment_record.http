@@ -1,0 +1,23 @@
+### payment.record — variante B (só se payment_origin='n8n'). total_value em CENTAVOS.
+# Nesta onda, payment.create devolve 501 para payment_origin != 'platform'; payment.record
+# permanece disponível apenas para tenants configurados na variante B.
+POST https://alteapay.com/api/webhooks/n8n
+Content-Type: application/json
+x-alteapay-signature: <HMAC_HEX>
+x-alteapay-timestamp: <EPOCH_SEGUNDOS>
+
+{
+  "action": "payment.record",
+  "session_id": "<UUID_SESSAO>",
+  "event_id": "<UUID_EVENTO>",
+  "args": {
+    "offer_id": "<UUID_OFERTA>", "asaas_customer_id": "cus_...", "asaas_payment_id": "pay_...",
+    "billing_type": "BOLETO", "invoice_url": "https://...", "due_date": "2026-09-28",
+    "total_value": 36184, "installments": 2, "status": "pending"
+  }
+}
+
+### Resposta esperada
+# 200 { "ok": true, "code": "recorded", "agreement_id": "<UUID>" }
+# status pago → 200 { "ok": true, "code": "claim", "case_id": "<UUID>" }  (NUNCA muda o acordo)
+# 409 { "ok": false, "code": "already_charged" }
