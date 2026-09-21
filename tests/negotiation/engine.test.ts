@@ -126,7 +126,8 @@ describe("engine n8n", () => {
     expect(lastPayload.type).toBe("chat.turn")
     expect(lastPayload.thread_id).toBe("web_test")
     expect(lastPayload.message).toBe("quero negociar")
-    expect(lastPayload.debt.amount).toBe(1000)
+    // contrato v2 (onda R): valor monetário na borda n8n em CENTAVOS (1000 → 100000)
+    expect(lastPayload.debt.amount).toBe(100000)
     expect(lastPayload.session_state.identity_verified).toBe(true)
     // A URL oficial do tenant NUNCA viaja para o fluxo
     expect(JSON.stringify(lastPayload)).not.toContain("official_channel_url")
