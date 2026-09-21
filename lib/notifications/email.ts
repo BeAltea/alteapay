@@ -9,6 +9,12 @@ interface SendEmailParams {
   body?: string
   text?: string
   replyTo?: string
+  /**
+   * Headers SMTP customizados repassados ao SendGrid (mail/send) pelo worker.
+   * Ex.: List-Unsubscribe / List-Unsubscribe-Post (RFC 2369/8058). Opcional —
+   * chamadas existentes seguem funcionando sem passar nada.
+   */
+  headers?: Record<string, string>
   metadata?: {
     chargeId?: string
     customerId?: string
@@ -36,6 +42,7 @@ export async function sendEmail({
   body,
   text,
   replyTo,
+  headers,
   metadata,
 }: SendEmailParams): Promise<SendEmailResult> {
   try {
@@ -64,6 +71,7 @@ export async function sendEmail({
         html: htmlContent,
         text: textContent,
         replyTo,
+        ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
         metadata: {
           ...metadata,
           queuedAt: new Date().toISOString(),

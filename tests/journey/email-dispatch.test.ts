@@ -106,6 +106,9 @@ describe("dispatchEmailInvite", () => {
     expect(sent[0].metadata.companyId).toBe("co")
     // o link vai no HTML
     expect(sent[0].html).toContain("https://app/n/abc")
+    // List-Unsubscribe (RFC 2369) + One-Click (RFC 8058) apontam para o hub
+    expect(sent[0].headers["List-Unsubscribe"]).toBe("<https://app/n/abc>")
+    expect(sent[0].headers["List-Unsubscribe-Post"]).toBe("List-Unsubscribe=One-Click")
   })
 
   it("propaga falha do provider como { ok:false }", async () => {

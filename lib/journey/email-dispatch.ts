@@ -11,18 +11,14 @@
 // Descadastro / direito de oposição (LGPD art. 18): o rodapé do convite traz um
 // link visível de opt-out (o PRÓPRIO /n/{code}, onde, pós-login, o titular se
 // opõe a novos contatos — não há rota de opt-out dedicada, então reusamos o
-// link do hub). Além do link visível, expomos o header `List-Unsubscribe`
+// link do hub). Além do link visível, enviamos o header `List-Unsubscribe`
 // (+ `List-Unsubscribe-Post: List-Unsubscribe=One-Click`), que melhora a
 // reputação do sender e atende o direito de oposição para clientes que o honram.
 //
-// LIMITAÇÃO CONHECIDA: o helper `sendEmail` (lib/notifications/email) e o worker
-// SendGrid (lib/queue/workers/email.worker) NÃO expõem headers customizados hoje
-// — o `requestBody` da API SendGrid é montado sem `headers`, e `metadata` é
-// descartado antes do envio. O mínimo viável DENTRO deste arquivo é montar o
-// valor do header e passá-lo em `metadata.listUnsubscribe` (documentado abaixo)
-// para que, quando o worker/helper ganhar suporte a headers, o encanamento já
-// entregue o valor certo sem tocar neste módulo. Enquanto isso, o opt-out
-// EFETIVO é o link visível do rodapé.
+// O encanamento de headers custom já existe de ponta a ponta: `sendEmail`
+// (lib/notifications/email) aceita `headers?` → enfileira no job → o worker
+// SendGrid (lib/queue/workers/email.worker) inclui `headers` no `requestBody` do
+// `mail/send`. Passamos os headers de descadastro abaixo.
 
 import { sendEmail } from "@/lib/notifications/email"
 
@@ -132,19 +128,17 @@ export async function dispatchEmailInvite(input: EmailInviteInput): Promise<Emai
 
   // Header List-Unsubscribe (RFC 2369) + List-Unsubscribe-Post One-Click (RFC
   // 8058). O alvo de opt-out é o próprio link do hub (/n/{code}); não há rota
-  // dedicada. Montamos os valores aqui como "mínimo viável" (§ LIMITAÇÃO no topo:
-  // sendEmail/worker ainda não repassam headers ao SendGrid; quando passarem, é só
-  // ligar `unsubHeaders` na chamada). O opt-out EFETIVO hoje é o link do rodapé.
+  // dedicada. Repassados a sendEmail → fila → worker → SendGrid (mail/send).
   const unsubHeaders: Record<string, string> = {
     "List-Unsubscribe": `<${input.link}>`,
     "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
   }
-  void unsubHeaders // TODO: repassar a sendEmail/worker quando suportarem headers
 
   const res = await sendEmail({
     to,
     subject: `Negociação disponível - ${input.creditorName}`,
     html,
+    headers: unsubHeaders,
     metadata: {
       companyId: input.companyId,
       customerId: input.customerId,
