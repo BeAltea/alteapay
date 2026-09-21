@@ -105,7 +105,7 @@ describe("recordAcknowledgement", () => {
     expect(db.debt_acknowledgements.length).toBe(2) // append-only
     refreshView()
     const latest = db.debt_acknowledgement_latest.find((v) => v.session_id === SID && v.debt_id === DEBT)
-    expect(latest.acknowledged).toBe(true) // a mais recente é "Sim"
+    expect(latest?.acknowledged).toBe(true) // a mais recente é "Sim"
   })
 
   it("[99] handoff: não grava debt_acknowledgements; onNotRecognized=human", async () => {
