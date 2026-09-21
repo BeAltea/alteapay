@@ -7,6 +7,7 @@
 //   casca neutra AlteaPay.
 import type React from "react"
 import type { Metadata } from "next"
+import { unstable_noStore as noStore } from "next/cache"
 import { cookies } from "next/headers"
 import { CHAT_COOKIE_NAME, verifyChatJwt } from "@/lib/negotiation/crypto"
 import { loadPublicLinkTenant } from "./_lib/tenant"
@@ -61,6 +62,9 @@ export default async function PublicLinkLayout({
   children: React.ReactNode
   params: Promise<{ code: string }>
 }) {
+  // Disponibilidade do link é MUTÁVEL: opta o render fora do Route/Data Cache
+  // para ligar/DESLIGAR valer em tempo real (sem clear-cache/redeploy).
+  noStore()
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return <UnavailableNotice />
   }

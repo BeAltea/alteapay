@@ -39,7 +39,9 @@ export async function resolvePublicLink(rawCode: string): Promise<PublicLinkResu
   if (!isPlausibleCode(code)) return { ok: false, reason: "not_found" }
 
   try {
-    const supabase = createServiceClient()
+    // noStore: a disponibilidade do link (enabled/validade) é MUTÁVEL e precisa
+    // valer em tempo real (ligar/desligar sem redeploy) — nunca do Data Cache.
+    const supabase = createServiceClient({ noStore: true })
     // Índice único parcial em public_link_code garante 0/1 linha.
     const { data, error } = await supabase
       .from("tenant_chat_config")
