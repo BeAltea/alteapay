@@ -155,12 +155,12 @@ export async function buildSessionContext(
   // dívidas abertas (consolidado)
   const { data: debts } = await supabase
     .from("debts")
-    .select("id, amount, current_amount, due_date")
+    .select("id, amount, due_date")
     .eq("company_id", session.company_id)
     .in("id", debtIds)
   const totalOriginal = (debts ?? []).reduce((s, d) => s + Number(d.amount ?? 0), 0)
   const totalUpdated = (debts ?? []).reduce(
-    (s, d) => s + Number(d.current_amount ?? d.amount ?? 0),
+    (s, d) => s + Number(d.amount ?? 0),
     0,
   )
 

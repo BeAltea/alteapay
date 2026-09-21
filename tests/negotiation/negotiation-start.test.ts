@@ -39,7 +39,7 @@ function seed() {
     tenant_chat_config: [{ company_id: CO, branding: { brand_name: "VMAX", slug: "vmax" }, payment_origin: "platform", send_document_to_engine: false }],
     companies: [{ id: CO, name: "VMAX LTDA" }],
     customers: [{ id: "cust1", company_id: CO, name: "Fabio Silva", document: "111.444.777-35", phone: "11999998888", email: "fabio@x.com" }],
-    debts: [{ id: "debt1", company_id: CO, amount: 100.5, current_amount: 120.5, due_date: "2020-01-01" }],
+    debts: [{ id: "debt1", company_id: CO, amount: 100.5, due_date: "2020-01-01" }],
     vmax_invoices: [{ id_company: CO, doc: "11144477735", fatura: "F1", vencimento: "2020-01-01", saldo: 120.5 }],
     negotiation_offers: [],
     debt_acknowledgement_latest: [{ session_id: SID, debt_id: "debt1", acknowledged: true, button_id: 1, created_at: "2026-09-18T10:05:00Z", prompt_id: "p1" }],
@@ -93,9 +93,10 @@ describe("buildNegotiationStartPayload (Apêndice B)", () => {
     expect(p!.company_id).toBe(CO)
     // tenant travado em platform (D17) → payment_origin='platform'
     expect((p!.tenant as any).payment_origin).toBe("platform")
-    // valores em CENTAVOS
+    // valores em CENTAVOS — `debts` só tem `amount` (não existe current_amount
+    // em produção): original === updated, ambos derivados de amount.
     expect((p!.debt as any).original_value).toBe(10050)
-    expect((p!.debt as any).updated_value).toBe(12050)
+    expect((p!.debt as any).updated_value).toBe(10050)
     // reconhecimento
     expect(p!.acknowledgement).toEqual({ acknowledged: true, button_id: 1, answered_at: "2026-09-18T10:05:00Z" })
     // available_actions viaja

@@ -66,7 +66,7 @@ function seed() {
     tenant_chat_config: [{ company_id: CO, branding: { brand_name: "VMAX" }, payment_origin: "platform", on_debt_not_recognized: "continue", acknowledgement_enabled: true, allow_payment_without_acknowledgement: false }],
     companies: [{ id: CO, name: "VMAX LTDA" }],
     customers: [{ id: CUST, company_id: CO, name: "Fabio", document: "11144477735" }],
-    debts: [{ id: DEBT, company_id: CO, customer_id: CUST, status: "pending", amount: 100, current_amount: 100, due_date: "2020-01-01" }],
+    debts: [{ id: DEBT, company_id: CO, customer_id: CUST, status: "pending", amount: 100, due_date: "2020-01-01" }],
     vmax_invoices: [{ id_company: CO, doc: "11144477735", fatura: "F1", vencimento: "2020-01-01", saldo: 100 }],
     negotiation_sessions: [{ id: SID, company_id: CO, customer_id: CUST, debt_id: DEBT, debt_acknowledged_at: null, agreement_id: null, identity_verified_at: new Date().toISOString() }],
     negotiation_offers: [{ id: "off-1", company_id: CO, session_id: SID, customer_id: CUST, debt_id: DEBT, status: "presented", valid_until: null, terms: { total_value: 80, installments: 1, installment_value: 80, billing_type: "PIX", first_due_date: "2026-10-01" } }],

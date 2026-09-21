@@ -39,7 +39,6 @@ interface DebtRow {
   id: string
   status: string
   amount: number | null
-  current_amount: number | null
   due_date: string | null
 }
 
@@ -131,7 +130,7 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolvedDe
   // 2) dívidas abertas (consolidado) — TODAS as pending/in_negotiation do cliente.
   const { data: debts, error: debtErr } = await supabase
     .from("debts")
-    .select("id, status, amount, current_amount, due_date")
+    .select("id, status, amount, due_date")
     .eq("company_id", input.companyId)
     .eq("customer_id", customer.id)
     .in("status", OPEN_DEBT_STATUSES as unknown as string[])
@@ -144,7 +143,7 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolvedDe
   const debtIds = open.map((d) => d.id)
   const primaryDebtId = debtIds[0] // ordenado por due_date asc → mais antiga
   const totalOpen = open.reduce(
-    (sum, d) => sum + Number(d.current_amount ?? d.amount ?? 0),
+    (sum, d) => sum + Number(d.amount ?? 0),
     0,
   )
 

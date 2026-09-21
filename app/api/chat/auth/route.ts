@@ -7,7 +7,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { validateToken } from "@/lib/journey/tokens"
 import { authenticateDebtor, GENERIC_AUTH_MESSAGE } from "@/lib/journey/auth"
-import { authenticateByDocument, authenticateByPublicLink } from "@/lib/journey/generic-auth"
+import { authenticateByDocument, authenticateByPublicLink, PUBLIC_NO_DEBT_MESSAGE } from "@/lib/journey/generic-auth"
 import { normalizeDocument } from "@/lib/journey/document"
 import { resolveCompanyBySlug } from "@/lib/journey/resolver"
 import { resolvePublicLink } from "@/lib/journey/public-link"
@@ -60,14 +60,24 @@ export async function POST(req: NextRequest) {
       // ajude a distinguir — mesma casca "indisponível" da página.
       return NextResponse.json({ ok: false, reason: "unavailable", message: "not available" }, { status: 200 })
     }
-    const result = await authenticateByPublicLink({
-      companyId: link.tenant.companyId,
-      document: normalizeDocument(body.document ?? ""),
-      consent: body.consent === true,
-      ip: clientIp(req),
-      userAgent: req.headers.get("user-agent"),
-      captchaToken: body.captchaToken ?? null,
-    })
+    // Defesa em profundidade (D14): NENHUM erro inesperado do resolver pode virar
+    // 500 (vaza stack + distingue "existe/não existe"). Qualquer throw colapsa na
+    // MESMA resposta neutra no_debt 200, com o padding de timing preservado.
+    let result: Awaited<ReturnType<typeof authenticateByPublicLink>>
+    try {
+      result = await authenticateByPublicLink({
+        companyId: link.tenant.companyId,
+        document: normalizeDocument(body.document ?? ""),
+        consent: body.consent === true,
+        ip: clientIp(req),
+        userAgent: req.headers.get("user-agent"),
+        captchaToken: body.captchaToken ?? null,
+      })
+    } catch (err) {
+      console.error("[chat/auth] public-link resolver falhou:", (err as Error).message)
+      await pad()
+      return NextResponse.json({ ok: false, reason: "no_debt", message: PUBLIC_NO_DEBT_MESSAGE }, { status: 200 })
+    }
     await pad()
     if (!result.ok) {
       // HTTP 200 em todos os casos de negócio (no_debt/blocked/invalid): o

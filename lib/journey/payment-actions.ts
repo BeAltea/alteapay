@@ -304,13 +304,13 @@ export async function paymentRecord(
   const supabase = createServiceClient()
   const { data: debt } = await supabase
     .from("debts")
-    .select("id, current_amount, amount")
+    .select("id, amount")
     .eq("id", ctx.debtId)
     .eq("company_id", ctx.companyId)
     .maybeSingle()
   if (!debt) return { ok: false, status: 404, code: "debt_not_found", message: "dívida não encontrada" }
 
-  const originalAmount = Number(debt.current_amount ?? debt.amount ?? 0)
+  const originalAmount = Number(debt.amount ?? 0)
   const { data: agreement, error } = await supabase
     .from("agreements")
     .insert({

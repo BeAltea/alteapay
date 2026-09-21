@@ -104,7 +104,7 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   if (!debt) return { ok: false, status: 404, error: "Dívida não encontrada para esta empresa" }
   if (debt.status === "paid") return { ok: false, status: 409, error: "Dívida já está paga" }
 
-  const currentAmount = Number(debt.current_amount ?? debt.amount) || 0
+  const currentAmount = Number(debt.amount) || 0
   if (currentAmount <= 0) return { ok: false, status: 422, error: "Dívida sem valor em aberto" }
 
   const terms = input.journey

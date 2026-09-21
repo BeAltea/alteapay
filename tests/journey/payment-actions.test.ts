@@ -33,7 +33,7 @@ function reset(paymentOrigin = "platform", opts: { acknowledged?: boolean; allow
       acknowledgement_enabled: true,
     }],
     agreements: [],
-    debts: [{ id: "debt1", company_id: CO, current_amount: 100, amount: 100 }],
+    debts: [{ id: "debt1", company_id: CO, amount: 100 }],
     negotiation_sessions: [{ id: "s1", company_id: CO, agreement_id: null }],
     negotiation_acceptances: [],
     debt_acknowledgement_latest: opts.acknowledged
