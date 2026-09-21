@@ -39,3 +39,6 @@ reports/
 
 # local supabase
 supabase/.temp
+
+# Local Netlify folder
+.netlify
