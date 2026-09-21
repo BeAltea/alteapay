@@ -11,7 +11,6 @@ import { whatsappQueue } from "@/lib/queue/queues"
 import { recordEvent } from "./events"
 import { isSuppressed } from "./suppressions"
 import { issueActionTokens } from "./tokens"
-import { applyJourneyEventToState } from "./negotiation-state"
 import { dispatchEmailInvite } from "./email-dispatch"
 import {
   loadTenantHubConfig,
@@ -178,6 +177,7 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
     await recordEvent({
       companyId, campaignId: campaign.id, messageId, customerId: msg.customer_id,
       type: isVoxuy ? "message.accepted" : "message.sent", actor: "system",
+      payload: { channel: "whatsapp" },
     })
     return "sent"
   }
@@ -189,7 +189,7 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
     await recordEvent({
       companyId, campaignId: campaign.id, messageId, customerId: msg.customer_id,
       type: "message.failed", actor: "system",
-      payload: { transient: true, error: result.error ?? "retryable" },
+      payload: { channel: "whatsapp", transient: true, error: result.error ?? "retryable" },
     })
     throw new Error(`voxuy_retryable:${result.error ?? "unknown"}`)
   }
@@ -212,7 +212,7 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
   await recordEvent({
     companyId, campaignId: campaign.id, messageId, customerId: msg.customer_id,
     type: "message.failed", actor: "system",
-    payload: { error: result.error ?? "send_failed", errorClass: result.errorClass, traceId: result.traceId },
+    payload: { channel: "whatsapp", error: result.error ?? "send_failed", errorClass: result.errorClass, traceId: result.traceId },
   })
   return "failed"
 }
@@ -255,21 +255,6 @@ function publicLink(code: string | null): string | null {
   if (!code) return null
   const base = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"
   return `${base}/n/${code}`
-}
-
-/** Enfileira o estado (best-effort; nunca derruba o envio). */
-async function projectQueued(companyId: string, customerId: string, campaignId: string): Promise<void> {
-  try {
-    await applyJourneyEventToState({
-      companyId,
-      customerId,
-      campaign_id: campaignId,
-      event_type: "message.queued",
-      occurred_at: new Date().toISOString(),
-    })
-  } catch (err) {
-    console.error("[journey] hub projectQueued (não-fatal):", (err as Error).message)
-  }
 }
 
 /**
@@ -390,7 +375,8 @@ export async function runHubSend(input: {
       actor: "system",
       payload: { channel: r.channel },
     })
-    await projectQueued(input.companyId, r.customerId, input.campaignId)
+    // A projeção negotiation_state é atualizada pelo gancho global em recordEvent
+    // (o payload.channel já viaja acima) — sem chamada direta aqui.
 
     // ---- roteamento por canal
     if (r.channel === "whatsapp") {
@@ -442,12 +428,7 @@ export async function runHubSend(input: {
         companyId: input.companyId, campaignId: input.campaignId, messageId: msg.id, customerId: r.customerId,
         type: "message.sent", actor: "system", payload: { channel: "email" },
       })
-      try {
-        await applyJourneyEventToState({
-          companyId: input.companyId, customerId: r.customerId, campaign_id: input.campaignId,
-          event_type: "message.sent", occurred_at: now,
-        })
-      } catch { /* não-fatal */ }
+      // projeção negotiation_state atualizada pelo gancho global em recordEvent.
       items.push({ customerId: r.customerId, channel: "email", status: "sent", messageId: msg.id, jobId: emailRes.jobId })
     } else {
       await supabase.from("whatsapp_messages").update({

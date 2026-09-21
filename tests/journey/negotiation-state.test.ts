@@ -195,6 +195,57 @@ describe("correlações (campaign/session/agreement)", () => {
   })
 })
 
+describe("channel / provider_status_source", () => {
+  it("grava channel a partir de payload.channel e deriva provider_status_source", () => {
+    const s = applyEventToState(initialState(), ev("message.sent", undefined, { payload: { channel: "whatsapp" } }))
+    expect(s.channel).toBe("whatsapp")
+    expect(s.provider_status_source).toBe("none")
+  })
+
+  it("grava channel a partir do input.channel (fallback do gancho global)", () => {
+    const s = applyEventToState(initialState(), ev("message.sent", undefined, { channel: "email" }))
+    expect(s.channel).toBe("email")
+    expect(s.provider_status_source).toBe("none")
+  })
+
+  it("payload.channel tem prioridade sobre input.channel", () => {
+    const s = applyEventToState(initialState(), ev("message.sent", undefined, {
+      payload: { channel: "whatsapp" }, channel: "email",
+    }))
+    expect(s.channel).toBe("whatsapp")
+  })
+
+  it("evento sem canal NÃO regride o último canal conhecido", () => {
+    const s0 = applyEventToState(initialState(), ev("message.sent", undefined, { payload: { channel: "whatsapp" } }))
+    const s1 = applyEventToState(s0, ev("auth.success"))
+    expect(s1.channel).toBe("whatsapp")
+    expect(s1.stage).toBe("authenticated")
+  })
+
+  it("canal desconhecido no payload é ignorado (mantém nulo)", () => {
+    const s = applyEventToState(initialState(), ev("message.sent", undefined, { payload: { channel: "pombo-correio" } }))
+    expect(s.channel).toBeNull()
+  })
+
+  it("estado inicial: channel nulo e provider_status_source 'none'", () => {
+    const s = initialState()
+    expect(s.channel).toBeNull()
+    expect(s.provider_status_source).toBe("none")
+  })
+
+  it("rebuild preserva channel do payload (rebuild==incremental com canal)", () => {
+    const evs: JourneyEventLike[] = [
+      ev("message.queued", "2026-09-21T09:00:00.000Z", { payload: { channel: "whatsapp" } }),
+      ev("auth.success", "2026-09-21T09:10:00.000Z"),
+      ev("payment.generated", "2026-09-21T09:20:00.000Z"),
+    ]
+    const rebuilt = reduceEvents(evs)
+    const inc = incremental(evs)
+    expect(rebuilt).toEqual(inc)
+    expect(rebuilt.channel).toBe("whatsapp")
+  })
+})
+
 describe("rebuild == incremental (diferença ZERO)", () => {
   // Conjunto sintético com fora de ordem, canal atrasado e domínio regressivo.
   const synthetic: JourneyEventLike[] = [

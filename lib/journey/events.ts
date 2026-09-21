@@ -5,6 +5,7 @@
 
 import { createHash } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
+import { applyJourneyEventToState } from "./negotiation-state"
 
 export type JourneyActor = "system" | "customer" | "ai" | "n8n" | "provider" | "admin"
 
@@ -91,7 +92,31 @@ export async function recordEvent(input: RecordEventInput): Promise<{ ok: boolea
     payload: maskPayload(input.payload ?? {}),
     occurred_at: occurredAt,
   })
-  if (!error) return { ok: true, duplicate: false }
+  if (!error) {
+    // GANCHO GLOBAL da projeção negotiation_state: todo evento NOVO (não-duplicata)
+    // com devedor identificado atualiza o estágio AO VIVO (auth/chat/reconhecimento/
+    // pagamento — não só envio). BEST-EFFORT e NÃO-FATAL: a projeção é idempotente
+    // e nunca pode derrubar o recordEvent (regra D14). A projeção NÃO chama
+    // recordEvent → sem loop.
+    if (input.companyId && input.customerId) {
+      try {
+        await applyJourneyEventToState({
+          companyId: input.companyId,
+          customerId: input.customerId,
+          event_type: input.type,
+          occurred_at: occurredAt,
+          payload: input.payload ?? null,
+          campaign_id: input.campaignId ?? null,
+          session_id: input.sessionId ?? null,
+          agreement_id: input.agreementId ?? null,
+          channel: typeof input.payload?.channel === "string" ? input.payload.channel : null,
+        })
+      } catch (err) {
+        console.error("[journey] projeção (não-fatal):", (err as Error).message)
+      }
+    }
+    return { ok: true, duplicate: false }
+  }
   if (error.code === "23505") return { ok: true, duplicate: true } // event_id UNIQUE
   console.error("[journey] recordEvent falhou:", error.code, error.message)
   return { ok: false, duplicate: false }

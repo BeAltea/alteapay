@@ -145,6 +145,8 @@ export interface JourneyEventLike {
   session_id?: string | null
   agreement_id?: string | null
   payload?: Record<string, unknown> | null
+  /** canal do gancho global (fallback ao payload.channel); nunca regride o último conhecido. */
+  channel?: string | null
 }
 
 export interface NegotiationStateProjection {
@@ -177,6 +179,21 @@ export function initialState(): NegotiationStateProjection {
 
 /** Estágios que representam uma cobrança viva (para has_live_charge). */
 const LIVE_CHARGE_STAGES = new Set<string>(["charge_generated", "overdue"])
+
+/** Canais válidos que a projeção reconhece (defensivo: ignora lixo no payload). */
+const KNOWN_CHANNELS = new Set<string>(["whatsapp", "email", "sms"])
+
+/**
+ * Extrai o canal de um evento (payload.channel tem prioridade; input.channel é o
+ * fallback do gancho global). Retorna null se ausente/desconhecido — nunca regride
+ * o último canal conhecido (ver applyEventToState).
+ */
+function channelOf(event: JourneyEventLike & { channel?: string | null }): string | null {
+  const fromPayload = event.payload?.channel
+  const fromInput = event.channel
+  const raw = typeof fromPayload === "string" ? fromPayload : typeof fromInput === "string" ? fromInput : null
+  return raw && KNOWN_CHANNELS.has(raw) ? raw : null
+}
 
 /**
  * Aplica um evento a um estado (função PURA).
@@ -218,6 +235,20 @@ export function applyEventToState(
   if (event.campaign_id) next.campaign_id = event.campaign_id
   if (event.session_id) next.session_id = event.session_id
   if (event.agreement_id) next.agreement_id = event.agreement_id
+
+  // Canal: acompanha o último canal CONHECIDO (whatsapp/email/…). Um evento sem
+  // canal (auth/chat/pagamento) NÃO regride o canal já registrado. Order-independent
+  // no sentido prático: só eventos message.* trazem canal, e o hub usa um só por
+  // devedor. provider_status_source deriva do canal — hoje 'none' (mock/API sem
+  // callback de entrega); um webhook real de status mudaria isto no futuro.
+  const channel = channelOf(event)
+  if (channel) {
+    next.channel = channel
+    // Sem confirmação de entrega do provedor (WhatsApp via API/Voxuy, e-mail via
+    // SendGrid sem callback): a fonte do status é o próprio disparo → 'none'. Só um
+    // delivery-callback real (message.delivered/read com origem de provedor) elevaria.
+    next.provider_status_source = "none"
+  }
 
   if (!mapping) return next
 
@@ -368,7 +399,7 @@ export async function rebuildNegotiationState(
   for (;;) {
     const { data, error } = await (supabase as any)
       .from("journey_events")
-      .select("customer_id, event_type, occurred_at, campaign_id, session_id, agreement_id")
+      .select("customer_id, event_type, occurred_at, campaign_id, session_id, agreement_id, payload")
       .eq("company_id", companyId)
       .order("occurred_at", { ascending: true })
       .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
@@ -383,6 +414,9 @@ export async function rebuildNegotiationState(
         campaign_id: r.campaign_id ?? null,
         session_id: r.session_id ?? null,
         agreement_id: r.agreement_id ?? null,
+        // payload carrega channel (message.* → whatsapp|email); rebuild preenche
+        // channel/provider_status_source igual ao incremental (equivalência mantida).
+        payload: (r.payload as Record<string, unknown> | null) ?? null,
       })
       byCustomer.set(r.customer_id, list)
     }
