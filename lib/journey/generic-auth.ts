@@ -361,7 +361,9 @@ export async function authenticateByPublicLink(
     await recordEvent({ companyId: input.companyId, type: "auth.locked", actor: "system", payload: { scope: "tenant_hourly_cap", degraded: true } })
     if (!input.captchaToken || !captchaOk) return blocked("degraded")
   } else if (!captchaOk) {
-    // captcha ligado e falhou → conta como tentativa (anti-brute) e responde neutro.
+    // captcha ligado e falhou → registra a tentativa (alimenta o teto/cedente-hora)
+    // e responde neutro. O captcha já é o controle anti-bot deste ramo.
+    await registerPublicAttempt({ companyId: input.companyId, docHash: dHash, ipHash: ipH, success: false, reason: "captcha" })
     return blocked("captcha")
   }
 
