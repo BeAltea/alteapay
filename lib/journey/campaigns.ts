@@ -8,6 +8,7 @@ import { findBlockingAgreement } from "@/lib/asaas-idempotency"
 import { whatsappQueue } from "@/lib/queue/queues"
 import { recordEvent } from "./events"
 import { isSuppressed } from "./suppressions"
+import { isEmailValid } from "./contact-profile"
 
 const OPEN_DEBT_STATUSES = ["pending", "in_negotiation"] // CHECK real de debts
 
@@ -274,4 +275,344 @@ export async function startCampaign(campaignId: string): Promise<{ queued: numbe
     type: "campaign.started", actor: "admin", payload: { queued },
   })
   return { queued, suppressedNow }
+}
+
+// ===========================================================================
+// HUB DE ENVIO (link único) — seleção multi-canal com precedência WhatsApp→e-mail
+//
+// Diferente de evaluateEligibility (só WhatsApp), a jornada do link único também
+// aceita e-mail: se o devedor não tem celular válido mas tem e-mail válido, o
+// MESMO link /n/{code} vai por e-mail (channel='email'). Precedência (E2/H10):
+//   celular E.164 válido → WhatsApp
+//   senão e-mail válido  → e-mail
+//   senão                → no_contact (fora, listado com motivo)
+// A cobrança (charge_email antigo) NÃO passa por aqui — o roteamento por `mode`
+// fica na rota /send; o modo whatsapp_chat só dispara o link do chat.
+// ===========================================================================
+
+/** Modo de envio da negociação (tenant_chat_config.negotiation_send_mode). */
+export type NegotiationSendMode = "whatsapp_chat" | "charge_email" | "both"
+
+/** Canal resolvido para o devedor no hub. */
+export type HubChannel = "whatsapp" | "email"
+
+/** Motivos de exclusão legíveis no preview/send do hub. */
+export type HubExclusionReason =
+  | "sem_contato"
+  | "suprimido"
+  | "sem_divida_aberta"
+  | "cooldown"
+  | "ja_contatado_campanha"
+  | "valor_minimo"
+  | "caso_aberto"
+  | "telefone_duplicado"
+
+export interface HubEligibilityResult {
+  customerId: string
+  eligible: boolean
+  channel?: HubChannel
+  reason?: HubExclusionReason
+  phoneE164?: string
+  email?: string
+  debtIds?: string[]
+  totalValue?: number
+  /** Cobrança viva ASAAS (informativo — NÃO exclui do link do chat). */
+  hasLiveCharge?: boolean
+}
+
+interface EvaluateHubInput {
+  companyId: string
+  customerIds: string[]
+  cooldownDays: number
+  minDebtValue: number
+  /** id da campanha em curso (exclui quem já tem mensagem nela). */
+  campaignId?: string | null
+}
+
+/**
+ * Avalia elegibilidade multi-canal para o hub do link único. Um registro por
+ * devedor; canal resolvido por precedência (celular→WhatsApp, senão e-mail).
+ * `hasLiveCharge` é INFORMATIVO (o link do chat não cria cobrança, então uma
+ * cobrança viva não barra o convite — só é reportada).
+ */
+export async function evaluateHubEligibility(
+  input: EvaluateHubInput,
+): Promise<HubEligibilityResult[]> {
+  const supabase = createServiceClient()
+  const results: HubEligibilityResult[] = []
+  const since = new Date(Date.now() - input.cooldownDays * 86400_000).toISOString()
+
+  for (const customerId of input.customerIds) {
+    const { data: customer } = await supabase
+      .from("customers")
+      .select("id, phone, email, company_id")
+      .eq("id", customerId)
+      .eq("company_id", input.companyId)
+      .maybeSingle()
+    if (!customer) {
+      results.push({ customerId, eligible: false, reason: "sem_divida_aberta" })
+      continue
+    }
+
+    // ---- precedência de canal (E2/H10)
+    const phone = toE164Mobile(customer.phone)
+    const emailOk = isEmailValid(customer.email)
+    let channel: HubChannel | null = null
+    if (phone) channel = "whatsapp"
+    else if (emailOk) channel = "email"
+    if (!channel) {
+      results.push({ customerId, eligible: false, reason: "sem_contato" })
+      continue
+    }
+
+    // ---- supressão (fail-closed no canal escolhido)
+    if (
+      await isSuppressed({
+        companyId: input.companyId,
+        channel,
+        phoneE164: phone,
+        customerId,
+      })
+    ) {
+      results.push({ customerId, eligible: false, reason: "suprimido" })
+      continue
+    }
+
+    // ---- dívida aberta
+    const { data: debts } = await supabase
+      .from("debts")
+      .select("id, amount, status")
+      .eq("customer_id", customerId)
+      .eq("company_id", input.companyId)
+      .in("status", OPEN_DEBT_STATUSES)
+    const openDebts = debts ?? []
+    if (openDebts.length === 0) {
+      results.push({ customerId, eligible: false, reason: "sem_divida_aberta" })
+      continue
+    }
+    const total = openDebts.reduce((s, d) => s + Number(d.amount ?? 0), 0)
+    if (total < input.minDebtValue) {
+      results.push({ customerId, eligible: false, reason: "valor_minimo" })
+      continue
+    }
+
+    // ---- cobrança viva (INFORMATIVO — não exclui do link do chat)
+    const { data: agreements } = await supabase
+      .from("agreements")
+      .select("id, asaas_payment_id, payment_status, asaas_status")
+      .eq("customer_id", customerId)
+      .eq("company_id", input.companyId)
+      .not("asaas_payment_id", "is", null)
+    const hasLiveCharge = !!findBlockingAgreement(agreements ?? [])
+
+    // ---- caso humano aberto barra
+    const { data: cases } = await supabase
+      .from("negotiation_cases")
+      .select("id")
+      .eq("customer_id", customerId)
+      .eq("company_id", input.companyId)
+      .in("status", ["open", "in_review"])
+      .limit(1)
+    if (cases && cases.length > 0) {
+      results.push({ customerId, eligible: false, reason: "caso_aberto" })
+      continue
+    }
+
+    // ---- já contatado NESTA campanha (idempotência da onda)
+    if (input.campaignId) {
+      const { data: already } = await supabase
+        .from("whatsapp_messages")
+        .select("id")
+        .eq("campaign_id", input.campaignId)
+        .eq("customer_id", customerId)
+        .limit(1)
+      if (already && already.length > 0) {
+        results.push({ customerId, eligible: false, reason: "ja_contatado_campanha" })
+        continue
+      }
+    }
+
+    // ---- cooldown POR CLIENTE e POR TELEFONE (contato recente barra)
+    const cdOrs: string[] = [`customer_id.eq.${customerId}`]
+    if (phone) cdOrs.push(`phone_e164.eq.${phone}`)
+    const { data: recent } = await supabase
+      .from("whatsapp_messages")
+      .select("id")
+      .eq("company_id", input.companyId)
+      .or(cdOrs.join(","))
+      .gte("queued_at", since)
+      .limit(1)
+    if (recent && recent.length > 0) {
+      results.push({ customerId, eligible: false, reason: "cooldown" })
+      continue
+    }
+
+    results.push({
+      customerId,
+      eligible: true,
+      channel,
+      phoneE164: phone ?? undefined,
+      email: channel === "email" ? (customer.email ?? undefined) : undefined,
+      debtIds: openDebts.map((d) => d.id),
+      totalValue: total,
+      hasLiveCharge,
+    })
+  }
+
+  return dedupeHubByPhone(results)
+}
+
+/**
+ * V10 para o hub: dois destinos WhatsApp com o mesmo número cancelariam o funil
+ * um do outro. O PRIMEIRO permanece; os demais viram telefone_duplicado. E-mail
+ * não sofre dedupe por telefone (canal independente).
+ */
+export function dedupeHubByPhone(results: HubEligibilityResult[]): HubEligibilityResult[] {
+  const seen = new Set<string>()
+  for (const r of results) {
+    if (!r.eligible || r.channel !== "whatsapp" || !r.phoneE164) continue
+    if (seen.has(r.phoneE164)) {
+      r.eligible = false
+      r.reason = "telefone_duplicado"
+      r.channel = undefined
+      r.phoneE164 = undefined
+    } else {
+      seen.add(r.phoneE164)
+    }
+  }
+  return results
+}
+
+export interface TenantHubConfig {
+  cooldownDays: number
+  minDebtValue: number
+  sendMode: NegotiationSendMode
+  dispatchMode: string
+  provider: string
+  publicLinkCode: string | null
+  publicLinkEnabled: boolean
+  linkTtlHours: number
+  voxuyFlowId: number | null
+  voxuyPlanId: string | null
+}
+
+/** Carrega a config do tenant relevante ao hub (send mode, link, cooldown, matriz). */
+export async function loadTenantHubConfig(companyId: string): Promise<TenantHubConfig> {
+  const supabase = createServiceClient()
+  const { data: cfg } = await supabase
+    .from("tenant_chat_config")
+    .select(
+      "contact_cooldown_days, whatsapp_provider, whatsapp_dispatch_mode, negotiation_send_mode, public_link_code, public_link_enabled, link_ttl_hours, voxuy_flow_id, voxuy_plan_id",
+    )
+    .eq("company_id", companyId)
+    .maybeSingle()
+  const { data: matrix } = await supabase
+    .from("negotiation_condition_matrix")
+    .select("min_debt_value")
+    .eq("company_id", companyId)
+    .eq("active", true)
+    .order("min_debt_value", { ascending: true })
+    .limit(1)
+  const rawMode = (cfg?.negotiation_send_mode ?? "whatsapp_chat") as string
+  const sendMode: NegotiationSendMode =
+    rawMode === "charge_email" || rawMode === "both" ? rawMode : "whatsapp_chat"
+  return {
+    cooldownDays: cfg?.contact_cooldown_days ?? 7,
+    minDebtValue: Number(matrix?.[0]?.min_debt_value ?? 0),
+    sendMode,
+    dispatchMode: cfg?.whatsapp_dispatch_mode ?? "mock",
+    provider: cfg?.whatsapp_provider ?? "mock",
+    publicLinkCode: cfg?.public_link_code ?? null,
+    publicLinkEnabled: cfg?.public_link_enabled ?? false,
+    linkTtlHours: cfg?.link_ttl_hours ?? 168,
+    voxuyFlowId:
+      typeof cfg?.voxuy_flow_id === "number" ? cfg.voxuy_flow_id : null,
+    voxuyPlanId: cfg?.voxuy_plan_id ?? null,
+  }
+}
+
+export interface HubPreviewCounts {
+  byChannel: { whatsapp: number; email: number }
+  excluded: Record<string, number>
+  liveChargeCount: number
+  eligibleTotal: number
+}
+
+/** Agrega os resultados de elegibilidade nas contagens do preview. */
+export function summarizeHubEligibility(results: HubEligibilityResult[]): HubPreviewCounts {
+  const counts: HubPreviewCounts = {
+    byChannel: { whatsapp: 0, email: 0 },
+    excluded: {},
+    liveChargeCount: 0,
+    eligibleTotal: 0,
+  }
+  for (const r of results) {
+    if (r.eligible && r.channel) {
+      counts.byChannel[r.channel]++
+      counts.eligibleTotal++
+      if (r.hasLiveCharge) counts.liveChargeCount++
+    } else if (r.reason) {
+      counts.excluded[r.reason] = (counts.excluded[r.reason] ?? 0) + 1
+    }
+  }
+  return counts
+}
+
+/**
+ * Cria (ou reaproveita) a campanha do hub com o snapshot imutável (ids+critérios
+ * +autor+avaliação). Diferente de createCampaign, guarda o canal por devedor e o
+ * modo de envio. Retorna o id e as contagens do preview.
+ */
+export async function createHubCampaign(input: {
+  companyId: string
+  name: string
+  templateKey: string
+  customerIds: string[]
+  createdBy?: string | null
+  sendMode: NegotiationSendMode
+  provider: string
+}): Promise<{ campaignId: string; evaluated: HubEligibilityResult[]; counts: HubPreviewCounts }> {
+  const supabase = createServiceClient()
+  const hub = await loadTenantHubConfig(input.companyId)
+  const evaluated = await evaluateHubEligibility({
+    companyId: input.companyId,
+    customerIds: input.customerIds,
+    cooldownDays: hub.cooldownDays,
+    minDebtValue: hub.minDebtValue,
+  })
+  const counts = summarizeHubEligibility(evaluated)
+  const { data, error } = await supabase
+    .from("whatsapp_campaigns")
+    .insert({
+      company_id: input.companyId,
+      name: input.name,
+      provider: input.provider,
+      template_key: input.templateKey,
+      status: "draft",
+      selection_snapshot: {
+        customer_ids: input.customerIds,
+        send_mode: input.sendMode,
+        created_by: input.createdBy ?? null,
+        created_at: new Date().toISOString(),
+        evaluated,
+      },
+      counts: {
+        eligible: counts.eligibleTotal,
+        by_channel: counts.byChannel,
+        excluded: counts.excluded,
+        live_charge: counts.liveChargeCount,
+      },
+      created_by: input.createdBy ?? null,
+    })
+    .select("id")
+    .single()
+  if (error) throw new Error(`createHubCampaign: ${error.message}`)
+  await recordEvent({
+    companyId: input.companyId,
+    campaignId: data.id,
+    type: "campaign.created",
+    actor: "admin",
+    payload: { name: input.name, mode: input.sendMode, ...counts.byChannel },
+  })
+  return { campaignId: data.id, evaluated, counts }
 }

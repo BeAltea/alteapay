@@ -248,6 +248,22 @@ begin
 end $$;
 
 -- ============================================================
+-- 3b. whatsapp_messages: canal multi-canal do hub (WhatsApp | e-mail).
+-- Resolve o request T2-2 (o disparo por e-mail do hub grava `channel`).
+-- Aditiva; o valor default reflete o comportamento legado (só WhatsApp).
+-- ============================================================
+alter table public.whatsapp_messages add column if not exists channel text not null default 'whatsapp';
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'whatsapp_messages_channel_check') then
+    alter table public.whatsapp_messages
+      add constraint whatsapp_messages_channel_check
+      check (channel in ('whatsapp','email')) not valid;
+    alter table public.whatsapp_messages validate constraint whatsapp_messages_channel_check;
+  end if;
+end $$;
+
+-- ============================================================
 -- 4. negotiation_state (NOVO): projeção de status por (company_id, customer_id)
 --    Alimentada por lib/journey/negotiation-state.ts (incremental + rebuild).
 -- ============================================================
