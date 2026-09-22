@@ -42,7 +42,7 @@ export function AdminSidebarWrapper({ user, children }: AdminSidebarWrapperProps
           onMenuClick={() => setIsMobileMenuOpen(true)}
         />
         <main
-          className="flex-1 overflow-y-auto"
+          className="flex-1 min-h-0 overflow-y-auto"
           style={{ background: "var(--admin-bg-primary)" }}
         >
           <div className="p-7">

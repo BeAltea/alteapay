@@ -12,11 +12,13 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Label } from "@/components/ui/label"
 import { Users, DollarSign, AlertTriangle, MapPin, CheckCircle, Clock, Trash2, Loader2, Pencil, RotateCcw } from "lucide-react"
 import { toast } from "sonner"
+import { RevealableDocument } from "@/components/super-admin/revealable-document"
 
 type Customer = {
   id: string
   name: string
-  document: string
+  // documento mascarado (o claro nunca chega ao cliente; reveal auditado por linha)
+  documentMasked: string
   city: string | null
   status: "active" | "overdue" | "negotiating" | "paid"
   totalDebt: number
@@ -48,7 +50,7 @@ export function CustomersFilterClient({ customers, companyId }: { customers: Cus
 
   const handleDeleteClient = async (customer: Customer) => {
     const confirmed = window.confirm(
-      `Excluir o cliente "${customer.name}"?\n\nCPF/CNPJ: ${customer.document}\n\nEsta ação é irreversível. Todas as dívidas e negociações deste cliente serão removidas.`
+      `Excluir o cliente "${customer.name}"?\n\nCPF/CNPJ: ${customer.documentMasked}\n\nEsta ação é irreversível. Todas as dívidas e negociações deste cliente serão removidas.`
     )
 
     if (!confirmed) return
@@ -201,7 +203,8 @@ export function CustomersFilterClient({ customers, companyId }: { customers: Cus
 
       if (!searchTerm) return true
       const searchLower = searchTerm.toLowerCase()
-      return customer.name.toLowerCase().includes(searchLower) || customer.document.toLowerCase().includes(searchLower)
+      // documento em claro não está no cliente (privacidade A5): busca casa o mascarado
+      return customer.name.toLowerCase().includes(searchLower) || customer.documentMasked.toLowerCase().includes(searchLower)
     })
 
     if (daysSort !== "none") {
@@ -431,7 +434,14 @@ export function CustomersFilterClient({ customers, companyId }: { customers: Cus
                       </div>
 
                       <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3 text-sm text-gray-600 dark:text-gray-400">
-                        <span className="font-mono text-xs">CPF: {customer.document}</span>
+                        <span className="text-xs">
+                          CPF:{" "}
+                          <RevealableDocument
+                            masked={customer.documentMasked}
+                            id={customer.id}
+                            companyId={companyId}
+                          />
+                        </span>
                         {customer.city && (
                           <>
                             <span className="hidden sm:inline">•</span>

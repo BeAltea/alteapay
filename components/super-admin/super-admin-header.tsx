@@ -74,19 +74,19 @@ export function SuperAdminHeader({ user }: SuperAdminHeaderProps) {
         .limit(10)
 
       if (error) {
-        console.error("[v0] Error fetching notifications:", error)
+        console.error("[AlteaPay] Error fetching notifications:", error)
         return
       }
 
       setNotifications(data || [])
       setUnreadCount(data?.filter((n) => !n.read).length || 0)
     } catch (error) {
-      console.error("[v0] Exception fetching notifications:", error)
+      console.error("[AlteaPay] Exception fetching notifications:", error)
     }
   }
 
   const handleSignOut = async () => {
-    console.log("[v0] SuperAdminHeader - Sign out initiated")
+    console.log("[AlteaPay] SuperAdminHeader - Sign out initiated")
     toast({
       title: "Logout realizado",
       description: "Voce foi desconectado com sucesso.",
@@ -95,7 +95,7 @@ export function SuperAdminHeader({ user }: SuperAdminHeaderProps) {
   }
 
   const handleThemeToggle = () => {
-    console.log("[v0] SuperAdminHeader - Theme toggle clicked, current theme:", theme)
+    console.log("[AlteaPay] SuperAdminHeader - Theme toggle clicked, current theme:", theme)
     setTheme(theme === "dark" ? "light" : "dark")
     toast({
       title: "Tema alterado",
@@ -104,7 +104,7 @@ export function SuperAdminHeader({ user }: SuperAdminHeaderProps) {
   }
 
   const handleNotificationClick = async (notificationId: string) => {
-    console.log("[v0] SuperAdminHeader - Notification clicked:", notificationId)
+    console.log("[AlteaPay] SuperAdminHeader - Notification clicked:", notificationId)
 
     try {
       const supabase = createClient()
@@ -112,7 +112,7 @@ export function SuperAdminHeader({ user }: SuperAdminHeaderProps) {
 
       await fetchNotifications()
     } catch (error) {
-      console.error("[v0] Error marking notification as read:", error)
+      console.error("[AlteaPay] Error marking notification as read:", error)
     }
 
     setShowNotifications(false)
@@ -162,7 +162,7 @@ export function SuperAdminHeader({ user }: SuperAdminHeaderProps) {
             size="sm"
             className="lg:hidden h-10 w-10 p-0 bg-white dark:bg-altea-navy border border-gray-200 dark:border-gray-700 shadow-sm"
             onClick={() => {
-              console.log("[v0] Mobile menu button clicked, current state:", isMobileMenuOpen)
+              console.log("[AlteaPay] Mobile menu button clicked, current state:", isMobileMenuOpen)
               setIsMobileMenuOpen(!isMobileMenuOpen)
             }}
           >

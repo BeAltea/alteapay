@@ -185,6 +185,20 @@ export async function POST(request: NextRequest) {
 
     const supabase = createAdminClient()
 
+    // Privacidade (A5): a lista super-admin não envia mais o documento em claro.
+    // Se o body não trouxer customer_document mas trouxer vmax_id, resolvemos o
+    // CPF/CNPJ no servidor (escopado por company) para persistir corretamente.
+    let resolvedCustomerDocument = body.customer_document || null
+    if (!resolvedCustomerDocument && body.vmax_id) {
+      const { data: vmaxRow } = await supabase
+        .from("VMAX")
+        .select('"CPF/CNPJ"')
+        .eq("id", body.vmax_id)
+        .eq("id_company", body.company_id)
+        .maybeSingle()
+      resolvedCustomerDocument = (vmaxRow?.["CPF/CNPJ"] as string | null) || null
+    }
+
     // Create the request
     const { data: newRequest, error: createError } = await supabase
       .from("negotiation_requests")
@@ -194,7 +208,7 @@ export async function POST(request: NextRequest) {
         company_id: body.company_id,
         vmax_id: body.vmax_id || null,
         customer_name: body.customer_name || null,
-        customer_document: body.customer_document || null,
+        customer_document: resolvedCustomerDocument,
         customer_email: body.customer_email || null,
         customer_phone: body.customer_phone || null,
         original_amount: body.original_amount,

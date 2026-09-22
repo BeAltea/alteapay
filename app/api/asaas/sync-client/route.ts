@@ -69,9 +69,9 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     const { vmaxId, cpfCnpj, companyId, customerName, createCharge, debtAmount: providedDebtAmount } = body
 
-    if (!cpfCnpj || !companyId) {
+    if (!companyId) {
       return NextResponse.json(
-        { success: false, error: "CPF/CNPJ e companyId são obrigatórios" },
+        { success: false, error: "companyId é obrigatório" },
         { status: 400 }
       )
     }
@@ -84,7 +84,28 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const normalizedCpf = normalizeCpfCnpj(cpfCnpj)
+    // Privacidade (A5): a lista super-admin não envia mais o documento em claro.
+    // Quando o cliente não manda `cpfCnpj`, resolvemos o CPF/CNPJ no servidor a
+    // partir do id da linha VMAX (escopado por company), evitando trafegar PII.
+    let resolvedCpfCnpj = cpfCnpj
+    if (!resolvedCpfCnpj && vmaxId) {
+      const { data: vmaxRow } = await supabase
+        .from("VMAX")
+        .select('"CPF/CNPJ"')
+        .eq("id", vmaxId)
+        .eq("id_company", companyId)
+        .maybeSingle()
+      resolvedCpfCnpj = vmaxRow?.["CPF/CNPJ"] || ""
+    }
+
+    if (!resolvedCpfCnpj) {
+      return NextResponse.json(
+        { success: false, error: "CPF/CNPJ é obrigatório (informe cpfCnpj ou um vmaxId válido)" },
+        { status: 400 }
+      )
+    }
+
+    const normalizedCpf = normalizeCpfCnpj(resolvedCpfCnpj)
     console.log(`[ASAAS Sync Client] Searching for ${customerName || normalizedCpf}...`)
 
     // 1. Search ASAAS for this CPF/CNPJ
