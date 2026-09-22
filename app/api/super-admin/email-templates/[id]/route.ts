@@ -40,6 +40,7 @@ export async function PUT(request: NextRequest, ctx: Ctx) {
     scope: body.scope === "company" ? "company" : "global",
     companyId: body.companyId ?? null,
     purpose: body.purpose === "negotiation" ? "negotiation" : "communication",
+    allowDebtFields: body.allowDebtFields === true,
     subject: body.subject ?? "",
     preheader: body.preheader ?? "",
     html: body.html ?? "",

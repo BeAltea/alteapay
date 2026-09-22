@@ -18,6 +18,12 @@ import {
   type ResolvedTemplate,
 } from "@/lib/email/templates/resolve-default"
 import {
+  resolveDebtEmailContext,
+  isPublicLinkAvailable,
+  type DebtEmailContextEntry,
+  type DebtEmailContext,
+} from "@/lib/email/templates/render-context"
+import {
   loadTenantHubConfig,
   evaluateHubChannels,
   type HubEligibilityResult,
@@ -279,6 +285,12 @@ interface HubSendContext {
   emailTemplate: ResolvedTemplate | null
   /** contato de suporte para a variável {{contato_suporte}} (branding/env). */
   supportContact: string
+  /**
+   * D1: contexto de DÉBITO por devedor (só quando o template resolvido tem
+   * allow_debt_fields). Map<customerId, ok:true{ctx} | ok:false{reason}>. Null
+   * quando o template não é de cobrança (nenhum dado de débito injetado).
+   */
+  debtContext: Map<string, DebtEmailContextEntry> | null
 }
 
 /**
@@ -422,17 +434,41 @@ async function sendEmailDecision(
 
   // Resolve subject/html/text a partir do template do cedente (fallback embutido).
   const resolved = ctx.emailTemplate ?? { source: "builtin" as const, subject: "", preheader: "", html: "", text: "" }
+  const needsDebtFields = resolved.source !== "builtin" && resolved.allowDebtFields === true
+
+  // D1: template de COBRANÇA exige o contexto de débito do devedor. Falha FECHADA:
+  // sem contexto ok:true, o devedor é EXCLUÍDO com o reason estável (nunca cai no
+  // convite neutro nem envia campos vazios). O reason aparece no resultado do
+  // envio (junto de sem_contato_para_o_canal etc.).
+  let debtCtxValue: DebtEmailContext | undefined
+  if (needsDebtFields) {
+    const entry = ctx.debtContext?.get(d.customerId)
+    if (!entry || !entry.ok) {
+      const reason = entry && !entry.ok ? entry.reason : "sem_contexto_debito"
+      await supabase.from("whatsapp_messages").update({ status: "skipped", error: reason }).eq("id", messageId)
+      await recordEvent({
+        companyId: ctx.companyId, campaignId: ctx.campaignId, messageId, customerId: d.customerId,
+        type: "message.suppressed", actor: "system", payload: { channel: "email", reason },
+      })
+      return { customerId: d.customerId, channel: "email", status: "skipped", reason, messageId }
+    }
+    debtCtxValue = entry.ctx
+  }
+
   let emailRes: { ok: boolean; jobId?: string; error?: string }
   // colunas de referência: preenchidas SÓ quando o template NÃO é builtin e o
   // render usou de fato o template (não caiu para o builtin).
   let templateId: string | null = null
   let versionId: string | null = null
+  // grupos de variáveis injetados (auditoria C12, sem PII).
+  let variableGroups: ("basic" | "debt")[] = ["basic"]
 
   if (resolved.source !== "builtin") {
-    const rendered = renderTemplate(resolved, buildTemplateVars(ctx, firstName), builtinCtx)
+    const rendered = renderTemplate(resolved, buildTemplateVars(ctx, firstName), builtinCtx, debtCtxValue)
     if (rendered.ok && !rendered.fellBackToBuiltin) {
       templateId = resolved.templateId ?? null
       versionId = resolved.versionId ?? null
+      variableGroups = rendered.variableGroups ?? ["basic"]
       emailRes = await dispatchRenderedEmail({
         to: d.email ?? "",
         subject: rendered.subject,
@@ -442,9 +478,22 @@ async function sendEmailDecision(
         companyId: ctx.companyId,
         customerId: d.customerId,
       })
+    } else if (!rendered.ok && rendered.reason === "render_incomplete") {
+      // FALHA FECHADA: token remanescente / cobrança sem contexto → NÃO envia.
+      // Nunca cai no convite neutro (seria enviar sem os dados prometidos).
+      const now = new Date().toISOString()
+      await supabase.from("whatsapp_messages").update({
+        status: "failed", error: "render_incomplete",
+        status_history: [{ at: now, to: "failed", channel: "email", error: "render_incomplete" }],
+      }).eq("id", messageId)
+      await recordEvent({
+        companyId: ctx.companyId, campaignId: ctx.campaignId, messageId, customerId: d.customerId,
+        type: "message.failed", actor: "system", payload: { channel: "email", error: "render_incomplete" },
+      })
+      return { customerId: d.customerId, channel: "email", status: "failed", reason: "render_incomplete", messageId }
     } else {
       // render caiu para o builtin (variável proibida / sem links): usa o convite
-      // embutido e mantém as colunas NULL.
+      // embutido e mantém as colunas NULL. Convite neutro NÃO leva dados de débito.
       emailRes = await dispatchEmailInvite({
         to: d.email ?? "", customerName: firstName, brandName: ctx.brandName,
         creditorName: ctx.creditorName, link: ctx.link, companyId: ctx.companyId, customerId: d.customerId,
@@ -463,12 +512,20 @@ async function sendEmailDecision(
     await supabase.from("whatsapp_messages").update({
       status: "sent", sent_at: now, provider_message_id: emailRes.jobId ?? null,
       email_template_id: templateId, email_template_version_id: versionId,
+      variable_groups: variableGroups,
       status_history: [{ at: now, to: "sent", channel: "email" }],
     }).eq("id", messageId)
     await recordEvent({
       companyId: ctx.companyId, campaignId: ctx.campaignId, messageId, customerId: d.customerId,
       type: "message.sent", actor: "system",
-      payload: { channel: "email", templateSource: templateId ? "template" : "builtin" },
+      // C12: log com ids + grupos de variáveis. NUNCA nome/documento/valor/venc/e-mail.
+      payload: {
+        channel: "email",
+        templateSource: templateId ? "template" : "builtin",
+        template_id: templateId,
+        template_version_id: versionId,
+        variable_groups: variableGroups,
+      },
     })
     return { customerId: d.customerId, channel: "email", status: "sent", messageId, jobId: emailRes.jobId }
   }
@@ -582,6 +639,7 @@ export async function runHubSend(input: {
     dispatchMode: input.dispatchMode,
     emailTemplate,
     supportContact,
+    debtContext: null,
   }
 
   // Nomes (só p/ {{primeiro_nome}}) dos devedores elegíveis por e-mail. Uma busca
@@ -604,6 +662,31 @@ export async function runHubSend(input: {
       for (const c of (names ?? []) as { id: string; name: string | null }[]) {
         emailFirstNames.set(c.id, firstNameOf(c.name))
       }
+    }
+  }
+
+  // D1: quando o template de e-mail resolvido é de COBRANÇA (allow_debt_fields),
+  // monta o contexto de débito (nome/documento mascarado/valor/vencimento/qtd)
+  // EM LOTE, reusando buildAckContext (C4) por devedor. A disponibilidade do link
+  // é resolvida UMA vez: fora do ar → resolveDebtEmailContext marca TODOS com
+  // link_indisponivel (bloqueia a campanha inteira). Cada devedor ok:false é
+  // depois EXCLUÍDO no sendEmailDecision com o reason.
+  if (emailTemplate?.allowDebtFields === true && channels.includes("email") && !input.dryRun) {
+    const debtInputs = Array.from(
+      reverified
+        .flatMap((r) => r.decisions)
+        .filter((x) => x.channel === "email" && x.eligible)
+        .reduce((acc, x) => {
+          if (!acc.has(x.customerId)) acc.set(x.customerId, { customerId: x.customerId, debtIds: x.debtIds ?? [] })
+          return acc
+        }, new Map<string, { customerId: string; debtIds: string[] }>())
+        .values(),
+    )
+    if (debtInputs.length > 0) {
+      const linkAvailable = await isPublicLinkAvailable(input.companyId)
+      ctx.debtContext = await resolveDebtEmailContext(input.companyId, debtInputs, { linkAvailable })
+    } else {
+      ctx.debtContext = new Map()
     }
   }
 

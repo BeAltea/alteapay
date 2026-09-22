@@ -110,6 +110,51 @@ describe("sanitizeEmailHtml — remove vetores de execução", () => {
   })
 })
 
+// Onda VMAX (G0): atributos/tag benignos de layout de e-mail table-based.
+describe("sanitizeEmailHtml — layout de e-mail (onda VMAX)", () => {
+  it("PRESERVA cellpadding, cellspacing, role, valign e <tbody>", () => {
+    const html =
+      '<table role="presentation" cellpadding="0" cellspacing="0">' +
+      '<tbody><tr><td valign="top">Oi</td></tr></tbody></table>'
+    const out = sanitizeEmailHtml(html)
+    expect(out).toContain('role="presentation"')
+    expect(out).toContain('cellpadding="0"')
+    expect(out).toContain('cellspacing="0"')
+    expect(out).toContain('valign="top"')
+    expect(out.toLowerCase()).toContain("<tbody>")
+    expect(out.toLowerCase()).toContain("</tbody>")
+    expect(out).toContain("Oi")
+  })
+
+  it("os novos atributos NÃO reabrem vetor de script (on*/javascript: continuam removidos)", () => {
+    const html =
+      '<table role="presentation" cellpadding="0" onmouseover="steal()">' +
+      '<tbody onload="x()"><tr><td valign="top"><a href="javascript:evil()">z</a></td></tr></tbody></table>'
+    const out = sanitizeEmailHtml(html)
+    expect(out).toContain('role="presentation"')
+    expect(out).toContain('cellpadding="0"')
+    expect(out.toLowerCase()).not.toContain("onmouseover")
+    expect(out.toLowerCase()).not.toContain("onload")
+    expect(out).not.toContain("steal()")
+    expect(out).not.toContain("x()")
+    expect(out.toLowerCase()).not.toContain("javascript:")
+  })
+
+  it("<script> continua descartado mesmo dentro de <tbody>", () => {
+    const out = sanitizeEmailHtml("<table><tbody><tr><td>ok</td></tr></tbody></table><script>bad()</script>")
+    expect(out.toLowerCase()).not.toContain("<script")
+    expect(out).not.toContain("bad()")
+    expect(out).toContain("ok")
+  })
+
+  it("continua idempotente com os novos atributos/tag", () => {
+    const html =
+      '<table role="presentation" cellpadding="0" cellspacing="0"><tbody><tr><td valign="middle">x</td></tr></tbody></table>'
+    const once = sanitizeEmailHtml(html)
+    expect(sanitizeEmailHtml(once)).toBe(once)
+  })
+})
+
 describe("toPlainText", () => {
   it("remove tags e <style>/<head>", () => {
     const txt = toPlainText('<html><head><style>p{color:red}</style></head><body><p>Olá &amp; bem-vindo</p></body></html>')

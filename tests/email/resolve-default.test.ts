@@ -246,3 +246,120 @@ describe("renderTemplate — substituição + re-sanitização", () => {
     expect(r.html).toContain("convite")
   })
 })
+
+// ===========================================================================
+// D1 — injeção do contexto de DÉBITO (allow_debt_fields) + escape + sweep.
+// ===========================================================================
+
+const DEBT_HTML =
+  "<p>Olá {{nome_cliente}} ({{documento_mascarado}})</p>" +
+  "<p>Valor {{valor_divida}}, venceu em {{vencimento_original}}, {{qtd_faturas}} fatura(s).</p>" +
+  '<p><a href="{{link_negociacao}}">negociar</a> <a href="{{link_descadastro}}">sair</a></p>'
+
+const DEBT_CTX = {
+  nome_cliente: "Jose Da Silva",
+  primeiro_nome: "Jose",
+  documento_mascarado: "***.444.777-**",
+  valor_divida: "R$ 199,80",
+  vencimento_original: "15/04/2026",
+  qtd_faturas: "1",
+}
+
+describe("renderTemplate — dados do débito (allow_debt_fields)", () => {
+  const RESOLVED_DEBT = {
+    source: "cedente" as const,
+    templateId: "t1",
+    versionId: "v1",
+    allowDebtFields: true,
+    subject: "Olá {{primeiro_nome}}",
+    preheader: "",
+    html: DEBT_HTML,
+    text: "Valor {{valor_divida}} — {{link_negociacao}} — {{link_descadastro}}",
+  }
+  const VARS = {
+    primeiro_nome: "João",
+    credor: "VMAX",
+    marca: "AlteaPay",
+    link_negociacao: "https://app/n/xyz",
+    link_descadastro: "https://app/n/xyz",
+    contato_suporte: "suporte@alteapay.com",
+    ano: "2026",
+  }
+
+  it("injeta as 5 DEBT vars quando o template permite E há debtCtx", async () => {
+    const { renderTemplate } = await import("@/lib/email/templates/resolve-default")
+    const r = renderTemplate(RESOLVED_DEBT, VARS, BUILTIN, DEBT_CTX)
+    expect(r.ok).toBe(true)
+    expect(r.fellBackToBuiltin).toBeFalsy()
+    expect(r.html).toContain("Jose Da Silva")
+    expect(r.html).toContain("***.444.777-**")
+    expect(r.html).toContain("R$ 199,80")
+    expect(r.html).toContain("15/04/2026")
+    expect(r.variableGroups).toEqual(["basic", "debt"])
+    // sem token remanescente
+    expect(r.html).not.toContain("{{")
+  })
+
+  it("FALHA FECHADA (render_incomplete) quando allow_debt_fields mas SEM debtCtx", async () => {
+    const { renderTemplate } = await import("@/lib/email/templates/resolve-default")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const r = renderTemplate(RESOLVED_DEBT, VARS, BUILTIN /* sem debtCtx */)
+    expect(r.ok).toBe(false)
+    expect(r.reason).toBe("render_incomplete")
+    // NUNCA renderiza {{valor_divida}} nem cai no builtin com campos vazios.
+    expect(r.html).toBe("")
+    warn.mockRestore()
+  })
+
+  it("HTML-ESCAPA os valores de débito interpolados (nome com < > &)", async () => {
+    const { renderTemplate } = await import("@/lib/email/templates/resolve-default")
+    const evil = { ...DEBT_CTX, nome_cliente: 'Jose <b>x</b> & "Cia"' }
+    const r = renderTemplate(RESOLVED_DEBT, VARS, BUILTIN, evil)
+    expect(r.ok).toBe(true)
+    // o markup do nome não vira tag real
+    expect(r.html).not.toContain("<b>x</b>")
+    expect(r.html).toContain("&lt;b&gt;")
+  })
+
+  it("varredura final: token {{...}} remanescente no corpo → render_incomplete", async () => {
+    const { renderTemplate } = await import("@/lib/email/templates/resolve-default")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    // template de débito que referencia uma DEBT var que o debtCtx não cobre não
+    // é possível (o ctx cobre as 5); simulamos um token literal não-variável.
+    const withStray = { ...RESOLVED_DEBT, html: DEBT_HTML + "<p>{{sobrou}}</p>" }
+    const r = renderTemplate(withStray, VARS, BUILTIN, DEBT_CTX)
+    // {{sobrou}} não é básica nem débito → cai antes no guard de variável proibida
+    // (fellBackToBuiltin) OU no sweep. Em ambos os casos NÃO envia o token cru.
+    expect(r.html).not.toContain("{{sobrou}}")
+    warn.mockRestore()
+  })
+
+  it("template SEM allow_debt_fields ignora o debtCtx e barra DEBT var (proibida)", async () => {
+    const { renderTemplate } = await import("@/lib/email/templates/resolve-default")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const noFlag = { ...RESOLVED_DEBT, allowDebtFields: false }
+    const r = renderTemplate(noFlag, VARS, BUILTIN, DEBT_CTX)
+    // DEBT var num template sem a flag → variável fora da allowlist → builtin.
+    expect(r.fellBackToBuiltin).toBe(true)
+    expect(r.reason).toBe("variavel_proibida")
+    expect(r.html).not.toContain("Jose Da Silva")
+    warn.mockRestore()
+  })
+
+  it("só básicas quando não há debtCtx e o template não é de débito → variableGroups=['basic']", async () => {
+    const { renderTemplate } = await import("@/lib/email/templates/resolve-default")
+    const basic = {
+      source: "cedente" as const,
+      templateId: "t1",
+      versionId: "v1",
+      allowDebtFields: false,
+      subject: "Olá {{primeiro_nome}}",
+      preheader: "",
+      html: VALID_HTML,
+      text: "Negocie: {{link_negociacao}} — {{link_descadastro}}",
+    }
+    const r = renderTemplate(basic, VARS, BUILTIN)
+    expect(r.ok).toBe(true)
+    expect(r.variableGroups).toEqual(["basic"])
+  })
+})
