@@ -133,6 +133,53 @@ describe("preview", () => {
     // purpose=communication → variável de débito nunca é permitida (dois níveis)
     expect(data.warnings.join(" ")).toMatch(/dado do débito/i)
   })
+
+  // Regressão: o preview do template de cobrança da VMAX (allow_debt_fields=true +
+  // negotiation + variáveis de débito) NÃO pode lançar NEM acusar as DEBT vars como
+  // proibidas quando o GATE está aberto — era a causa da página de e-mails quebrar
+  // (o editor não enviava allowDebtFields, o gate ficava fechado e o painel virava
+  // um mar de "variável proibida"). Passa o gate → sem aviso de débito, canSave ok.
+  it("VMAX (allow_debt_fields + negotiation + debt vars): não lança e não acusa débito", async () => {
+    const { POST } = await import("@/app/api/super-admin/email-templates/preview/route")
+    const res = await call(POST, {
+      subject: "{{credor}}: regularize sua pendência",
+      preheader: "Comunicação oficial",
+      html:
+        "<p>Olá {{nome_cliente}}</p><p>{{documento_mascarado}} — {{valor_divida}} — {{vencimento_original}}</p>" +
+        '<p>{{qtd_faturas}}</p><a href="{{link_negociacao}}">Negociar</a>' +
+        '<a href="{{link_descadastro}}">Sair</a>',
+      textFallback: "{{nome_cliente}} {{valor_divida}} {{link_negociacao}} {{link_descadastro}}",
+      purpose: "negotiation",
+      allowDebtFields: true,
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json()
+    // Sem exceção: preview renderizado.
+    expect(typeof data.previewHtml).toBe("string")
+    expect(data.previewHtml.length).toBeGreaterThan(0)
+    // Nenhum aviso — o gate está aberto, as DEBT vars são legítimas aqui.
+    expect(data.warnings).toEqual([])
+    expect(data.canSave).toBe(true)
+  })
+
+  // Contra-prova de SEGURANÇA: o MESMO corpo, mas com o gate FECHADO
+  // (allowDebtFields ausente), volta a acusar as variáveis de débito. A regra de
+  // segurança não foi enfraquecida.
+  it("mesmo corpo sem allow_debt_fields → DEBT vars continuam proibidas", async () => {
+    const { POST } = await import("@/app/api/super-admin/email-templates/preview/route")
+    const res = await call(POST, {
+      subject: "{{credor}}",
+      html:
+        "<p>{{nome_cliente}} {{valor_divida}}</p>" +
+        '<a href="{{link_negociacao}}">x</a><a href="{{link_descadastro}}">y</a>',
+      purpose: "negotiation",
+      // allowDebtFields omitido de propósito
+    })
+    expect(res.status).toBe(200)
+    const data = await res.json()
+    expect(data.canSave).toBe(false)
+    expect(data.warnings.join(" ")).toMatch(/dado do débito/i)
+  })
 })
 
 describe("POST create — validação", () => {

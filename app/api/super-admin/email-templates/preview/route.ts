@@ -43,18 +43,34 @@ export async function POST(request: NextRequest) {
 
   // GATE de débito no preview: canal 'email', propósito, flag. As DEBT vars só não
   // acusam warning quando o gate abre (mesma regra da gravação).
-  const varResult = validateVariables(
-    { subject, preheader, html, textFallback },
-    { allowDebtFields, purpose, channel: "email" },
-  )
-  const purposeResult = validatePurposeRequirements(purpose, { subject, preheader, html, textFallback })
-  const debtResult = validateDebtFieldsRequirements(allowDebtFields, purpose, { subject, preheader, html, textFallback })
-  const warnings = [...varResult.errors, ...purposeResult.errors, ...debtResult.errors]
+  //
+  // NUNCA lançar: o preview é auxiliar e um template qualquer (inclusive um com
+  // allow_debt_fields + variáveis de débito) não pode derrubar a rota. Qualquer
+  // exceção vira um aviso e um preview vazio — o painel segue de pé.
+  try {
+    const varResult = validateVariables(
+      { subject, preheader, html, textFallback },
+      { allowDebtFields, purpose, channel: "email" },
+    )
+    const purposeResult = validatePurposeRequirements(purpose, { subject, preheader, html, textFallback })
+    const debtResult = validateDebtFieldsRequirements(allowDebtFields, purpose, { subject, preheader, html, textFallback })
+    const warnings = [...varResult.errors, ...purposeResult.errors, ...debtResult.errors]
 
-  const previewHtml = buildPreviewHtml({ subject, preheader, html })
+    const previewHtml = buildPreviewHtml({ subject, preheader, html })
 
-  return NextResponse.json(
-    { previewHtml, variablesUsed: varResult.used, warnings, canSave: warnings.length === 0 },
-    { headers: noCacheHeaders },
-  )
+    return NextResponse.json(
+      { previewHtml, variablesUsed: varResult.used, warnings, canSave: warnings.length === 0 },
+      { headers: noCacheHeaders },
+    )
+  } catch (e) {
+    return NextResponse.json(
+      {
+        previewHtml: "",
+        variablesUsed: [],
+        warnings: [e instanceof Error ? e.message : "Falha ao gerar a pré-visualização."],
+        canSave: false,
+      },
+      { headers: noCacheHeaders },
+    )
+  }
 }
