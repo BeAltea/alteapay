@@ -136,6 +136,11 @@ export function TemplateEditor({
   }, [templateId])
 
   // Preview (debounce) — sempre via servidor: renderiza dados fictícios + sanitiza.
+  // Passa o GATE de débito (allowDebtFields + purpose) para o preview avaliar as
+  // variáveis com a MESMA regra da gravação: um template de negociação com
+  // "permitir dados do débito" ligado NÃO deve acusar {{valor_divida}} & cia como
+  // proibidas. Sem isso, abrir o template de cobrança da VMAX mostrava avisos
+  // falsos de "variável proibida" (o gate ficava fechado no preview).
   const refreshPreview = useCallback(async () => {
     try {
       const res = await fetch("/api/super-admin/email-templates/preview", {
@@ -147,6 +152,8 @@ export function TemplateEditor({
           html: state.html,
           textFallback: state.textFallback,
           purpose: state.purpose,
+          // Só faz sentido em negociação (o gate só abre aí); comunicação → false.
+          allowDebtFields: state.purpose === "negotiation" ? state.allowDebtFields : false,
         }),
       })
       const data = await res.json()
@@ -157,7 +164,7 @@ export function TemplateEditor({
     } catch {
       // silencioso: o preview é auxiliar.
     }
-  }, [state.subject, state.preheader, state.html, state.textFallback, state.purpose])
+  }, [state.subject, state.preheader, state.html, state.textFallback, state.purpose, state.allowDebtFields])
 
   useEffect(() => {
     if (loading) return

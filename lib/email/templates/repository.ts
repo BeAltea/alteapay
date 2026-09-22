@@ -91,11 +91,23 @@ export async function listTemplates(
   const { data: defaults } = await supabase.from("email_template_defaults").select("template_id")
   const defaultTemplateIds = new Set((defaults ?? []).map((d: any) => d.template_id))
 
-  return rows.map((row) => ({
-    template: mapTemplate(row),
-    currentVersion: row.current_version_id ? versionsById.get(row.current_version_id) ?? null : null,
-    isDefault: defaultTemplateIds.has(row.id),
-  }))
+  // Mapeia POR TEMPLATE com guarda: uma linha malformada (ex.: um seed gravado
+  // direto no banco, como o template de cobrança da VMAX com dados do débito) NÃO
+  // pode derrubar a listagem inteira — pula-se a linha problemática e o painel
+  // segue de pé com os demais templates.
+  const out: EmailTemplateWithVersion[] = []
+  for (const row of rows) {
+    try {
+      out.push({
+        template: mapTemplate(row),
+        currentVersion: row.current_version_id ? versionsById.get(row.current_version_id) ?? null : null,
+        isDefault: defaultTemplateIds.has(row.id),
+      })
+    } catch (e) {
+      console.warn(`[email/templates] linha ignorada na listagem (id=${row?.id ?? "?"}): ${e instanceof Error ? e.message : "erro"}`)
+    }
+  }
+  return out
 }
 
 export async function getTemplate(

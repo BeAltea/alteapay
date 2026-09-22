@@ -34,8 +34,12 @@ interface TemplateRow {
   isDefault?: boolean
 }
 
-const PURPOSE_LABEL: Record<string, string> = { negotiation: "Negociação", communication: "Comunicação" }
-const STATUS_LABEL: Record<string, string> = { draft: "Rascunho", active: "Ativo", archived: "Arquivado" }
+const PURPOSE_LABELS: Record<string, string> = { negotiation: "Negociação", communication: "Comunicação" }
+const STATUS_LABELS: Record<string, string> = { draft: "Rascunho", active: "Ativo", archived: "Arquivado" }
+// Fallback tolerante: um propósito/status inesperado (ex.: seed gravado direto no
+// banco) rende o valor cru em vez de "undefined" — nunca quebra a linha.
+const PURPOSE_LABEL = (p: string) => PURPOSE_LABELS[p] ?? p ?? "—"
+const STATUS_LABEL = (s: string) => STATUS_LABELS[s] ?? s ?? "—"
 
 export function TemplatesManager({ companies }: { companies: Company[] }) {
   const { toast } = useToast()
@@ -197,7 +201,7 @@ export function TemplatesManager({ companies }: { companies: Company[] }) {
                 <div className="flex shrink-0 items-center gap-2">
                   <Badge variant="outline">{companyName(template.companyId)}</Badge>
                   <Badge variant={template.purpose === "negotiation" ? "default" : "secondary"}>
-                    {PURPOSE_LABEL[template.purpose]}
+                    {PURPOSE_LABEL(template.purpose)}
                   </Badge>
                   <Badge
                     variant={
@@ -208,7 +212,7 @@ export function TemplatesManager({ companies }: { companies: Company[] }) {
                           : "secondary"
                     }
                   >
-                    {STATUS_LABEL[template.status]}
+                    {STATUS_LABEL(template.status)}
                   </Badge>
                   {currentVersion && <Badge variant="outline">v{currentVersion.version}</Badge>}
                   <DropdownMenu>
