@@ -140,6 +140,34 @@ export interface SettledContext {
 }
 
 /**
+ * Ação de LINK EXTERNO anexada à mensagem de quitação: abre o formulário de
+ * contato da home (#contato) com o campo "Sou" já em "Recebi uma cobrança"
+ * (a home lê ?tipo=recebi_cobranca e pré-seleciona). Só um botão-link (<a>),
+ * sem POST — a UI (chat.tsx) renderiza abaixo da bolha. Segue a convenção da
+ * home: query ANTES do hash (ex.: /?tipo=publico#contato).
+ */
+export interface MessageLinkAction {
+  type: "external_link"
+  label: string
+  href: string
+}
+
+/** URL do form de contato da home com o "Sou" pré-preenchido "Recebi uma cobrança". */
+export function debtSettledContactHref(): string {
+  const base = (process.env.NEXT_PUBLIC_APP_URL ?? "https://alteapay.com").replace(/\/+$/, "")
+  return `${base}/?tipo=recebi_cobranca#contato`
+}
+
+/** Ação de contato mostrada na mensagem de quitação (botão-link externo). */
+export function debtSettledContactAction(): MessageLinkAction {
+  return {
+    type: "external_link",
+    label: "Recebi uma cobrança — falar com atendimento",
+    href: debtSettledContactHref(),
+  }
+}
+
+/**
  * Texto informativo de quitação (pt-BR). Sem botões de reconhecimento. Se a data
  * de pagamento for desconhecida, omite o "em {data}" e mantém o "consta como paga".
  */
@@ -240,6 +268,10 @@ export async function bootstrapSettledMessage(input: {
       role: "assistant",
       text: settledMessage(ctx),
       engine: "platform",
+      // Botão-link externo (Recebi uma cobrança → #contato) anexado à bolha.
+      // Reusa a coluna jsonb existente (offers_snapshot) — sem migração — e a
+      // rota /api/chat/messages devolve como `action` para a UI renderizar.
+      offers_snapshot: { message_action: debtSettledContactAction() },
     })
     .select("id")
     .single()

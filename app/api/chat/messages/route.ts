@@ -21,13 +21,24 @@ export async function GET(req: NextRequest) {
 
   let q = supabase
     .from("chat_messages")
-    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, created_at")
+    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, offers_snapshot, created_at")
     .eq("session_id", claims.sid)
     .eq("company_id", claims.cid)
     .order("created_at", { ascending: true })
     .limit(200)
   if (since) q = q.gt("created_at", since)
-  const { data: messages } = await q
+  const { data: rawMessages } = await q
+
+  // Anexa o botão-link externo (ex.: quitação → #contato) quando a mensagem o
+  // carrega em offers_snapshot.message_action. A UI renderiza como <a> abaixo da
+  // bolha; offers_snapshot cru não vaza para o cliente. Sem PII.
+  const messages = (rawMessages ?? []).map((m) => {
+    const snapshot = m.offers_snapshot as { message_action?: unknown } | null
+    const action =
+      snapshot && typeof snapshot === "object" && snapshot.message_action ? snapshot.message_action : null
+    const { offers_snapshot: _drop, ...rest } = m as Record<string, unknown>
+    return action ? { ...rest, action } : rest
+  })
 
   const { data: activePrompt } = await supabase
     .from("chat_prompts")

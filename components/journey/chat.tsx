@@ -10,10 +10,28 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 
+interface MsgAction {
+  type: string
+  label: string
+  href: string
+}
+
 interface ChatMsg {
   id: string
   from: "customer" | "assistant"
   text: string
+  action?: MsgAction | null
+}
+
+/** Só aceitamos links externos http(s) — nunca javascript:/relativos suspeitos. */
+function safeExternalAction(raw: unknown): MsgAction | null {
+  if (!raw || typeof raw !== "object") return null
+  const a = raw as Record<string, unknown>
+  if (a.type !== "external_link") return null
+  const label = typeof a.label === "string" ? a.label : ""
+  const href = typeof a.href === "string" ? a.href : ""
+  if (!label || !/^https?:\/\//i.test(href)) return null
+  return { type: "external_link", label, href }
 }
 
 let msgSeq = 0
@@ -78,17 +96,35 @@ export function JourneyChat() {
         ? `/api/chat/messages?since=${encodeURIComponent(sinceRef.current)}`
         : "/api/chat/messages"
       const res = await fetch(url)
+      // Sessão do chat expirada/ausente → volta para o login do CHAT (/n/{code}),
+      // NUNCA o login da AlteaPay. Mesma lógica do timer de inatividade.
+      if (res.status === 401) {
+        stopPoll()
+        goToChatLogin()
+        return
+      }
       if (!res.ok) return
       const data = await res.json()
-      const pushed: Array<{ id: string; role: string; text: string; created_at: string; button_id: number | null }> =
-        Array.isArray(data?.messages) ? data.messages : []
+      const pushed: Array<{
+        id: string
+        role: string
+        text: string
+        created_at: string
+        button_id: number | null
+        action?: unknown
+      }> = Array.isArray(data?.messages) ? data.messages : []
       for (const m of pushed) {
         if (seenIds.current.has(m.id)) continue
         seenIds.current.add(m.id)
         sinceRef.current = m.created_at
         setMessages((prev) => [
           ...prev,
-          { id: m.id, from: m.role === "customer" ? "customer" : "assistant", text: m.text },
+          {
+            id: m.id,
+            from: m.role === "customer" ? "customer" : "assistant",
+            text: m.text,
+            action: safeExternalAction(m.action),
+          },
         ])
       }
       // Nunca sobrescreve o prompt depois de encerrado (preserva o histórico).
@@ -126,6 +162,12 @@ export function JourneyChat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt_id: promptId, button_id: buttonId }),
       })
+      // Sessão do chat expirada/ausente → login do CHAT (/n/{code}), nunca AlteaPay.
+      if (res.status === 401) {
+        stopPoll()
+        goToChatLogin()
+        return { ok: false, code: "unauthorized" }
+      }
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
         const chosen = current?.buttons.find((b) => b.id === buttonId)?.label ?? ""
@@ -166,7 +208,7 @@ export function JourneyChat() {
         {messages.map((m) => (
           <div
             key={m.id}
-            className={m.from === "customer" ? "flex justify-end" : "flex justify-start"}
+            className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}
           >
             <div
               style={
@@ -182,6 +224,18 @@ export function JourneyChat() {
             >
               {m.text}
             </div>
+            {/* Botão-link externo anexado à bolha (ex.: quitação → #contato). */}
+            {m.from === "assistant" && m.action ? (
+              <a
+                href={m.action.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ backgroundColor: "var(--brand-secondary)" }}
+                className="mt-2 inline-block rounded-md px-4 py-2 text-sm font-semibold text-white"
+              >
+                {m.action.label}
+              </a>
+            ) : null}
           </div>
         ))}
 
