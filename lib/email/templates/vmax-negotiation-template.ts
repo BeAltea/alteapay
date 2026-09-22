@@ -124,10 +124,10 @@ export const VMAX_TEMPLATE_HTML = `<!DOCTYPE html>
 </tr>
 <tr>
 <td align="center" style="background-color:${CARD_BG};padding:28px 32px 8px 32px;">
-<table role="presentation" style="border-collapse:collapse;">
+<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:separate;">
 <tr>
 <td align="center" bgcolor="${GOLD}" style="background-color:${GOLD};border-radius:6px;">
-<a href="{{link_negociacao}}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:14px 36px;font-size:16px;font-weight:bold;color:${NAVY};text-decoration:none;">Negociar agora</a>
+<a href="{{link_negociacao}}" target="_blank" rel="noopener noreferrer" style="display:block;padding:15px 40px;font-size:16px;font-weight:bold;color:${NAVY};text-decoration:none;border-radius:6px;">Negociar agora</a>
 </td>
 </tr>
 </table>
