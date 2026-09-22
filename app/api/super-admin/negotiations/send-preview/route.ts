@@ -1,9 +1,13 @@
 // POST /api/super-admin/negotiations/send-preview
 //
-// Preview SEM efeito colateral: distribuição por canal (WhatsApp/e-mail),
-// excluídos POR DEVEDOR com motivo, quantos com cobrança viva (informativo), o
-// `mode` vigente, os modos permitidos pelo tenant e o link /n/{code} que será
-// enviado. NÃO cria campanha, token, mensagem nem cobrança.
+// Preview SEM efeito colateral: distribuição POR CANAL (WhatsApp/e-mail),
+// excluídos POR DEVEDOR com motivo em CADA canal, o CRUZAMENTO (quantos têm os
+// dois contatos / recebem pelos dois), quantos com cobrança viva (informativo),
+// e o link /n/{code} que será enviado. NÃO cria campanha, token, mensagem nem
+// cobrança.
+//
+// F1: a escolha é por CANAL (channels: ["whatsapp","email"]), não mais por forma
+// de pagamento. `dedupe` ("não duplicar") prioriza WhatsApp para quem tem os dois.
 //
 // Fonte da verdade do FORMATO: components/super-admin/negotiations/send-contract.ts
 // (a UI é rica; a rota emite exatamente o que o diálogo consome).
@@ -19,12 +23,15 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { maskDocument } from "@/lib/journey/document"
 import {
   loadTenantHubConfig,
-  evaluateHubEligibility,
-  summarizeHubEligibility,
+  evaluateHubChannels,
+  summarizeHubChannels,
+  type HubChannel,
+  type HubChannelDecision,
 } from "@/lib/journey/campaigns"
+import { resolveNegotiationTemplateInfo } from "@/lib/email/templates/resolve-default"
 import { resolveSelection, type SelectionBody } from "../selection"
 import type {
-  SendMode,
+  SendChannel,
   SendPreviewExcluded,
   SendPreviewResponse,
 } from "@/components/super-admin/negotiations/send-contract"
@@ -36,7 +43,8 @@ const noCache = { "Cache-Control": "no-store, no-cache, must-revalidate, max-age
 
 interface PreviewBody extends SelectionBody {
   companyId?: string
-  mode?: string
+  channels?: string[]
+  dedupe?: boolean
 }
 
 /**
@@ -74,18 +82,14 @@ async function resolveCompany(request: NextRequest, bodyCompanyId?: string) {
   return { companyId, role, userId: user.id, fullName: profile?.full_name ?? null }
 }
 
-const VALID_MODES: SendMode[] = ["whatsapp_chat", "charge_email", "both"]
+const ALL: SendChannel[] = ["whatsapp", "email"]
 
-/**
- * Modos permitidos pelo tenant: whatsapp_chat é SEMPRE oferecido (é o link do
- * chat, base da jornada). charge_email/both só quando o send mode configurado do
- * tenant os habilita (negotiation_send_mode). Isso alimenta a troca de modo no
- * diálogo (canSwitchMode).
- */
-function allowedModesFor(sendMode: SendMode): SendMode[] {
-  if (sendMode === "both") return ["whatsapp_chat", "charge_email", "both"]
-  if (sendMode === "charge_email") return ["whatsapp_chat", "charge_email"]
-  return ["whatsapp_chat"]
+/** Sanitiza os canais do corpo (default: ambos). Vazio → ambos (o diálogo já
+ * desabilita confirmar com nenhum; aqui default-a para o preview não quebrar). */
+function parseChannels(raw: unknown): SendChannel[] {
+  if (!Array.isArray(raw)) return [...ALL]
+  const out = raw.filter((c): c is SendChannel => c === "whatsapp" || c === "email")
+  return out.length > 0 ? Array.from(new Set(out)) : [...ALL]
 }
 
 /** Mascara o documento de cada customer excluído (nunca em claro). */
@@ -106,6 +110,15 @@ async function maskedDocuments(companyId: string, customerIds: string[]): Promis
   return out
 }
 
+/** Converte as decisões inelegíveis de um canal no array por-devedor do contrato. */
+function toExcluded(decisions: HubChannelDecision[], docs: Map<string, string>): SendPreviewExcluded[] {
+  return decisions.map((d) => ({
+    customerId: d.customerId,
+    documentMasked: docs.get(d.customerId) ?? "***",
+    reason: d.reason ?? "excluido",
+  }))
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json().catch(() => ({}))) as PreviewBody
@@ -121,51 +134,59 @@ export async function POST(request: NextRequest) {
     const { customerIds } = selection
 
     const hub = await loadTenantHubConfig(companyId)
-    const mode: SendMode = VALID_MODES.includes(body.mode as SendMode)
-      ? (body.mode as SendMode)
-      : hub.sendMode
+    const channels = parseChannels(body.channels)
+    const dedupe = body.dedupe === true
 
-    const evaluated = await evaluateHubEligibility({
+    const decisions = await evaluateHubChannels({
       companyId,
       customerIds,
       cooldownDays: hub.cooldownDays,
       minDebtValue: hub.minDebtValue,
+      channels: channels as HubChannel[],
+      dedupe,
     })
-    const counts = summarizeHubEligibility(evaluated)
+    const counts = summarizeHubChannels(decisions, channels as HubChannel[])
 
     const base = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"
     const publicLink = hub.publicLinkCode && hub.publicLinkEnabled ? `${base}/n/${hub.publicLinkCode}` : null
 
-    // Excluídos POR DEVEDOR (array), com documento MASCARADO + motivo.
-    const excludedIds = evaluated.filter((e) => !e.eligible).map((e) => e.customerId)
+    // documentos mascarados de TODOS os excluídos (qualquer canal), uma vez só.
+    const excludedIds = Array.from(
+      new Set(
+        (["whatsapp", "email"] as HubChannel[]).flatMap((ch) =>
+          counts.perChannel[ch].excluded.map((d) => d.customerId),
+        ),
+      ),
+    )
     const docs = await maskedDocuments(companyId, excludedIds)
-    const excluded: SendPreviewExcluded[] = evaluated
-      .filter((e) => !e.eligible)
-      .map((e) => ({
-        customerId: e.customerId,
-        documentMasked: docs.get(e.customerId) ?? "***",
-        reason: e.reason ?? "excluido",
-      }))
 
-    const response: SendPreviewResponse & {
-      // por-devedor (sem PII: só id + canal/motivo) — auxiliar para depuração.
-      rows: Array<{ customerId: string; channel: string | null; eligible: boolean; reason: string | null; hasLiveCharge: boolean }>
-    } = {
-      mode,
-      total: counts.eligibleTotal,
-      byChannel: { whatsapp: counts.byChannel.whatsapp, email: counts.byChannel.email },
+    // F4: qual template o E-MAIL usará (padrão do cedente → global → convite
+    // embutido). Só resolve quando o e-mail está entre os canais marcados.
+    const emailTemplate = channels.includes("email")
+      ? await resolveNegotiationTemplateInfo(companyId).then((t) => ({ source: t.source, name: t.name }))
+      : undefined
+
+    const response: SendPreviewResponse = {
+      channels,
+      dedupe,
+      total: counts.total,
+      perChannel: {
+        whatsapp: {
+          eligible: counts.perChannel.whatsapp.eligible,
+          excluded: toExcluded(counts.perChannel.whatsapp.excluded, docs),
+        },
+        email: {
+          eligible: counts.perChannel.email.eligible,
+          excluded: toExcluded(counts.perChannel.email.excluded, docs),
+        },
+      },
+      bothCount: counts.bothCount,
+      hasBothContacts: counts.hasBothContacts,
       withLiveCharge: counts.liveChargeCount,
       publicLink,
       linkEnabled: hub.publicLinkEnabled,
-      allowedModes: allowedModesFor(hub.sendMode),
-      excluded,
-      rows: evaluated.map((e) => ({
-        customerId: e.customerId,
-        channel: e.channel ?? null,
-        eligible: e.eligible,
-        reason: e.reason ?? null,
-        hasLiveCharge: !!e.hasLiveCharge,
-      })),
+      whatsappSimulated: hub.provider === "mock",
+      emailTemplate,
     }
 
     return NextResponse.json(response, { headers: noCache })

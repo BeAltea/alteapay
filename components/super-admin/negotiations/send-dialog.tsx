@@ -1,10 +1,11 @@
-// Diálogo de confirmação de "Enviar negociação" (T5 §4.2).
+// Diálogo de confirmação de "Enviar negociação" (F1 §4.2).
 //
-// Fluxo: abrir → chama /send-preview (servidor) e mostra distribuição por canal,
-// excluídos com motivo, quantos com cobrança viva (informativo), o mode vigente
-// (com troca whatsapp_chat↔charge_email quando o tenant permitir) e o link
-// /n/{code}. Confirmar → /send (dryRun disponível). Mostra resultado por devedor
-// (sent/failed/suppressed/skipped) e devolve os contadores ao pai.
+// Fluxo: abrir → escolher CANAL (WhatsApp/e-mail, ambos por padrão) e "não
+// duplicar" → chama /send-preview (servidor) e mostra distribuição POR CANAL,
+// o CRUZAMENTO (quantos recebem pelos dois), excluídos com motivo por canal,
+// quantos com cobrança viva (informativo) e o link /n/{code}. Confirmar → /send
+// (dryRun disponível). Mostra resultado por (devedor, canal) e devolve os
+// contadores ao pai.
 "use client"
 
 import { useEffect, useRef, useState } from "react"
@@ -23,7 +24,9 @@ import {
   detailLabel,
   failureRows,
   summarizeForDisplay,
-  type SendMode,
+  type EmailTemplateInfo,
+  type SendChannel,
+  type SendPreviewExcluded,
   type SendPreviewResponse,
   type SendRequestBody,
   type SendResponse,
@@ -42,19 +45,15 @@ interface Props {
   onDone?: (result: SendResponse) => void
 }
 
-const MODE_LABEL: Record<SendMode, string> = {
-  whatsapp_chat: "WhatsApp + chat",
-  charge_email: "Cobrança por e-mail",
-  both: "Ambos",
-}
-
 function toBody(
   selection: SelectionPayload,
   companyId: string,
-  mode: SendMode,
+  channels: SendChannel[],
+  dedupe: boolean,
   dryRun: boolean,
+  idempotencyKey?: string | null,
 ): SendRequestBody {
-  const base = { companyId, mode, dryRun }
+  const base = { companyId, channels, dedupe, dryRun, ...(idempotencyKey ? { idempotencyKey } : {}) }
   return selection.kind === "ids"
     ? { ...base, customerIds: selection.customerIds }
     : { ...base, allFiltered: { filters: selection.filters, expectedCount: selection.expectedCount } }
@@ -71,7 +70,10 @@ export function SendNegotiationDialog({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [preview, setPreview] = useState<SendPreviewResponse | null>(null)
-  const [mode, setMode] = useState<SendMode>("whatsapp_chat")
+  // Canal: ambos marcados por padrão (E1). "não duplicar" default OFF.
+  const [whatsapp, setWhatsapp] = useState(true)
+  const [email, setEmail] = useState(true)
+  const [dedupe, setDedupe] = useState(false)
   const [dryRun, setDryRun] = useState(false)
   const [result, setResult] = useState<SendResponse | null>(null)
   // Envio em andamento (A3.3): barra de progresso + contagem. Como /send é uma
@@ -81,6 +83,15 @@ export function SendNegotiationDialog({
   const [sending, setSending] = useState(false)
   const [progress, setProgress] = useState(0)
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null)
+  // A1: chave de idempotência gerada 1x por abertura do diálogo. Double-click/retry
+  // reusam a MESMA chave → o servidor devolve a MESMA campanha (não duplica e-mail).
+  const [idempotencyKey, setIdempotencyKey] = useState<string | null>(null)
+
+  const channels: SendChannel[] = [
+    ...(whatsapp ? (["whatsapp"] as const) : []),
+    ...(email ? (["email"] as const) : []),
+  ]
+  const noChannel = channels.length === 0
 
   // Limpa o timer da barra ao desmontar.
   useEffect(() => {
@@ -89,14 +100,21 @@ export function SendNegotiationDialog({
     }
   }, [])
 
-  async function loadPreview(nextMode?: SendMode) {
+  async function loadPreview(next?: { channels?: SendChannel[]; dedupe?: boolean }) {
+    const ch = next?.channels ?? channels
+    if (ch.length === 0) {
+      // sem canal: nada a pré-visualizar; o servidor default-a para ambos, então
+      // evitamos a chamada e deixamos o preview vazio até o operador marcar um.
+      setPreview(null)
+      return
+    }
     setLoading(true)
     setError(null)
     try {
       const res = await fetch("/api/super-admin/negotiations/send-preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toBody(selection, companyId, nextMode ?? mode, true)),
+        body: JSON.stringify(toBody(selection, companyId, ch, next?.dedupe ?? dedupe, true)),
       })
       if (!res.ok) {
         setError(`Falha ao pré-visualizar (${res.status}).`)
@@ -105,7 +123,6 @@ export function SendNegotiationDialog({
       }
       const data = (await res.json()) as SendPreviewResponse
       setPreview(data)
-      if (data.mode) setMode(data.mode)
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -118,6 +135,11 @@ export function SendNegotiationDialog({
   if (open && !loadedFor) {
     setLoadedFor(true)
     setResult(null)
+    // nova chave por abertura: cada intenção de envio é uma campanha; o double-click
+    // dentro da MESMA abertura compartilha a chave e é deduplicado no servidor.
+    setIdempotencyKey(
+      typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `hub-${Date.now()}`,
+    )
     void loadPreview()
   }
   if (!open && loadedFor) {
@@ -127,6 +149,10 @@ export function SendNegotiationDialog({
     setError(null)
     setSending(false)
     setProgress(0)
+    setWhatsapp(true)
+    setEmail(true)
+    setDedupe(false)
+    setDryRun(false)
     if (progressTimer.current) {
       clearInterval(progressTimer.current)
       progressTimer.current = null
@@ -147,10 +173,11 @@ export function SendNegotiationDialog({
       const res = await fetch("/api/super-admin/negotiations/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toBody(selection, companyId, mode, dryRun)),
+        body: JSON.stringify(toBody(selection, companyId, channels, dedupe, dryRun, idempotencyKey)),
       })
       if (!res.ok) {
-        setError(`Falha ao enviar (${res.status}).`)
+        const msg = await res.json().catch(() => null)
+        setError(msg?.error ? String(msg.error) : `Falha ao enviar (${res.status}).`)
         return
       }
       const data = (await res.json()) as SendResponse
@@ -169,15 +196,13 @@ export function SendNegotiationDialog({
     }
   }
 
-  const canSwitchMode = (preview?.allowedModes.length ?? 0) > 1
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>Enviar negociação</DialogTitle>
           <DialogDescription>
-            {selectedCount} devedor(es) selecionado(s). Revise antes de confirmar.
+            {selectedCount} devedor(es) selecionado(s). Escolha o canal e revise antes de confirmar.
           </DialogDescription>
         </DialogHeader>
 
@@ -191,82 +216,112 @@ export function SendNegotiationDialog({
           <SendingProgress count={selectedCount} progress={progress} dryRun={dryRun} />
         ) : !result ? (
           <div className="space-y-4">
+            {/* Seleção de CANAL (E1) */}
+            <div className="rounded-md border p-3 text-sm">
+              <div className="mb-2 font-medium">Canais</div>
+              <div className="flex flex-col gap-2">
+                <label className="flex items-center gap-2">
+                  <Checkbox
+                    checked={whatsapp}
+                    onCheckedChange={(v) => {
+                      const nv = !!v
+                      setWhatsapp(nv)
+                      const nc: SendChannel[] = [...(nv ? (["whatsapp"] as const) : []), ...(email ? (["email"] as const) : [])]
+                      void loadPreview({ channels: nc })
+                    }}
+                  />
+                  <span>
+                    WhatsApp (Voxuy)
+                    {preview?.whatsappSimulated ? (
+                      <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-[11px] font-medium text-amber-700">
+                        simulado
+                      </span>
+                    ) : null}
+                  </span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <Checkbox
+                    checked={email}
+                    onCheckedChange={(v) => {
+                      const nv = !!v
+                      setEmail(nv)
+                      const nc: SendChannel[] = [...(whatsapp ? (["whatsapp"] as const) : []), ...(nv ? (["email"] as const) : [])]
+                      void loadPreview({ channels: nc })
+                    }}
+                  />
+                  <span>E-mail (SendGrid)</span>
+                </label>
+                <label className="mt-1 flex items-center gap-2 border-t pt-2">
+                  <Checkbox
+                    checked={dedupe}
+                    onCheckedChange={(v) => {
+                      const nv = !!v
+                      setDedupe(nv)
+                      void loadPreview({ dedupe: nv })
+                    }}
+                  />
+                  <span>Não duplicar (priorizar WhatsApp para quem tem os dois)</span>
+                </label>
+              </div>
+              {noChannel ? (
+                <p className="mt-2 text-xs text-red-600">
+                  Marque ao menos um canal para enviar.
+                </p>
+              ) : null}
+            </div>
+
             {loading && !preview ? (
               <p className="text-sm text-muted-foreground">Calculando pré-visualização…</p>
             ) : preview ? (
               <>
+                {/* Destaque do CRUZAMENTO (E2): quantos recebem pelos dois. */}
+                {channels.length === 2 ? (
+                  <div className="rounded-md border border-blue-200 bg-blue-50 p-2 text-sm text-blue-800">
+                    <strong>{preview.bothCount}</strong> devedor(es) receberão pelos{" "}
+                    <strong>dois canais</strong> (WhatsApp + e-mail).{" "}
+                    {preview.dedupe ? (
+                      <span>Com &quot;não duplicar&quot; ativo, quem tem os dois vai só por WhatsApp.</span>
+                    ) : (
+                      <span>{preview.hasBothContacts} têm os dois contatos.</span>
+                    )}
+                  </div>
+                ) : null}
+
                 <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
-                  <Stat label="Total" value={preview.total} />
-                  <Stat label="WhatsApp" value={preview.byChannel.whatsapp} />
-                  <Stat label="E-mail" value={preview.byChannel.email} />
+                  <Stat label="Total (distintos)" value={preview.total} />
+                  <Stat label="WhatsApp" value={preview.perChannel.whatsapp.eligible} />
+                  <Stat label="E-mail" value={preview.perChannel.email.eligible} />
                   <Stat label="Cobrança viva" value={preview.withLiveCharge} muted />
                 </div>
 
-                <div className="rounded-md border p-3 text-sm">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <span className="font-medium">Modo:</span>
-                    {(["whatsapp_chat", "charge_email", "both"] as SendMode[]).map((m) => {
-                      const allowed = preview.allowedModes.includes(m)
-                      return (
-                        <label
-                          key={m}
-                          className={`flex items-center gap-1.5 ${
-                            allowed ? "cursor-pointer" : "cursor-not-allowed opacity-40"
-                          }`}
-                        >
-                          <input
-                            type="radio"
-                            name="send-mode"
-                            checked={mode === m}
-                            disabled={!allowed || !canSwitchMode}
-                            onChange={() => {
-                              setMode(m)
-                              void loadPreview(m)
-                            }}
-                          />
-                          {MODE_LABEL[m]}
-                        </label>
-                      )
-                    })}
-                  </div>
-                  {!canSwitchMode ? (
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      Este cedente permite apenas o modo {MODE_LABEL[mode]}.
-                    </p>
-                  ) : null}
-                  <p className="mt-2 text-xs">
-                    Link a enviar:{" "}
-                    {preview.publicLink ? (
-                      <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono">
-                        {preview.publicLink}
-                      </code>
-                    ) : (
-                      <span className="text-amber-600">
-                        link único desabilitado para este cedente
-                      </span>
-                    )}
-                  </p>
+                <div className="rounded-md border p-3 text-xs">
+                  Link a enviar:{" "}
+                  {preview.publicLink ? (
+                    <code className="rounded bg-neutral-100 px-1.5 py-0.5 font-mono">
+                      {preview.publicLink}
+                    </code>
+                  ) : (
+                    <span className="text-amber-600">
+                      link único desabilitado para este cedente
+                    </span>
+                  )}
                 </div>
 
-                {preview.excluded.length > 0 ? (
-                  <details className="rounded-md border p-3 text-sm">
-                    <summary className="cursor-pointer font-medium">
-                      Excluídos ({preview.excluded.length})
-                    </summary>
-                    <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
-                      {preview.excluded.map((e) => (
-                        <li key={e.customerId} className="flex justify-between gap-2 text-xs">
-                          <span className="font-mono">{e.documentMasked}</span>
-                          <span className="text-muted-foreground">{e.reason}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
+                {/* F4: qual template o E-MAIL usará (padrão do cedente / global / convite). */}
+                {email && preview.emailTemplate ? (
+                  <EmailTemplateLine info={preview.emailTemplate} />
                 ) : null}
+
+                {/* Excluídos POR CANAL (E4): nunca troca silenciosa. */}
+                {channels.map((ch) => {
+                  const ex = preview.perChannel[ch].excluded
+                  if (ex.length === 0) return null
+                  return <ExcludedList key={ch} channel={ch} excluded={ex} />
+                })}
 
                 <label className="flex items-center gap-2 text-sm">
                   <Checkbox checked={dryRun} onCheckedChange={(v) => setDryRun(!!v)} />
-                  Simular (dry run) — não envia nada, só reporta o resultado por devedor
+                  Simular (dry run) — não envia nada, só reporta o resultado por canal
                 </label>
               </>
             ) : null}
@@ -283,7 +338,10 @@ export function SendNegotiationDialog({
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
                 Cancelar
               </Button>
-              <Button onClick={confirmSend} disabled={loading || !preview || preview.total === 0}>
+              <Button
+                onClick={confirmSend}
+                disabled={loading || noChannel || !preview || preview.total === 0}
+              >
                 {dryRun ? "Simular envio" : "Confirmar e enviar"}
               </Button>
             </>
@@ -296,11 +354,63 @@ export function SendNegotiationDialog({
   )
 }
 
+const CHANNEL_LABEL: Record<SendChannel, string> = {
+  whatsapp: "WhatsApp",
+  email: "E-mail",
+}
+
+function ExcludedList({ channel, excluded }: { channel: SendChannel; excluded: SendPreviewExcluded[] }) {
+  return (
+    <details className="rounded-md border p-3 text-sm">
+      <summary className="cursor-pointer font-medium">
+        Excluídos de {CHANNEL_LABEL[channel]} ({excluded.length})
+      </summary>
+      <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
+        {excluded.map((e) => (
+          <li key={`${channel}_${e.customerId}`} className="flex justify-between gap-2 text-xs">
+            <span className="font-mono">{e.documentMasked}</span>
+            <span className="text-muted-foreground">{detailLabel(e.reason)}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  )
+}
+
 function Stat({ label, value, muted }: { label: string; value: number; muted?: boolean }) {
   return (
     <div className={`rounded-md border p-2 text-center ${muted ? "bg-neutral-50" : ""}`}>
       <div className="text-lg font-semibold">{value}</div>
       <div className="text-[11px] text-muted-foreground">{label}</div>
+    </div>
+  )
+}
+
+const TEMPLATE_SOURCE_LABEL: Record<EmailTemplateInfo["source"], string> = {
+  cedente: "padrão do cedente",
+  global: "padrão global",
+  builtin: "convite padrão AlteaPay",
+}
+
+/**
+ * F4: linha "E-mail usará: <template> (fonte)". Quando o cedente não tem padrão
+ * definido (builtin), mostra o convite embutido e um link para Gerenciamento de
+ * E-mails, onde o operador pode definir o padrão do cedente.
+ */
+function EmailTemplateLine({ info }: { info: EmailTemplateInfo }) {
+  return (
+    <div className="rounded-md border p-3 text-xs">
+      E-mail usará:{" "}
+      <strong>{info.name}</strong>{" "}
+      <span className="text-muted-foreground">({TEMPLATE_SOURCE_LABEL[info.source]})</span>
+      {info.source === "builtin" ? (
+        <span className="ml-1 text-muted-foreground">
+          — nenhum padrão definido para este cedente.{" "}
+          <a href="/super-admin/emails" className="underline" target="_blank" rel="noopener noreferrer">
+            Definir em Gerenciamento de E-mails
+          </a>
+        </span>
+      ) : null}
     </div>
   )
 }
@@ -377,7 +487,8 @@ function SendResultView({ result }: { result: SendResponse }) {
         </p>
       ) : null}
 
-      {/* Resumo A3.3: enviadas / simuladas / falharam / suprimidas / ignoradas. */}
+      {/* Resumo A3.3: enviadas / simuladas / falharam / suprimidas / ignoradas.
+          As linhas são por (devedor, canal). */}
       <div className="grid grid-cols-3 gap-2 text-sm sm:grid-cols-5">
         <SummaryStat label="Enviadas" value={summary.enviadas} className="text-green-700" />
         <SummaryStat label="Simuladas" value={summary.simuladas} className="text-blue-700" />
@@ -392,7 +503,7 @@ function SendResultView({ result }: { result: SendResponse }) {
           <div className="mb-2 font-medium text-red-700">Falhas ({failures.length})</div>
           <ul className="max-h-40 space-y-1 overflow-y-auto">
             {failures.map((f) => (
-              <li key={f.customerId} className="flex justify-between gap-2 text-xs">
+              <li key={`${f.channel ?? "-"}_${f.customerId}`} className="flex justify-between gap-2 text-xs">
                 <span className="font-mono">{f.documentMasked}</span>
                 <span className="text-muted-foreground">
                   {f.channel ? `${f.channel} · ` : ""}
@@ -404,7 +515,7 @@ function SendResultView({ result }: { result: SendResponse }) {
         </div>
       ) : null}
 
-      {/* Detalhamento por devedor (todos os desfechos). */}
+      {/* Detalhamento por (devedor, canal) (todos os desfechos). */}
       <div className="max-h-56 overflow-y-auto rounded-md border">
         <table className="w-full text-xs">
           <thead className="sticky top-0 bg-neutral-50">
@@ -416,8 +527,8 @@ function SendResultView({ result }: { result: SendResponse }) {
             </tr>
           </thead>
           <tbody>
-            {result.results.map((r) => (
-              <tr key={r.customerId} className="border-t">
+            {result.results.map((r, i) => (
+              <tr key={`${r.customerId}_${r.channel ?? "-"}_${i}`} className="border-t">
                 <td className="p-2 font-mono">{r.documentMasked}</td>
                 <td className="p-2">{r.channel ?? "—"}</td>
                 <td className={`p-2 font-medium ${OUTCOME_CLASS[r.outcome]}`}>

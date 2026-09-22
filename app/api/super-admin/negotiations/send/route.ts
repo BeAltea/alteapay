@@ -1,24 +1,19 @@
 // POST /api/super-admin/negotiations/send
 //
-// Dispara a negociação por devedor. Modos (tenant_chat_config.negotiation_send_mode
-// é o default):
-//   whatsapp_chat (default) — dispara o LINK do chat (/n/{code}) por WhatsApp ou
-//     e-mail (precedência E2/H10). NÃO cria cobrança nem e-mail de cobrança.
-//   charge_email — comportamento ANTIGO preservado. Esta rota NÃO reescreve a
-//     criação de cobrança/e-mail: apenas roteia para o caminho legado
-//     (/api/super-admin/send-bulk-negotiations), que continua intacto.
-//   both — dispara o link do chat E sinaliza a cobrança pelo caminho legado.
+// Dispara a negociação por (devedor, CANAL). O corpo carrega os CANAIS marcados
+// no diálogo (channels: ["whatsapp","email"]) e `dedupe` ("não duplicar"). Cada
+// devedor recebe por TODOS os canais que possuir (E2/E3); com dedupe, quem tem os
+// dois vai só por WhatsApp. NÃO cria cobrança nem e-mail de cobrança — o link do
+// chat (/n/{code}) vai por WhatsApp (Voxuy mock) e/ou por e-mail (SendGrid).
 //
-// Precedência de canal (E2/H10): celular válido → WhatsApp (Voxuy API via
-// getWhatsAppProvider com voxuy_flow_id do tenant); senão e-mail válido → e-mail
-// (mesmo link); senão no_contact (fora, listado).
+// Canais em SEQUÊNCIA INDEPENDENTE (E3): uma falha no e-mail não afeta o WhatsApp.
 //
 // Fonte da verdade do FORMATO: components/super-admin/negotiations/send-contract.ts
-// (a rota emite { dryRun, mode, campaignId, counts, results } que o diálogo lê).
+// (a rota emite { dryRun, channels, dedupe, counts, results } que o diálogo lê).
 //
-// DISPATCH_MODE=inline|queue (default queue). inline dispara na request, com teto
-// INLINE_DISPATCH_MAX_BATCH (25) + rate-limit e TRAVA em super_admin. dryRun =
-// resultado completo sem enviar.
+// EMAIL_SEND_MODE/DISPATCH_MODE=inline|queue (default queue). inline dispara na
+// request, com teto INLINE_DISPATCH_MAX_BATCH (25) + TRAVA em super_admin. Acima
+// do teto orienta dividir em lotes. dryRun = resultado completo sem enviar.
 //
 // Segurança (§3): só admin do tenant e super_admin; company_id DERIVADO no
 // servidor. Provider mock é o default (nada sai).
@@ -27,11 +22,11 @@ import { NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
 import { createServiceClient } from "@/lib/supabase/service"
 import { maskDocument } from "@/lib/journey/document"
-import { createHubCampaign, loadTenantHubConfig, type NegotiationSendMode } from "@/lib/journey/campaigns"
+import { createHubCampaign, loadTenantHubConfig } from "@/lib/journey/campaigns"
 import { runHubSend, type HubSendItem } from "@/lib/journey/campaign-send"
 import { resolveSelection, type SelectionBody } from "../selection"
 import type {
-  SendMode,
+  SendChannel,
   SendOutcome,
   SendResultRow,
 } from "@/components/super-admin/negotiations/send-contract"
@@ -46,8 +41,12 @@ const INLINE_DISPATCH_MAX_BATCH = Number(process.env.INLINE_DISPATCH_MAX_BATCH ?
 
 interface SendBody extends SelectionBody {
   companyId?: string
-  mode?: string
+  channels?: string[]
+  dedupe?: boolean
   dryRun?: boolean
+  /** A1: chave de idempotência gerada 1x pelo diálogo. Double-click/retry com a
+   * mesma chave reusam a mesma campanha (não duplicam envio real). */
+  idempotencyKey?: string
 }
 
 async function resolveCompany(request: NextRequest, bodyCompanyId?: string) {
@@ -79,7 +78,18 @@ async function resolveCompany(request: NextRequest, bodyCompanyId?: string) {
 }
 
 function resolveDispatch(): "inline" | "queue" {
-  return (process.env.DISPATCH_MODE ?? "queue").toLowerCase() === "inline" ? "inline" : "queue"
+  // EMAIL_SEND_MODE/DISPATCH_MODE compartilham o mesmo eixo (inline dispara na
+  // request; queue enfileira). Qualquer um dos dois em 'inline' liga o modo inline.
+  const raw = (process.env.EMAIL_SEND_MODE ?? process.env.DISPATCH_MODE ?? "queue").toLowerCase()
+  return raw === "inline" ? "inline" : "queue"
+}
+
+const ALL: SendChannel[] = ["whatsapp", "email"]
+
+function parseChannels(raw: unknown): SendChannel[] {
+  if (!Array.isArray(raw)) return [...ALL]
+  const out = raw.filter((c): c is SendChannel => c === "whatsapp" || c === "email")
+  return Array.from(new Set(out))
 }
 
 /** status do item do hub → desfecho do contrato. São nomes iguais, mas o cast
@@ -128,55 +138,53 @@ export async function POST(request: NextRequest) {
     }
     const { customerIds } = selection
 
-    const hub = await loadTenantHubConfig(companyId)
-    const mode: NegotiationSendMode =
-      body.mode === "charge_email" || body.mode === "both" || body.mode === "whatsapp_chat"
-        ? body.mode
-        : hub.sendMode
+    const channels = parseChannels(body.channels)
+    if (channels.length === 0) {
+      return NextResponse.json({ error: "Selecione ao menos um canal" }, { status: 400, headers: noCache })
+    }
+    const dedupe = body.dedupe === true
     const dryRun = body.dryRun === true
+
+    const hub = await loadTenantHubConfig(companyId)
     const dispatchMode = resolveDispatch()
 
     // inline só para super_admin (E2/§4): dispara na request, teto + rate-limit.
+    // Acima do teto: orienta dividir em lotes (não trunca silenciosamente).
     if (dispatchMode === "inline" && !dryRun) {
       if (role !== "super_admin") {
         return NextResponse.json({ error: "inline dispatch restrito a super_admin" }, { status: 403, headers: noCache })
       }
       if (customerIds.length > INLINE_DISPATCH_MAX_BATCH) {
         return NextResponse.json(
-          { error: `inline dispatch limitado a ${INLINE_DISPATCH_MAX_BATCH} por lote (recebido ${customerIds.length})` },
+          {
+            error: `Envio inline limitado a ${INLINE_DISPATCH_MAX_BATCH} devedores por lote (recebidos ${customerIds.length}). Divida a seleção em lotes de até ${INLINE_DISPATCH_MAX_BATCH}.`,
+            maxBatch: INLINE_DISPATCH_MAX_BATCH,
+            received: customerIds.length,
+          },
           { status: 400, headers: noCache },
         )
       }
     }
 
-    // charge_email: NÃO reescreve a criação de cobrança/e-mail — o caminho antigo
-    // (/api/super-admin/send-bulk-negotiations) fica intacto. Aqui apenas roteia
-    // (o cliente chama o endpoint legado para a parte de cobrança).
-    const chargeEmailDelegation =
-      mode === "charge_email" || mode === "both"
-        ? { delegated: true, endpoint: "/api/super-admin/send-bulk-negotiations", note: "cobrança/e-mail preservados no caminho legado" }
-        : null
+    // O envio do hub dispara o LINK do chat por canal. Não cria cobrança.
+    const { campaignId } = await createHubCampaign({
+      companyId,
+      name: `Hub ${new Date().toISOString().slice(0, 10)}`,
+      templateKey: "hub_link",
+      customerIds,
+      createdBy: userId,
+      sendMode: "whatsapp_chat",
+      provider: hub.provider,
+      channels,
+      dedupe,
+      // dryRun não consome/colide com a chave do envio real.
+      idempotencyKey: dryRun ? null : (typeof body.idempotencyKey === "string" ? body.idempotencyKey : null),
+    })
+    const hubResult = await runHubSend({ campaignId, companyId, dispatchMode, dryRun })
 
-    // A parte do LINK do chat só roda em whatsapp_chat e both.
-    let hubResult = null as Awaited<ReturnType<typeof runHubSend>> | null
-    let campaignId: string | null = null
-    if (mode === "whatsapp_chat" || mode === "both") {
-      const { campaignId: cid } = await createHubCampaign({
-        companyId,
-        name: `Hub ${new Date().toISOString().slice(0, 10)}`,
-        templateKey: "hub_link",
-        customerIds,
-        createdBy: userId,
-        sendMode: mode,
-        provider: hub.provider,
-      })
-      campaignId = cid
-      hubResult = await runHubSend({ campaignId: cid, companyId, dispatchMode, dryRun })
-    }
-
-    // counts (=summary) + results POR DEVEDOR com documento MASCARADO.
-    const items: HubSendItem[] = hubResult?.items ?? []
-    const docs = await maskedDocuments(companyId, items.map((i) => i.customerId))
+    // counts (=summary) + results POR (DEVEDOR, CANAL) com documento MASCARADO.
+    const items: HubSendItem[] = hubResult.items
+    const docs = await maskedDocuments(companyId, Array.from(new Set(items.map((i) => i.customerId))))
     const results: SendResultRow[] = items.map((i) => ({
       customerId: i.customerId,
       documentMasked: docs.get(i.customerId) ?? "***",
@@ -184,15 +192,15 @@ export async function POST(request: NextRequest) {
       outcome: toOutcome(i.status),
       detail: i.reason ?? null,
     }))
-    const counts = hubResult?.summary ?? { sent: 0, failed: 0, suppressed: 0, skipped: 0 }
+    const counts = hubResult.summary
 
     return NextResponse.json(
       {
         dryRun,
-        mode: mode as SendMode,
+        channels,
+        dedupe,
         dispatchMode,
         campaignId,
-        chargeEmail: chargeEmailDelegation,
         counts,
         results,
       },

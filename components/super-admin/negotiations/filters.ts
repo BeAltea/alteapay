@@ -81,8 +81,12 @@ export function parseFilters(raw: RawParams | URLSearchParams): NegotiationFilte
   return {
     companyId: get("companyId") || get("cedente") || null,
     stages: toList(get("stage")),
-    contactProfiles: toList(get("contact_profile")).filter((p): p is ContactProfile =>
-      ["mobile", "email_only", "both", "none"].includes(p),
+    // Perfil de contato: aceita o alias curto `contato` (forma compartilhável
+    // documentada, ?contato=mobile,both) OU o nome canônico `contact_profile`
+    // (compat com selection.ts / round-trip de serializeFilters). `contato` tem
+    // precedência quando ambos vêm na URL. Valores fora do enum são descartados.
+    contactProfiles: toList(get("contato") || get("contact_profile")).filter(
+      (p): p is ContactProfile => ["mobile", "email_only", "both", "none"].includes(p),
     ),
     channel: get("channel") || null,
     campaignId: get("campaign") || get("campaignId") || null,
@@ -107,7 +111,9 @@ export function serializeFilters(f: Partial<NegotiationFilters>): string {
   const p = new URLSearchParams()
   if (f.companyId) p.set("companyId", f.companyId)
   if (f.stages?.length) p.set("stage", f.stages.join(","))
-  if (f.contactProfiles?.length) p.set("contact_profile", f.contactProfiles.join(","))
+  // Emite o alias curto documentado (?contato=mobile,both) para a URL
+  // compartilhável/recarregável. parseFilters aceita `contato` e `contact_profile`.
+  if (f.contactProfiles?.length) p.set("contato", f.contactProfiles.join(","))
   if (f.channel) p.set("channel", f.channel)
   if (f.campaignId) p.set("campaign", f.campaignId)
   if (f.hasLiveCharge != null) p.set("live_charge", f.hasLiveCharge ? "1" : "0")

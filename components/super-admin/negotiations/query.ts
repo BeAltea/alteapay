@@ -175,6 +175,14 @@ async function resolveSatelliteCustomerIds(
     f.agingMin != null || f.agingMax != null || f.valueMin != null || f.valueMax != null
 
   // --- contact_profile (customers.contact_profile) ---
+  // Predicado = (company_id = X AND contact_profile IN (...)) — casa EXATAMENTE o
+  // índice composto idx_customers_company_contact_profile (company_id,
+  // contact_profile) da migration 20260922_hub_link_status.sql. Multi-valor via
+  // `.in(...)` (NUNCA regex/like em runtime): o planner resolve o IN como um
+  // Bitmap Index Scan sobre esse índice (uma sonda por valor, todas com o mesmo
+  // prefixo company_id). Verificado por EXPLAIN em introspecção: Index/Bitmap Scan
+  // using idx_customers_company_contact_profile (sem Seq Scan). `select id` só lê
+  // a coluna indexável de retorno — nenhum PII trafega nesta resolução.
   if (f.contactProfiles.length) {
     const ids = new Set<string>()
     let page = 0

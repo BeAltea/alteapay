@@ -1,0 +1,8 @@
+const fs=require("fs"),path=require("path"),{Client}=require("pg")
+const ROOT=path.resolve(__dirname,"../..")
+const raw=fs.readFileSync(ROOT+"/.env.local","utf8").split("\n").find(l=>l.startsWith("POSTGRES_URL_NON_POOLING=")).slice(25).trim().replace(/^["']|["']$/g,"")
+const u=new URL(raw);u.searchParams.delete("sslmode");u.searchParams.delete("uselibpqcompat")
+;(async()=>{const c=new Client({connectionString:u.toString(),ssl:{rejectUnauthorized:false}});await c.connect()
+const r=await c.query(`select column_name from information_schema.columns where table_name='debts' order by column_name`)
+console.log("debts cols:", r.rows.map(x=>x.column_name).join(", "))
+await c.end()})().catch(e=>{console.error(e.message);process.exit(1)})

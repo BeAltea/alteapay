@@ -148,3 +148,53 @@ export async function dispatchEmailInvite(input: EmailInviteInput): Promise<Emai
   if (!res.success) return { ok: false, error: res.error ?? "email_send_failed" }
   return { ok: true, jobId: res.jobId }
 }
+
+// ---------------------------------------------------------------------------
+// F4: envio de um convite JÁ RENDERIZADO a partir do template padrão do cedente
+// (resolve-default.renderTemplate). Diferente de dispatchEmailInvite (que monta
+// o corpo fixo embutido), aqui o subject/html/text vêm prontos e sanitizados —
+// esta função só valida o destinatário e enfileira via SendGrid, mantendo o
+// mesmo header de descadastro (List-Unsubscribe → o próprio link do hub). NUNCA
+// recebe/loga PII: o corpo já foi renderizado só com a allowlist de variáveis.
+// ---------------------------------------------------------------------------
+
+export interface RenderedEmailInput {
+  to: string
+  subject: string
+  html: string
+  text?: string
+  /** link do hub (/n/{code}) para o header List-Unsubscribe. */
+  link: string
+  companyId: string
+  customerId: string
+  dryRun?: boolean
+}
+
+/** Dispara um e-mail de negociação já renderizado (template do cedente/global). */
+export async function dispatchRenderedEmail(input: RenderedEmailInput): Promise<EmailInviteResult> {
+  const to = (input.to ?? "").trim()
+  if (!EMAIL_RE.test(to)) return { ok: false, error: "email_invalido" }
+  if (!input.subject.trim() || !input.html.trim()) return { ok: false, error: "template_vazio" }
+
+  if (input.dryRun) return { ok: true, previewed: true }
+
+  const unsubHeaders: Record<string, string> = {
+    "List-Unsubscribe": `<${input.link}>`,
+    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+  }
+
+  const res = await sendEmail({
+    to,
+    subject: input.subject,
+    html: input.html,
+    ...(input.text && input.text.trim() ? { text: input.text } : {}),
+    headers: unsubHeaders,
+    metadata: {
+      companyId: input.companyId,
+      customerId: input.customerId,
+      type: "negotiation_invite",
+    },
+  })
+  if (!res.success) return { ok: false, error: res.error ?? "email_send_failed" }
+  return { ok: true, jobId: res.jobId }
+}

@@ -122,8 +122,8 @@ export function SuperAdminSidebar({ user }: SuperAdminSidebarProps) {
           icon: Target,
         },
         {
-          name: "Enviar Email",
-          href: "/super-admin/send-email",
+          name: "Gerenciamento de E-mails",
+          href: "/super-admin/emails",
           icon: Mail,
         },
         {

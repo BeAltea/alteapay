@@ -74,6 +74,12 @@ export async function createHandoffSession(input: CreateHandoffInput): Promise<C
     debt_acknowledged_at: input.debt_acknowledged ? now.toISOString() : null,
     fulfillment_mode: fulfillmentMode,
     thread_id: input.thread_id ?? null,
+    // A1.1 — grava a atividade inicial JÁ no INSERT (coluna antiga, sempre no
+    // schema-cache). Assim o reuso (findReusableOpenSession, que filtra por
+    // last_activity_at >= cutoff) funciona mesmo que o UPDATE posterior de
+    // enriquecimento (debt_ids/first_opened_at) falhe — antes ela ficava NULL e
+    // toda autenticação recriava sessão.
+    last_activity_at: now.toISOString(),
   }
 
   const { data, error } = await supabase

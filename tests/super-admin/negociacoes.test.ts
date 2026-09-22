@@ -142,6 +142,40 @@ describe("filtros — parse/serialize idempotente e combináveis (§4)", () => {
     expect(f.contactProfiles).toEqual(["mobile", "none"])
   })
 
+  it("aceita o alias curto ?contato= (forma compartilhável documentada)", () => {
+    const f = parseFilters(new URLSearchParams({ contato: "mobile,both" }))
+    expect(f.contactProfiles).toEqual(["mobile", "both"])
+  })
+
+  it("`contato` tem precedência sobre `contact_profile` quando ambos vêm na URL", () => {
+    const f = parseFilters(new URLSearchParams({ contato: "email_only", contact_profile: "none" }))
+    expect(f.contactProfiles).toEqual(["email_only"])
+  })
+
+  it("serializeFilters emite o alias `contato` (URL compartilhável = ?contato=…)", () => {
+    const qs = serializeFilters({ contactProfiles: ["mobile", "both"] })
+    const p = new URLSearchParams(qs)
+    expect(p.get("contato")).toBe("mobile,both")
+    expect(p.get("contact_profile")).toBeNull()
+  })
+
+  it("cada opção de perfil filtra o valor correto (uma a uma)", () => {
+    for (const opt of ["mobile", "email_only", "both", "none"] as const) {
+      const f = parseFilters(new URLSearchParams({ contato: opt }))
+      expect(f.contactProfiles).toEqual([opt])
+    }
+  })
+
+  it("perfil combina com status/estágio e demais filtros (multi-valor coexiste)", () => {
+    const f = parseFilters(
+      new URLSearchParams({ stage: "paid,overdue", contato: "mobile,both", companyId: "co-1" }),
+    )
+    // os dois grupos são independentes e combináveis (AND entre grupos, OR dentro)
+    expect(f.stages).toEqual(["paid", "overdue"])
+    expect(f.contactProfiles).toEqual(["mobile", "both"])
+    expect(f.companyId).toBe("co-1")
+  })
+
   it("pageSize é limitado ao teto e mínimo", () => {
     expect(parseFilters(new URLSearchParams({ pageSize: "9999" })).pageSize).toBe(200)
     expect(parseFilters(new URLSearchParams({ pageSize: "0" })).pageSize).toBe(1)

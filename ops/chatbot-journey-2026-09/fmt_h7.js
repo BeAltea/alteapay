@@ -1,0 +1,8 @@
+const fs=require("fs"),path=require("path"),{Client}=require("pg")
+const ROOT=path.resolve(__dirname,"../..")
+const raw=fs.readFileSync(ROOT+"/.env.local","utf8").split("\n").find(l=>l.startsWith("POSTGRES_URL_NON_POOLING=")).slice(25).trim().replace(/^["']|["']$/g,"")
+const u=new URL(raw);u.searchParams.delete("sslmode");u.searchParams.delete("uselibpqcompat")
+;(async()=>{const c=new Client({connectionString:u.toString(),ssl:{rejectUnauthorized:false}});await c.connect()
+const r=await c.query(`select regexp_replace(document,'[0-9]','#','g') fmt, count(*) from customers where company_id='1f7729ee-a537-43fc-a27f-5747c177988d' group by fmt order by 2 desc limit 8`)
+console.log("formatos de document (digitos->#):");console.table(r.rows)
+await c.end()})().catch(e=>{console.error(e.message);process.exit(1)})
