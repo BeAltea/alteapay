@@ -12,7 +12,7 @@ export interface FakeDb {
 }
 
 interface Filter {
-  op: "eq" | "in" | "gt" | "gte" | "lt" | "notNull" | "isNull" | "filterEq"
+  op: "eq" | "neq" | "in" | "gt" | "gte" | "lt" | "notNull" | "isNull" | "filterEq"
   col: string
   val?: any
 }
@@ -23,6 +23,8 @@ function matches(row: Row, f: Filter): boolean {
     case "eq":
     case "filterEq":
       return v === f.val
+    case "neq":
+      return v !== f.val
     case "in":
       return Array.isArray(f.val) && f.val.includes(v)
     case "gt":
@@ -61,6 +63,10 @@ class QueryBuilder {
   }
   eq(col: string, val: any) {
     this.filters.push({ op: "eq", col, val })
+    return this
+  }
+  neq(col: string, val: any) {
+    this.filters.push({ op: "neq", col, val })
     return this
   }
   in(col: string, val: any[]) {

@@ -8,6 +8,8 @@ const CO = "dddddddd-0000-0000-0000-000000000004"
 
 let db: FakeDb
 let resolveResult: any = null
+let reusableResult: any = null
+const reopenCalls: any[] = []
 
 vi.mock("@/lib/supabase/service", () => ({
   createServiceClient: () => makeFakeSupabase(db),
@@ -17,6 +19,18 @@ vi.mock("@/lib/journey/resolver", () => ({
 }))
 vi.mock("@/lib/negotiation/sessions", () => ({
   createHandoffSession: async () => ({ session: { id: "sess_new" }, token: "tok", deep_link: "x" }),
+  // por padrão NÃO há sessão reutilizável → cai no caminho de criação (asserções
+  // existentes). O teste de reuso liga um valor não-nulo abaixo.
+  findReusableOpenSession: async () => reusableResult,
+  reopenSession: async (input: any) => {
+    reopenCalls.push(input)
+    const sess = db.negotiation_sessions?.find((s) => s.id === input.sessionId)
+    if (sess) {
+      sess.last_activity_at = new Date().toISOString()
+      sess.reopen_count = input.currentReopenCount + 1
+      sess.channel = input.channel
+    }
+  },
 }))
 vi.mock("@/lib/journey/events", () => ({ recordEvent: async () => ({ ok: true, duplicate: false }) }))
 vi.mock("@/lib/negotiation/crypto", () => ({
@@ -39,6 +53,8 @@ function reset() {
       debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 100, agingDays: 30, invoiceCount: 1, oldestDueDate: "2020-01-01",
     },
   }
+  reusableResult = null
+  reopenCalls.length = 0
   process.env.CHAT_CAPTCHA_ENABLED = "false"
   delete process.env.CHAT_AUTH_IP_MAX_ATTEMPTS
   delete process.env.CHAT_AUTH_IP_WINDOW_MIN
@@ -119,5 +135,51 @@ describe("authenticateByDocument", () => {
   it("captcha desligado por padrão não bloqueia", async () => {
     const r = await auth({ captchaToken: null })
     expect(r.ok).toBe(true)
+  })
+
+  // --- A1.1 reuso de sessão ---------------------------------------------------
+
+  it("reuso: 2ª auth do MESMO cliente dentro do TTL reusa o session_id (sem criar nova)", async () => {
+    // simula uma sessão aberta e recente do mesmo (company, customer)
+    reusableResult = {
+      id: "sess_existing",
+      status: "open",
+      last_activity_at: new Date().toISOString(),
+      reopen_count: 0,
+    }
+    db.negotiation_sessions = [{ id: "sess_existing", company_id: CO, status: "open", reopen_count: 0 }]
+
+    const r = await auth()
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.sessionId).toBe("sess_existing") // MESMO id, não "sess_new"
+    // reabriu (bump), não criou
+    expect(reopenCalls.length).toBe(1)
+    expect(reopenCalls[0]).toMatchObject({ sessionId: "sess_existing", currentReopenCount: 0 })
+    const sess = db.negotiation_sessions?.find((s) => s.id === "sess_existing")
+    expect(sess?.reopen_count).toBe(1) // incrementado
+  })
+
+  it("sem sessão reutilizável (fora do TTL / fechada) → cria nova", async () => {
+    reusableResult = null // findReusableOpenSession não achou candidata dentro do TTL
+    const r = await auth()
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.sessionId).toBe("sess_new")
+    expect(reopenCalls.length).toBe(0)
+  })
+
+  it("cliente DIFERENTE → nova sessão (não reusa a de outro devedor)", async () => {
+    // findReusableOpenSession filtra por customer_id; para outro cliente devolve null
+    reusableResult = null
+    resolveResult = {
+      kind: "open",
+      debtor: {
+        customerId: "cust2", customerName: "Outro", document: VALID_CPF,
+        debtIds: ["d9"], primaryDebtId: "d9", totalOpen: 50, agingDays: 10, invoiceCount: 1, oldestDueDate: null,
+      },
+    }
+    const r = await auth()
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.sessionId).toBe("sess_new")
+    expect(reopenCalls.length).toBe(0)
   })
 })

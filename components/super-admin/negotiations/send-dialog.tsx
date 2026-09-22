@@ -7,7 +7,7 @@
 // (sent/failed/suppressed/skipped) e devolve os contadores ao pai.
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   Dialog,
   DialogContent,
@@ -18,7 +18,11 @@ import {
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Progress } from "@/components/ui/progress"
 import {
+  detailLabel,
+  failureRows,
+  summarizeForDisplay,
   type SendMode,
   type SendPreviewResponse,
   type SendRequestBody,
@@ -70,6 +74,20 @@ export function SendNegotiationDialog({
   const [mode, setMode] = useState<SendMode>("whatsapp_chat")
   const [dryRun, setDryRun] = useState(false)
   const [result, setResult] = useState<SendResponse | null>(null)
+  // Envio em andamento (A3.3): barra de progresso + contagem. Como /send é uma
+  // request única em lote (o servidor processa todos e responde uma vez), o
+  // progresso avança de forma suave até ~90% enquanto a request está no ar e
+  // fecha em 100% ao chegar a resposta — nunca alega mais do que sabe.
+  const [sending, setSending] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Limpa o timer da barra ao desmontar.
+  useEffect(() => {
+    return () => {
+      if (progressTimer.current) clearInterval(progressTimer.current)
+    }
+  }, [])
 
   async function loadPreview(nextMode?: SendMode) {
     setLoading(true)
@@ -107,11 +125,24 @@ export function SendNegotiationDialog({
     setPreview(null)
     setResult(null)
     setError(null)
+    setSending(false)
+    setProgress(0)
+    if (progressTimer.current) {
+      clearInterval(progressTimer.current)
+      progressTimer.current = null
+    }
   }
 
   async function confirmSend() {
     setLoading(true)
+    setSending(true)
     setError(null)
+    // Progresso suave até 90% enquanto a request está no ar (não inventa 100%).
+    setProgress(8)
+    if (progressTimer.current) clearInterval(progressTimer.current)
+    progressTimer.current = setInterval(() => {
+      setProgress((p) => (p >= 90 ? 90 : p + Math.max(1, Math.round((90 - p) / 8))))
+    }, 250)
     try {
       const res = await fetch("/api/super-admin/negotiations/send", {
         method: "POST",
@@ -128,6 +159,12 @@ export function SendNegotiationDialog({
     } catch (e) {
       setError((e as Error).message)
     } finally {
+      if (progressTimer.current) {
+        clearInterval(progressTimer.current)
+        progressTimer.current = null
+      }
+      setProgress(100)
+      setSending(false)
       setLoading(false)
     }
   }
@@ -150,7 +187,9 @@ export function SendNegotiationDialog({
           </p>
         ) : null}
 
-        {!result ? (
+        {sending ? (
+          <SendingProgress count={selectedCount} progress={progress} dryRun={dryRun} />
+        ) : !result ? (
           <div className="space-y-4">
             {loading && !preview ? (
               <p className="text-sm text-muted-foreground">Calculando pré-visualização…</p>
@@ -237,7 +276,9 @@ export function SendNegotiationDialog({
         )}
 
         <DialogFooter>
-          {!result ? (
+          {sending ? (
+            <Button disabled>Enviando…</Button>
+          ) : !result ? (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
                 Cancelar
@@ -264,12 +305,6 @@ function Stat({ label, value, muted }: { label: string; value: number; muted?: b
   )
 }
 
-const OUTCOME_LABEL: Record<string, string> = {
-  sent: "Enviado",
-  failed: "Falhou",
-  suppressed: "Suprimido",
-  skipped: "Ignorado",
-}
 const OUTCOME_CLASS: Record<string, string> = {
   sent: "text-green-700",
   failed: "text-red-700",
@@ -277,7 +312,63 @@ const OUTCOME_CLASS: Record<string, string> = {
   skipped: "text-muted-foreground",
 }
 
+/** Rótulo por linha: num dry run, "sent" é "Simulado" (nada saiu). */
+function outcomeLabel(outcome: string, dryRun: boolean): string {
+  if (outcome === "sent") return dryRun ? "Simulado" : "Enviado"
+  if (outcome === "failed") return "Falhou"
+  if (outcome === "suppressed") return "Suprimido"
+  if (outcome === "skipped") return "Ignorado"
+  return outcome
+}
+
+/**
+ * Barra de progresso + contagem durante o envio (A3.3). O envio é uma request
+ * única em lote; a barra é honesta: avança enquanto a request está no ar e só
+ * chega a 100% ao concluir. Nunca alega desfecho antes de existir.
+ */
+function SendingProgress({
+  count,
+  progress,
+  dryRun,
+}: {
+  count: number
+  progress: number
+  dryRun: boolean
+}) {
+  return (
+    <div className="space-y-3 py-2">
+      <p className="text-sm font-medium">
+        {dryRun ? "Simulando" : "Enviando"} {count} devedor(es)…
+      </p>
+      <Progress value={progress} />
+      <p className="text-xs text-muted-foreground">
+        Processando a seleção no servidor. Não feche esta janela.
+      </p>
+    </div>
+  )
+}
+
+/** Cartão de contador do resumo (A3.3). */
+function SummaryStat({
+  label,
+  value,
+  className,
+}: {
+  label: string
+  value: number
+  className?: string
+}) {
+  return (
+    <div className="rounded-md border p-2 text-center">
+      <div className={`text-lg font-semibold ${className ?? ""}`}>{value}</div>
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+    </div>
+  )
+}
+
 function SendResultView({ result }: { result: SendResponse }) {
+  const summary = summarizeForDisplay(result)
+  const failures = failureRows(result)
   return (
     <div className="space-y-3">
       {result.dryRun ? (
@@ -285,14 +376,35 @@ function SendResultView({ result }: { result: SendResponse }) {
           Simulação (dry run) — nada foi enviado.
         </p>
       ) : null}
-      <div className="grid grid-cols-4 gap-2 text-sm">
-        {(["sent", "failed", "suppressed", "skipped"] as const).map((k) => (
-          <div key={k} className="rounded-md border p-2 text-center">
-            <div className={`text-lg font-semibold ${OUTCOME_CLASS[k]}`}>{result.counts[k]}</div>
-            <div className="text-[11px] text-muted-foreground">{OUTCOME_LABEL[k]}</div>
-          </div>
-        ))}
+
+      {/* Resumo A3.3: enviadas / simuladas / falharam / suprimidas / ignoradas. */}
+      <div className="grid grid-cols-3 gap-2 text-sm sm:grid-cols-5">
+        <SummaryStat label="Enviadas" value={summary.enviadas} className="text-green-700" />
+        <SummaryStat label="Simuladas" value={summary.simuladas} className="text-blue-700" />
+        <SummaryStat label="Falharam" value={summary.falharam} className="text-red-700" />
+        <SummaryStat label="Suprimidas" value={summary.suprimidas} className="text-amber-700" />
+        <SummaryStat label="Ignoradas" value={summary.ignoradas} className="text-muted-foreground" />
       </div>
+
+      {/* Lista dedicada de FALHAS com motivo legível (A3.3). */}
+      {failures.length > 0 ? (
+        <div className="rounded-md border border-red-200 bg-red-50/40 p-3 text-sm">
+          <div className="mb-2 font-medium text-red-700">Falhas ({failures.length})</div>
+          <ul className="max-h-40 space-y-1 overflow-y-auto">
+            {failures.map((f) => (
+              <li key={f.customerId} className="flex justify-between gap-2 text-xs">
+                <span className="font-mono">{f.documentMasked}</span>
+                <span className="text-muted-foreground">
+                  {f.channel ? `${f.channel} · ` : ""}
+                  {f.reason}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {/* Detalhamento por devedor (todos os desfechos). */}
       <div className="max-h-56 overflow-y-auto rounded-md border">
         <table className="w-full text-xs">
           <thead className="sticky top-0 bg-neutral-50">
@@ -309,9 +421,9 @@ function SendResultView({ result }: { result: SendResponse }) {
                 <td className="p-2 font-mono">{r.documentMasked}</td>
                 <td className="p-2">{r.channel ?? "—"}</td>
                 <td className={`p-2 font-medium ${OUTCOME_CLASS[r.outcome]}`}>
-                  {OUTCOME_LABEL[r.outcome]}
+                  {outcomeLabel(r.outcome, result.dryRun)}
                 </td>
-                <td className="p-2 text-muted-foreground">{r.detail ?? "—"}</td>
+                <td className="p-2 text-muted-foreground">{detailLabel(r.detail)}</td>
               </tr>
             ))}
           </tbody>

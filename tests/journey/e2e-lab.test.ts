@@ -42,6 +42,28 @@ vi.mock("@/lib/negotiation/sessions", () => ({
     })
     return { session: { id }, token: "t", deep_link: "x" }
   },
+  // reuso real sobre o fake db: só reaproveita sessão 'open' recente do mesmo
+  // cliente. Neste lab cada teste autentica UMA vez, então sempre cai no create.
+  findReusableOpenSession: async (i: any) => {
+    const cutoff = Date.now() - i.ttlMinutes * 60_000
+    const rows = (db.negotiation_sessions ?? []).filter(
+      (s: any) =>
+        s.company_id === i.companyId &&
+        s.customer_id === i.customerId &&
+        s.status === "open" &&
+        s.last_activity_at != null &&
+        new Date(s.last_activity_at).getTime() >= cutoff,
+    )
+    rows.sort((a: any, b: any) => (b.last_activity_at ?? "").localeCompare(a.last_activity_at ?? ""))
+    return rows[0] ?? null
+  },
+  reopenSession: async (i: any) => {
+    const sess = (db.negotiation_sessions ?? []).find((s: any) => s.id === i.sessionId)
+    if (sess) {
+      sess.last_activity_at = new Date().toISOString()
+      sess.reopen_count = (i.currentReopenCount ?? 0) + 1
+    }
+  },
 }))
 vi.mock("@/lib/negotiation/crypto", () => ({
   signChatJwt: () => "jwt", CHAT_COOKIE_NAME: "alteapay_chat_session",

@@ -23,6 +23,10 @@ import {
 import {
   emptyOutcomeCounts,
   tallyOutcomes,
+  summarizeForDisplay,
+  failureRows,
+  detailLabel,
+  type SendResponse,
   type SendResultRow,
 } from "@/components/super-admin/negotiations/send-contract"
 import { STAGE_RANK } from "@/lib/journey/negotiation-state"
@@ -210,5 +214,53 @@ describe("resultado por devedor — contadores de desfecho", () => {
     expect(counts).toEqual({ sent: 2, failed: 1, suppressed: 1, skipped: 1 })
     const sum = Object.values(counts).reduce((s, c) => s + c, 0)
     expect(sum).toBe(rows.length)
+  })
+})
+
+// A3.3 — feedback na tela do diálogo de envio: resumo em 5 categorias (separa
+// "enviadas" de "simuladas"), lista de falhas com motivo legível, e rótulos.
+describe("feedback do envio (A3.3) — resumo/falhas/rótulos", () => {
+  const RESULTS: SendResultRow[] = [
+    { customerId: "a", documentMasked: "***-01", channel: "whatsapp", outcome: "sent" },
+    { customerId: "b", documentMasked: "***-02", channel: "email", outcome: "sent" },
+    { customerId: "c", documentMasked: "***-03", channel: null, outcome: "suppressed", detail: "suprimido" },
+    { customerId: "d", documentMasked: "***-04", channel: "whatsapp", outcome: "failed", detail: "send_failed" },
+    { customerId: "e", documentMasked: "***-05", channel: null, outcome: "skipped", detail: "sem_contato" },
+  ]
+
+  it("summarizeForDisplay (real): 'sent' contam como enviadas, simuladas=0", () => {
+    const result: SendResponse = { dryRun: false, counts: tallyOutcomes(RESULTS), results: RESULTS }
+    expect(summarizeForDisplay(result)).toEqual({
+      enviadas: 2,
+      simuladas: 0,
+      falharam: 1,
+      suprimidas: 1,
+      ignoradas: 1,
+    })
+  })
+
+  it("summarizeForDisplay (dry run): 'sent' vira simuladas, enviadas=0", () => {
+    const result: SendResponse = { dryRun: true, counts: tallyOutcomes(RESULTS), results: RESULTS }
+    const s = summarizeForDisplay(result)
+    expect(s.enviadas).toBe(0)
+    expect(s.simuladas).toBe(2)
+    expect(s.falharam).toBe(1)
+  })
+
+  it("failureRows lista só as falhas com motivo legível (nunca o código cru)", () => {
+    const result: SendResponse = { dryRun: false, counts: tallyOutcomes(RESULTS), results: RESULTS }
+    const failures = failureRows(result)
+    expect(failures.length).toBe(1)
+    expect(failures[0].customerId).toBe("d")
+    expect(failures[0].reason).toBe("Falha no envio") // send_failed → legível
+    expect(failures[0].reason).not.toBe("send_failed")
+  })
+
+  it("detailLabel: código conhecido vira texto; desconhecido cai no próprio código; nulo → '—'", () => {
+    expect(detailLabel("sem_contato")).toBe("Sem contato válido (celular ou e-mail)")
+    expect(detailLabel("dry_run")).toBe("Simulado (nada enviado)")
+    expect(detailLabel("codigo_novo_desconhecido")).toBe("codigo_novo_desconhecido")
+    expect(detailLabel(null)).toBe("—")
+    expect(detailLabel(undefined)).toBe("—")
   })
 })

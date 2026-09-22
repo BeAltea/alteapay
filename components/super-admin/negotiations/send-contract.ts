@@ -67,3 +67,77 @@ export function tallyOutcomes(rows: SendResultRow[]): Record<SendOutcome, number
   for (const r of rows) c[r.outcome] += 1
   return c
 }
+
+// ---------------------------------------------------------------------------
+// Rótulos legíveis (A3.3): tradução dos códigos de `detail`/`reason` que o
+// backend (lib/journey/campaigns + campaign-send) devolve por devedor, para
+// exibição no resumo/lista de falhas SEM treino. Nunca contém PII (só código).
+// ---------------------------------------------------------------------------
+export const DETAIL_LABEL: Record<string, string> = {
+  // exclusões (elegibilidade do hub) — vêm em suppressed/skipped
+  sem_contato: "Sem contato válido (celular ou e-mail)",
+  sem_celular_valido: "Sem celular válido",
+  suprimido: "Contato suprimido (opt-out/bloqueio)",
+  sem_divida_aberta: "Sem dívida em aberto",
+  cobranca_viva: "Já possui cobrança viva",
+  caso_aberto: "Já possui caso de negociação aberto",
+  cooldown: "Em janela de espera (cooldown)",
+  valor_minimo: "Abaixo do valor mínimo",
+  telefone_duplicado: "Telefone repetido na seleção",
+  ja_contatado_campanha: "Já contatado nesta campanha",
+  ja_registrado: "Já registrado nesta campanha",
+  // desfechos de envio
+  dry_run: "Simulado (nada enviado)",
+  queued: "Enfileirado para envio",
+  sem_link_publico: "Cedente sem link único habilitado",
+  email_failed: "Falha no envio do e-mail",
+  send_failed: "Falha no envio",
+  insert_failed: "Falha ao registrar o envio",
+  network_error: "Erro de rede ao enviar",
+  timeout: "Tempo esgotado ao enviar",
+}
+
+/** Traduz um código de `detail` para texto legível. Desconhecido → o próprio
+ * código (nunca inventamos; nunca é PII, o backend só emite códigos). */
+export function detailLabel(detail: string | null | undefined): string {
+  if (!detail) return "—"
+  return DETAIL_LABEL[detail] ?? detail
+}
+
+/**
+ * Resumo por categoria de EXIBIÇÃO (A3.3). Diferente de `counts` (o contrato
+ * bruto sent/failed/suppressed/skipped), separa "enviadas" de "simuladas": num
+ * dry run TODO desfecho `sent` é simulação. Puro e testável.
+ */
+export interface SendDisplaySummary {
+  enviadas: number
+  simuladas: number
+  falharam: number
+  suprimidas: number
+  ignoradas: number
+}
+
+export function summarizeForDisplay(result: SendResponse): SendDisplaySummary {
+  const sent = result.counts.sent ?? 0
+  return {
+    enviadas: result.dryRun ? 0 : sent,
+    simuladas: result.dryRun ? sent : 0,
+    falharam: result.counts.failed ?? 0,
+    suprimidas: result.counts.suppressed ?? 0,
+    ignoradas: result.counts.skipped ?? 0,
+  }
+}
+
+/** Linhas de FALHA (outcome === "failed"), com o motivo já legível. */
+export function failureRows(
+  result: SendResponse,
+): Array<{ customerId: string; documentMasked: string; channel: string | null; reason: string }> {
+  return result.results
+    .filter((r) => r.outcome === "failed")
+    .map((r) => ({
+      customerId: r.customerId,
+      documentMasked: r.documentMasked,
+      channel: r.channel,
+      reason: detailLabel(r.detail),
+    }))
+}
