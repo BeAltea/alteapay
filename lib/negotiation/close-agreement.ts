@@ -3,7 +3,6 @@
 // agreement.close do webhook n8n (HMAC). Os termos SEMPRE derivam das regras
 // do servidor (buckets de aging em charge-rules) — nunca do LLM/fluxo.
 
-import { chargeQueue } from "@/lib/queue/queues"
 import { createServiceClient } from "@/lib/supabase/service"
 import { cashDiscountPctForAging } from "./charge-rules"
 import { agingDays } from "./config"
@@ -188,35 +187,61 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
       ? `Acordo ${agreement.id} - pagamento à vista`
       : `Acordo ${agreement.id} - parcela 1/${terms.installments}`
 
-  try {
-    await chargeQueue.add(`agent-agreement-${agreement.id}`, {
-      customer: {
-        name: customer.name || "Cliente",
-        cpfCnpj,
-        email: customer.email || undefined,
-        mobilePhone: customerPhone || undefined,
-      },
-      payment: {
-        billingType: input.journey ? input.journey.terms.billing_type : "UNDEFINED",
-        value: terms.installments === 1 ? terms.agreedAmount : terms.installmentAmount,
-        dueDate: firstDueDate,
-        description: chargeDescription,
-        externalReference: input.journey
-          ? `journey_${input.journey.session_id}_${input.journey.offer_row_id}`
-          : agreement.id,
-        ...(terms.installments > 1
-          ? { installmentCount: terms.installments, installmentValue: terms.installmentAmount }
-          : {}),
-      },
-      metadata: {
-        companyId: company_id,
-        source: origin,
-        agreementId: agreement.id,
-      },
-    })
-  } catch (queueError: any) {
-    // O acordo já está registrado; falha no enqueue não pode perdê-lo.
-    console.warn("[CLOSE-AGREEMENT] Failed to enqueue ASAAS charge:", queueError?.message)
+  // Payload da cobrança — idêntico nos dois modos (fila e inline).
+  const chargeJobData = {
+    customer: {
+      name: customer.name || "Cliente",
+      cpfCnpj,
+      email: customer.email || undefined,
+      mobilePhone: customerPhone || undefined,
+    },
+    payment: {
+      billingType: (input.journey ? input.journey.terms.billing_type : "UNDEFINED") as
+        | "BOLETO"
+        | "CREDIT_CARD"
+        | "PIX"
+        | "UNDEFINED",
+      value: terms.installments === 1 ? terms.agreedAmount : terms.installmentAmount,
+      dueDate: firstDueDate,
+      description: chargeDescription,
+      externalReference: input.journey
+        ? `journey_${input.journey.session_id}_${input.journey.offer_row_id}`
+        : agreement.id,
+      ...(terms.installments > 1
+        ? { installmentCount: terms.installments, installmentValue: terms.installmentAmount }
+        : {}),
+    },
+    metadata: {
+      companyId: company_id,
+      source: origin,
+      agreementId: agreement.id,
+    },
+  }
+
+  // CHARGE_MODE decide onde a cobrança é criada:
+  //  - 'queue' (DEFAULT): enfileira em chargeQueue; o worker Fargate cria no ASAAS.
+  //  - 'inline': cria a cobrança na PRÓPRIA request (import dinâmico de
+  //    charge-inline p/ nunca puxar lib/queue/Redis no caminho inline).
+  // Em ambos os modos, falha na cobrança NÃO pode perder o acordo já registrado.
+  const chargeMode = (process.env.CHARGE_MODE || "queue").toLowerCase()
+  if (chargeMode === "inline") {
+    try {
+      const { createAsaasChargeInline } = await import("@/lib/journey/charge-inline")
+      const inline = await createAsaasChargeInline(chargeJobData)
+      if (!inline.ok) {
+        console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge failed:", inline.error)
+      }
+    } catch (inlineError: any) {
+      console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge threw:", inlineError?.message)
+    }
+  } else {
+    try {
+      const { chargeQueue } = await import("@/lib/queue/queues")
+      await chargeQueue.add(`agent-agreement-${agreement.id}`, chargeJobData)
+    } catch (queueError: any) {
+      // O acordo já está registrado; falha no enqueue não pode perdê-lo.
+      console.warn("[CLOSE-AGREEMENT] Failed to enqueue ASAAS charge:", queueError?.message)
+    }
   }
 
   return {
