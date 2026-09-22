@@ -247,9 +247,13 @@ export async function createAsaasCustomer(params: {
   notificationDisabled?: boolean
   externalReference?: string
 }): Promise<AsaasCustomer> {
-  // Remove undefined/empty values before sending
+  // POLÍTICA DE COMUNICAÇÃO: o ASAAS NÃO envia NENHUMA comunicação ao devedor
+  // (e-mail/SMS/WhatsApp). Toda comunicação é feita pela AlteaPay (SendGrid +
+  // WhatsApp/Voxuy). `notificationDisabled: true` na criação do cliente é a
+  // chave-mestra que suprime todas as notificações do ASAAS — forçado aqui,
+  // ignorando o valor do caller, para não haver janela de corrida nem canal solto.
   const cleanParams = Object.fromEntries(
-    Object.entries(params).filter(([_, v]) => v !== undefined && v !== "")
+    Object.entries({ ...params, notificationDisabled: true }).filter(([_, v]) => v !== undefined && v !== "")
   )
   return asaasRequest("/customers", "POST", cleanParams)
 }
@@ -276,9 +280,12 @@ export async function updateAsaasCustomer(
     externalReference?: string
   }
 ): Promise<AsaasCustomer> {
-  // Remove undefined values before sending
+  // Mesma política do create: o ASAAS não comunica o devedor. Forçamos
+  // notificationDisabled=true também no update, para reforçar a supressão em
+  // clientes que já existiam no ASAAS (criados antes desta política) sempre que
+  // passam por uma atualização no fluxo de cobrança.
   const cleanParams = Object.fromEntries(
-    Object.entries(params).filter(([_, v]) => v !== undefined && v !== "")
+    Object.entries({ ...params, notificationDisabled: true }).filter(([_, v]) => v !== undefined && v !== "")
   )
   return asaasRequest(`/customers/${customerId}`, "PUT", cleanParams)
 }
@@ -444,9 +451,9 @@ export const OPTIMIZED_NOTIFICATION_CONFIG: Record<string, {
     emailEnabledForProvider: false,
     smsEnabledForProvider: false,
     emailEnabledForCustomer: false, // We handle this via Resend
-    smsEnabledForCustomer: true,
+    smsEnabledForCustomer: false,
     phoneCallEnabledForCustomer: false,
-    whatsappEnabledForCustomer: true,
+    whatsappEnabledForCustomer: false,
   },
   // PAYMENT_UPDATED (scheduleOffset: 0) — Only if value/date changes
   "PAYMENT_UPDATED:0": {
@@ -473,10 +480,10 @@ export const OPTIMIZED_NOTIFICATION_CONFIG: Record<string, {
     enabled: true, // Keep (important reminder)
     emailEnabledForProvider: false,
     smsEnabledForProvider: false,
-    emailEnabledForCustomer: true,
-    smsEnabledForCustomer: true,
+    emailEnabledForCustomer: false,
+    smsEnabledForCustomer: false,
     phoneCallEnabledForCustomer: false,
-    whatsappEnabledForCustomer: true,
+    whatsappEnabledForCustomer: false,
   },
   // SEND_LINHA_DIGITAVEL (scheduleOffset: 0) — Boleto digital line
   "SEND_LINHA_DIGITAVEL:0": {
@@ -493,30 +500,30 @@ export const OPTIMIZED_NOTIFICATION_CONFIG: Record<string, {
     enabled: true, // Keep
     emailEnabledForProvider: true, // Provider needs to know
     smsEnabledForProvider: false,
-    emailEnabledForCustomer: true,
-    smsEnabledForCustomer: true,
+    emailEnabledForCustomer: false,
+    smsEnabledForCustomer: false,
     phoneCallEnabledForCustomer: false,
-    whatsappEnabledForCustomer: true,
+    whatsappEnabledForCustomer: false,
   },
   // PAYMENT_OVERDUE (scheduleOffset: 7) — Every 7 days overdue reminder
   "PAYMENT_OVERDUE:7": {
     enabled: true, // Keep (great for collections)
     emailEnabledForProvider: false,
     smsEnabledForProvider: false,
-    emailEnabledForCustomer: true,
-    smsEnabledForCustomer: true,
+    emailEnabledForCustomer: false,
+    smsEnabledForCustomer: false,
     phoneCallEnabledForCustomer: false,
-    whatsappEnabledForCustomer: true,
+    whatsappEnabledForCustomer: false,
   },
   // PAYMENT_RECEIVED (scheduleOffset: 0) — Payment confirmed
   "PAYMENT_RECEIVED:0": {
     enabled: true, // Keep
     emailEnabledForProvider: true,
     smsEnabledForProvider: false,
-    emailEnabledForCustomer: true,
-    smsEnabledForCustomer: true,
+    emailEnabledForCustomer: false,
+    smsEnabledForCustomer: false,
     phoneCallEnabledForCustomer: false,
-    whatsappEnabledForCustomer: true,
+    whatsappEnabledForCustomer: false,
   },
 }
 

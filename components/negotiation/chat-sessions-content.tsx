@@ -287,6 +287,24 @@ export function ChatSessionsContent({
                     <TableCell>
                       <div className="font-medium">{d.customer_name_masked}</div>
                       <div className="text-xs text-muted-foreground">{d.document_masked}</div>
+                      {d.payment_link && (
+                        <div className="mt-1 text-xs">
+                          <a
+                            href={d.payment_link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-primary underline decoration-dotted underline-offset-2"
+                            title="Link de pagamento ASAAS enviado ao devedor"
+                          >
+                            Link de pagamento
+                          </a>
+                          {d.payment_paid && (
+                            <span className="ml-1 rounded bg-green-100 px-1 text-[10px] font-medium text-green-800">
+                              pago
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell>
                       {d.session_count > 1 ? (

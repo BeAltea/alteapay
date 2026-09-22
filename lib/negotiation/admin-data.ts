@@ -18,6 +18,7 @@ import {
 } from "@/lib/negotiation/chat-debtors"
 import { maskDocument } from "@/lib/journey/document"
 import { createServiceClient } from "@/lib/supabase/service"
+import { PAID_PAYMENT_STATUSES, PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
 import { maskCpf, maskName } from "./pii"
 
 export interface ChatDebtorsData {
@@ -109,17 +110,44 @@ export async function loadChatDebtors(companyId: string | null): Promise<ChatDeb
     new Set(debtors.map((d) => d.agreement_id).filter((x): x is string => x != null)),
   )
   let agreementsClosedAmount = 0
+  // Link de pagamento ASAAS por devedor (consultável no hub). O ASAAS não envia
+  // comunicação; a AlteaPay compartilha este link pelo chat/e-mail/WhatsApp. Após
+  // o pagamento (conciliação via webhook), fica só para CONSULTA e não cobra mais.
+  const paymentByAgreement = new Map<string, { link: string | null; status: string | null; paid: boolean }>()
   if (agreementIds.length) {
     for (let i = 0; i < agreementIds.length; i += 500) {
       const { data: agrs } = await supabase
         .from("agreements")
-        .select("agreed_amount, total_amount")
+        .select(
+          "id, agreed_amount, total_amount, asaas_invoice_url, asaas_payment_url, asaas_boleto_url, asaas_pix_qrcode_url, payment_status, asaas_status",
+        )
         .in("id", agreementIds.slice(i, i + 500))
       for (const a of agrs ?? []) {
         const v = a.agreed_amount ?? a.total_amount
         if (v != null) agreementsClosedAmount += Number(v)
+        const link =
+          (a as Record<string, string | null>).asaas_invoice_url ??
+          (a as Record<string, string | null>).asaas_payment_url ??
+          (a as Record<string, string | null>).asaas_boleto_url ??
+          (a as Record<string, string | null>).asaas_pix_qrcode_url ??
+          null
+        const paid =
+          (PAID_PAYMENT_STATUSES as readonly string[]).includes(String((a as Record<string, string>).payment_status)) ||
+          (PAID_ASAAS_STATUSES as readonly string[]).includes(String((a as Record<string, string>).asaas_status))
+        paymentByAgreement.set(a.id, {
+          link,
+          status: (a as Record<string, string | null>).payment_status ?? (a as Record<string, string | null>).asaas_status ?? null,
+          paid,
+        })
       }
     }
+  }
+  // anexa o link (e se já foi pago) a cada devedor
+  for (const d of debtors) {
+    const p = d.agreement_id ? paymentByAgreement.get(d.agreement_id) : undefined
+    d.payment_link = p?.link ?? null
+    d.payment_status = p?.status ?? null
+    d.payment_paid = p?.paid ?? false
   }
 
   // Redirects (separado dos acordos), com R$ — filtrado por company quando aplicável

@@ -129,6 +129,13 @@ export interface DebtorRow {
   acknowledged: boolean
   /** algum acordo fechado. */
   agreement_id: string | null
+  /** link de pagamento ASAAS enviado (invoiceUrl/boleto/pix). Consultável no hub;
+   * a AlteaPay o compartilha pelo chat/e-mail/WhatsApp (o ASAAS não comunica). */
+  payment_link?: string | null
+  /** status de pagamento do acordo (payment_status/asaas_status). */
+  payment_status?: string | null
+  /** true quando conciliado como pago — o link fica só para consulta, sem cobrar. */
+  payment_paid?: boolean
   /** sessões individuais (para expandir). */
   sessions: DebtorSessionRow[]
 }
