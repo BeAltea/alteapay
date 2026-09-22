@@ -39,12 +39,14 @@ import {
 import { toast } from "sonner"
 import { ReadOnlyGuard, useCanPerformActions } from "@/components/super-admin/read-only-guard"
 import { CreateNegotiationRequestDialog } from "@/components/super-admin/create-negotiation-request-dialog"
+import { RevealableDocument } from "@/components/super-admin/revealable-document"
 import { isPaidStatus } from "@/lib/constants/payment-status"
 
 type VmaxCustomer = {
   id: string
   name: string
-  document: string
+  // documento mascarado (o claro nunca chega ao cliente; reveal auditado por linha)
+  documentMasked: string
   status: "active" | "overdue" | "negotiating" | "paid"
   totalDebt: number
   originalDebt?: number
@@ -432,10 +434,10 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
         if (c.asaasStatus !== "OVERDUE" && c.paymentStatus !== "overdue") return false
       }
 
-      // Search filter
+      // Search filter (documento em claro não está no cliente — casa o mascarado)
       if (searchTerm) {
         const s = searchTerm.toLowerCase()
-        if (!c.name.toLowerCase().includes(s) && !c.document.toLowerCase().includes(s)) {
+        if (!c.name.toLowerCase().includes(s) && !c.documentMasked.toLowerCase().includes(s)) {
           return false
         }
       }
@@ -966,8 +968,8 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          // documento em claro não é enviado: o servidor resolve por vmaxId (A5)
           vmaxId: customer.id,
-          cpfCnpj: customer.document,
           companyId: selectedCompanyId,
           customerName: customer.name,
           createCharge,
@@ -1673,7 +1675,13 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                       {/* Name + Document */}
                       <div className="w-[180px] flex-shrink-0 min-w-0">
                         <p className="text-sm font-medium truncate" title={customer.name}>{customer.name}</p>
-                        <p className="text-xs text-muted-foreground">{customer.document}</p>
+                        <p className="text-xs text-muted-foreground">
+                          <RevealableDocument
+                            masked={customer.documentMasked}
+                            id={customer.id}
+                            companyId={selectedCompanyId}
+                          />
+                        </p>
                       </div>
                       {/* Debt */}
                       <div className="w-[100px] flex-shrink-0 flex items-center gap-1">
@@ -1794,7 +1802,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                                 customer={{
                                   id: customer.id,
                                   name: customer.name,
-                                  document: customer.document,
+                                  documentMasked: customer.documentMasked,
                                   email: customer.email,
                                   phone: customer.phone,
                                   totalDebt: customer.totalDebt,
@@ -1839,7 +1847,13 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                         </span>
                       </div>
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-xs text-muted-foreground">{customer.document}</span>
+                        <span className="text-xs text-muted-foreground">
+                          <RevealableDocument
+                            masked={customer.documentMasked}
+                            id={customer.id}
+                            companyId={selectedCompanyId}
+                          />
+                        </span>
                         <Badge className={`${debtAgeColors.bg} ${debtAgeColors.text} border-0 text-xs`}>
                           {formatDebtAge(customer.daysOverdue)}
                         </Badge>

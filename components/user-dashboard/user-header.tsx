@@ -103,7 +103,7 @@ export function UserHeader({ user }: UserHeaderProps) {
   }, [])
 
   const handleSignOut = async () => {
-    console.log("[v0] UserHeader - Sign out initiated")
+    console.log("[AlteaPay] UserHeader - Sign out initiated")
     toast({
       title: "Logout realizado",
       description: "Voce foi desconectado com sucesso.",
@@ -112,7 +112,7 @@ export function UserHeader({ user }: UserHeaderProps) {
   }
 
   const handleThemeToggle = () => {
-    console.log("[v0] UserHeader - Theme toggle clicked, current theme:", theme)
+    console.log("[AlteaPay] UserHeader - Theme toggle clicked, current theme:", theme)
     setTheme(theme === "dark" ? "light" : "dark")
     toast({
       title: "Tema alterado",
@@ -121,7 +121,7 @@ export function UserHeader({ user }: UserHeaderProps) {
   }
 
   const handleNotificationClick = (notification: Notification) => {
-    console.log("[v0] UserHeader - Notification clicked:", notification.id)
+    console.log("[AlteaPay] UserHeader - Notification clicked:", notification.id)
 
     // Mark as read
     setNotifications((prev) => prev.map((n) => (n.id === notification.id ? { ...n, read: true } : n)))

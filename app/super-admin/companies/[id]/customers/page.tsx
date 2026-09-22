@@ -1,5 +1,6 @@
 import { createAdminClient } from "@/lib/supabase/admin"
 import { CustomersFilterClient } from "@/components/super-admin/customers-filter-client"
+import { maskDocument } from "@/lib/journey/document"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
 import { ArrowLeft } from "lucide-react"
@@ -133,7 +134,8 @@ export default async function ManageCustomersPage({ params }: { params: Promise<
       name: vmax.Cliente || vmax.cliente || "Cliente VMAX",
       email: null,
       phone: null,
-      document: vmax["CPF/CNPJ"] || vmax.cpf_cnpj || "N/A",
+      // Privacidade (A5): só o mascarado trafega; claro sai pelo reveal auditado.
+      documentMasked: maskDocument(vmax["CPF/CNPJ"] || vmax.cpf_cnpj || ""),
       company_id: id,
       created_at: primeiraVencida || new Date().toISOString(),
       totalDebt: vencidoValue,

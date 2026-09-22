@@ -28,6 +28,10 @@ export type JourneyEventType =
   | "contact.stopped" | "contact.stop_failed"
   | "message.accepted"
   | "session.closed" | "retry.available"
+  // Auditoria de privacidade: super_admin revelou o documento em claro de uma
+  // linha (listas super-admin). Aditivo — o payload NUNCA carrega o doc em claro
+  // (maskPayload já mascara; registramos ator/motivo/doc mascarado/ids).
+  | "document.revealed"
 
 export interface RecordEventInput {
   companyId: string

@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation"
 
 import { ChatSessionsContent } from "@/components/negotiation/chat-sessions-content"
-import { loadChatSessions } from "@/lib/negotiation/admin-data"
+import { loadChatDebtors } from "@/lib/negotiation/admin-data"
 import { createClient } from "@/lib/supabase/server"
 
 export const dynamic = "force-dynamic"
@@ -20,17 +20,21 @@ export default async function SuperAdminNegociacoesChatPage() {
     .single()
   if (profile?.role !== "super_admin" && profile?.role !== "viewer") redirect("/")
 
-  const sessions = await loadChatSessions(null)
+  const { debtors, kpis } = await loadChatDebtors(null)
 
   return (
     <div className="container mx-auto space-y-6 p-6">
       <div>
         <h1 className="text-2xl font-bold">Negociações — Chatbot (global)</h1>
         <p className="text-muted-foreground">
-          Todas as sessões de negociação do assistente digital, em todas as empresas.
+          Devedores em negociação com o assistente digital, em todas as empresas.
         </p>
       </div>
-      <ChatSessionsContent sessions={sessions} isSuperAdmin={profile?.role === "super_admin"} />
+      <ChatSessionsContent
+        debtors={debtors}
+        kpis={kpis}
+        isSuperAdmin={profile?.role === "super_admin"}
+      />
     </div>
   )
 }

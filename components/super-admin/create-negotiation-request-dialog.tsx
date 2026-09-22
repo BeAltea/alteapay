@@ -34,7 +34,9 @@ import {
 interface Customer {
   id: string
   name: string
-  document: string
+  // Documento mascarado para exibição (o claro nunca trafega no cliente; o
+  // servidor resolve o CPF/CNPJ por vmax_id ao persistir a solicitação — A5).
+  documentMasked: string
   email?: string | null
   phone?: string | null
   totalDebt: number
@@ -72,7 +74,7 @@ export function CreateNegotiationRequestDialog({ customer, companyId, onSuccess,
         agreement_id: customer.agreementId || null,
         vmax_id: customer.id,
         customer_name: customer.name,
-        customer_document: customer.document,
+        // documento em claro NÃO é enviado: o servidor resolve por vmax_id (A5).
         customer_email: customer.email || null,
         customer_phone: customer.phone || null,
         original_amount: customer.totalDebt,
@@ -137,7 +139,7 @@ export function CreateNegotiationRequestDialog({ customer, companyId, onSuccess,
           {/* Customer Info */}
           <div className="bg-muted/50 rounded-lg p-3 space-y-1">
             <p className="text-sm font-medium">{customer.name}</p>
-            <p className="text-xs text-muted-foreground">{customer.document}</p>
+            <p className="text-xs text-muted-foreground">{customer.documentMasked}</p>
             <p className="text-sm font-semibold text-red-600">
               Dívida: R$ {customer.totalDebt.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}
             </p>

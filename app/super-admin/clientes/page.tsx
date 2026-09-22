@@ -1,6 +1,7 @@
 import { createAdminClient } from "@/lib/supabase/admin"
 import { SuperAdminClientesContent } from "./clientes-content"
 import { PAID_AGREEMENT_STATUSES, PAID_PAYMENT_STATUSES, PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
+import { maskDocument } from "@/lib/journey/document"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -156,7 +157,9 @@ export default async function SuperAdminClientesPage() {
     return {
       id: record.id,
       name: record.Cliente || "N/A",
-      document: record["CPF/CNPJ"] || "",
+      // Privacidade (A5): o documento em claro NUNCA trafega no payload da lista.
+      // Enviamos só o mascarado; o claro sai apenas pelo reveal auditado por linha.
+      documentMasked: maskDocument(record["CPF/CNPJ"] || ""),
       email: record.Email || "",
       phone: record.Telefone || "",
       city: record.Cidade || "",

@@ -1,6 +1,7 @@
 import { createAdminClient, createClient } from "@/lib/supabase/server"
 import { NextRequest, NextResponse } from "next/server"
 import { PAID_AGREEMENT_STATUSES, PAID_PAYMENT_STATUSES, PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
+import { maskDocument } from "@/lib/journey/document"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -305,7 +306,9 @@ export async function GET(request: NextRequest) {
       return {
         id: vmax.id,
         name: vmax.Cliente || "Cliente",
-        document: vmax["CPF/CNPJ"] || "N/A",
+        // Privacidade (A5): a lista NUNCA devolve o documento em claro. Só o
+        // mascarado; o claro sai apenas pelo reveal auditado por linha.
+        documentMasked: maskDocument(vmax["CPF/CNPJ"] || ""),
         email,
         phone,
         status,

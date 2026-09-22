@@ -64,7 +64,7 @@ export function SuperAdminAuthWrapper({
     try {
       supabase = createBrowserClient()
     } catch (err) {
-      console.error("[v0] Failed to create Supabase client:", err)
+      console.error("[AlteaPay] Failed to create Supabase client:", err)
       setError("Failed to initialize authentication. Please check your configuration.")
       setLoading(false)
       return
@@ -78,7 +78,7 @@ export function SuperAdminAuthWrapper({
         } = await supabase.auth.getUser()
 
         if (error) {
-          console.error("[v0] Auth error:", error)
+          console.error("[AlteaPay] Auth error:", error)
           if (error.message.includes("Failed to fetch")) {
             setError("Network error. Please check your internet connection.")
             setLoading(false)
@@ -101,7 +101,7 @@ export function SuperAdminAuthWrapper({
           .single()
 
         if (profileError) {
-          console.error("[v0] Profile error:", profileError)
+          console.error("[AlteaPay] Profile error:", profileError)
           router.push("/auth/login")
           return
         }
@@ -124,7 +124,7 @@ export function SuperAdminAuthWrapper({
         setRole(profile?.role || null)
         setCompanyId(profile?.company_id || null)
       } catch (error) {
-        console.error("[v0] Auth check error:", error)
+        console.error("[AlteaPay] Auth check error:", error)
         setError("Authentication error. Please try again.")
       } finally {
         setLoading(false)
@@ -190,7 +190,9 @@ export function SuperAdminAuthWrapper({
             <SuperAdminHeader user={user} />
             {/* Demo banner for viewer role */}
             {isViewer && <DemoBanner />}
-            <main className="flex-1 overflow-y-auto">
+            {/* min-h-0 lets this flex child shrink so the scroll area computes
+                its height correctly and never clips the top (page title). */}
+            <main className="flex-1 min-h-0 overflow-y-auto">
               <div className="p-4 sm:p-6 lg:p-8">{children}</div>
             </main>
           </div>

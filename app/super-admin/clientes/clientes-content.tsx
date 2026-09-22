@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import Link from "next/link"
+import { RevealableDocument } from "@/components/super-admin/revealable-document"
 import {
   Users,
   DollarSign,
@@ -22,7 +23,8 @@ import {
 type Cliente = {
   id: string
   name: string
-  document: string
+  // documento mascarado (o claro nunca chega ao cliente; reveal auditado por linha)
+  documentMasked: string
   email: string
   phone: string
   city: string
@@ -113,9 +115,11 @@ export function SuperAdminClientesContent({ clientes, companies }: Props) {
     // Search filter
     if (searchTerm) {
       const term = searchTerm.toLowerCase()
+      // Busca por nome/email/documento mascarado. O documento em claro não está
+      // no cliente (privacidade A5), então a busca por CPF casa a versão exibida.
       result = result.filter(c =>
         c.name.toLowerCase().includes(term) ||
-        c.document.includes(term) ||
+        c.documentMasked.toLowerCase().includes(term) ||
         c.email?.toLowerCase().includes(term)
       )
     }
@@ -329,7 +333,13 @@ export function SuperAdminClientesContent({ clientes, companies }: Props) {
                         {cliente.name}
                       </Link>
                       <p className="text-sm text-gray-500 dark:text-gray-400 truncate">
-                        {cliente.document} • {cliente.city}, {cliente.state}
+                        <RevealableDocument
+                          masked={cliente.documentMasked}
+                          id={cliente.id}
+                          companyId={cliente.companyId}
+                        />
+                        {" • "}
+                        {cliente.city}, {cliente.state}
                       </p>
                       <p className="text-xs text-gray-400 dark:text-gray-500 truncate">
                         {companyMap.get(cliente.companyId) || "Empresa desconhecida"}
