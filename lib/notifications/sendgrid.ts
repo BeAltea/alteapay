@@ -109,6 +109,15 @@ export async function sendEmailViaSendGrid({
         ...(text ? [{ type: "text/plain", value: text }] : []),
         { type: "text/html", value: html },
       ],
+      // Click/open tracking DESLIGADO: o domínio de rastreio da conta
+      // (url6522.alteapay.com) não resolve no DNS e reescreve TODO link para um
+      // redirecionador morto — quebrava o botão "Negociar agora". Sem tracking, o
+      // link real (https://alteapay.com/n/...) vai intacto. Reativar só depois de
+      // configurar o link branding/CNAME no SendGrid.
+      tracking_settings: {
+        click_tracking: { enable: false, enable_text: false },
+        open_tracking: { enable: false },
+      },
     }
 
     // Add reply_to if configured
