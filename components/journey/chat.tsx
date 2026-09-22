@@ -5,7 +5,7 @@
 // por ora — o fluxo é ver a dívida → reconhecer (Sim/Não) → mensagem final.
 // - HISTÓRICO SEMPRE PRESERVADO: ao responder, a pergunta e a resposta escolhida
 //   viram mensagens fixas (não somem da tela).
-// - Timer de inatividade: 60s sem interação → volta para a tela de login do CHAT
+// - Timer de inatividade: 5min sem interação → volta para a tela de login do CHAT
 //   (/n/{code}), NÃO o login da AlteaPay.
 import { useCallback, useEffect, useRef, useState } from "react"
 import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
@@ -19,7 +19,7 @@ interface ChatMsg {
 let msgSeq = 0
 const nextId = () => `m${Date.now()}_${msgSeq++}`
 
-const IDLE_MS = 60_000
+const IDLE_MS = 5 * 60_000 // 5 minutos sem interação
 
 export function JourneyChat() {
   // Sem saudação hardcoded: a 1ª (e única) mensagem inicial é o prompt de
