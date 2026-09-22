@@ -579,6 +579,31 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
   if (!ctx) return jsonError(404, "sessão não encontrada")
   const args = (input.args ?? {}) as Record<string, unknown>
 
+  // Dedupe por event_id na BORDA (§7) SÓ para ações cujo retry é um efeito
+  // colateral puro, sem payload idempotente próprio a reenviar:
+  //   dispute.register / payment_claim.register / human.transfer → abrem
+  //   negotiation_cases ANTES do recordEvent, e a tabela não tem event_id UNIQUE
+  //   → retry duplicava o caso. negotiation.note idem (evento puro).
+  // As demais NÃO entram aqui de propósito: payment.create/payment.record/
+  // offer.accept têm idempotência própria por (session_id, offer_id)/aceite e
+  // devolvem o MESMO payload (link/agreement) no reenvio (§8); offer.propose/
+  // offer.reject/chat.send/prompt.* devolvem ids que o fluxo precisa de volta.
+  // Escopo por ação. Fail-open (markEventSeen trata Redis indisponível).
+  const DEDUPE_AT_EDGE = new Set([
+    "dispute.register", "payment_claim.register", "human.transfer", "negotiation.note",
+  ])
+  if (input.event_id && DEDUPE_AT_EDGE.has(input.action)) {
+    const fresh = await markEventSeen(`journey:${input.action}:${input.event_id}`)
+    if (!fresh) {
+      return NextResponse.json({
+        success: true,
+        duplicate: true,
+        session_id: input.session_id,
+        detail: "event_id já recebido para esta ação",
+      })
+    }
+  }
+
   switch (input.action) {
     case "debt.summary":
       return NextResponse.json({ success: true, summary: await debtSummary(ctx) })

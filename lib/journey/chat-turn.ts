@@ -8,13 +8,17 @@
 // visão turno-a-turno da onda, com rastreio de engine/execução.
 
 import { createServiceClient } from "@/lib/supabase/service"
-import { engineName } from "@/lib/negotiation/engine"
+import { engineName, fallbackMode } from "@/lib/negotiation/engine"
 import { runChatbotTurn } from "@/lib/negotiation/turn"
 import type { NegotiationSession } from "@/lib/negotiation/types"
 import { listOffers, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
 
-const N8N_TIMEOUT_MS = Number(process.env.N8N_TIMEOUT_MS || "20000")
+// Safety-net externo: o engine n8n já aplica seu próprio N8N_TIMEOUT_MS (default
+// 20000) por turno e devolve um resultado NEUTRO (n8n_mode='async'|'fallback')
+// em vez de lançar. Este timeout externo cobre só o caso de o engine travar por
+// completo (ex.: engine assistido); um pouco acima do do engine para não competir.
+const OUTER_TIMEOUT_MS = Number(process.env.N8N_TIMEOUT_MS || "20000") + 5000
 
 export interface ChatTurnOutput {
   reply: string
@@ -82,44 +86,100 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
     .maybeSingle()
   if (!session) throw new Error("sessão não encontrada")
 
-  // 3) roda o engine com timeout de N8N_TIMEOUT_MS (modo assíncrono no estouro).
+  // 3) roda o engine. O engine n8n NÃO lança: aplica seu próprio timeout e
+  //    devolve n8n_mode='async' (HTTP 202) ou 'fallback' (timeout/5xx/inválido)
+  //    com um reply neutro. O timeout externo cobre só um travamento total.
   const t0 = Date.now()
   let result: Awaited<ReturnType<typeof runChatbotTurn>>
   try {
     result = await withTimeout(
       runChatbotTurn(session as NegotiationSession, text, "webchat"),
-      engine === "n8n" ? N8N_TIMEOUT_MS : 60_000,
+      OUTER_TIMEOUT_MS,
     )
   } catch (err) {
     if (err instanceof TimeoutError) {
-      // N3.3: timeout → modo assíncrono. O fluxo n8n devolve depois via
-      // session.message async (callback assinado). Ao cliente, mensagem neutra.
+      // Safety-net: engine travou por completo → modo assíncrono neutro.
       await recordChatMessage({
         companyId: ctx.companyId, sessionId: ctx.sessionId, role: "system",
         text: "engine timeout — modo assíncrono", engine, latencyMs: Date.now() - t0,
       })
-      const reply = "Estou verificando com o credor e já te respondo por aqui."
+      // §5: degrada a sessão para o assistido nos próximos turnos (se != off).
+      await degradeToAssisted(ctx.sessionId)
+      const reply = "Só um instante, estou verificando…"
       return { reply, offers: await listOffers(ctx), action: null, processing: true }
     }
     throw err
   }
-  const latency = Date.now() - t0
+  // §7: latência round-trip do POST papel A vem do próprio engine (result.latency_ms);
+  // se ausente (assistido/stub), mede aqui.
+  const latency = result.latency_ms ?? Date.now() - t0
+  const engineUsed = result.engine ?? engine
 
-  // 4) grava a resposta do assistente + evento (com rastreio de execução)
+  // §4: 202 async → turno pendente. A resposta real chega depois via chat.send
+  //     (papel B) e o cliente a busca por polling. Grava a resposta neutra e
+  //     sinaliza processing (o front mantém o polling por ~N8N_ASYNC_WAIT_MS).
+  if (result.n8n_mode === "async") {
+    await recordChatMessage({
+      companyId: ctx.companyId, sessionId: ctx.sessionId, role: "assistant",
+      text: result.reply, n8nExecutionId: result.n8n_execution_id ?? null,
+      engine: engineUsed, latencyMs: latency,
+    })
+    await recordEvent({
+      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+      sessionId: ctx.sessionId, type: "chat.turn.assistant", actor: "n8n",
+      payload: { latency_ms: latency, mode: "async" },
+    })
+    return { reply: result.reply, offers: await listOffers(ctx), action: null, processing: true }
+  }
+
+  // §5: fallback técnico → resposta neutra + degradação da sessão para o
+  //     assistido no próximo turno (a menos que NEGOTIATION_ENGINE_FALLBACK=off).
+  //     Registra o erro técnico (sem PII/URL/segredo), 1x por sessão.
+  if (result.n8n_mode === "fallback") {
+    await recordChatMessage({
+      companyId: ctx.companyId, sessionId: ctx.sessionId, role: "assistant",
+      text: result.reply, engine: engineUsed, latencyMs: latency,
+    })
+    await recordEvent({
+      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+      sessionId: ctx.sessionId, type: "chat.engine_error", actor: "system",
+      eventId: `chat.engine_error|${ctx.sessionId}`,
+    })
+    await degradeToAssisted(ctx.sessionId)
+    return { reply: result.reply, offers: await listOffers(ctx), action: null, processing: true }
+  }
+
+  // 4) resposta síncrona normal: grava assistente + evento (rastreio de execução).
   const offers = await listOffers(ctx)
   await recordChatMessage({
     companyId: ctx.companyId, sessionId: ctx.sessionId, role: "assistant",
     text: result.reply, offersSnapshot: offers.length ? offers : null,
     n8nExecutionId: result.n8n_execution_id ?? null,
-    engine: result.engine ?? engine, latencyMs: latency,
+    engine: engineUsed, latencyMs: latency,
   })
   await recordEvent({
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-    sessionId: ctx.sessionId, type: "chat.turn.assistant", actor: engine === "n8n" ? "n8n" : "ai",
+    sessionId: ctx.sessionId, type: "chat.turn.assistant", actor: engineUsed === "n8n" ? "n8n" : "ai",
     payload: { latency_ms: latency, action: result.action },
   })
 
   return { reply: result.reply, offers, action: result.action }
+}
+
+/**
+ * §5: marca a sessão para cair no chat assistido a partir do próximo turno
+ * (persiste negotiation_sessions.engine='disabled', lido por
+ * resolveEngineForSession). No-op quando NEGOTIATION_ENGINE_FALLBACK=off.
+ * Best-effort e não-fatal: nunca derruba o turno.
+ */
+async function degradeToAssisted(sessionId: string): Promise<void> {
+  if (fallbackMode() === "off") return
+  try {
+    const supabase = createServiceClient()
+    await supabase.from("negotiation_sessions").update({ engine: "disabled" }).eq("id", sessionId)
+  } catch (err) {
+    console.warn("[chat-turn] degradeToAssisted falhou (não-fatal):", (err as Error).message)
+  }
 }
 
 class TimeoutError extends Error {}

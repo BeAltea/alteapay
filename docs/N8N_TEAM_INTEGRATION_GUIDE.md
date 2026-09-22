@@ -46,13 +46,29 @@ Dois canais entre n8n e AlteaPay, ambos assinados por HMAC (§3):
 
 ## 3. Autenticação HMAC
 
-Todas as chamadas (nos dois sentidos) são assinadas por **HMAC-SHA256** sobre a string `${timestamp}.${body}`, com o segredo compartilhado `<SEGREDO_COMPARTILHADO>` (variável `N8N_WEBHOOK_SECRET`).
+Todas as chamadas (nos dois sentidos) são assinadas por **HMAC-SHA256** sobre a string `${timestamp}.${body}`, com o segredo compartilhado `<N8N_WEBHOOK_SECRET>` (variável `N8N_WEBHOOK_SECRET`).
 
-- **Headers:**
-  - `x-alteapay-signature`: o HMAC em hex.
+- **Headers HMAC:**
+  - `x-alteapay-signature`: `sha256=<hex>`.
   - `x-alteapay-timestamp`: epoch em **segundos** (string).
 - **Janela de tolerância:** ±300 s. Fora disso → `401`.
-- **`body`:** o corpo **cru** (a mesma string exata que vai no POST). Assine antes de qualquer reserialização.
+- **`body`:** o corpo **cru** (a mesma string exata que vai no POST). Assine antes de qualquer reserialização — re-serializar quebra a assinatura.
+
+### Headers REAIS do papel A (plataforma → seu fluxo)
+
+Estes são os headers que a AlteaPay envia em **todo** POST ao seu Webhook trigger (`N8N_CHAT_FLOW_URL`) — `chat.turn`, `negotiation.start` e `ping`. Configure o Webhook trigger com **HTTP Basic Auth** e **Raw Body ON**.
+
+| Header | Valor | Nota |
+|---|---|---|
+| `Content-Type` | `application/json` | — |
+| `Authorization` | `Basic <base64(user:password)>` | credenciais do Basic Auth do trigger n8n (`<N8N_BASIC_AUTH_USER>` / `<N8N_BASIC_AUTH_PASSWORD>`); base64 em UTF-8. Sem elas → `401` no trigger. **Nunca logar.** |
+| `x-alteapay-timestamp` | epoch em **segundos** | usado na assinatura |
+| `x-alteapay-signature` | `sha256=<hex>` | HMAC-SHA256 de `${timestamp}.${rawBody}` |
+| `x-alteapay-event-id` | uuid v4 por request | idempotência do lado do fluxo (dedup por este id) |
+
+> **Duas camadas independentes:** o **Basic Auth** protege o endpoint do trigger (sem ele o n8n devolve `401` antes de qualquer nó); a **assinatura HMAC** prova a autenticidade/integridade do corpo (valide-a no primeiro nó Code, §3). As duas devem passar.
+
+> Nomes de header são **case-insensitive** (a plataforma envia em minúsculas; no n8n leia como `x-alteapay-*`).
 
 ### Nó Code do n8n — GERAR a assinatura (ao chamar o papel B)
 
@@ -82,25 +98,35 @@ return [{
 
 ```javascript
 // Nó "Code" logo após o Webhook trigger que recebe o chat.turn.
+// PRÉ-REQUISITO: Webhook trigger com "Raw Body" LIGADO — a assinatura cobre o
+// corpo byte-a-byte; qualquer reserialização (parse + stringify) pode quebrá-la.
 const crypto = require('crypto');
 const SECRET = $env.N8N_WEBHOOK_SECRET;
 
-const rawBody = $json.body ? JSON.stringify($json.body) : ''; // use o corpo cru se disponível
-const ts = $headers['x-alteapay-timestamp'];
-const sig = $headers['x-alteapay-signature'];
+// Corpo CRU exatamente como chegou. Com Raw Body ON o n8n expõe os bytes em
+// $binary.data (base64) ou $json.body como string — use a string crua, NUNCA
+// um objeto já parseado e re-serializado.
+const rawBody = ($binary && $binary.data)
+  ? Buffer.from($binary.data.data, 'base64').toString('utf8')
+  : (typeof $json.body === 'string' ? $json.body : JSON.stringify($json.body));
+
+const ts  = $headers['x-alteapay-timestamp'];
+const sig = $headers['x-alteapay-signature']; // 'sha256=<hex>'
 
 const now = Math.floor(Date.now() / 1000);
 if (!ts || Math.abs(now - Number(ts)) > 300) {
   throw new Error('timestamp fora da janela (±300s)');
 }
-const expected = crypto.createHmac('sha256', SECRET).update(`${ts}.${rawBody}`).digest('hex');
-const ok = crypto.timingSafeEqual(Buffer.from(sig || '', 'hex'), Buffer.from(expected, 'hex'));
+const expected = 'sha256=' + crypto.createHmac('sha256', SECRET).update(`${ts}.${rawBody}`).digest('hex');
+const a = Buffer.from(sig || '', 'utf8');
+const b = Buffer.from(expected, 'utf8');
+const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
 if (!ok) throw new Error('assinatura inválida');
 
-return [{ json: $json.body }];
+return [{ json: JSON.parse(rawBody) }];
 ```
 
-> **Dica:** no Webhook trigger do n8n, habilite "Raw Body" para assinar/validar sobre o corpo exato.
+> **Dica:** no Webhook trigger do n8n, habilite **"Raw Body"** para assinar/validar sobre o corpo exato. O Basic Auth do trigger (§3, tabela de headers) já barra requests sem `Authorization` antes de chegar neste nó.
 
 ---
 
@@ -273,6 +299,16 @@ Só `reply` é obrigatório. Campos desconhecidos são ignorados.
 - **`close_session`** (opcional): `true` encerra a sessão após a resposta.
 - **`n8n_execution_id`** (opcional, recomendado): id da execução, gravado por turno para observabilidade.
 - Resposta inválida (sem `reply` / JSON quebrado / timeout) → o cliente vê uma mensagem neutra e o servidor loga `chat.engine_error`. Nunca expomos erro interno.
+
+### Modo assíncrono (RECOMENDADO para IA/LLM)
+
+O turno síncrono tem timeout `N8N_TIMEOUT_MS` (padrão **20 s**) e a janela de Functions do Netlify é curta (~10–26 s). Se o seu fluxo usa um AI Agent/LLM que pode passar disso, **prefira o modo assíncrono**:
+
+1. Responda o webhook do `chat.turn` **na hora** com **HTTP `202`** (Respond to Webhook → Response Code `202`). A plataforma mostra ao cliente uma mensagem neutra ("Só um instante, estou verificando…") e passa a fazer polling.
+2. Termine o processamento com calma no fluxo (LLM, ferramentas, etc.).
+3. Entregue a resposta real chamando **`chat.send`** (§7.8) assinado — ela aparece no chat via o polling do cliente (`GET /api/chat/messages?since=`).
+
+Assim você nunca corre contra o timeout do turno. No modo síncrono, projete o fluxo para responder **rápido**.
 
 ---
 
@@ -463,21 +499,32 @@ Sempre `{ "ok":false, "code", "message" }` (ou `{ "success":false, "error", "cod
   6. Repita `payment.create` na mesma oferta → `idempotent:true`, mesmo link.
   7. `chat.send` com um link → confirme que aparece no chat (via `GET /api/chat/messages?since=`).
 - Exemplos prontos: `docs/n8n/examples/*.http` (um por ação) e fixtures em `docs/n8n/fixtures/`.
+- **Sonda do papel A** (`scripts/ops/n8n-probe.ts`): valida a segurança do **seu** Webhook trigger do lado da AlteaPay. Envia um `ping` assinado em 4 casos e imprime só status + latência (nunca URL/segredo):
+  1. **ok** (assinado + Basic Auth) → `200`;
+  2. **assinatura adulterada** → recusa (`401`/`403`);
+  3. **timestamp -600s** (fora de ±300s) → recusa (`401`/`403`);
+  4. **sem `Authorization`** → `401` (Basic Auth do trigger).
+  Executar (lê tudo de `process.env`; nada hardcoded): `pnpm exec tsx scripts/ops/n8n-probe.ts`
+  (requer `N8N_CHAT_FLOW_URL`, `N8N_WEBHOOK_SECRET`, `N8N_BASIC_AUTH_USER`, `N8N_BASIC_AUTH_PASSWORD` no ambiente).
 
 ---
 
-## 12. Checklist de aceite do fluxo
+## 12. Checklist de aceite do fluxo (14 itens)
 
-- [ ] Assinatura HMAC gerada e validada corretamente (±300s); `ping` responde `success:true`.
-- [ ] Lê `chat.turn` tratando **centavos** (não multiplica por 100 de novo).
-- [ ] Respeita a **matriz** (nunca oferece fora dos limites); trata `422`.
-- [ ] Conduz o **reconhecimento** (não tenta pagar antes; trata `409 debt_not_acknowledged`).
-- [ ] Usa `payment.create` para cobrar; trata `processing` (polling via `payment.status`).
-- [ ] Idempotência: reenvio de `payment.create` não gera cobrança nova.
-- [ ] Manda o link via `chat.send`; usa `event_id` para dedupe.
-- [ ] Trata `409 already_charged` e `prompt_not_active` com fala adequada.
-- [ ] Inclui `n8n_execution_id` na resposta ao `chat.turn`.
-- [ ] Não loga/persiste documento em claro.
+- [ ] **1.** Webhook trigger com **HTTP Basic Auth** ligado; request sem `Authorization` recebe `401` (validado pela sonda, §11).
+- [ ] **2.** Webhook trigger com **Raw Body ON**; a validação de assinatura usa o corpo **cru** (não reserializado).
+- [ ] **3.** Assinatura HMAC gerada e validada corretamente (`sha256=<hex>`, janela ±300s); assinatura adulterada ou `ts` fora da janela → recusa.
+- [ ] **4.** `ping` assinado responde `200 { success:true, engine }` (conectividade + saúde).
+- [ ] **5.** Lê `chat.turn` tratando **centavos** (não multiplica por 100 de novo).
+- [ ] **6.** Respeita a **matriz** (nunca oferece desconto/parcela/validade fora dos limites); trata `422` (`DISCOUNT_ABOVE_MAX`, …).
+- [ ] **7.** Conduz o **reconhecimento** da dívida antes de cobrar; trata `409 debt_not_acknowledged`.
+- [ ] **8.** Usa `payment.create` para cobrar; trata o modo `processing` (polling via `payment.status`).
+- [ ] **9.** Idempotência: reenvio de `payment.create` na mesma oferta não gera cobrança nova (`idempotent:true`).
+- [ ] **10.** Trata `409 already_charged` chamando `payment.status` e **reenviando o link existente** (`from_live_charge:true`).
+- [ ] **11.** Trata `prompt_not_active` (clique em prompt já respondido) com fala adequada.
+- [ ] **12.** Manda o link via `chat.send`; usa `event_id` para dedupe (24h).
+- [ ] **13.** Inclui `n8n_execution_id` na resposta ao `chat.turn`; considera o **modo assíncrono** (`202` + `chat.send`) se o LLM puder estourar o timeout.
+- [ ] **14.** Não loga/persiste o documento em claro nem tenta declarar pagamento (a verdade é o webhook ASAAS; "já paguei" → `payment_claim.register`); respeita `501 not_implemented` quando `payment_origin != 'platform'`.
 
 ---
 

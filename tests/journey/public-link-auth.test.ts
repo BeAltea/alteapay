@@ -24,7 +24,13 @@ vi.mock("@/lib/negotiation/crypto", () => ({
   signChatJwt: () => "signed.jwt.token",
   CHAT_COOKIE_NAME: "alteapay_chat_session",
 }))
-vi.mock("@/lib/journey/acknowledgement", () => ({ bootstrapAckSafe: async () => ({ ok: true }) }))
+const settledCalls: Array<Record<string, unknown>> = []
+vi.mock("@/lib/journey/acknowledgement", () => ({
+  bootstrapAckSafe: async () => ({ ok: true }),
+  bootstrapSettledSafe: async (input: Record<string, unknown>) => {
+    settledCalls.push(input)
+  },
+}))
 
 const VALID_CPF = "11144477735"
 const VALID_CNPJ = "11444777000161"
@@ -35,13 +41,17 @@ const BLOCKED = "Muitas tentativas em sequência. Por segurança, tente novament
 const UNIFORM = "Não foi possível confirmar seus dados. Verifique e tente novamente."
 
 function reset() {
+  settledCalls.length = 0
   db = {
     tenant_chat_config: [{ company_id: CO, session_ttl_minutes: 30 }],
     negotiation_sessions: [{ id: "sess_new", company_id: CO }],
   }
   resolveResult = {
-    customerId: "cust1", customerName: "Fabio", document: VALID_CPF,
-    debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 100, agingDays: 30, invoiceCount: 1, oldestDueDate: "2020-01-01",
+    kind: "open",
+    debtor: {
+      customerId: "cust1", customerName: "Fabio", document: VALID_CPF,
+      debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 100, agingDays: 30, invoiceCount: 1, oldestDueDate: "2020-01-01",
+    },
   }
   process.env.CHAT_CAPTCHA_ENABLED = "false"
   delete process.env.PUBLIC_AUTH_IP_MAX_ATTEMPTS
@@ -80,23 +90,42 @@ describe("authenticateByPublicLink", () => {
   })
 
   it("aceita CNPJ com DV válido", async () => {
-    resolveResult = { ...resolveResult, document: VALID_CNPJ }
+    resolveResult = { kind: "open", debtor: { ...resolveResult.debtor, document: VALID_CNPJ } }
     const r = await auth({ document: VALID_CNPJ })
     expect(r.ok).toBe(true)
   })
 
-  it("no_debt: documento INEXISTENTE e SEM-DÍVIDA devolvem resposta IDÊNTICA", async () => {
-    // caso 1: resolve == null (inexistente OU só-VMAX OU sem dívida aberta)
-    resolveResult = null
+  it("no_debt: documento INEXISTENTE e SEM-DÍVIDA NENHUMA devolvem resposta IDÊNTICA", async () => {
+    // caso 1: 'none' (inexistente OU só-VMAX OU sem dívida nenhuma)
+    resolveResult = { kind: "none" }
     const inexistente = await auth({ document: VALID_CPF, ip: "10.0.0.1" })
 
-    // caso 2: outro documento válido também sem resolução (sem dívida aberta)
+    // caso 2: outro documento válido também 'none' (sem dívida nenhuma)
     const semDivida = await auth({ document: VALID_CNPJ, ip: "10.0.0.2" })
 
     // MESMO ok, MESMO reason, MESMA mensagem — indistinguíveis.
     expect(inexistente).toEqual({ ok: false, reason: "no_debt", message: NO_DEBT })
     expect(semDivida).toEqual({ ok: false, reason: "no_debt", message: NO_DEBT })
     expect(inexistente).toEqual(semDivida)
+  })
+
+  it("dívida QUITADA: NÃO é no_debt — cria sessão, emite cookie e empurra a mensagem de quitação", async () => {
+    resolveResult = {
+      kind: "settled",
+      debtor: {
+        customerId: "cust1", customerName: "Fabio", document: VALID_CPF,
+        paidDebtIds: ["dp1"], totalPaid: 250, oldestDueDate: "2020-01-01", paidAt: "2026-05-10T12:00:00.000Z",
+      },
+    }
+    const r = await auth()
+    expect(r.ok).toBe(true) // ENTRA no chat (não no_debt)
+    // sessão criada normalmente
+    const sess = db.negotiation_sessions?.find((s) => s.id === "sess_new")
+    expect(sess?.status).toBe("open")
+    expect(sess?.primary_debt_id).toBe("dp1")
+    // empurrou a mensagem informativa (não o prompt de reconhecimento)
+    expect(settledCalls.length).toBe(1)
+    expect(settledCalls[0]).toMatchObject({ totalPaid: 250, paidAt: "2026-05-10T12:00:00.000Z" })
   })
 
   it("invalid: DV errado NÃO resolve e devolve mensagem uniforme (reason=invalid)", async () => {

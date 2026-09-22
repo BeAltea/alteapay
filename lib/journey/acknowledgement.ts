@@ -124,6 +124,159 @@ export function acknowledgementQuestion(ctx: AckContext): string {
   )
 }
 
+// --- dívida quitada (cliente já pagou) --------------------------------------
+//
+// Quando o cliente autentica e NÃO tem dívida aberta, mas TEM dívida(s) paga(s),
+// não há o que reconhecer/negociar. Em vez do prompt Sim/Não, empurramos uma
+// MENSAGEM informativa (role='assistant') como 1ª mensagem do chat — o mesmo
+// mecanismo (`chat_messages`) que a UI já renderiza, sem botões.
+
+export interface SettledContext {
+  firstName: string
+  creditorName: string
+  totalPaid: number // reais
+  oldestDueDate: string | null // vencimento mais antigo entre as pagas
+  paidAt: string | null // data de pagamento mais recente (ISO)
+}
+
+/**
+ * Texto informativo de quitação (pt-BR). Sem botões de reconhecimento. Se a data
+ * de pagamento for desconhecida, omite o "em {data}" e mantém o "consta como paga".
+ */
+export function settledMessage(ctx: SettledContext): string {
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
+  const paidWhen = ctx.paidAt ? ` em ${formatDatePt(ctx.paidAt)}` : ""
+  const dueWhen = ctx.oldestDueDate ? ` (vencimento ${formatDatePt(ctx.oldestDueDate)})` : ""
+  return (
+    `${greeting} Verificamos aqui: sua dívida com a ${ctx.creditorName} ` +
+    `no valor de ${BRL(ctx.totalPaid)}${dueWhen} consta como PAGA${paidWhen} e está quitada. ` +
+    `Obrigado! Se precisar de algo, fale com o nosso atendimento.`
+  )
+}
+
+/**
+ * Monta o contexto de quitação: nome do cliente + credor (branding › company) +
+ * total pago + vencimento mais antigo + data de pagamento. Reaproveita a mesma
+ * fonte de credor do reconhecimento.
+ */
+export async function buildSettledContext(input: {
+  companyId: string
+  customerId: string
+  totalPaid: number
+  oldestDueDate: string | null
+  paidAt: string | null
+}): Promise<SettledContext> {
+  const supabase = createServiceClient()
+  const { data: company } = await supabase
+    .from("companies")
+    .select("name")
+    .eq("id", input.companyId)
+    .maybeSingle()
+  const { data: cfg } = await supabase
+    .from("tenant_chat_config")
+    .select("branding")
+    .eq("company_id", input.companyId)
+    .maybeSingle()
+  const branding = (cfg?.branding ?? {}) as Record<string, unknown>
+  const creditorName =
+    (typeof branding.brand_name === "string" && branding.brand_name) || company?.name || "Credor"
+  const { data: customer } = await supabase
+    .from("customers")
+    .select("name")
+    .eq("id", input.customerId)
+    .maybeSingle()
+  return {
+    firstName: firstNameOf(customer?.name),
+    creditorName,
+    totalPaid: input.totalPaid,
+    oldestDueDate: input.oldestDueDate,
+    paidAt: input.paidAt,
+  }
+}
+
+export type BootstrapSettledResult =
+  | { ok: true; created: false; reason: "already_present" }
+  | { ok: true; created: true; messageId: string }
+  | { ok: false; error: string }
+
+/**
+ * Publica a mensagem informativa de quitação como 1ª mensagem da sessão. Grava
+ * uma linha em `chat_messages` (role='assistant') — o mesmo caminho que a UI
+ * (`components/journey/chat.tsx`) já lê via /api/chat/messages. Idempotente: não
+ * duplica se já houver uma mensagem 'assistant' na sessão.
+ */
+export async function bootstrapSettledMessage(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  totalPaid: number
+  oldestDueDate: string | null
+  paidAt: string | null
+}): Promise<BootstrapSettledResult> {
+  const supabase = createServiceClient()
+
+  // idempotência: já existe mensagem do assistente na sessão? não recria.
+  const { data: existing } = await supabase
+    .from("chat_messages")
+    .select("id")
+    .eq("session_id", input.sessionId)
+    .eq("role", "assistant")
+    .limit(1)
+    .maybeSingle()
+  if (existing) return { ok: true, created: false, reason: "already_present" }
+
+  const ctx = await buildSettledContext({
+    companyId: input.companyId,
+    customerId: input.customerId,
+    totalPaid: input.totalPaid,
+    oldestDueDate: input.oldestDueDate,
+    paidAt: input.paidAt,
+  })
+  const { data: message, error } = await supabase
+    .from("chat_messages")
+    .insert({
+      company_id: input.companyId,
+      session_id: input.sessionId,
+      role: "assistant",
+      text: settledMessage(ctx),
+      engine: "platform",
+    })
+    .select("id")
+    .single()
+  if (error || !message) return { ok: false, error: error?.message ?? "settled_message_insert_failed" }
+
+  await recordEvent({
+    companyId: input.companyId,
+    customerId: input.customerId,
+    sessionId: input.sessionId,
+    type: "chat.turn.assistant",
+    actor: "system",
+    payload: { message_id: message.id, kind: "debt_settled" },
+  })
+  return { ok: true, created: true, messageId: message.id }
+}
+
+/**
+ * Bootstrap tolerante a falhas da mensagem de quitação (análogo a bootstrapAckSafe).
+ * Só roda com CHAT_JOURNEY_ENABLED=true e NUNCA lança — uma falha aqui não pode
+ * derrubar a autenticação (o cliente entra no chat de qualquer forma).
+ */
+export async function bootstrapSettledSafe(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  totalPaid: number
+  oldestDueDate: string | null
+  paidAt: string | null
+}): Promise<void> {
+  if (process.env.CHAT_JOURNEY_ENABLED !== "true") return
+  try {
+    await bootstrapSettledMessage(input)
+  } catch (err) {
+    console.warn("[journey] bootstrap quitação falhou:", (err as Error).message)
+  }
+}
+
 export type BootstrapAckResult =
   | { ok: true; created: false; reason: "disabled" | "already_answered" }
   | { ok: true; created: true; prompt: PromptRow }

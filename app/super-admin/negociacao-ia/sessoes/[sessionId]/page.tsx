@@ -38,6 +38,13 @@ export default async function SessionDetailPage({
   const s = detail.session
   const a = detail.agreement
   const ack = detail.acknowledgement
+  const sig = detail.engineSignals
+  const tc = detail.turnCounters
+  // Turno do assistente sem n8n_execution_id numa sessão de engine n8n é um
+  // forte indício de turno de fallback (o fluxo não respondeu → resposta neutra
+  // gravada sem execução). Usado só como marcador visual por turno.
+  const flagFallbackTurn = (m: { role: string; engine: string | null; n8n_execution_id: string | null }) =>
+    sig.hadFallback && m.role === "assistant" && m.engine === "n8n" && !m.n8n_execution_id
 
   return (
     <div className="space-y-6">
@@ -47,6 +54,67 @@ export default async function SessionDetailPage({
           {s.brand_name ?? "—"} · {s.channel ?? "—"} · {s.customer_name_masked} · {s.customer_masked}
         </p>
       </div>
+
+      {/* Contadores do topo (X4): turnos enviados/respondidos, fallback e ações recusadas. */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Turnos do cliente</p>
+            <p className="text-2xl font-bold">{tc.customerTurns}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Respostas do assistente</p>
+            <p className="text-2xl font-bold">{tc.assistantTurns}</p>
+          </CardContent>
+        </Card>
+        <Card className={tc.fallbackTurns > 0 ? "border-amber-500 bg-amber-50" : undefined}>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Turnos em fallback</p>
+            <p className="text-2xl font-bold">{tc.fallbackTurns}</p>
+          </CardContent>
+        </Card>
+        <Card className={tc.refusedActions > 0 ? "border-amber-500 bg-amber-50" : undefined}>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground">Ações recusadas</p>
+            <p className="text-2xl font-bold">{tc.refusedActions}</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Banner de fallback do engine (X4): só aparece quando houve algum sinal. */}
+      {sig.hadFallback ? (
+        <Card className="border-amber-500 bg-amber-50">
+          <CardHeader>
+            <CardTitle>Fallback do engine detectado</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-1 text-sm">
+            <div className="flex flex-wrap gap-2">
+              {sig.engineErrors > 0 ? (
+                <span className="rounded bg-amber-200 px-2 py-0.5 font-mono text-xs">
+                  chat.engine_error: {sig.engineErrors}
+                </span>
+              ) : null}
+              {sig.engineUnavailable > 0 ? (
+                <span className="rounded bg-amber-200 px-2 py-0.5 font-mono text-xs">
+                  engine_unavailable: {sig.engineUnavailable}
+                </span>
+              ) : null}
+              {sig.invalidActions > 0 ? (
+                <span className="rounded bg-amber-200 px-2 py-0.5 font-mono text-xs">
+                  chat.engine_invalid_action: {sig.invalidActions}
+                </span>
+              ) : null}
+            </div>
+            {sig.fallbackAt.length > 0 ? (
+              <p className="text-xs text-muted-foreground">
+                Em: {sig.fallbackAt.map((t) => new Date(t).toLocaleTimeString("pt-BR")).join(", ")}
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Reconhecimento da dívida em DESTAQUE (onda R). */}
       <Card
@@ -143,6 +211,11 @@ export default async function SessionDetailPage({
                     {m.latency_ms != null ? <span>{m.latency_ms}ms</span> : null}
                     {m.n8n_execution_id ? (
                       <span className="font-mono">exec: {m.n8n_execution_id}</span>
+                    ) : null}
+                    {flagFallbackTurn(m) ? (
+                      <span className="rounded bg-amber-200 px-1.5 font-mono text-amber-800">
+                        fallback
+                      </span>
                     ) : null}
                     <span>{new Date(m.created_at).toLocaleTimeString("pt-BR")}</span>
                   </span>

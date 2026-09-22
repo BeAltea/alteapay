@@ -33,8 +33,11 @@ function reset() {
     negotiation_sessions: [{ id: "sess_new", company_id: CO }],
   }
   resolveResult = {
-    customerId: "cust1", customerName: "Fabio", document: VALID_CPF,
-    debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 100, agingDays: 30, invoiceCount: 1, oldestDueDate: "2020-01-01",
+    kind: "open",
+    debtor: {
+      customerId: "cust1", customerName: "Fabio", document: VALID_CPF,
+      debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 100, agingDays: 30, invoiceCount: 1, oldestDueDate: "2020-01-01",
+    },
   }
   process.env.CHAT_CAPTCHA_ENABLED = "false"
   delete process.env.CHAT_AUTH_IP_MAX_ATTEMPTS
@@ -73,7 +76,7 @@ describe("authenticateByDocument", () => {
   const UNIFORM = "Não foi possível confirmar seus dados. Verifique e tente novamente."
 
   it("resposta uniforme: inexistente e sem-dívida devolvem a MESMA mensagem", async () => {
-    resolveResult = null
+    resolveResult = { kind: "none" }
     const r = await auth()
     expect(r).toEqual({ ok: false, message: UNIFORM })
   })
@@ -89,7 +92,7 @@ describe("authenticateByDocument", () => {
   })
 
   it("lock por DOCUMENTO após max tentativas (independente do IP)", async () => {
-    resolveResult = null
+    resolveResult = { kind: "none" }
     // 3 falhas do mesmo doc em IPs diferentes → lock por documento
     await auth({ ip: "9.9.9.1" })
     await auth({ ip: "9.9.9.2" })
@@ -97,14 +100,14 @@ describe("authenticateByDocument", () => {
     const docLock = db.chat_auth_generic_locks?.find((l) => l.scope === "document")
     expect(docLock).toBeTruthy()
     // agora mesmo com dados válidos e IP novo, o documento bloqueado responde uniforme
-    resolveResult = { customerId: "c", customerName: "x", document: VALID_CPF, debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 1, agingDays: 1, invoiceCount: 1, oldestDueDate: null }
+    resolveResult = { kind: "open", debtor: { customerId: "c", customerName: "x", document: VALID_CPF, debtIds: ["d1"], primaryDebtId: "d1", totalOpen: 1, agingDays: 1, invoiceCount: 1, oldestDueDate: null } }
     const r = await auth({ ip: "9.9.9.9" })
     expect(r).toEqual({ ok: false, message: UNIFORM })
   })
 
   it("lock por IP após max tentativas (independente do documento)", async () => {
     process.env.CHAT_AUTH_IP_MAX_ATTEMPTS = "3"
-    resolveResult = null
+    resolveResult = { kind: "none" }
     // 3 falhas do mesmo IP com documentos válidos diferentes
     await auth({ document: "11144477735", ip: "5.5.5.5" })
     await auth({ document: "52998224725", ip: "5.5.5.5" })

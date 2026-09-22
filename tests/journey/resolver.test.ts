@@ -13,6 +13,7 @@ interface Db {
   customers: Row[]
   debts: Row[]
   vmax_invoices: Row[]
+  agreements: Row[]
 }
 
 const CO_A = "aaaaaaaa-0000-0000-0000-000000000001"
@@ -116,27 +117,29 @@ describe("resolveByDocument", () => {
         { id: "cust_b", company_id: CO_B, name: "Outro Cliente", document: "11144477735" },
       ],
       debts: [
-        { id: "debt_a1", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 100, due_date: OLD_DUE },
-        { id: "debt_a2", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 200, due_date: "2021-06-01" },
-        { id: "debt_a3", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 50, due_date: "2022-01-01" },
-        { id: "debt_b1", company_id: CO_B, customer_id: "cust_b", status: "pending", amount: 999, due_date: OLD_DUE },
+        { id: "debt_a1", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 100, due_date: OLD_DUE, updated_at: "2021-01-01T00:00:00.000Z" },
+        { id: "debt_a2", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 200, due_date: "2021-06-01", updated_at: "2021-06-02T00:00:00.000Z" },
+        { id: "debt_a3", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 50, due_date: "2022-01-01", updated_at: "2022-02-01T00:00:00.000Z" },
+        { id: "debt_b1", company_id: CO_B, customer_id: "cust_b", status: "pending", amount: 999, due_date: OLD_DUE, updated_at: "2021-01-01T00:00:00.000Z" },
       ],
       vmax_invoices: [
         { id_company: CO_A, doc: "11144477735", fatura: "F1", vencimento: OLD_DUE, saldo: 100 },
       ],
+      agreements: [],
     }
   })
 
-  it("resolve consolidado: todas as abertas, primária = mais antiga", async () => {
+  it("resolve consolidado (kind='open'): todas as abertas, primária = mais antiga", async () => {
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
-    expect(r).not.toBeNull()
-    expect(r!.customerId).toBe("cust_a")
-    expect(r!.debtIds.sort()).toEqual(["debt_a1", "debt_a2"]) // paid excluída
-    expect(r!.primaryDebtId).toBe("debt_a1") // due_date mais antigo
-    expect(r!.totalOpen).toBe(300)
-    expect(r!.agingDays).toBeGreaterThan(0)
-    expect(r!.invoiceCount).toBe(1)
+    expect(r.kind).toBe("open")
+    if (r.kind !== "open") throw new Error("esperava kind=open")
+    expect(r.debtor.customerId).toBe("cust_a")
+    expect(r.debtor.debtIds.sort()).toEqual(["debt_a1", "debt_a2"]) // paid excluída das abertas
+    expect(r.debtor.primaryDebtId).toBe("debt_a1") // due_date mais antigo
+    expect(r.debtor.totalOpen).toBe(300)
+    expect(r.debtor.agingDays).toBeGreaterThan(0)
+    expect(r.debtor.invoiceCount).toBe(1)
   })
 
   it("resolve pela query DIRETA (.in), sem varrer todos os customers", async () => {
@@ -144,7 +147,7 @@ describe("resolveByDocument", () => {
     // doc CRU no input casa com o cust_b (doc CRU na base) — mas em CO_B.
     // Testamos em CO_A com input CRU → candidato pontuado casa o cust_a.
     const r = await resolveByDocument({ companyId: CO_A, document: "11144477735" })
-    expect(r?.customerId).toBe("cust_a")
+    expect(r.kind === "open" && r.debtor.customerId).toBe("cust_a")
     expect(calls.customerIn).toBe(1) // usou a query direta
     expect(calls.customerRange).toBe(0) // NÃO precisou do fallback paginado
   })
@@ -153,45 +156,72 @@ describe("resolveByDocument", () => {
     // cust_b tem doc CRU; buscamos no CO_B com input PONTUADO
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_B, document: "111.444.777-35" })
-    expect(r?.customerId).toBe("cust_b")
+    expect(r.kind === "open" && r.debtor.customerId).toBe("cust_b")
     expect(calls.customerRange).toBe(0)
   })
 
   it("input CRU + base CRUA resolve (candidato cru casa direto)", async () => {
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_B, document: "11144477735" })
-    expect(r?.customerId).toBe("cust_b")
+    expect(r.kind === "open" && r.debtor.customerId).toBe("cust_b")
   })
 
   it("NUNCA cruza company_id (mesmo doc em outro tenant não vaza)", async () => {
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
-    expect(r?.debtIds).not.toContain("debt_b1")
+    expect(r.kind === "open" && r.debtor.debtIds).not.toContain("debt_b1")
   })
 
-  it("documento inexistente → null", async () => {
+  it("documento inexistente → kind='none'", async () => {
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "99999999999" })
-    expect(r).toBeNull()
+    expect(r).toEqual({ kind: "none" })
   })
 
-  it("só-VMAX-sem-customers → null (não cria registro)", async () => {
+  it("só-VMAX-sem-customers → kind='none' (não cria registro)", async () => {
     db.customers = [] // documento existe só na VMAX
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "11144477735" })
-    expect(r).toBeNull()
+    expect(r).toEqual({ kind: "none" })
   })
 
-  it("cliente sem dívida aberta → null", async () => {
-    db.debts = db.debts.filter((d) => d.customer_id !== "cust_a" || d.status === "paid")
+  it("cliente só com dívida PAGA → kind='settled' (quitado, consolida valor/vencimento/data)", async () => {
+    // remove as abertas; sobra só a debt_a3 (paid). Sem agreement → paidAt cai no
+    // fallback debts.updated_at.
+    db.debts = db.debts.filter((d) => d.id === "debt_a3")
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
-    expect(r).toBeNull()
+    expect(r.kind).toBe("settled")
+    if (r.kind !== "settled") throw new Error("esperava kind=settled")
+    expect(r.debtor.customerId).toBe("cust_a")
+    expect(r.debtor.paidDebtIds).toEqual(["debt_a3"])
+    expect(r.debtor.totalPaid).toBe(50)
+    expect(r.debtor.oldestDueDate).toBe("2022-01-01")
+    expect(r.debtor.paidAt).toBe("2022-02-01T00:00:00.000Z") // fallback updated_at
   })
 
-  it("documento vazio → null", async () => {
+  it("dívida paga: data de pagamento vem do agreement (payment_received_at), mais recente vence", async () => {
+    db.debts = db.debts.filter((d) => d.id === "debt_a3")
+    db.agreements = [
+      { id: "agr1", company_id: CO_A, debt_id: "debt_a3", payment_received_at: "2026-05-10T12:00:00.000Z", asaas_payment_date: "2026-05-09" },
+    ]
     const { resolveByDocument } = await importResolver()
-    expect(await resolveByDocument({ companyId: CO_A, document: "" })).toBeNull()
+    const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
+    expect(r.kind).toBe("settled")
+    if (r.kind !== "settled") throw new Error("esperava kind=settled")
+    expect(r.debtor.paidAt).toBe("2026-05-10T12:00:00.000Z") // payment_received_at tem prioridade
+  })
+
+  it("cliente sem dívida NENHUMA (nem aberta nem paga) → kind='none'", async () => {
+    db.debts = db.debts.filter((d) => d.customer_id !== "cust_a")
+    const { resolveByDocument } = await importResolver()
+    const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
+    expect(r).toEqual({ kind: "none" })
+  })
+
+  it("documento vazio → kind='none'", async () => {
+    const { resolveByDocument } = await importResolver()
+    expect(await resolveByDocument({ companyId: CO_A, document: "" })).toEqual({ kind: "none" })
   })
 
   it("fallback paginado (.range) acha o customer em formato atípico", async () => {
@@ -202,28 +232,33 @@ describe("resolveByDocument", () => {
       { id: "cust_odd", company_id: CO_A, name: "Formato Atípico", document: "330 366 958 93" },
     ]
     db.debts = [
-      { id: "debt_odd", company_id: CO_A, customer_id: "cust_odd", status: "pending", amount: 42, due_date: OLD_DUE },
+      { id: "debt_odd", company_id: CO_A, customer_id: "cust_odd", status: "pending", amount: 42, due_date: OLD_DUE, updated_at: null },
     ]
     db.vmax_invoices = []
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "330.366.958-93" })
-    expect(r?.customerId).toBe("cust_odd")
-    expect(r?.debtIds).toEqual(["debt_odd"])
+    expect(r.kind).toBe("open")
+    if (r.kind !== "open") throw new Error("esperava kind=open")
+    expect(r.debtor.customerId).toBe("cust_odd")
+    expect(r.debtor.debtIds).toEqual(["debt_odd"])
     expect(calls.customerIn).toBe(1) // tentou a direta primeiro
     expect(calls.customerRange).toBeGreaterThanOrEqual(1) // e caiu no fallback
   })
 
-  it("status filter intacto: pending + in_negotiation contam; paid/cancelled não", async () => {
+  it("status filter: pending + in_negotiation viram 'open'; paid vira 'settled'; cancelled ignorada", async () => {
+    // com abertas presentes → open (paid não entra no consolidado de abertas)
     db.debts = [
-      { id: "d_pending", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 10, due_date: OLD_DUE },
-      { id: "d_inneg", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 20, due_date: "2021-01-01" },
-      { id: "d_paid", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 30, due_date: "2021-02-01" },
-      { id: "d_cancelled", company_id: CO_A, customer_id: "cust_a", status: "cancelled", amount: 40, due_date: "2021-03-01" },
+      { id: "d_pending", company_id: CO_A, customer_id: "cust_a", status: "pending", amount: 10, due_date: OLD_DUE, updated_at: null },
+      { id: "d_inneg", company_id: CO_A, customer_id: "cust_a", status: "in_negotiation", amount: 20, due_date: "2021-01-01", updated_at: null },
+      { id: "d_paid", company_id: CO_A, customer_id: "cust_a", status: "paid", amount: 30, due_date: "2021-02-01", updated_at: "2021-03-01T00:00:00.000Z" },
+      { id: "d_cancelled", company_id: CO_A, customer_id: "cust_a", status: "cancelled", amount: 40, due_date: "2021-03-01", updated_at: null },
     ]
     const { resolveByDocument } = await importResolver()
     const r = await resolveByDocument({ companyId: CO_A, document: "111.444.777-35" })
-    expect(r!.debtIds.sort()).toEqual(["d_inneg", "d_pending"])
-    expect(r!.totalOpen).toBe(30)
+    expect(r.kind).toBe("open")
+    if (r.kind !== "open") throw new Error("esperava kind=open")
+    expect(r.debtor.debtIds.sort()).toEqual(["d_inneg", "d_pending"])
+    expect(r.debtor.totalOpen).toBe(30)
   })
 })
 
