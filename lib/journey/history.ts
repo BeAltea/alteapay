@@ -194,6 +194,86 @@ export async function adminSessions(filter: {
   })
 }
 
+/**
+ * Sinais de engine/fallback derivados de journey_events (X4). A "flag de
+ * fallback" por turno NÃO é uma coluna de chat_messages: ela vive em eventos
+ * de sessão. Três fontes, todas sem PII/URL/segredo no payload:
+ *   - `chat.engine_error`               → timeout / 5xx / corpo inválido do fluxo
+ *                                          (deduplicado 1x/sessão na origem)
+ *   - `chat.engine_invalid_action`      → o fluxo pediu uma ação fora da matriz;
+ *                                          o servidor recusou (reply ainda exibido)
+ *   - `chat.turn.assistant` com
+ *      payload.event = 'engine_unavailable' → disparo negotiation.start não
+ *                                          entregue; sessão seguiu no assistido
+ */
+export interface EngineEventRow {
+  event_type: string
+  occurred_at: string
+  payload: Record<string, unknown> | null
+}
+
+export interface EngineSignals {
+  /** houve QUALQUER fallback nesta sessão (banner no topo). */
+  hadFallback: boolean
+  /** contadores por tipo de sinal. */
+  engineErrors: number
+  invalidActions: number
+  engineUnavailable: number
+  /** momentos (ISO) de cada sinal de fallback, ordenados. */
+  fallbackAt: string[]
+}
+
+/** Pura e testável: classifica eventos em sinais de engine/fallback. */
+export function computeEngineSignals(events: EngineEventRow[]): EngineSignals {
+  let engineErrors = 0
+  let invalidActions = 0
+  let engineUnavailable = 0
+  const fallbackAt: string[] = []
+  for (const e of events) {
+    if (e.event_type === "chat.engine_error") {
+      engineErrors += 1
+      fallbackAt.push(e.occurred_at)
+    } else if (e.event_type === "chat.engine_invalid_action") {
+      invalidActions += 1
+      fallbackAt.push(e.occurred_at)
+    } else if (
+      e.event_type === "chat.turn.assistant" &&
+      e.payload?.event === "engine_unavailable"
+    ) {
+      engineUnavailable += 1
+      fallbackAt.push(e.occurred_at)
+    }
+  }
+  fallbackAt.sort()
+  return {
+    hadFallback: engineErrors + invalidActions + engineUnavailable > 0,
+    engineErrors,
+    invalidActions,
+    engineUnavailable,
+    fallbackAt,
+  }
+}
+
+/** Contadores de turno para o topo do painel (X4). Puro/testável. */
+export interface TurnCounters {
+  customerTurns: number
+  assistantTurns: number
+  fallbackTurns: number
+  refusedActions: number
+}
+
+export function computeTurnCounters(
+  messages: Pick<ChatMessageView, "role">[],
+  signals: EngineSignals,
+): TurnCounters {
+  return {
+    customerTurns: messages.filter((m) => m.role === "customer").length,
+    assistantTurns: messages.filter((m) => m.role === "assistant").length,
+    fallbackTurns: signals.engineErrors + signals.engineUnavailable,
+    refusedActions: signals.invalidActions,
+  }
+}
+
 export interface AdminSessionDetail {
   session: AdminSessionRow | null
   messages: ChatMessageView[]
@@ -201,6 +281,8 @@ export interface AdminSessionDetail {
   prompts: PromptView[]
   acknowledgement: AckView | null
   agreement: AgreementCardView | null
+  engineSignals: EngineSignals
+  turnCounters: TurnCounters
 }
 
 /** Detalhe de uma sessão para o painel: transcrição + n8n_execution_id + botões +
@@ -214,9 +296,19 @@ export async function adminSessionDetail(sessionId: string): Promise<AdminSessio
     )
     .eq("id", sessionId)
     .maybeSingle()
-  if (!session) return { session: null, messages: [], offers: [], prompts: [], acknowledgement: null, agreement: null }
+  if (!session)
+    return {
+      session: null,
+      messages: [],
+      offers: [],
+      prompts: [],
+      acknowledgement: null,
+      agreement: null,
+      engineSignals: computeEngineSignals([]),
+      turnCounters: computeTurnCounters([], computeEngineSignals([])),
+    }
 
-  const [{ data: msgs }, { data: offers }, { data: prompts }, { data: ack }, { data: company }, { data: customer }] =
+  const [{ data: msgs }, { data: offers }, { data: prompts }, { data: ack }, { data: company }, { data: customer }, { data: engineEvents }] =
     await Promise.all([
       supabase
         .from("chat_messages")
@@ -245,6 +337,13 @@ export async function adminSessionDetail(sessionId: string): Promise<AdminSessio
       session.customer_id
         ? supabase.from("customers").select("name, document").eq("id", session.customer_id).maybeSingle()
         : Promise.resolve({ data: null as { name: string; document: string } | null }),
+      // Sinais de engine/fallback (X4): eventos de sessão, sem PII no payload.
+      supabase
+        .from("journey_events")
+        .select("event_type, occurred_at, payload")
+        .eq("session_id", sessionId)
+        .in("event_type", ["chat.engine_error", "chat.engine_invalid_action", "chat.turn.assistant"])
+        .order("occurred_at", { ascending: true }),
     ])
 
   const start = new Date(session.created_at).getTime()
@@ -274,12 +373,18 @@ export async function adminSessionDetail(sessionId: string): Promise<AdminSessio
     ? await agreementCard(session.agreement_id, session.company_id)
     : null
 
+  const messages = (msgs ?? []) as ChatMessageView[]
+  const engineSignals = computeEngineSignals((engineEvents ?? []) as EngineEventRow[])
+  const turnCounters = computeTurnCounters(messages, engineSignals)
+
   return {
     session: detailRow,
-    messages: (msgs ?? []) as ChatMessageView[],
+    messages,
     offers: (offers ?? []) as AdminSessionDetail["offers"],
     prompts: (prompts ?? []) as PromptView[],
     acknowledgement: (ack as AckView | null) ?? null,
     agreement,
+    engineSignals,
+    turnCounters,
   }
 }

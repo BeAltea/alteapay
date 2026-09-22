@@ -16,7 +16,7 @@ export type JourneyEventType =
   | "link.clicked"
   | "auth.attempt" | "auth.failed" | "auth.locked" | "auth.success"
   | "consent.given" | "session.started"
-  | "chat.turn.customer" | "chat.turn.assistant" | "chat.engine_error"
+  | "chat.turn.customer" | "chat.turn.assistant" | "chat.engine_error" | "chat.engine_invalid_action"
   | "debt.viewed"
   | "debt.acknowledged" | "debt.not_recognized"
   | "offer.presented" | "offer.invalid" | "offer.accepted" | "offer.rejected" | "offer.expired"

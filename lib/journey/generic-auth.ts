@@ -20,8 +20,8 @@ import { signChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { recordEvent } from "./events"
 import { GENERIC_AUTH_MESSAGE } from "./auth"
 import { isAcceptableDocument, normalizeDocument } from "./document"
-import { resolveByDocument } from "./resolver"
-import { bootstrapAckSafe } from "./acknowledgement"
+import { resolveByDocument, type ResolvedDebtor, type SettledDebtor } from "./resolver"
+import { bootstrapAckSafe, bootstrapSettledSafe } from "./acknowledgement"
 import { verifyCaptcha as verifyCaptchaFunctional } from "./captcha"
 import {
   docHashOf,
@@ -194,14 +194,15 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   if (!isAcceptableDocument(doc)) return fail("doc_invalid")
 
   const resolved = await resolveByDocument({ companyId: input.companyId, document: doc })
-  if (!resolved) {
-    // inexistente OU só-VMAX-sem-customers OU sem dívida aberta: mesma resposta.
+  if (resolved.kind === "none") {
+    // inexistente OU só-VMAX-sem-customers OU sem dívida nenhuma: mesma resposta.
     // auth.unresolved é auditoria interna (não distingue os casos para o cliente).
     await recordEvent({ companyId: input.companyId, type: "auth.failed", actor: "customer", payload: { reason: "unresolved" } })
     return fail("unresolved")
   }
 
-  // sucesso: sessão consolidada (todas as dívidas abertas) via handoff helper.
+  // sucesso: sessão consolidada via handoff helper — dívida aberta (reconhecimento)
+  // ou dívida quitada (mensagem informativa). Os dois criam sessão + cookie.
   await recordAttempt(supabase, input.companyId, dHash, ipH, true, null)
   return establishSession({
     supabase,
@@ -215,14 +216,19 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   })
 }
 
-// --- helper compartilhado: consolida sessão + cookie + eventos + ack ----------
+// --- helper compartilhado: consolida sessão + cookie + eventos + 1ª mensagem ---
 // Usado tanto pelo caminho genérico /t/{slug} quanto pelo link público /n/{code}.
-type ResolvedDebtor = NonNullable<Awaited<ReturnType<typeof resolveByDocument>>>
+// Aceita os DOIS desfechos com sessão: dívida aberta (reconhecimento) e dívida
+// quitada (mensagem informativa). O `debt_id` primário da sessão é a dívida mais
+// antiga (aberta) ou a 1ª paga (quitado) — só para amarrar a sessão a uma dívida.
+type ResolvedForSession =
+  | { kind: "open"; debtor: ResolvedDebtor }
+  | { kind: "settled"; debtor: SettledDebtor }
 
 interface EstablishSessionInput {
   supabase: Supabase
   companyId: string
-  resolved: ResolvedDebtor
+  resolved: ResolvedForSession
   document: string
   channel: string
   userAgent: string | null
@@ -232,11 +238,17 @@ interface EstablishSessionInput {
 }
 
 async function establishSession(input: EstablishSessionInput): Promise<SessionSuccess> {
+  const { resolved } = input
+  const customerId = resolved.debtor.customerId
+  // dívida "primária" só para vincular a sessão: aberta mais antiga OU 1ª paga.
+  const debtIds = resolved.kind === "open" ? resolved.debtor.debtIds : resolved.debtor.paidDebtIds
+  const primaryDebtId = resolved.kind === "open" ? resolved.debtor.primaryDebtId : (resolved.debtor.paidDebtIds[0] ?? null)
+
   const { createHandoffSession } = await import("@/lib/negotiation/sessions")
   const created = await createHandoffSession({
     company_id: input.companyId,
-    customer_id: input.resolved.customerId,
-    debt_id: input.resolved.primaryDebtId,
+    customer_id: customerId,
+    debt_id: primaryDebtId ?? undefined,
     document: input.document,
     channel_origin: "direct",
     identity_verified: true,
@@ -245,8 +257,8 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
   const sessionId = created.session.id
   const now = new Date().toISOString()
   await input.supabase.from("negotiation_sessions").update({
-    debt_ids: input.resolved.debtIds,
-    primary_debt_id: input.resolved.primaryDebtId,
+    debt_ids: debtIds,
+    primary_debt_id: primaryDebtId,
     channel: input.channel,
     status: "open",
     engine: process.env.NEGOTIATION_ENGINE || "disabled",
@@ -258,19 +270,32 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
     ip_hash: input.ipHash,
   }).eq("id", sessionId)
 
-  const base = { companyId: input.companyId, customerId: input.resolved.customerId, debtId: input.resolved.primaryDebtId, sessionId }
+  const base = { companyId: input.companyId, customerId, debtId: primaryDebtId ?? undefined, sessionId }
   await recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } })
   await recordEvent({ ...base, type: "auth.success", actor: "customer" })
   await recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } })
 
-  // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
-  await bootstrapAckSafe({
-    companyId: input.companyId,
-    sessionId,
-    customerId: input.resolved.customerId,
-    debtIds: input.resolved.debtIds,
-    primaryDebtId: input.resolved.primaryDebtId,
-  })
+  if (resolved.kind === "open") {
+    // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
+    await bootstrapAckSafe({
+      companyId: input.companyId,
+      sessionId,
+      customerId,
+      debtIds: resolved.debtor.debtIds,
+      primaryDebtId: resolved.debtor.primaryDebtId,
+    })
+  } else {
+    // dívida quitada: SEM prompt Sim/Não — mensagem informativa de quitação como
+    // 1ª mensagem do chat (mesmo mecanismo `chat_messages` que a UI já lê).
+    await bootstrapSettledSafe({
+      companyId: input.companyId,
+      sessionId,
+      customerId,
+      totalPaid: resolved.debtor.totalPaid,
+      oldestDueDate: resolved.debtor.oldestDueDate,
+      paidAt: resolved.debtor.paidAt,
+    })
+  }
 
   const ttlSeconds = input.sessionTtlMinutes * 60
   const cookieValue = signChatJwt({ sid: sessionId, cid: input.companyId }, ttlSeconds)
@@ -371,12 +396,13 @@ export async function authenticateByPublicLink(
 
   // 5) resolução do devedor no tenant do code.
   const resolved = await resolveByDocument({ companyId: input.companyId, document: doc })
-  if (!resolved) {
-    // inexistente OU só-VMAX OU sem dívida aberta → MESMA resposta no_debt.
+  if (resolved.kind === "none") {
+    // inexistente OU só-VMAX OU sem dívida nenhuma → MESMA resposta no_debt.
+    // (dívida quitada NÃO é no_debt: o cliente entra e vê a mensagem de quitação.)
     return noDebt("unresolved")
   }
 
-  // sucesso: registra e consolida sessão (reuso do helper do /t/).
+  // sucesso (aberta OU quitada): registra e consolida sessão (reuso do helper do /t/).
   await registerPublicAttempt({ companyId: input.companyId, docHash: dHash, ipHash: ipH, success: true, reason: "ok" })
   return establishSession({
     supabase,

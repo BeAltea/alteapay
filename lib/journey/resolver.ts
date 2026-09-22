@@ -1,13 +1,22 @@
-// Resolução de cliente + dívidas abertas por documento (N1, GATE N0: consolidado).
+// Resolução de cliente + dívidas por documento (N1, GATE N0: consolidado).
 //
 // Fonte primária = `customers` (documento normalizado dos DOIS lados). VMAX é
 // só um sinal auxiliar de aging/faturas; um documento que existe SÓ na VMAX
-// (sem customers) resolve para `null` e o chamador emite `auth.unresolved` —
-// NUNCA se cria registro aqui.
+// (sem customers) resolve para `{ kind: 'none' }` e o chamador emite a resposta
+// uniforme (no_debt) — NUNCA se cria registro aqui.
+//
+// Três desfechos (discriminados por `kind`):
+//   - 'open'    → cliente COM dívida(s) aberta(s) (pending|in_negotiation): entra
+//                 no fluxo normal de reconhecimento.
+//   - 'settled' → cliente SEM dívida aberta, mas COM dívida(s) PAGA(s) ('paid'):
+//                 entra no chat e vê a mensagem informativa de quitação.
+//   - 'none'    → não há cliente OU não há dívida NENHUMA (aberta ou paga):
+//                 resposta uniforme (no_debt) — nunca revela qual dos dois.
 //
 // Invariantes:
 //   - company_id SEMPRE restringe (nunca cruza tenant).
 //   - dívidas abertas = status `pending` + `in_negotiation` (CHECK real).
+//   - dívida paga = status `paid` (CHECK real).
 //   - consolidado: debtIds = TODAS as abertas; primaryDebtId = a mais antiga.
 //   - agingDays pela fatura/vencimento mais antigo (vmax_invoices › debts.due_date).
 
@@ -17,6 +26,8 @@ import { normalizeDocument } from "./document"
 
 /** Status de dívida considerados "em aberto" (CHECK real: pending|paid|cancelled|in_negotiation). */
 export const OPEN_DEBT_STATUSES = ["pending", "in_negotiation"] as const
+/** Status de dívida considerado "quitado" (CHECK real). */
+export const PAID_DEBT_STATUSES = ["paid"] as const
 
 export interface ResolvedDebtor {
   customerId: string
@@ -30,6 +41,28 @@ export interface ResolvedDebtor {
   oldestDueDate: string | null
 }
 
+/** Cliente sem dívida aberta, mas com dívida(s) quitada(s) (consolidado). */
+export interface SettledDebtor {
+  customerId: string
+  customerName: string
+  document: string // normalizado (só dígitos)
+  paidDebtIds: string[]
+  totalPaid: number // soma dos valores das dívidas pagas (reais)
+  oldestDueDate: string | null // vencimento mais antigo entre as pagas
+  paidAt: string | null // data de pagamento MAIS RECENTE (ISO); null se indisponível
+}
+
+/**
+ * Desfecho da resolução por documento — discriminado por `kind`:
+ *  - 'open'    → há dívida(s) aberta(s): `debtor`.
+ *  - 'settled' → sem aberta, mas com paga(s): `debtor` (quitado).
+ *  - 'none'    → sem cliente OU sem dívida nenhuma.
+ */
+export type ResolveResult =
+  | { kind: "open"; debtor: ResolvedDebtor }
+  | { kind: "settled"; debtor: SettledDebtor }
+  | { kind: "none" }
+
 interface ResolveInput {
   companyId: string
   document: string
@@ -40,6 +73,7 @@ interface DebtRow {
   status: string
   amount: number | null
   due_date: string | null
+  updated_at: string | null
 }
 
 interface CustomerRow {
@@ -73,13 +107,17 @@ export function documentCandidates(doc: string): string[] {
 }
 
 /**
- * Resolve o devedor pelo documento no tenant. `null` = não há cliente em
- * `customers` com esse documento (inclui o caso "só VMAX") OU não há dívida
- * aberta — o chamador trata os dois como resposta uniforme (nunca revela qual).
+ * Resolve o devedor pelo documento no tenant. Discrimina o desfecho por `kind`:
+ *  - 'open'    → há dívida(s) aberta(s) (pending|in_negotiation): fluxo normal.
+ *  - 'settled' → sem aberta, mas com dívida(s) paga(s) ('paid'): quitado.
+ *  - 'none'    → não há cliente (inclui "só VMAX") OU não há dívida nenhuma.
+ *
+ * O chamador trata 'none' com a resposta uniforme (no_debt) e nunca revela se o
+ * documento existe na base. 'open' e 'settled' criam sessão normalmente.
  */
-export async function resolveByDocument(input: ResolveInput): Promise<ResolvedDebtor | null> {
+export async function resolveByDocument(input: ResolveInput): Promise<ResolveResult> {
   const doc = normalizeDocument(input.document)
-  if (!doc) return null
+  if (!doc) return { kind: "none" }
   const supabase = createServiceClient()
 
   // 1) cliente por documento — query DIRETA por valor (indexável, SEM o limite
@@ -125,20 +163,29 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolvedDe
     }
   }
 
-  if (!customer) return null // inexistente OU só-VMAX → null (auth.unresolved no chamador)
+  if (!customer) return { kind: "none" } // inexistente OU só-VMAX → 'none' (uniforme no chamador)
 
-  // 2) dívidas abertas (consolidado) — TODAS as pending/in_negotiation do cliente.
+  // 2) TODAS as dívidas do cliente no tenant (abertas + pagas). Uma única query;
+  //    separamos por status em memória. Ordenado por due_date asc → a primária/mais
+  //    antiga sai naturalmente.
   const { data: debts, error: debtErr } = await supabase
     .from("debts")
-    .select("id, status, amount, due_date")
+    .select("id, status, amount, due_date, updated_at")
     .eq("company_id", input.companyId)
     .eq("customer_id", customer.id)
-    .in("status", OPEN_DEBT_STATUSES as unknown as string[])
+    .in("status", [...OPEN_DEBT_STATUSES, ...PAID_DEBT_STATUSES] as unknown as string[])
     .order("due_date", { ascending: true })
   if (debtErr) throw new Error(`resolveByDocument/debts: ${debtErr.message}`)
 
-  const open = (debts ?? []) as DebtRow[]
-  if (open.length === 0) return null // sem dívida aberta → resposta uniforme
+  const rows = (debts ?? []) as DebtRow[]
+  const open = rows.filter((d) => (OPEN_DEBT_STATUSES as readonly string[]).includes(d.status))
+  const paid = rows.filter((d) => (PAID_DEBT_STATUSES as readonly string[]).includes(d.status))
+
+  // Sem dívida aberta: se há paga(s), quitado; senão, nada.
+  if (open.length === 0) {
+    if (paid.length === 0) return { kind: "none" } // sem dívida nenhuma → uniforme
+    return { kind: "settled", debtor: await consolidateSettled(supabase, input.companyId, customer, doc, paid) }
+  }
 
   const debtIds = open.map((d) => d.id)
   const primaryDebtId = debtIds[0] // ordenado por due_date asc → mais antiga
@@ -162,15 +209,71 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolvedDe
   const oldestDueDate = oldestInvoiceDue ?? oldestDebtDue
 
   return {
+    kind: "open",
+    debtor: {
+      customerId: customer.id,
+      customerName: customer.name ?? "",
+      document: doc,
+      debtIds,
+      primaryDebtId,
+      totalOpen: Math.round(totalOpen * 100) / 100,
+      agingDays: oldestDueDate ? agingFromDueDate(oldestDueDate) : 0,
+      invoiceCount: invoices?.length ?? open.length,
+      oldestDueDate,
+    },
+  }
+}
+
+/**
+ * Consolida as dívidas PAGAS de um cliente num `SettledDebtor`:
+ *   - totalPaid = soma dos valores das pagas (reais);
+ *   - oldestDueDate = vencimento mais antigo entre as pagas;
+ *   - paidAt = data de pagamento MAIS RECENTE.
+ *
+ * Fonte da data de pagamento (em ordem): `agreements.payment_received_at` (coluna
+ * canônica local, gravada pelo fluxo de webhook do ASAAS) › `agreements.asaas_payment_date`
+ * (data crua do ASAAS) › `debts.updated_at` (fallback: quando o pagamento foi
+ * conciliado a dívida foi marcada 'paid'). Os agreements são casados por debt_id.
+ */
+async function consolidateSettled(
+  supabase: ReturnType<typeof createServiceClient>,
+  companyId: string,
+  customer: CustomerRow,
+  doc: string,
+  paid: DebtRow[],
+): Promise<SettledDebtor> {
+  const paidDebtIds = paid.map((d) => d.id)
+  const totalPaid = paid.reduce((sum, d) => sum + Number(d.amount ?? 0), 0)
+  const oldestDueDate = paid.map((d) => d.due_date).filter(Boolean).sort()[0] ?? null
+
+  // acordos das dívidas pagas → melhor data de pagamento disponível.
+  const { data: agreements, error: agrErr } = await supabase
+    .from("agreements")
+    .select("debt_id, payment_received_at, asaas_payment_date")
+    .eq("company_id", companyId)
+    .in("debt_id", paidDebtIds)
+  if (agrErr) throw new Error(`resolveByDocument/agreements: ${agrErr.message}`)
+
+  // candidatos de data de pagamento (todas as fontes, mais recente vence).
+  const paidDates: string[] = []
+  for (const a of (agreements ?? []) as Array<{ payment_received_at: string | null; asaas_payment_date: string | null }>) {
+    const d = a.payment_received_at ?? a.asaas_payment_date
+    if (d) paidDates.push(d)
+  }
+  // fallback: debts.updated_at (o pagamento conciliado marcou a dívida 'paid').
+  if (paidDates.length === 0) {
+    for (const d of paid) if (d.updated_at) paidDates.push(d.updated_at)
+  }
+  const paidAt = paidDates.length > 0 ? paidDates.sort().slice(-1)[0] : null // mais recente
+
+  return {
     customerId: customer.id,
     customerName: customer.name ?? "",
     document: doc,
-    debtIds,
-    primaryDebtId,
-    totalOpen: Math.round(totalOpen * 100) / 100,
-    agingDays: oldestDueDate ? agingFromDueDate(oldestDueDate) : 0,
-    invoiceCount: invoices?.length ?? open.length,
+    paidDebtIds,
+    totalPaid: Math.round(totalPaid * 100) / 100,
     oldestDueDate,
+    paidAt,
   }
 }
 
