@@ -101,6 +101,85 @@ export async function createHandoffSession(input: CreateHandoffInput): Promise<C
   return { session, token, deep_link: deepLink }
 }
 
+// ===========================================================================
+// Reuso de sessão (A1.1): em vez de criar uma sessão nova a cada autenticação
+// do mesmo devedor, reaproveita a sessão 'open' mais recente que ainda esteja
+// dentro do TTL. Evita a proliferação de registros (ex.: 6 sessões do mesmo CPF
+// em 40 min). Espelha o reaproveitamento que o link /c/{token} já fazia.
+// ===========================================================================
+
+export interface ReusableSessionRow {
+  id: string
+  status: string | null
+  last_activity_at: string | null
+  reopen_count: number | null
+}
+
+/**
+ * Busca a sessão 'open' mais recente de (company_id, customer_id) cuja
+ * last_activity_at ainda esteja dentro de `ttlMinutes`. Devolve null quando não
+ * há candidata (sem sessão aberta OU a mais recente já expirou o TTL).
+ *
+ * A busca é servida pelo índice (company_id, customer_id, status, last_activity_at desc).
+ * Sem PII: só ids e timestamps.
+ */
+export async function findReusableOpenSession(input: {
+  companyId: string
+  customerId: string
+  ttlMinutes: number
+}): Promise<ReusableSessionRow | null> {
+  const supabase = createServiceClient()
+  const cutoff = new Date(Date.now() - input.ttlMinutes * 60_000).toISOString()
+  const { data } = await supabase
+    .from("negotiation_sessions")
+    .select("id, status, last_activity_at, reopen_count")
+    .eq("company_id", input.companyId)
+    .eq("customer_id", input.customerId)
+    .eq("status", "open")
+    .gte("last_activity_at", cutoff)
+    .order("last_activity_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  return (data as ReusableSessionRow) ?? null
+}
+
+/**
+ * REABRE uma sessão existente: bump de last_activity_at=now(), reopen_count+1 e
+ * consentimento/atividade renovados. NÃO recria a 1ª mensagem — o bootstrap de
+ * reconhecimento/quitação já é idempotente (não duplica). Devolve o mesmo id.
+ *
+ * `currentReopenCount` vem da candidata lida em findReusableOpenSession (mesma
+ * request), então o +1 não precisa de RPC — o reuso é 1 request por visita e a
+ * janela de corrida é desprezível.
+ */
+export async function reopenSession(input: {
+  sessionId: string
+  channel: string
+  userAgent: string | null
+  ipHash: string | null
+  currentReopenCount: number
+}): Promise<void> {
+  const supabase = createServiceClient()
+  const now = new Date().toISOString()
+  const { data, error } = await supabase
+    .from("negotiation_sessions")
+    .update({
+      last_activity_at: now,
+      updated_at: now,
+      consent_at: now,
+      consent_lgpd_at: now,
+      reopen_count: input.currentReopenCount + 1,
+      channel: input.channel,
+      user_agent: input.userAgent,
+      ip_hash: input.ipHash,
+    })
+    .eq("id", input.sessionId)
+    .select("id")
+  if (error || !data?.length) {
+    throw new Error(`falha ao reabrir negotiation_session ${input.sessionId}: ${error?.message ?? "0 linhas"}`)
+  }
+}
+
 export type ResolveTokenResult =
   | { ok: true; session: NegotiationSession; firstUse: boolean }
   | { ok: false; reason: "not_found" | "expired" | "already_used" }

@@ -9,6 +9,8 @@ const CO = "cccccccc-0000-0000-0000-000000000001"
 
 let db: FakeDb
 let resolveResult: any = null
+let reusableResult: any = null
+const reopenCalls: any[] = []
 
 vi.mock("@/lib/supabase/service", () => ({
   createServiceClient: () => makeFakeSupabase(db),
@@ -18,6 +20,11 @@ vi.mock("@/lib/journey/resolver", () => ({
 }))
 vi.mock("@/lib/negotiation/sessions", () => ({
   createHandoffSession: async () => ({ session: { id: "sess_new" }, token: "tok", deep_link: "x" }),
+  // sem sessão reutilizável por padrão → caminho de criação (asserções existentes).
+  findReusableOpenSession: async () => reusableResult,
+  reopenSession: async (input: any) => {
+    reopenCalls.push(input)
+  },
 }))
 vi.mock("@/lib/journey/events", () => ({ recordEvent: async () => ({ ok: true, duplicate: false }) }))
 vi.mock("@/lib/negotiation/crypto", () => ({
@@ -42,6 +49,8 @@ const UNIFORM = "Não foi possível confirmar seus dados. Verifique e tente nova
 
 function reset() {
   settledCalls.length = 0
+  reusableResult = null
+  reopenCalls.length = 0
   db = {
     tenant_chat_config: [{ company_id: CO, session_ttl_minutes: 30 }],
     negotiation_sessions: [{ id: "sess_new", company_id: CO }],
@@ -151,6 +160,15 @@ describe("authenticateByPublicLink", () => {
   it("captcha desligado (default) não bloqueia", async () => {
     const r = await auth({ captchaToken: null })
     expect(r.ok).toBe(true)
+  })
+
+  it("reuso: 2ª auth do mesmo cliente dentro do TTL reusa o session_id (link público)", async () => {
+    reusableResult = { id: "sess_existing", status: "open", last_activity_at: new Date().toISOString(), reopen_count: 2 }
+    const r = await auth()
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.sessionId).toBe("sess_existing")
+    expect(reopenCalls.length).toBe(1)
+    expect(reopenCalls[0]).toMatchObject({ sessionId: "sess_existing", currentReopenCount: 2, channel: "web_public_link" })
   })
 
   it("documento bloqueado (lock ativo) → blocked, sem revelar existência", async () => {

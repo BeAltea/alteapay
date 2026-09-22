@@ -244,36 +244,81 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
   const debtIds = resolved.kind === "open" ? resolved.debtor.debtIds : resolved.debtor.paidDebtIds
   const primaryDebtId = resolved.kind === "open" ? resolved.debtor.primaryDebtId : (resolved.debtor.paidDebtIds[0] ?? null)
 
-  const { createHandoffSession } = await import("@/lib/negotiation/sessions")
-  const created = await createHandoffSession({
-    company_id: input.companyId,
-    customer_id: customerId,
-    debt_id: primaryDebtId ?? undefined,
-    document: input.document,
-    channel_origin: "direct",
-    identity_verified: true,
-    debt_acknowledged: false,
+  const { createHandoffSession, findReusableOpenSession, reopenSession } = await import("@/lib/negotiation/sessions")
+
+  // A1.1 — REUSO: antes de criar uma sessão nova, procura a sessão 'open' mais
+  // recente do mesmo (company_id, customer_id) DENTRO do TTL. Se existir, REABRE
+  // (bump de atividade + reopen_count) e devolve o MESMO session_id/cookie, em vez
+  // de multiplicar registros do mesmo devedor. O bootstrap de reconhecimento/
+  // quitação abaixo é idempotente, então não recria a 1ª mensagem.
+  const reusable = await findReusableOpenSession({
+    companyId: input.companyId,
+    customerId,
+    ttlMinutes: input.sessionTtlMinutes,
   })
-  const sessionId = created.session.id
+
   const now = new Date().toISOString()
-  await input.supabase.from("negotiation_sessions").update({
-    debt_ids: debtIds,
-    primary_debt_id: primaryDebtId,
-    channel: input.channel,
-    status: "open",
-    engine: process.env.NEGOTIATION_ENGINE || "disabled",
-    consent_lgpd_at: now,
-    consent_lgpd_version: "journey-v1",
-    consent_at: now,
-    last_activity_at: now,
-    user_agent: input.userAgent,
-    ip_hash: input.ipHash,
-  }).eq("id", sessionId)
+  let sessionId: string
+  const reopened = reusable !== null
+
+  if (reusable) {
+    sessionId = reusable.id
+    await reopenSession({
+      sessionId,
+      channel: input.channel,
+      userAgent: input.userAgent,
+      ipHash: input.ipHash,
+      currentReopenCount: reusable.reopen_count ?? 0,
+    })
+  } else {
+    const created = await createHandoffSession({
+      company_id: input.companyId,
+      customer_id: customerId,
+      debt_id: primaryDebtId ?? undefined,
+      document: input.document,
+      channel_origin: "direct",
+      identity_verified: true,
+      debt_acknowledged: false,
+    })
+    sessionId = created.session.id
+    // Se havia uma sessão anterior FECHADA (fora do TTL), encadeia a nova nela
+    // para não perder a linha do tempo (previous_session_id).
+    const { data: prevClosed } = await input.supabase
+      .from("negotiation_sessions")
+      .select("id")
+      .eq("company_id", input.companyId)
+      .eq("customer_id", customerId)
+      .neq("id", sessionId)
+      .order("last_activity_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    await input.supabase.from("negotiation_sessions").update({
+      debt_ids: debtIds,
+      primary_debt_id: primaryDebtId,
+      channel: input.channel,
+      status: "open",
+      engine: process.env.NEGOTIATION_ENGINE || "disabled",
+      consent_lgpd_at: now,
+      consent_lgpd_version: "journey-v1",
+      consent_at: now,
+      first_opened_at: now,
+      last_activity_at: now,
+      previous_session_id: (prevClosed as { id: string } | null)?.id ?? null,
+      user_agent: input.userAgent,
+      ip_hash: input.ipHash,
+    }).eq("id", sessionId)
+  }
 
   const base = { companyId: input.companyId, customerId, debtId: primaryDebtId ?? undefined, sessionId }
-  await recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } })
-  await recordEvent({ ...base, type: "auth.success", actor: "customer" })
-  await recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } })
+  if (reopened) {
+    // Reuso: registra a reabertura (auditoria da consolidação) + auth.success.
+    await recordEvent({ ...base, type: "session.reopened" as unknown as Parameters<typeof recordEvent>[0]["type"], actor: "system", payload: { channel: input.channel } })
+    await recordEvent({ ...base, type: "auth.success", actor: "customer" })
+  } else {
+    await recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } })
+    await recordEvent({ ...base, type: "auth.success", actor: "customer" })
+    await recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } })
+  }
 
   if (resolved.kind === "open") {
     // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
