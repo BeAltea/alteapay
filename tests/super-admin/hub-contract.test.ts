@@ -103,8 +103,9 @@ vi.mock("@/lib/supabase/server", () => ({
   }),
 }))
 
-// campaigns: config do hub + avaliação/preview. Emula um excluído (ex1) para
-// provar o array `excluded` por-devedor com documento mascarado.
+// campaigns: config do hub + avaliação/preview MULTI-CANAL (F1). Emula c1 (só
+// WhatsApp, cobrança viva), c2 (só e-mail) e ex1 (excluído dos dois) para provar
+// o preview por-canal com documento mascarado.
 vi.mock("@/lib/journey/campaigns", async (orig) => {
   const actual = (await orig()) as any
   return {
@@ -112,7 +113,7 @@ vi.mock("@/lib/journey/campaigns", async (orig) => {
     loadTenantHubConfig: async () => ({
       cooldownDays: 7,
       minDebtValue: 0,
-      sendMode: "both" as SendMode, // both → allowedModes = todos os 3
+      sendMode: "whatsapp_chat" as SendMode,
       dispatchMode: "mock",
       provider: "mock",
       publicLinkCode: "k7Qm3Xb9Rt",
@@ -121,32 +122,67 @@ vi.mock("@/lib/journey/campaigns", async (orig) => {
       voxuyFlowId: null,
       voxuyPlanId: null,
     }),
-    evaluateHubEligibility: async ({ customerIds }: { customerIds: string[] }) => {
-      // c1 whatsapp elegível (com cobrança viva), c2 email elegível; ex1 excluído.
-      const all = [
-        { customerId: "c1", eligible: true, channel: "whatsapp", hasLiveCharge: true },
-        { customerId: "c2", eligible: true, channel: "email", hasLiveCharge: false },
-        { customerId: "ex1", eligible: false, reason: "sem_contato" },
-      ]
-      return all.filter((r) => customerIds.includes(r.customerId))
+    evaluateHubChannels: async ({ customerIds, channels }: { customerIds: string[]; channels: string[] }) => {
+      // c1: WhatsApp elegível (cobrança viva); c2: e-mail elegível; ex1: excluído.
+      const byId: Record<string, any> = {
+        c1: {
+          customerId: "c1",
+          hasBothContacts: false,
+          hasLiveCharge: true,
+          decisions: [
+            { customerId: "c1", channel: "whatsapp", eligible: true, hasLiveCharge: true },
+            { customerId: "c1", channel: "email", eligible: false, reason: "sem_contato_para_o_canal" },
+          ],
+        },
+        c2: {
+          customerId: "c2",
+          hasBothContacts: false,
+          hasLiveCharge: false,
+          decisions: [
+            { customerId: "c2", channel: "whatsapp", eligible: false, reason: "sem_contato_para_o_canal" },
+            { customerId: "c2", channel: "email", eligible: true },
+          ],
+        },
+        ex1: {
+          customerId: "ex1",
+          hasBothContacts: false,
+          decisions: [
+            { customerId: "ex1", channel: "whatsapp", eligible: false, reason: "sem_contato" },
+            { customerId: "ex1", channel: "email", eligible: false, reason: "sem_contato" },
+          ],
+        },
+      }
+      return customerIds
+        .filter((id) => byId[id])
+        .map((id) => ({
+          ...byId[id],
+          decisions: byId[id].decisions.filter((d: any) => channels.includes(d.channel)),
+        }))
     },
-    createHubCampaign: async () => ({ campaignId: "camp-1", evaluated: [], counts: {} }),
+    createHubCampaign: async () => ({ campaignId: "camp-1", evaluated: [], counts: {}, channelDecisions: [] }),
   }
 })
 
-// campaign-send: retorna items (status/reason) que a rota mapeia p/ results.
+// F4: resolução do template de e-mail (a rota só reporta fonte+nome no preview).
+// A resolução real é coberta em tests/email/resolve-default.test.ts.
+vi.mock("@/lib/email/templates/resolve-default", () => ({
+  resolveNegotiationTemplateInfo: async () => ({ source: "cedente", name: "Convite do Cedente" }),
+}))
+
+// campaign-send: retorna items por (devedor, canal) que a rota mapeia p/ results.
 vi.mock("@/lib/journey/campaign-send", () => ({
   runHubSend: async ({ dryRun }: { dryRun: boolean }) => ({
     campaignId: "camp-1",
-    mode: "both",
+    mode: "whatsapp_chat",
     dispatchMode: "queue",
     dryRun,
     items: [
       { customerId: "c1", channel: "whatsapp", status: "sent", messageId: "m1" },
       { customerId: "c2", channel: "email", status: "sent", messageId: "m2" },
-      { customerId: "ex1", status: "skipped", reason: "sem_contato" },
+      { customerId: "ex1", channel: "whatsapp", status: "skipped", reason: "sem_contato" },
+      { customerId: "ex1", channel: "email", status: "skipped", reason: "sem_contato" },
     ],
-    summary: { sent: 2, failed: 0, suppressed: 0, skipped: 1 },
+    summary: { sent: 2, failed: 0, suppressed: 0, skipped: 2 },
   }),
 }))
 
@@ -182,55 +218,67 @@ beforeEach(() => {
 })
 
 describe("send-preview — resposta casa com SendPreviewResponse (o diálogo lê)", () => {
-  it("customerIds explícitos: todos os campos que o diálogo consome existem e têm o tipo certo", async () => {
+  it("customerIds explícitos: todos os campos por-canal que o diálogo consome existem", async () => {
     const { POST } = await import("@/app/api/super-admin/negotiations/send-preview/route")
-    const res = await call(POST, { companyId: CO, customerIds: ["c1", "c2", "ex1"], mode: "whatsapp_chat" })
+    const res = await call(POST, { companyId: CO, customerIds: ["c1", "c2", "ex1"], channels: ["whatsapp", "email"] })
     expect(res.status).toBe(200)
     const data = (await res.json()) as SendPreviewResponse
 
     // campos LIDOS pelo send-dialog:
-    expect(typeof data.total).toBe("number")            // preview.total
-    expect(typeof data.byChannel.whatsapp).toBe("number") // preview.byChannel.whatsapp
-    expect(typeof data.byChannel.email).toBe("number")    // preview.byChannel.email
-    expect(typeof data.withLiveCharge).toBe("number")     // preview.withLiveCharge
-    expect(Array.isArray(data.allowedModes)).toBe(true)   // preview.allowedModes
-    expect(["whatsapp_chat", "charge_email", "both"]).toContain(data.mode) // preview.mode
-    // publicLink: string | null (o diálogo trata os dois casos)
+    expect(typeof data.total).toBe("number")                          // preview.total
+    expect(typeof data.perChannel.whatsapp.eligible).toBe("number")   // preview.perChannel.whatsapp.eligible
+    expect(typeof data.perChannel.email.eligible).toBe("number")      // preview.perChannel.email.eligible
+    expect(Array.isArray(data.perChannel.whatsapp.excluded)).toBe(true)
+    expect(Array.isArray(data.perChannel.email.excluded)).toBe(true)
+    expect(typeof data.bothCount).toBe("number")                      // preview.bothCount
+    expect(typeof data.hasBothContacts).toBe("number")                // preview.hasBothContacts
+    expect(typeof data.withLiveCharge).toBe("number")                 // preview.withLiveCharge
+    expect(Array.isArray(data.channels)).toBe(true)                   // preview.channels
+    expect(typeof data.dedupe).toBe("boolean")                        // preview.dedupe
     expect(data.publicLink === null || typeof data.publicLink === "string").toBe(true)
+    // F4: o preview reporta qual template o e-mail usará (fonte + nome).
+    expect(data.emailTemplate).toBeDefined()
+    expect(data.emailTemplate!.source).toBe("cedente")
+    expect(data.emailTemplate!.name).toBe("Convite do Cedente")
 
-    // valores esperados
+    // valores esperados (c1 → WhatsApp, c2 → e-mail, ex1 → excluído dos dois)
     expect(data.total).toBe(2)
-    expect(data.byChannel.whatsapp).toBe(1)
-    expect(data.byChannel.email).toBe(1)
-    expect(data.withLiveCharge).toBe(1)
+    expect(data.perChannel.whatsapp.eligible).toBe(1)
+    expect(data.perChannel.email.eligible).toBe(1)
+    expect(data.bothCount).toBe(0)
+    expect(data.withLiveCharge).toBe(1) // c1 tem cobrança viva
     expect(data.publicLink).toBe("https://alteapay.com/n/k7Qm3Xb9Rt")
-    // tenant é 'both' → os 3 modos permitidos (habilita a troca no diálogo)
-    expect(data.allowedModes).toEqual(["whatsapp_chat", "charge_email", "both"])
   })
 
-  it("excluded é um ARRAY por-devedor (não Record) com documentMasked + reason", async () => {
+  it("excluded por-canal é ARRAY por-devedor com documentMasked + reason", async () => {
     const { POST } = await import("@/app/api/super-admin/negotiations/send-preview/route")
-    const res = await call(POST, { companyId: CO, customerIds: ["c1", "c2", "ex1"] })
+    const res = await call(POST, { companyId: CO, customerIds: ["c1", "c2", "ex1"], channels: ["whatsapp", "email"] })
     const data = (await res.json()) as SendPreviewResponse
 
-    expect(Array.isArray(data.excluded)).toBe(true) // o diálogo faz .map/.length
-    expect(data.excluded.length).toBe(1)
-    const ex = data.excluded[0]
-    expect(ex.customerId).toBe("ex1")            // key do <li> e do map
-    expect(typeof ex.reason).toBe("string")      // <span>{e.reason}</span>
-    expect(typeof ex.documentMasked).toBe("string")
-    assertNoClearDocument(ex.documentMasked)     // documento NUNCA em claro
+    // WhatsApp exclui c2 (só e-mail) + ex1 (sem contato); e-mail exclui c1 + ex1.
+    for (const ch of ["whatsapp", "email"] as const) {
+      expect(Array.isArray(data.perChannel[ch].excluded)).toBe(true)
+      for (const ex of data.perChannel[ch].excluded) {
+        expect(typeof ex.customerId).toBe("string")
+        expect(typeof ex.reason).toBe("string")
+        expect(typeof ex.documentMasked).toBe("string")
+        assertNoClearDocument(ex.documentMasked) // documento NUNCA em claro
+      }
+    }
+    const waEx = data.perChannel.whatsapp.excluded.map((e) => e.customerId).sort()
+    expect(waEx).toEqual(["c2", "ex1"])
   })
 
   it("allFiltered é ACEITO (resolve ids no servidor) — não dá 400", async () => {
     const { POST } = await import("@/app/api/super-admin/negotiations/send-preview/route")
     const res = await call(POST, {
       companyId: CO,
+      channels: ["whatsapp", "email"],
       allFiltered: { filters: { companyId: CO, stages: ["dispatched", "in_chat"] }, expectedCount: 2 },
     })
     expect(res.status).toBe(200)
     const data = (await res.json()) as SendPreviewResponse
-    // os ids vieram de negotiation_state (c1, c2) → 2 elegíveis
+    // os ids vieram de negotiation_state (c1, c2) → 2 elegíveis (c1 WA, c2 email)
     expect(data.total).toBe(2)
   })
 
@@ -242,9 +290,9 @@ describe("send-preview — resposta casa com SendPreviewResponse (o diálogo lê
 })
 
 describe("send — resposta casa com SendResponse (o diálogo lê)", () => {
-  it("customerIds explícitos: dryRun, counts e results por-devedor com os tipos do contrato", async () => {
+  it("customerIds explícitos: dryRun, counts e results por (devedor, canal)", async () => {
     const { POST } = await import("@/app/api/super-admin/negotiations/send/route")
-    const res = await call(POST, { companyId: CO, customerIds: ["c1", "c2", "ex1"], mode: "whatsapp_chat", dryRun: true })
+    const res = await call(POST, { companyId: CO, customerIds: ["c1", "c2", "ex1"], channels: ["whatsapp", "email"], dryRun: true })
     expect(res.status).toBe(200)
     const data = (await res.json()) as SendResponse
 
@@ -263,19 +311,23 @@ describe("send — resposta casa com SendResponse (o diálogo lê)", () => {
       assertNoClearDocument(r.documentMasked)              // documento NUNCA em claro
     }
 
-    // valores esperados (mapeados de items→results)
-    expect(data.counts).toEqual({ sent: 2, failed: 0, suppressed: 0, skipped: 1 })
-    expect(data.results.length).toBe(3)
-    const ex = data.results.find((r) => r.customerId === "ex1")!
-    expect(ex.outcome).toBe("skipped")
-    expect(ex.detail).toBe("sem_contato")
+    // valores esperados (mapeados de items→results; ex1 excluído nos DOIS canais)
+    expect(data.counts).toEqual({ sent: 2, failed: 0, suppressed: 0, skipped: 2 })
+    expect(data.results.length).toBe(4)
+    expect(data.channels).toEqual(["whatsapp", "email"])
+    const ex1s = data.results.filter((r) => r.customerId === "ex1")
+    expect(ex1s.length).toBe(2)
+    for (const ex of ex1s) {
+      expect(ex.outcome).toBe("skipped")
+      expect(ex.detail).toBe("sem_contato")
+    }
   })
 
   it("allFiltered é ACEITO — não dá 400", async () => {
     const { POST } = await import("@/app/api/super-admin/negotiations/send/route")
     const res = await call(POST, {
       companyId: CO,
-      mode: "whatsapp_chat",
+      channels: ["whatsapp", "email"],
       dryRun: true,
       allFiltered: { filters: { companyId: CO, stages: ["dispatched", "in_chat"] }, expectedCount: 2 },
     })
@@ -284,9 +336,15 @@ describe("send — resposta casa com SendResponse (o diálogo lê)", () => {
     expect(Array.isArray(data.results)).toBe(true)
   })
 
+  it("nenhum canal marcado → 400", async () => {
+    const { POST } = await import("@/app/api/super-admin/negotiations/send/route")
+    const res = await call(POST, { companyId: CO, customerIds: ["c1"], channels: [], dryRun: true })
+    expect(res.status).toBe(400)
+  })
+
   it("sem customerIds e sem allFiltered → 400", async () => {
     const { POST } = await import("@/app/api/super-admin/negotiations/send/route")
-    const res = await call(POST, { companyId: CO, mode: "whatsapp_chat" })
+    const res = await call(POST, { companyId: CO, channels: ["whatsapp"] })
     expect(res.status).toBe(400)
   })
 })

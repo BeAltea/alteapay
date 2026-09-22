@@ -11,11 +11,18 @@ import { whatsappQueue } from "@/lib/queue/queues"
 import { recordEvent } from "./events"
 import { isSuppressed } from "./suppressions"
 import { issueActionTokens } from "./tokens"
-import { dispatchEmailInvite } from "./email-dispatch"
+import { dispatchEmailInvite, dispatchRenderedEmail } from "./email-dispatch"
+import {
+  resolveNegotiationTemplate,
+  renderTemplate,
+  type ResolvedTemplate,
+} from "@/lib/email/templates/resolve-default"
 import {
   loadTenantHubConfig,
-  evaluateHubEligibility,
+  evaluateHubChannels,
   type HubEligibilityResult,
+  type HubMultiChannelResult,
+  type HubChannel,
   type NegotiationSendMode,
 } from "./campaigns"
 
@@ -218,15 +225,16 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
 }
 
 // ===========================================================================
-// HUB DE ENVIO (link único) — orquestra o disparo por devedor.
+// HUB DE ENVIO (link único) — orquestra o disparo por devedor E CANAL.
 //
-// Diferente do worker de campanha (processCampaignMessage), esta função roteia
+// Diferente do worker de campanha (processCampaignMessage), esta função dispara
 // por CANAL (whatsapp → fila/inline; email → convite com o mesmo link) a partir
-// do snapshot da campanha do hub. Grava 1 whatsapp_messages por devedor com
-// `channel`, jobId determinístico SEM ':', journey_events e estágio.
+// do snapshot MULTI-CANAL da campanha do hub. Grava 1 whatsapp_messages por
+// (campaign_id, customer_id, channel), jobId determinístico SEM ':' com o canal,
+// journey_events e estágio. Cada canal é uma sequência independente (E3).
 // ===========================================================================
 
-/** Resultado por devedor no hub. */
+/** Resultado por (devedor, canal) no hub. */
 export interface HubSendItem {
   customerId: string
   channel?: "whatsapp" | "email"
@@ -245,9 +253,10 @@ export interface HubSendResult {
   summary: { sent: number; failed: number; suppressed: number; skipped: number }
 }
 
-/** jobId determinístico SEM ':' (regra BullMQ). */
-function hubJobId(campaignId: string, customerId: string): string {
-  return `hub_${campaignId}_${customerId}`
+/** jobId determinístico SEM ':' (regra BullMQ). Inclui o canal para que os dois
+ * canais do mesmo devedor tenham jobs distintos (E4). */
+function hubJobId(campaignId: string, customerId: string, channel: HubChannel): string {
+  return `hub_${channel}_${campaignId}_${customerId}`
 }
 
 /** Monta o link público único do cedente (/n/{code}). */
@@ -257,12 +266,239 @@ function publicLink(code: string | null): string | null {
   return `${base}/n/${code}`
 }
 
+/** Contexto de branding/link compartilhado por todos os envios de uma campanha. */
+interface HubSendContext {
+  campaignId: string
+  companyId: string
+  provider: string
+  link: string | null
+  brandName: string
+  creditorName: string
+  dispatchMode: "inline" | "queue"
+  /** F4: template de negociação resolvido (cedente→global→builtin), 1x por campanha. */
+  emailTemplate: ResolvedTemplate | null
+  /** contato de suporte para a variável {{contato_suporte}} (branding/env). */
+  supportContact: string
+}
+
+/**
+ * Insere (idempotente por (campaign_id, customer_id, channel)) a whatsapp_messages
+ * do canal e registra o evento `message.queued`. Retorna o id, ou um item de
+ * skip (já registrado) / falha (insert falhou).
+ */
+async function ensureChannelMessage(
+  supabase: ReturnType<typeof createServiceClient>,
+  ctx: HubSendContext,
+  d: { customerId: string; channel: HubChannel; debtIds?: string[]; phoneE164?: string },
+): Promise<{ id: string } | { skipped: HubSendItem } | { failed: HubSendItem }> {
+  const { data: existing } = await supabase
+    .from("whatsapp_messages")
+    .select("id, status")
+    .eq("campaign_id", ctx.campaignId)
+    .eq("customer_id", d.customerId)
+    .eq("channel", d.channel)
+    .maybeSingle()
+  if (existing) {
+    return { skipped: { customerId: d.customerId, channel: d.channel, status: "skipped", reason: "ja_registrado", messageId: existing.id } }
+  }
+  const { data: msg, error: msgErr } = await supabase
+    .from("whatsapp_messages")
+    .insert({
+      company_id: ctx.companyId,
+      campaign_id: ctx.campaignId,
+      customer_id: d.customerId,
+      debt_id: d.debtIds?.[0] ?? null,
+      phone_e164: d.phoneE164 ?? "",
+      provider: d.channel === "whatsapp" ? ctx.provider : "email",
+      channel: d.channel,
+      // espelho do canal no jsonb (queryável). Sem PII.
+      provider_payload: { channel: d.channel },
+      status: "queued",
+    })
+    .select("id")
+    .single()
+  if (msgErr || !msg) {
+    return { failed: { customerId: d.customerId, channel: d.channel, status: "failed", reason: msgErr?.message ?? "insert_failed" } }
+  }
+  await recordEvent({
+    companyId: ctx.companyId,
+    campaignId: ctx.campaignId,
+    messageId: msg.id,
+    customerId: d.customerId,
+    type: "message.queued",
+    actor: "system",
+    payload: { channel: d.channel },
+  })
+  return { id: msg.id }
+}
+
+/** Envia UMA decisão de WhatsApp (fila ou inline). Isolado por canal. */
+async function sendWhatsAppDecision(
+  supabase: ReturnType<typeof createServiceClient>,
+  ctx: HubSendContext,
+  d: { customerId: string; debtIds?: string[]; phoneE164?: string },
+): Promise<HubSendItem> {
+  const ensured = await ensureChannelMessage(supabase, ctx, { ...d, channel: "whatsapp" })
+  if ("skipped" in ensured) return ensured.skipped
+  if ("failed" in ensured) return ensured.failed
+  const messageId = ensured.id
+  const jobId = hubJobId(ctx.campaignId, d.customerId, "whatsapp")
+  if (ctx.dispatchMode === "queue") {
+    await whatsappQueue.add(
+      "campaign-message",
+      { kind: "campaign-message", messageId },
+      { jobId },
+    )
+    return { customerId: d.customerId, channel: "whatsapp", status: "sent", reason: "queued", messageId, jobId }
+  }
+  const outcome = await processCampaignMessage(messageId)
+  return {
+    customerId: d.customerId,
+    channel: "whatsapp",
+    status: outcome === "sent" ? "sent" : outcome === "suppressed" ? "suppressed" : outcome === "skipped" ? "skipped" : "failed",
+    messageId,
+  }
+}
+
+/** Primeiro nome do destinatário (para a variável {{primeiro_nome}}). Sem PII no log. */
+function firstNameOf(name: string | null | undefined): string {
+  return (name ?? "").trim().split(/\s+/)[0] ?? ""
+}
+
+/**
+ * Monta o mapa de variáveis da ALLOWLIST para o render do template (F4). NUNCA
+ * inclui valores/documentos do débito — só os campos neutros permitidos.
+ */
+function buildTemplateVars(ctx: HubSendContext, firstName: string): Record<string, string> {
+  return {
+    primeiro_nome: firstName,
+    credor: ctx.creditorName,
+    marca: ctx.brandName,
+    // {{link_negociacao}} e {{link_descadastro}} apontam para o MESMO link opaco
+    // do hub (/n/{code}); o opt-out acontece pós-login (sem rota dedicada).
+    link_negociacao: ctx.link ?? "",
+    link_descadastro: ctx.link ?? "",
+    contato_suporte: ctx.supportContact,
+    ano: String(new Date().getFullYear()),
+  }
+}
+
+/**
+ * Envia UMA decisão de e-mail (mesmo link /n/{code}). Isolado por canal.
+ *
+ * F4: ANTES de despachar, usa o template de negociação resolvido do cedente
+ * (ctx.emailTemplate: cedente→global→builtin). Renderiza com a allowlist +
+ * re-sanitiza. Se o template resolvido for de cedente/global, dispara o corpo
+ * renderizado e GRAVA email_template_id + email_template_version_id na linha da
+ * whatsapp_messages. Se for builtin (ou o render caiu para o builtin), usa o
+ * convite embutido e as colunas ficam NULL.
+ */
+async function sendEmailDecision(
+  supabase: ReturnType<typeof createServiceClient>,
+  ctx: HubSendContext,
+  d: { customerId: string; debtIds?: string[]; email?: string; firstName?: string },
+): Promise<HubSendItem> {
+  const ensured = await ensureChannelMessage(supabase, ctx, { customerId: d.customerId, channel: "email", debtIds: d.debtIds })
+  if ("skipped" in ensured) return ensured.skipped
+  if ("failed" in ensured) return ensured.failed
+  const messageId = ensured.id
+
+  if (!ctx.link) {
+    await supabase.from("whatsapp_messages").update({ status: "failed", error: "sem_link_publico" }).eq("id", messageId)
+    await recordEvent({
+      companyId: ctx.companyId, campaignId: ctx.campaignId, messageId, customerId: d.customerId,
+      type: "message.failed", actor: "system", payload: { channel: "email", reason: "sem_link_publico" },
+    })
+    return { customerId: d.customerId, channel: "email", status: "failed", reason: "sem_link_publico", messageId }
+  }
+
+  const firstName = d.firstName ?? ""
+  const builtinCtx = {
+    firstName,
+    brandName: ctx.brandName,
+    creditorName: ctx.creditorName,
+    link: ctx.link,
+  }
+
+  // Resolve subject/html/text a partir do template do cedente (fallback embutido).
+  const resolved = ctx.emailTemplate ?? { source: "builtin" as const, subject: "", preheader: "", html: "", text: "" }
+  let emailRes: { ok: boolean; jobId?: string; error?: string }
+  // colunas de referência: preenchidas SÓ quando o template NÃO é builtin e o
+  // render usou de fato o template (não caiu para o builtin).
+  let templateId: string | null = null
+  let versionId: string | null = null
+
+  if (resolved.source !== "builtin") {
+    const rendered = renderTemplate(resolved, buildTemplateVars(ctx, firstName), builtinCtx)
+    if (rendered.ok && !rendered.fellBackToBuiltin) {
+      templateId = resolved.templateId ?? null
+      versionId = resolved.versionId ?? null
+      emailRes = await dispatchRenderedEmail({
+        to: d.email ?? "",
+        subject: rendered.subject,
+        html: rendered.html,
+        text: rendered.text,
+        link: ctx.link,
+        companyId: ctx.companyId,
+        customerId: d.customerId,
+      })
+    } else {
+      // render caiu para o builtin (variável proibida / sem links): usa o convite
+      // embutido e mantém as colunas NULL.
+      emailRes = await dispatchEmailInvite({
+        to: d.email ?? "", customerName: firstName, brandName: ctx.brandName,
+        creditorName: ctx.creditorName, link: ctx.link, companyId: ctx.companyId, customerId: d.customerId,
+      })
+    }
+  } else {
+    // builtin puro: convite embutido, colunas NULL.
+    emailRes = await dispatchEmailInvite({
+      to: d.email ?? "", customerName: firstName, brandName: ctx.brandName,
+      creditorName: ctx.creditorName, link: ctx.link, companyId: ctx.companyId, customerId: d.customerId,
+    })
+  }
+
+  const now = new Date().toISOString()
+  if (emailRes.ok) {
+    await supabase.from("whatsapp_messages").update({
+      status: "sent", sent_at: now, provider_message_id: emailRes.jobId ?? null,
+      email_template_id: templateId, email_template_version_id: versionId,
+      status_history: [{ at: now, to: "sent", channel: "email" }],
+    }).eq("id", messageId)
+    await recordEvent({
+      companyId: ctx.companyId, campaignId: ctx.campaignId, messageId, customerId: d.customerId,
+      type: "message.sent", actor: "system",
+      payload: { channel: "email", templateSource: templateId ? "template" : "builtin" },
+    })
+    return { customerId: d.customerId, channel: "email", status: "sent", messageId, jobId: emailRes.jobId }
+  }
+  await supabase.from("whatsapp_messages").update({
+    status: "failed", error: emailRes.error ?? "email_failed",
+    status_history: [{ at: now, to: "failed", channel: "email", error: emailRes.error }],
+  }).eq("id", messageId)
+  await recordEvent({
+    companyId: ctx.companyId, campaignId: ctx.campaignId, messageId, customerId: d.customerId,
+    type: "message.failed", actor: "system", payload: { channel: "email", error: emailRes.error },
+  })
+  return { customerId: d.customerId, channel: "email", status: "failed", reason: emailRes.error, messageId }
+}
+
+function tallySummary(items: HubSendItem[]): HubSendResult["summary"] {
+  return {
+    sent: items.filter((i) => i.status === "sent").length,
+    failed: items.filter((i) => i.status === "failed").length,
+    suppressed: items.filter((i) => i.status === "suppressed").length,
+    skipped: items.filter((i) => i.status === "skipped").length,
+  }
+}
+
 /**
  * Executa o envio do hub a partir do snapshot da campanha (já criada por
- * createHubCampaign). REVERIFICA cada devedor no envio (estado pode ter mudado)
- * e roteia por canal. `dryRun` devolve o resultado completo sem escrever nem
- * enviar. `dispatchMode='inline'` dispara na request (com teto/rate-limit no
- * chamador); 'queue' enfileira o job de WhatsApp e envia e-mail direto.
+ * createHubCampaign). REVERIFICA cada devedor no envio (estado pode ter mudado) e
+ * dispara por CANAL. Cada canal é uma SEQUÊNCIA INDEPENDENTE (E3): uma falha no
+ * e-mail não afeta o WhatsApp e vice-versa. `dryRun` devolve o resultado completo
+ * sem escrever nem enviar. `dispatchMode='inline'` dispara na request (com
+ * teto/rate-limit no chamador); 'queue' enfileira o WhatsApp e envia e-mail direto.
  */
 export async function runHubSend(input: {
   campaignId: string
@@ -280,10 +516,16 @@ export async function runHubSend(input: {
   if (error || !campaign) throw new Error("campanha não encontrada")
 
   const snapshot = campaign.selection_snapshot as {
-    evaluated: HubEligibilityResult[]
+    evaluated?: HubEligibilityResult[]
+    channel_decisions?: HubMultiChannelResult[]
+    channels?: HubChannel[]
+    dedupe?: boolean
     send_mode?: NegotiationSendMode
   }
   const mode: NegotiationSendMode = snapshot?.send_mode ?? "whatsapp_chat"
+  const channels: HubChannel[] =
+    snapshot?.channels && snapshot.channels.length > 0 ? snapshot.channels : ["whatsapp", "email"]
+  const dedupe = snapshot?.dedupe ?? false
   const hub = await loadTenantHubConfig(input.companyId)
   const link = publicLink(hub.publicLinkCode)
 
@@ -297,166 +539,127 @@ export async function runHubSend(input: {
     .select("branding, whatsapp_sender_label")
     .eq("company_id", input.companyId)
     .maybeSingle()
-  const branding = (cfg?.branding ?? {}) as { brand_name?: string; creditor_name?: string }
+  const branding = (cfg?.branding ?? {}) as { brand_name?: string; creditor_name?: string; support_email?: string }
   const brandName = branding.brand_name ?? "AlteaPay"
   const creditorName = branding.creditor_name ?? company?.name ?? brandName
+  const supportContact =
+    branding.support_email ?? process.env.SENDGRID_FROM_EMAIL ?? "suporte@alteapay.com"
 
-  // Reverifica TODO o snapshot no envio (supressão/contato/dívida/cooldown/já
-  // contatado). O snapshot é congelado, mas o mundo pode ter mudado.
-  const snapshotIds = (snapshot?.evaluated ?? [])
-    .filter((e) => e.eligible)
-    .map((e) => e.customerId)
-  const reverified = await evaluateHubEligibility({
+  // F4: resolve UMA vez por campanha o template de negociação por e-mail do
+  // cedente (cedente→global→builtin). Só quando o canal e-mail está ativo e não é
+  // dry run (o dry run não renderiza/envia). O builtin usa o link do hub.
+  let emailTemplate: ResolvedTemplate | null = null
+  if (channels.includes("email") && !input.dryRun) {
+    emailTemplate = await resolveNegotiationTemplate(
+      input.companyId,
+      { brandName, creditorName, link: link ?? "" },
+      supabase,
+    )
+  }
+
+  // Reverifica TODO o snapshot no envio (multi-canal). O snapshot é congelado,
+  // mas o mundo pode ter mudado (supressão/contato/dívida/cooldown/já contatado).
+  const snapshotIds = Array.from(
+    new Set((snapshot?.channel_decisions ?? []).map((r) => r.customerId)),
+  )
+  const reverified = await evaluateHubChannels({
     companyId: input.companyId,
     customerIds: snapshotIds,
     cooldownDays: hub.cooldownDays,
     minDebtValue: hub.minDebtValue,
     campaignId: input.campaignId,
+    channels,
+    dedupe,
   })
+
+  const ctx: HubSendContext = {
+    campaignId: input.campaignId,
+    companyId: input.companyId,
+    provider: campaign.provider,
+    link,
+    brandName,
+    creditorName,
+    dispatchMode: input.dispatchMode,
+    emailTemplate,
+    supportContact,
+  }
+
+  // Nomes (só p/ {{primeiro_nome}}) dos devedores elegíveis por e-mail. Uma busca
+  // em lote, sem outros dados (nunca documento/valor). Vazio quando não há e-mail.
+  const emailFirstNames = new Map<string, string>()
+  if (channels.includes("email") && !input.dryRun) {
+    const emailIds = Array.from(
+      new Set(
+        reverified.flatMap((r) =>
+          r.decisions.filter((x) => x.channel === "email" && x.eligible).map((x) => x.customerId),
+        ),
+      ),
+    )
+    if (emailIds.length > 0) {
+      const { data: names } = await supabase
+        .from("customers")
+        .select("id, name")
+        .eq("company_id", input.companyId)
+        .in("id", emailIds)
+      for (const c of (names ?? []) as { id: string; name: string | null }[]) {
+        emailFirstNames.set(c.id, firstNameOf(c.name))
+      }
+    }
+  }
 
   const items: HubSendItem[] = []
 
+  // Exclusões por (devedor, canal) inelegível — reportadas uma vez cada. Supressão
+  // vira suppressed; sem_contato_para_o_canal/priorizado_whatsapp/cooldown/etc. =
+  // skipped (nunca troca silenciosa: o canal sempre aparece com o motivo).
   for (const r of reverified) {
-    if (!r.eligible || !r.channel) {
-      items.push({
-        customerId: r.customerId,
-        status: r.reason === "suprimido" ? "suppressed" : "skipped",
-        reason: r.reason,
-      })
-      continue
+    for (const d of r.decisions) {
+      if (d.eligible) continue
+      const status: HubSendItem["status"] = d.reason === "suprimido" ? "suppressed" : "skipped"
+      items.push({ customerId: d.customerId, channel: d.channel, status, reason: d.reason })
     }
+  }
 
-    if (input.dryRun) {
-      items.push({ customerId: r.customerId, channel: r.channel, status: "sent", reason: "dry_run" })
-      continue
-    }
-
-    // 1 registro por devedor. jobId determinístico SEM ':'.
-    const jobId = hubJobId(input.campaignId, r.customerId)
-    const { data: existing } = await supabase
-      .from("whatsapp_messages")
-      .select("id, status")
-      .eq("campaign_id", input.campaignId)
-      .eq("customer_id", r.customerId)
-      .maybeSingle()
-    if (existing) {
-      items.push({ customerId: r.customerId, channel: r.channel, status: "skipped", reason: "ja_registrado", messageId: existing.id })
-      continue
-    }
-
-    const { data: msg, error: msgErr } = await supabase
-      .from("whatsapp_messages")
-      .insert({
-        company_id: input.companyId,
-        campaign_id: input.campaignId,
-        customer_id: r.customerId,
-        debt_id: r.debtIds?.[0] ?? null,
-        phone_e164: r.phoneE164 ?? "",
-        provider: r.channel === "whatsapp" ? campaign.provider : "email",
-        channel: r.channel,
-        // espelho do canal no jsonb (queryável mesmo antes da coluna `channel`
-        // ser aplicada; ver request T2-2). Sem PII.
-        provider_payload: { channel: r.channel },
-        status: "queued",
-      })
-      .select("id")
-      .single()
-    if (msgErr || !msg) {
-      items.push({ customerId: r.customerId, channel: r.channel, status: "failed", reason: msgErr?.message ?? "insert_failed" })
-      continue
-    }
-
-    await recordEvent({
-      companyId: input.companyId,
-      campaignId: input.campaignId,
-      messageId: msg.id,
-      customerId: r.customerId,
-      type: "message.queued",
-      actor: "system",
-      payload: { channel: r.channel },
-    })
-    // A projeção negotiation_state é atualizada pelo gancho global em recordEvent
-    // (o payload.channel já viaja acima) — sem chamada direta aqui.
-
-    // ---- roteamento por canal
-    if (r.channel === "whatsapp") {
-      if (input.dispatchMode === "queue") {
-        await whatsappQueue.add(
-          "campaign-message",
-          { kind: "campaign-message", messageId: msg.id },
-          { jobId },
-        )
-        items.push({ customerId: r.customerId, channel: "whatsapp", status: "sent", reason: "queued", messageId: msg.id, jobId })
-      } else {
-        const outcome = await processCampaignMessage(msg.id)
-        items.push({
-          customerId: r.customerId,
-          channel: "whatsapp",
-          status: outcome === "sent" ? "sent" : outcome === "suppressed" ? "suppressed" : outcome === "skipped" ? "skipped" : "failed",
-          messageId: msg.id,
-        })
+  if (input.dryRun) {
+    for (const r of reverified) {
+      for (const d of r.decisions) {
+        if (d.eligible) items.push({ customerId: d.customerId, channel: d.channel, status: "sent", reason: "dry_run" })
       }
-      continue
     }
+    return { campaignId: input.campaignId, mode, dispatchMode: input.dispatchMode, dryRun: input.dryRun, items, summary: tallySummary(items) }
+  }
 
-    // ---- e-mail: mesmo link /n/{code}, sem cobrança
-    if (!link) {
-      await supabase.from("whatsapp_messages").update({ status: "failed", error: "sem_link_publico" }).eq("id", msg.id)
-      await recordEvent({
-        companyId: input.companyId, campaignId: input.campaignId, messageId: msg.id, customerId: r.customerId,
-        type: "message.failed", actor: "system", payload: { reason: "sem_link_publico" },
-      })
-      items.push({ customerId: r.customerId, channel: "email", status: "failed", reason: "sem_link_publico", messageId: msg.id })
-      continue
-    }
-    const emailRes = await dispatchEmailInvite({
-      to: r.email ?? "",
-      customerName: "",
-      brandName,
-      creditorName,
-      link,
-      companyId: input.companyId,
-      customerId: r.customerId,
-    })
-    const now = new Date().toISOString()
-    if (emailRes.ok) {
-      await supabase.from("whatsapp_messages").update({
-        status: "sent", sent_at: now, provider_message_id: emailRes.jobId ?? null,
-        status_history: [{ at: now, to: "sent", channel: "email" }],
-      }).eq("id", msg.id)
-      await recordEvent({
-        companyId: input.companyId, campaignId: input.campaignId, messageId: msg.id, customerId: r.customerId,
-        type: "message.sent", actor: "system", payload: { channel: "email" },
-      })
-      // projeção negotiation_state atualizada pelo gancho global em recordEvent.
-      items.push({ customerId: r.customerId, channel: "email", status: "sent", messageId: msg.id, jobId: emailRes.jobId })
-    } else {
-      await supabase.from("whatsapp_messages").update({
-        status: "failed", error: emailRes.error ?? "email_failed",
-        status_history: [{ at: now, to: "failed", channel: "email", error: emailRes.error }],
-      }).eq("id", msg.id)
-      await recordEvent({
-        companyId: input.companyId, campaignId: input.campaignId, messageId: msg.id, customerId: r.customerId,
-        type: "message.failed", actor: "system", payload: { channel: "email", error: emailRes.error },
-      })
-      items.push({ customerId: r.customerId, channel: "email", status: "failed", reason: emailRes.error, messageId: msg.id })
+  // ---- envio real, POR CANAL, em sequências INDEPENDENTES.
+  // Cada canal roda seu próprio laço; um throw dentro de um canal é capturado e
+  // vira item 'failed' daquele (devedor, canal), sem abortar o outro canal.
+  for (const channel of channels) {
+    for (const r of reverified) {
+      const d = r.decisions.find((x) => x.channel === channel && x.eligible)
+      if (!d) continue
+      try {
+        const item =
+          channel === "whatsapp"
+            ? await sendWhatsAppDecision(supabase, ctx, { customerId: d.customerId, debtIds: d.debtIds, phoneE164: d.phoneE164 })
+            : await sendEmailDecision(supabase, ctx, {
+                customerId: d.customerId,
+                debtIds: d.debtIds,
+                email: d.email,
+                firstName: emailFirstNames.get(d.customerId) ?? "",
+              })
+        items.push(item)
+      } catch (e) {
+        // isolamento entre canais (E3): a exceção não escapa e não afeta o outro.
+        items.push({ customerId: d.customerId, channel, status: "failed", reason: (e as Error)?.message ?? "send_failed" })
+      }
     }
   }
 
   // status da campanha (não mexe se pausada por config-error do provider)
-  if (!input.dryRun) {
-    await supabase
-      .from("whatsapp_campaigns")
-      .update({ status: "running", started_at: campaign.started_at ?? new Date().toISOString() })
-      .eq("id", input.campaignId)
-      .in("status", ["draft", "scheduled", "running"])
-  }
+  await supabase
+    .from("whatsapp_campaigns")
+    .update({ status: "running", started_at: campaign.started_at ?? new Date().toISOString() })
+    .eq("id", input.campaignId)
+    .in("status", ["draft", "scheduled", "running"])
 
-  const summary = {
-    sent: items.filter((i) => i.status === "sent").length,
-    failed: items.filter((i) => i.status === "failed").length,
-    suppressed: items.filter((i) => i.status === "suppressed").length,
-    skipped: items.filter((i) => i.status === "skipped").length,
-  }
-  return { campaignId: input.campaignId, mode, dispatchMode: input.dispatchMode, dryRun: input.dryRun, items, summary }
+  return { campaignId: input.campaignId, mode, dispatchMode: input.dispatchMode, dryRun: input.dryRun, items, summary: tallySummary(items) }
 }

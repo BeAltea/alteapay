@@ -24,6 +24,7 @@ class QB {
   constructor(private t: string) {}
   select() { return this }
   eq(col: string, val: any) { this.filters.push({ op: "eq", col, val }); return this }
+  neq(col: string, val: any) { this.filters.push({ op: "neq", col, val }); return this }
   in(col: string, val: any[]) { this.filters.push({ op: "in", col, val }); return this }
   gte(col: string, val: any) { this.filters.push({ op: "gte", col, val }); return this }
   not(col: string) { this.filters.push({ op: "notNull", col }); return this }
@@ -43,6 +44,7 @@ class QB {
     const v = r[f.col]
     switch (f.op) {
       case "eq": return v === f.val
+      case "neq": return v !== f.val
       case "in": return Array.isArray(f.val) && f.val.includes(v)
       case "gte": return v != null && v >= f.val
       case "notNull": return v != null
@@ -103,8 +105,22 @@ vi.mock("@/lib/queue/queues", () => ({
 }))
 vi.mock("@/lib/journey/events", () => ({ recordEvent: async () => ({ ok: true, duplicate: false }) }))
 vi.mock("@/lib/journey/negotiation-state", () => ({ applyJourneyEventToState: async () => ({ ok: true }) }))
+let renderedCalls: any[] = []
 vi.mock("@/lib/journey/email-dispatch", () => ({
-  dispatchEmailInvite: async (i: any) => { emailCalls.push(i); return { ok: true, jobId: "email_job" } },
+  dispatchEmailInvite: async (i: any) => {
+    emailCalls.push(i)
+    // teste de isolamento (E3): e-mail para "boom@" estoura — não pode afetar WA.
+    if (String(i.to).includes("boom")) throw new Error("smtp_explodiu")
+    return { ok: true, jobId: "email_job" }
+  },
+  // F4: envio de template já renderizado (padrão do cedente/global).
+  dispatchRenderedEmail: async (i: any) => {
+    renderedCalls.push(i)
+    if (String(i.to).includes("boom")) throw new Error("smtp_explodiu")
+    return { ok: true, jobId: "rendered_job" }
+  },
+  // usado pelo resolver (resolve-default.builtinTemplate) no fallback embutido.
+  buildEmailInviteHtml: (i: any) => `<html><body>convite ${i.link}</body></html>`,
 }))
 vi.mock("@/lib/journey/suppressions", () => ({ isSuppressed: async () => false }))
 vi.mock("@/lib/asaas-idempotency", () => ({ findBlockingAgreement: () => null }))
@@ -117,9 +133,10 @@ function seedCustomer(id: string, over: Partial<Row> = {}) {
 }
 
 beforeEach(() => {
-  db = { customers: [], debts: [], agreements: [], negotiation_cases: [], whatsapp_messages: [], whatsapp_campaigns: [], tenant_chat_config: [], companies: [], negotiation_condition_matrix: [] }
+  db = { customers: [], debts: [], agreements: [], negotiation_cases: [], whatsapp_messages: [], whatsapp_campaigns: [], tenant_chat_config: [], companies: [], negotiation_condition_matrix: [], email_template_defaults: [], email_templates: [], email_template_versions: [] }
   queued = []
   emailCalls = []
+  renderedCalls = []
   processed = []
   db.companies.push({ id: CO, name: "VMAX" })
   db.tenant_chat_config.push({
@@ -162,6 +179,36 @@ describe("summarizeHubEligibility (puro)", () => {
   })
 })
 
+describe("createHubCampaign — idempotência (A1)", () => {
+  it("mesma chave (double-click/retry) reusa a MESMA campanha; chave nova cria outra", async () => {
+    seedCustomer("ci", { phone: "11999998888", email: "ci@dominio.com" })
+    const { createHubCampaign } = await import("@/lib/journey/campaigns")
+    // channels omitido → createHubCampaign default-a para ambos (whatsapp+email).
+    const base = {
+      companyId: CO, name: "Hub teste", templateKey: "hub_link", customerIds: ["ci"],
+      sendMode: "whatsapp_chat" as const, provider: "mock",
+    }
+    const a = await createHubCampaign({ ...base, idempotencyKey: "K1" })
+    expect(db.whatsapp_campaigns.length).toBe(1)
+
+    // 2ª chamada com a MESMA chave: não cria nova campanha, devolve a mesma.
+    const b = await createHubCampaign({ ...base, idempotencyKey: "K1" })
+    expect(b.campaignId).toBe(a.campaignId)
+    expect(b.deduped).toBe(true)
+    expect(db.whatsapp_campaigns.length).toBe(1)
+
+    // chave NOVA = intenção nova = campanha nova.
+    const c = await createHubCampaign({ ...base, idempotencyKey: "K2" })
+    expect(c.campaignId).not.toBe(a.campaignId)
+    expect(db.whatsapp_campaigns.length).toBe(2)
+
+    // sem chave: comportamento antigo (sempre cria) — não deve deduplicar.
+    const d = await createHubCampaign({ ...base })
+    expect(d.deduped).toBeFalsy()
+    expect(db.whatsapp_campaigns.length).toBe(3)
+  })
+})
+
 describe("evaluateHubEligibility — precedência de canal", () => {
   it("celular válido → whatsapp; só e-mail → email; nenhum → sem_contato", async () => {
     seedCustomer("wa", { phone: "11999998888", email: "wa@x.com" })
@@ -189,33 +236,98 @@ describe("evaluateHubEligibility — precedência de canal", () => {
   })
 })
 
-describe("runHubSend — roteamento e jobId", () => {
-  async function makeCampaign(mode: string, evaluated: any[]) {
+describe("evaluateHubChannels + summarizeHubChannels — seleção de canal (F1)", () => {
+  it("3 clientes (só-celular / só-email / ambos): contagens por canal + cruzamento", async () => {
+    seedCustomer("soWa", { phone: "11999998888", email: "naotem@vmax" }) // só celular
+    seedCustomer("soMail", { phone: "1122", email: "mail@dominio.com" })  // só e-mail
+    seedCustomer("ambos", { phone: "11977776666", email: "ambos@dominio.com" }) // os dois
+    const { evaluateHubChannels, summarizeHubChannels } = await import("@/lib/journey/campaigns")
+    const decisions = await evaluateHubChannels({
+      companyId: CO, customerIds: ["soWa", "soMail", "ambos"], cooldownDays: 7, minDebtValue: 0,
+      channels: ["whatsapp", "email"], dedupe: false,
+    })
+    const c = summarizeHubChannels(decisions, ["whatsapp", "email"])
+    // WhatsApp: soWa + ambos; e-mail: soMail + ambos.
+    expect(c.perChannel.whatsapp.eligible).toBe(2)
+    expect(c.perChannel.email.eligible).toBe(2)
+    // cruzamento: só "ambos" recebe pelos dois.
+    expect(c.bothCount).toBe(1)
+    expect(c.hasBothContacts).toBe(1)
+    // total de DEVEDORES distintos que recebem por >=1 canal.
+    expect(c.total).toBe(3)
+    // exclusões por-canal: soMail sem WhatsApp; soWa sem e-mail.
+    expect(c.perChannel.whatsapp.excluded.map((d) => d.customerId)).toContain("soMail")
+    expect(c.perChannel.whatsapp.excluded.find((d) => d.customerId === "soMail")!.reason).toBe("sem_contato_para_o_canal")
+    expect(c.perChannel.email.excluded.map((d) => d.customerId)).toContain("soWa")
+  })
+
+  it("desmarcar WhatsApp: só-celular vira exclusão sem_contato_para_o_canal (nunca troca silenciosa)", async () => {
+    seedCustomer("soWa", { phone: "11999998888", email: "naotem@vmax" })
+    const { evaluateHubChannels } = await import("@/lib/journey/campaigns")
+    const decisions = await evaluateHubChannels({
+      companyId: CO, customerIds: ["soWa"], cooldownDays: 7, minDebtValue: 0,
+      channels: ["email"], dedupe: false, // só e-mail marcado
+    })
+    const d = decisions[0].decisions.find((x) => x.channel === "email")!
+    expect(d.eligible).toBe(false)
+    expect(d.reason).toBe("sem_contato_para_o_canal")
+    // o WhatsApp NÃO aparece (canal desmarcado) — nunca é usado silenciosamente.
+    expect(decisions[0].decisions.some((x) => x.channel === "whatsapp")).toBe(false)
+  })
+
+  it("não duplicar: quem tem os dois vai só por WhatsApp (e-mail = priorizado_whatsapp)", async () => {
+    seedCustomer("ambos", { phone: "11977776666", email: "ambos@dominio.com" })
+    const { evaluateHubChannels, summarizeHubChannels } = await import("@/lib/journey/campaigns")
+    const decisions = await evaluateHubChannels({
+      companyId: CO, customerIds: ["ambos"], cooldownDays: 7, minDebtValue: 0,
+      channels: ["whatsapp", "email"], dedupe: true,
+    })
+    const wa = decisions[0].decisions.find((x) => x.channel === "whatsapp")!
+    const em = decisions[0].decisions.find((x) => x.channel === "email")!
+    expect(wa.eligible).toBe(true)
+    expect(em.eligible).toBe(false)
+    expect(em.reason).toBe("priorizado_whatsapp")
+    // com dedupe, bothCount = 0 (ninguém recebe pelos dois).
+    const c = summarizeHubChannels(decisions, ["whatsapp", "email"])
+    expect(c.bothCount).toBe(0)
+    expect(c.hasBothContacts).toBe(1) // ainda TEM os dois contatos
+  })
+})
+
+describe("runHubSend — roteamento por canal e jobId", () => {
+  // O snapshot novo carrega channel_decisions (multi-canal) + channels + dedupe.
+  async function makeCampaign(channels: string[], customerIds: string[], dedupe = false) {
     const cid = `camp_${Math.random().toString(36).slice(2, 8)}`
     db.whatsapp_campaigns.push({
       id: cid, company_id: CO, provider: "mock", template_key: "hub_link", status: "draft",
-      selection_snapshot: { send_mode: mode, evaluated }, counts: {}, started_at: null,
+      selection_snapshot: {
+        send_mode: "whatsapp_chat",
+        channels,
+        dedupe,
+        // channel_decisions só precisa dos customerIds; runHubSend REVERIFICA tudo.
+        channel_decisions: customerIds.map((customerId) => ({ customerId, decisions: [], hasBothContacts: false })),
+      },
+      counts: {}, started_at: null,
     })
     return cid
   }
 
-  it("WhatsApp em modo queue: enfileira com jobId determinístico SEM ':'", async () => {
+  it("WhatsApp em modo queue: enfileira com jobId determinístico SEM ':' (com canal)", async () => {
     seedCustomer("wa", { phone: "11999998888" })
-    const cid = await makeCampaign("whatsapp_chat", [{ customerId: "wa", eligible: true, channel: "whatsapp", phoneE164: "+5511999998888", debtIds: ["debt_wa"] }])
+    const cid = await makeCampaign(["whatsapp"], ["wa"])
     const { runHubSend } = await import("@/lib/journey/campaign-send")
     const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
     expect(res.summary.sent).toBe(1)
     expect(queued.length).toBe(1)
-    expect(queued[0].opts.jobId).toBe(`hub_${cid}_wa`)
+    expect(queued[0].opts.jobId).toBe(`hub_whatsapp_${cid}_wa`)
     expect(queued[0].opts.jobId).not.toContain(":")
-    // registro com channel
     const msg = db.whatsapp_messages.find((m) => m.customer_id === "wa")!
     expect(msg.channel).toBe("whatsapp")
   })
 
   it("E-mail: dispara convite com o mesmo link /n/{code}, sem fila WhatsApp", async () => {
     seedCustomer("mail", { phone: null, email: "so@dominio.com" })
-    const cid = await makeCampaign("whatsapp_chat", [{ customerId: "mail", eligible: true, channel: "email", email: "so@dominio.com", debtIds: ["debt_mail"] }])
+    const cid = await makeCampaign(["email"], ["mail"])
     const { runHubSend } = await import("@/lib/journey/campaign-send")
     const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
     expect(res.summary.sent).toBe(1)
@@ -227,9 +339,35 @@ describe("runHubSend — roteamento e jobId", () => {
     expect(msg.status).toBe("sent")
   })
 
+  it("ambos os canais: quem tem os dois contatos gera 2 whatsapp_messages (E4)", async () => {
+    seedCustomer("both", { phone: "11999997777", email: "both@dominio.com" })
+    const cid = await makeCampaign(["whatsapp", "email"], ["both"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
+    expect(res.summary.sent).toBe(2)
+    const msgs = db.whatsapp_messages.filter((m) => m.customer_id === "both")
+    expect(msgs.length).toBe(2)
+    expect(new Set(msgs.map((m) => m.channel))).toEqual(new Set(["whatsapp", "email"]))
+    // WhatsApp enfileirado, e-mail direto.
+    expect(queued.length).toBe(1)
+    expect(emailCalls.length).toBe(1)
+  })
+
+  it("não duplicar: quem tem os dois vai SÓ por WhatsApp (e-mail priorizado)", async () => {
+    seedCustomer("both", { phone: "11999997777", email: "both@dominio.com" })
+    const cid = await makeCampaign(["whatsapp", "email"], ["both"], true)
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
+    expect(res.summary.sent).toBe(1) // só WhatsApp enviado
+    expect(emailCalls.length).toBe(0)
+    const emailItem = res.items.find((i) => i.channel === "email")!
+    expect(emailItem.status).toBe("skipped")
+    expect(emailItem.reason).toBe("priorizado_whatsapp")
+  })
+
   it("dryRun: resultado completo sem escrever mensagem nem enfileirar", async () => {
     seedCustomer("wa", { phone: "11999998888" })
-    const cid = await makeCampaign("whatsapp_chat", [{ customerId: "wa", eligible: true, channel: "whatsapp", phoneE164: "+5511999998888", debtIds: ["debt_wa"] }])
+    const cid = await makeCampaign(["whatsapp"], ["wa"])
     const { runHubSend } = await import("@/lib/journey/campaign-send")
     const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: true })
     expect(res.dryRun).toBe(true)
@@ -238,16 +376,109 @@ describe("runHubSend — roteamento e jobId", () => {
     expect(db.whatsapp_messages.length).toBe(0)
   })
 
-  it("reverifica no envio: quem virou sem_contato sai como skipped", async () => {
-    // no snapshot era elegível, mas o customer não tem mais contato válido
+  it("reverifica no envio: quem virou sem contato do canal sai como skipped", async () => {
+    // no snapshot era elegível, mas o customer não tem mais celular válido
     ;(db.customers ??= []).push({ id: "perdido", company_id: CO, phone: "1122", email: "naotem@vmax" })
     ;(db.debts ??= []).push({ id: "debt_perdido", customer_id: "perdido", company_id: CO, amount: 500, status: "pending" })
-    const cid = await makeCampaign("whatsapp_chat", [{ customerId: "perdido", eligible: true, channel: "whatsapp", phoneE164: "+5511000000000", debtIds: ["debt_perdido"] }])
+    const cid = await makeCampaign(["whatsapp"], ["perdido"])
     const { runHubSend } = await import("@/lib/journey/campaign-send")
     const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
     expect(res.summary.sent).toBe(0)
     expect(res.summary.skipped).toBe(1)
-    expect(res.items[0].reason).toBe("sem_contato")
+    expect(res.items[0].reason).toBe("sem_contato_para_o_canal")
+  })
+
+  it("erro forçado no e-mail NÃO afeta o WhatsApp (E3 — sequências independentes)", async () => {
+    // devedor com os dois contatos; o e-mail estoura (boom@), o WhatsApp segue.
+    seedCustomer("both", { phone: "11999997777", email: "boom@dominio.com" })
+    const cid = await makeCampaign(["whatsapp", "email"], ["both"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
+    // WhatsApp enviado apesar do e-mail ter estourado.
+    const wa = res.items.find((i) => i.channel === "whatsapp")!
+    const em = res.items.find((i) => i.channel === "email")!
+    expect(wa.status).toBe("sent")
+    expect(em.status).toBe("failed")
+    expect(em.reason).toBe("smtp_explodiu")
+    expect(queued.length).toBe(1) // WA enfileirado
+  })
+})
+
+describe("runHubSend — template padrão por cedente (F4)", () => {
+  async function makeCampaign(channels: string[], customerIds: string[], dedupe = false) {
+    const cid = `camp_${Math.random().toString(36).slice(2, 8)}`
+    db.whatsapp_campaigns.push({
+      id: cid, company_id: CO, provider: "mock", template_key: "hub_link", status: "draft",
+      selection_snapshot: {
+        send_mode: "whatsapp_chat", channels, dedupe,
+        channel_decisions: customerIds.map((customerId) => ({ customerId, decisions: [], hasBothContacts: false })),
+      },
+      counts: {}, started_at: null,
+    })
+    return cid
+  }
+
+  const VALID_HTML =
+    "<p>Olá {{primeiro_nome}} da {{credor}}</p>" +
+    '<p><a href="{{link_negociacao}}">negociar</a></p>' +
+    '<p><a href="{{link_descadastro}}">sair</a></p>'
+
+  function seedCedenteTemplate(companyId: string) {
+    db.email_template_versions.push({
+      id: "ver_ced", template_id: "tpl_ced", subject: "Olá {{primeiro_nome}}",
+      preheader: "", html: VALID_HTML, text_fallback: "Negocie: {{link_negociacao}} sair {{link_descadastro}}",
+    })
+    db.email_templates.push({
+      id: "tpl_ced", company_id: companyId, name: "Convite do Cedente", purpose: "negotiation",
+      status: "active", current_version_id: "ver_ced", updated_at: "2026-02-01",
+    })
+    db.email_template_defaults.push({ company_id: companyId, template_id: "tpl_ced", purpose: "negotiation" })
+  }
+
+  it("SEM padrão do cedente: usa o convite embutido e grava template_id/version = NULL", async () => {
+    seedCustomer("mail", { phone: null, email: "so@dominio.com", name: "Maria Silva" })
+    const cid = await makeCampaign(["email"], ["mail"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
+    expect(res.summary.sent).toBe(1)
+    // caminho builtin: dispatchEmailInvite chamado, dispatchRenderedEmail NÃO.
+    expect(emailCalls.length).toBe(1)
+    expect(renderedCalls.length).toBe(0)
+    const msg = db.whatsapp_messages.find((m) => m.customer_id === "mail")!
+    expect(msg.status).toBe("sent")
+    expect(msg.email_template_id ?? null).toBeNull()
+    expect(msg.email_template_version_id ?? null).toBeNull()
+  })
+
+  it("COM padrão do cedente: renderiza o template e grava template_id + version_id", async () => {
+    seedCustomer("mail", { phone: null, email: "so@dominio.com", name: "João Souza" })
+    seedCedenteTemplate(CO)
+    const cid = await makeCampaign(["email"], ["mail"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
+    expect(res.summary.sent).toBe(1)
+    // caminho template: dispatchRenderedEmail chamado, dispatchEmailInvite NÃO.
+    expect(renderedCalls.length).toBe(1)
+    expect(emailCalls.length).toBe(0)
+    // o subject/html renderizados trazem o primeiro nome e o link do hub.
+    expect(renderedCalls[0].subject).toBe("Olá João")
+    expect(renderedCalls[0].html).toContain("http://localhost:3000/n/k7Qm3Xb9Rt")
+    expect(renderedCalls[0].html).not.toContain("{{")
+    const msg = db.whatsapp_messages.find((m) => m.customer_id === "mail")!
+    expect(msg.email_template_id).toBe("tpl_ced")
+    expect(msg.email_template_version_id).toBe("ver_ced")
+  })
+
+  it("dryRun não resolve nem renderiza template (nada de rendered/builtin)", async () => {
+    seedCustomer("mail", { phone: null, email: "so@dominio.com", name: "Maria" })
+    seedCedenteTemplate(CO)
+    const cid = await makeCampaign(["email"], ["mail"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: true })
+    expect(res.summary.sent).toBe(1)
+    expect(renderedCalls.length).toBe(0)
+    expect(emailCalls.length).toBe(0)
+    expect(db.whatsapp_messages.length).toBe(0)
   })
 })
 

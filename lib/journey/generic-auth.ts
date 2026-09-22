@@ -292,7 +292,7 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
       .order("last_activity_at", { ascending: false })
       .limit(1)
       .maybeSingle()
-    await input.supabase.from("negotiation_sessions").update({
+    const { error: enrichErr } = await input.supabase.from("negotiation_sessions").update({
       debt_ids: debtIds,
       primary_debt_id: primaryDebtId,
       channel: input.channel,
@@ -307,6 +307,13 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
       user_agent: input.userAgent,
       ip_hash: input.ipHash,
     }).eq("id", sessionId)
+    // NÃO silenciar: se este enriquecimento falhar (ex.: schema-cache velho após
+    // migration sem reload), a sessão fica degradada (sem debt_ids/first_opened_at)
+    // mas o reuso segue OK porque last_activity_at já foi gravado no INSERT.
+    // Logamos sem PII para não repetir o bug silencioso que zerava o reuso.
+    if (enrichErr) {
+      console.error(`[journey] enriquecimento da sessão ${sessionId} falhou: ${enrichErr.message}`)
+    }
   }
 
   const base = { companyId: input.companyId, customerId, debtId: primaryDebtId ?? undefined, sessionId }
