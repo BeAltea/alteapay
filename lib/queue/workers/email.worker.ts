@@ -50,6 +50,13 @@ export function buildSendGridRequestBody(
       ...(params.text ? [{ type: 'text/plain', value: params.text }] : []),
       { type: 'text/html', value: params.html },
     ],
+    // Click/open tracking DESLIGADO: o domínio de rastreio da conta não resolve no
+    // DNS e reescreve TODO link para um redirecionador morto (quebrava o CTA). Sem
+    // tracking, o link real vai intacto. Reativar só após configurar o link branding.
+    tracking_settings: {
+      click_tracking: { enable: false, enable_text: false },
+      open_tracking: { enable: false },
+    },
   };
 
   if (params.replyTo) {
