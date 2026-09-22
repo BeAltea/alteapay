@@ -170,7 +170,10 @@ export async function paymentCreate(
   }
 
   const details = await fetchPaymentDetails(result.agreementId, ctx.companyId)
-  // Workers 0/0 (D5): sem link ainda → processing; a UI/n8n faz polling.
+  // CHARGE_MODE='inline': closeAgreement já criou a cobrança e gravou as URLs de
+  // forma síncrona → payment_id presente → devolvemos 'created' com o link agora.
+  // CHARGE_MODE='queue' (Workers 0/0, D5): sem link ainda → 'processing'; a UI/n8n
+  // faz polling até o worker gravar as URLs.
   if (!details.payment_id) {
     return { ok: true, status: "processing", idempotent: false, agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS }
   }
