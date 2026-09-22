@@ -3,7 +3,11 @@
 // Chat da jornada (pré-negociação): reconhecimento da dívida em UMA mensagem
 // (saudação + resumo + pergunta Sim/Não). Sem ofertas/desconto e sem chat livre
 // por ora — o fluxo é ver a dívida → reconhecer (Sim/Não) → mensagem final.
-import { useEffect, useRef, useState } from "react"
+// - HISTÓRICO SEMPRE PRESERVADO: ao responder, a pergunta e a resposta escolhida
+//   viram mensagens fixas (não somem da tela).
+// - Timer de inatividade: 60s sem interação → volta para a tela de login do CHAT
+//   (/n/{code}), NÃO o login da AlteaPay.
+import { useCallback, useEffect, useRef, useState } from "react"
 import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 
 interface ChatMsg {
@@ -15,6 +19,8 @@ interface ChatMsg {
 let msgSeq = 0
 const nextId = () => `m${Date.now()}_${msgSeq++}`
 
+const IDLE_MS = 60_000
+
 export function JourneyChat() {
   // Sem saudação hardcoded: a 1ª (e única) mensagem inicial é o prompt de
   // reconhecimento, empurrado via /api/chat/messages (active_prompt).
@@ -24,10 +30,45 @@ export function JourneyChat() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const sinceRef = useRef<string | null>(null)
   const seenIds = useRef<Set<string>>(new Set())
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const endedRef = useRef(false)
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
   }, [messages, activePrompt, ended])
+
+  // Timer de inatividade: 60s sem interação → tela de login do CHAT (não AlteaPay).
+  const goToChatLogin = useCallback(() => {
+    // /n/{code}/chat → /n/{code}  (o formulário de CPF do próprio chat)
+    const parent = window.location.pathname.replace(/\/chat\/?$/, "") || "/"
+    window.location.href = parent
+  }, [])
+
+  const resetIdle = useCallback(() => {
+    if (idleRef.current) clearTimeout(idleRef.current)
+    idleRef.current = setTimeout(goToChatLogin, IDLE_MS)
+  }, [goToChatLogin])
+
+  useEffect(() => {
+    const events: (keyof WindowEventMap)[] = [
+      "mousemove", "mousedown", "keydown", "touchstart", "scroll", "click",
+    ]
+    const onActivity = () => resetIdle()
+    events.forEach((e) => window.addEventListener(e, onActivity, { passive: true }))
+    resetIdle()
+    return () => {
+      events.forEach((e) => window.removeEventListener(e, onActivity))
+      if (idleRef.current) clearTimeout(idleRef.current)
+    }
+  }, [resetIdle])
+
+  function stopPoll() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+  }
 
   // Polling das mensagens da sessão + prompt ativo (o reconhecimento é a 1ª
   // interação). Para em visibilitychange e tem teto de 20min. Sem PII.
@@ -50,7 +91,8 @@ export function JourneyChat() {
           { id: m.id, from: m.role === "customer" ? "customer" : "assistant", text: m.text },
         ])
       }
-      setActivePrompt(data?.active_prompt ?? null)
+      // Nunca sobrescreve o prompt depois de encerrado (preserva o histórico).
+      if (!endedRef.current) setActivePrompt(data?.active_prompt ?? null)
     } catch {
       /* silencioso */
     }
@@ -60,22 +102,24 @@ export function JourneyChat() {
     pollMessages()
     const startedAt = Date.now()
     const CAP_MS = 20 * 60 * 1000
-    const interval = setInterval(() => {
+    pollRef.current = setInterval(() => {
       if (document.visibilityState !== "visible") return
       if (Date.now() - startedAt > CAP_MS) {
-        clearInterval(interval)
+        stopPoll()
         return
       }
       pollMessages()
     }, 2500)
-    return () => clearInterval(interval)
+    return () => stopPoll()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Clique no reconhecimento (Sim/Não). O backend devolve `reply` (texto fixo
-  // local), que exibimos como bolha do assistente. Depois, conversa encerrada:
-  // não há chat livre nem ofertas/negociação neste momento.
+  // Clique no reconhecimento (Sim/Não). PRESERVA o histórico: a pergunta e a
+  // resposta escolhida viram mensagens fixas; o `reply` do backend (texto fixo
+  // local) também. Depois, conversa encerrada — sem chat livre nem ofertas.
   async function clickButton(promptId: string, buttonId: number): Promise<PromptClickResult> {
+    resetIdle()
+    const current = activePrompt
     try {
       const res = await fetch("/api/chat/button", {
         method: "POST",
@@ -84,11 +128,22 @@ export function JourneyChat() {
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
-        if (typeof data?.reply === "string" && data.reply.trim()) {
-          setMessages((m) => [...m, { id: nextId(), from: "assistant", text: data.reply }])
-        }
+        const chosen = current?.buttons.find((b) => b.id === buttonId)?.label ?? ""
+        setMessages((m) => {
+          const add: ChatMsg[] = []
+          // 1) a pergunta (com o resumo da dívida) fica PERMANENTE no histórico
+          if (current?.question) add.push({ id: nextId(), from: "assistant", text: current.question })
+          // 2) a resposta escolhida pelo cliente
+          if (chosen) add.push({ id: nextId(), from: "customer", text: chosen })
+          // 3) o retorno do assistente
+          if (typeof data?.reply === "string" && data.reply.trim())
+            add.push({ id: nextId(), from: "assistant", text: data.reply })
+          return [...m, ...add]
+        })
+        endedRef.current = true
         setActivePrompt(null)
         setEnded(true)
+        stopPoll() // encerrado: não busca mais (evita duplicar a resposta do servidor)
         return { ok: true }
       }
       // 409 prompt_not_active: recarrega o prompt ativo atual.
