@@ -132,11 +132,17 @@ export async function GET(request: NextRequest) {
     // IMPORTANT: All documents must be normalized (digits only) for consistent lookups
     const customerIdToNormalizedDoc = new Map<string, string>()
     const docToContactInfo = new Map<string, { email: string | null; phone: string | null }>()
+    // document (normalized) -> customers.id. This bridges the VMAX-keyed list to
+    // the customers-keyed journey send routes (send-preview/send resolve each
+    // customerId against the `customers` table by id). VMAX rows with no matching
+    // `customers` record get customerId=null and cannot be sent via that path.
+    const docToCustomerId = new Map<string, string>()
     for (const c of dbCustomers || []) {
       const normalizedDoc = (c.document || "").replace(/\D/g, "")
       if (normalizedDoc) {
         customerIdToNormalizedDoc.set(c.id, normalizedDoc)
         docToContactInfo.set(normalizedDoc, { email: c.email, phone: c.phone })
+        if (!docToCustomerId.has(normalizedDoc)) docToCustomerId.set(normalizedDoc, c.id)
       }
     }
 
@@ -305,6 +311,10 @@ export async function GET(request: NextRequest) {
 
       return {
         id: vmax.id,
+        // customers.id resolvido por documento (null = sem cadastro em `customers`).
+        // A lista é VMAX-keyed; o envio pela jornada (send-preview/send) é
+        // customers-keyed, então carregamos a ponte aqui.
+        customerId: cpfCnpj ? docToCustomerId.get(cpfCnpj) ?? null : null,
         name: vmax.Cliente || "Cliente",
         // Privacidade (A5): a lista NUNCA devolve o documento em claro. Só o
         // mascarado; o claro sai apenas pelo reveal auditado por linha.

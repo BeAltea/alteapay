@@ -40,10 +40,15 @@ import { toast } from "sonner"
 import { ReadOnlyGuard, useCanPerformActions } from "@/components/super-admin/read-only-guard"
 import { CreateNegotiationRequestDialog } from "@/components/super-admin/create-negotiation-request-dialog"
 import { RevealableDocument } from "@/components/super-admin/revealable-document"
+import { SendNegotiationDialog } from "@/components/super-admin/negotiations/send-dialog"
 import { isPaidStatus } from "@/lib/constants/payment-status"
 
 type VmaxCustomer = {
   id: string
+  // customers.id resolvido no servidor por documento. null = sem cadastro em
+  // `customers` → não é enviável pela jornada (send-preview/send são
+  // customers-keyed). A lista é VMAX-keyed (id = VMAX row id).
+  customerId: string | null
   name: string
   // documento mascarado (o claro nunca chega ao cliente; reveal auditado por linha)
   documentMasked: string
@@ -86,17 +91,12 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
   const [dueDateTo, setDueDateTo] = useState<string>("")
   const [displayLimit, setDisplayLimit] = useState<number>(50)
   const [selectedCustomers, setSelectedCustomers] = useState<Set<string>>(new Set())
+  // showModal agora controla o diálogo de envio F1 (seleção de canal WhatsApp/
+  // e-mail + "não duplicar"), que reusa as rotas send-preview/send.
   const [showModal, setShowModal] = useState(false)
-  const [sending, setSending] = useState(false)
   const [sortField, setSortField] = useState<"name" | "debt" | "debtAge" | "dueDate" | null>(null)
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc")
   const [syncing, setSyncing] = useState(false)
-
-  // Modal form state
-  const [discountType, setDiscountType] = useState<"none" | "percentage" | "fixed">("none")
-  const [discountValue, setDiscountValue] = useState<string>("")
-  const [paymentMethods, setPaymentMethods] = useState<Set<string>>(new Set(["boleto", "pix", "credit_card"]))
-  const [notificationChannels, setNotificationChannels] = useState<Set<string>>(new Set(["email", "whatsapp"]))
 
   // Duplicate warning dialog state
   const [showDuplicateWarning, setShowDuplicateWarning] = useState(false)
@@ -597,23 +597,16 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
     setSelectedCustomers(new Set())
   }
 
-  const togglePaymentMethod = (method: string) => {
-    setPaymentMethods((prev) => {
-      const next = new Set(prev)
-      if (next.has(method)) next.delete(method)
-      else next.add(method)
-      return next
-    })
-  }
-
-  const toggleNotificationChannel = (channel: string) => {
-    setNotificationChannels((prev) => {
-      const next = new Set(prev)
-      if (next.has(channel)) next.delete(channel)
-      else next.add(channel)
-      return next
-    })
-  }
+  // customers.id (resolvidos por documento) dos VMAX selecionados que são
+  // enviáveis pela jornada. Linhas sem cadastro em `customers` (customerId=null)
+  // não podem ser enviadas por WhatsApp/e-mail via send-preview/send.
+  const sendableCustomerIds = useMemo(() => {
+    const ids: string[] = []
+    for (const c of customers) {
+      if (selectedCustomers.has(c.id) && c.customerId) ids.push(c.customerId)
+    }
+    return Array.from(new Set(ids))
+  }, [customers, selectedCustomers])
 
   const openSendModal = () => {
     if (selectedCustomers.size === 0) {
@@ -649,21 +642,23 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
       return
     }
 
-    // 3. No issues, open modal directly
-    setDiscountType("none")
-    setDiscountValue("")
-    setPaymentMethods(new Set(["boleto", "pix", "credit_card"]))
-    setNotificationChannels(new Set(["email", "whatsapp"]))
+    // 3. BLOCK — nenhum selecionado tem cadastro em `customers` (não enviável).
+    if (sendableCustomerIds.length === 0) {
+      toast.error("Nenhum cliente selecionado possui cadastro para envio de negociacao (documento sem correspondencia na base de clientes).")
+      return
+    }
+
+    // 4. No issues, open the F1 channel-selection dialog.
     setShowModal(true)
   }
 
   const confirmSendWithDuplicates = () => {
     setShowDuplicateWarning(false)
     setDuplicateCustomers([])
-    setDiscountType("none")
-    setDiscountValue("")
-    setPaymentMethods(new Set(["boleto", "pix", "credit_card"]))
-    setNotificationChannels(new Set(["email", "whatsapp"]))
+    if (sendableCustomerIds.length === 0) {
+      toast.error("Nenhum cliente selecionado possui cadastro para envio de negociacao (documento sem correspondencia na base de clientes).")
+      return
+    }
     setShowModal(true)
   }
 
@@ -707,95 +702,12 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
     }
   }
 
-  const handleSendNegotiations = async () => {
-    if (paymentMethods.size === 0) {
-      toast.error("Selecione pelo menos um metodo de pagamento")
-      return
-    }
-    if (notificationChannels.size === 0) {
-      toast.error("Selecione pelo menos um canal de notificacao")
-      return
-    }
-
-    setSending(true)
-    try {
-      // Use API route instead of server action (supports maxDuration = 120s for large batches)
-      const response = await fetch("/api/super-admin/send-bulk-negotiations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          companyId: selectedCompanyId,
-          customerIds: Array.from(selectedCustomers),
-          discountType,
-          discountValue: discountValue ? Number(discountValue) : 0,
-          paymentMethods: Array.from(paymentMethods),
-          notificationChannels: Array.from(notificationChannels),
-        }),
-      })
-
-      const result = await response.json()
-
-      setShowModal(false) // Close send modal
-
-      // Check if the request was queued (background processing)
-      if (result.queued === true) {
-        // Start background job tracking
-        setBackgroundJob({
-          jobId: result.job_id,
-          totalCustomers: result.total_customers,
-          startedAt: new Date().toISOString(),
-        })
-
-        // Start queue progress polling
-        startQueuePolling(result.total_customers)
-
-        toast.success(`Processamento de ${result.total_customers} negociações iniciado em background. Você pode continuar navegando.`)
-
-        setSelectedCustomers(new Set())
-        return
-      }
-
-      // Synchronous processing response
-      if (result.success) {
-        const totalSelected = selectedCustomers.size
-
-        // Always show results modal if there are any failures or partial success
-        if (result.failed > 0 || result.sent < totalSelected) {
-          setSendResults({
-            sent: result.sent,
-            failed: result.failed,
-            total: result.total,
-            results: result.results,
-            stepLabels: result.stepLabels,
-          })
-          setShowResultsModal(true)
-          toast.warning(`Concluído com ${result.failed} erro(s). Veja detalhes abaixo.`)
-        } else {
-          toast.success(`Negociacao enviada com sucesso para todos os ${result.sent} cliente(s)!`)
-        }
-
-        setSelectedCustomers(new Set())
-        // Reload customers to update status
-        loadCustomers(selectedCompanyId)
-      } else {
-        // Total failure - still show results if available
-        if (result.results && result.results.length > 0) {
-          setSendResults({
-            sent: result.sent || 0,
-            failed: result.failed || result.results.length,
-            total: result.total || result.results.length,
-            results: result.results,
-            stepLabels: result.stepLabels,
-          })
-          setShowResultsModal(true)
-        }
-        toast.error(result.error || "Erro ao enviar negociacoes")
-      }
-    } catch (error) {
-      toast.error("Erro ao enviar negociacoes")
-    } finally {
-      setSending(false)
-    }
+  // O envio agora é feito pelo diálogo F1 (SendNegotiationDialog), que chama
+  // send-preview/send com channels[]/dedupe. Ao concluir, limpamos a seleção e
+  // recarregamos a lista para refletir o novo status.
+  const handleSendDone = () => {
+    setSelectedCustomers(new Set())
+    if (selectedCompanyId) loadCustomers(selectedCompanyId)
   }
 
   const formatCurrency = (value: number) =>
@@ -1907,121 +1819,19 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
         </Card>
       )}
 
-      {/* Send Negotiation Modal */}
-      <Dialog open={showModal} onOpenChange={setShowModal}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Enviar Negociacao</DialogTitle>
-            <DialogDescription>
-              Configure os parametros da negociacao para {selectedCustomers.size} cliente(s) selecionado(s).
-              Divida total: {formatCurrency(totalDebtSelected)}.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-6 py-4">
-            {/* Discount */}
-            <div className="space-y-3">
-              <Label className="text-sm font-semibold">Desconto (opcional)</Label>
-              <Select value={discountType} onValueChange={(v: any) => setDiscountType(v)}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="none">Sem desconto (valor integral)</SelectItem>
-                  <SelectItem value="percentage">Percentual (%)</SelectItem>
-                  <SelectItem value="fixed">Valor fixo (R$)</SelectItem>
-                </SelectContent>
-              </Select>
-              {discountType !== "none" && (
-                <Input
-                  type="number"
-                  min="0"
-                  step={discountType === "percentage" ? "1" : "0.01"}
-                  max={discountType === "percentage" ? "100" : undefined}
-                  placeholder={discountType === "percentage" ? "Ex: 15" : "Ex: 500.00"}
-                  value={discountValue}
-                  onChange={(e) => setDiscountValue(e.target.value)}
-                />
-              )}
-            </div>
-
-            {/* Payment Methods */}
-            <div className="space-y-3">
-              <Label className="text-sm font-semibold">
-                Metodo de Pagamento <span className="text-red-500">*</span>
-              </Label>
-              <div className="flex flex-col gap-3">
-                {[
-                  { key: "boleto", label: "Boleto" },
-                  { key: "pix", label: "PIX" },
-                  { key: "credit_card", label: "Cartao de Credito" },
-                ].map((m) => (
-                  <div key={m.key} className="flex items-center gap-2">
-                    <Checkbox
-                      id={`pm-${m.key}`}
-                      checked={paymentMethods.has(m.key)}
-                      onCheckedChange={() => togglePaymentMethod(m.key)}
-                      className="border-foreground/70"
-                    />
-                    <Label htmlFor={`pm-${m.key}`} className="text-sm cursor-pointer">
-                      {m.label}
-                    </Label>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Notification Channels */}
-            <div className="space-y-3">
-              <Label className="text-sm font-semibold">
-                Canal de Notificacao <span className="text-red-500">*</span>
-              </Label>
-              <div className="flex flex-col gap-3">
-                {[
-                  { key: "email", label: "E-mail" },
-                  { key: "sms", label: "SMS" },
-                  { key: "whatsapp", label: "WhatsApp" },
-                ].map((c) => (
-                  <div key={c.key} className="flex items-center gap-2">
-                    <Checkbox
-                      id={`nc-${c.key}`}
-                      checked={notificationChannels.has(c.key)}
-                      onCheckedChange={() => toggleNotificationChannel(c.key)}
-                      className="border-foreground/70"
-                    />
-                    <Label htmlFor={`nc-${c.key}`} className="text-sm cursor-pointer">
-                      {c.label}
-                    </Label>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowModal(false)} disabled={sending}>
-              Cancelar
-            </Button>
-            <Button
-              onClick={handleSendNegotiations}
-              disabled={sending || paymentMethods.size === 0 || notificationChannels.size === 0}
-              className="bg-altea-gold text-altea-navy hover:bg-altea-gold/90"
-            >
-              {sending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Enviando...
-                </>
-              ) : (
-                <>
-                  <Send className="mr-2 h-4 w-4" />
-                  Confirmar Envio
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* Send Negotiation Dialog (F1): seleção de canal WhatsApp/e-mail +
+          "não duplicar" → send-preview/send. Envia os customers.id resolvidos
+          (não os VMAX ids). */}
+      {showModal && selectedCompanyId && sendableCustomerIds.length > 0 ? (
+        <SendNegotiationDialog
+          open={showModal}
+          onOpenChange={setShowModal}
+          companyId={selectedCompanyId}
+          selectedCount={sendableCustomerIds.length}
+          selection={{ kind: "ids", customerIds: sendableCustomerIds }}
+          onDone={handleSendDone}
+        />
+      ) : null}
 
       {/* Duplicate Warning Dialog */}
       <Dialog open={showDuplicateWarning} onOpenChange={setShowDuplicateWarning}>
