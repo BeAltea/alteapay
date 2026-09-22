@@ -123,6 +123,72 @@ describe("recordAcknowledgement", () => {
   })
 })
 
+describe("acknowledgementQuestion", () => {
+  it("mensagem única: nome do cliente + nome do credor, valor e vencimento; SEM faturas", async () => {
+    const { acknowledgementQuestion } = await import("@/lib/journey/acknowledgement")
+    const msg = acknowledgementQuestion({
+      firstName: "Fabio",
+      creditorName: "VMAX",
+      updatedValue: 500,
+      invoiceCount: 7, // dígito ausente no valor/data → prova que não é exibido
+      oldestDueDate: "2020-01-15",
+    })
+    expect(msg).toContain("Olá, Fabio!")
+    expect(msg).toContain("da empresa VMAX")
+    expect(msg).toContain("R$")
+    expect(msg).toContain("Você reconhece esta cobrança em seu nome?")
+    // não menciona contagem de faturas
+    expect(msg.toLowerCase()).not.toContain("fatura")
+    expect(msg).not.toContain("7")
+  })
+
+  it("firstName vazio → saudação genérica 'Olá!'", async () => {
+    const { acknowledgementQuestion } = await import("@/lib/journey/acknowledgement")
+    const msg = acknowledgementQuestion({
+      firstName: "",
+      creditorName: "VMAX",
+      updatedValue: 100,
+      invoiceCount: 1,
+      oldestDueDate: "2020-01-15",
+    })
+    expect(msg.startsWith("Olá! Temos uma dívida")).toBe(true)
+    expect(msg).not.toContain("Olá, !")
+  })
+})
+
+describe("buildAckContext", () => {
+  it("popula firstName (1º token do customers.name) + creditorName do branding", async () => {
+    db = {
+      companies: [{ id: CO, name: "VMAX LTDA" }],
+      tenant_chat_config: [{ company_id: CO, branding: { brand_name: "VMAX" } }],
+      customers: [{ id: CUST, company_id: CO, name: "Fabio Mendes", document: "11144477735" }],
+      debts: [{ id: DEBT, company_id: CO, amount: 250, due_date: "2020-02-01" }],
+      vmax_invoices: [{ id_company: CO, doc: "11144477735", vencimento: "2020-01-10" }],
+    }
+    const { buildAckContext } = await import("@/lib/journey/acknowledgement")
+    const ctx = await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] })
+    expect(ctx.firstName).toBe("Fabio")
+    expect(ctx.creditorName).toBe("VMAX")
+    expect(ctx.updatedValue).toBe(250)
+    expect(ctx.oldestDueDate).toBe("2020-01-10")
+  })
+
+  it("sem nome do cliente → firstName vazio (saudação genérica no texto)", async () => {
+    db = {
+      companies: [{ id: CO, name: "VMAX LTDA" }],
+      tenant_chat_config: [{ company_id: CO, branding: {} }],
+      customers: [{ id: CUST, company_id: CO, name: null, document: "11144477735" }],
+      debts: [{ id: DEBT, company_id: CO, amount: 90, due_date: "2020-02-01" }],
+      vmax_invoices: [],
+    }
+    const { buildAckContext, acknowledgementQuestion } = await import("@/lib/journey/acknowledgement")
+    const ctx = await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] })
+    expect(ctx.firstName).toBe("")
+    expect(ctx.creditorName).toBe("VMAX LTDA") // cai no company.name
+    expect(acknowledgementQuestion(ctx).startsWith("Olá! Temos")).toBe(true)
+  })
+})
+
 describe("assertAcknowledgedForPayment", () => {
   it("sem reconhecimento (ou 'Não') → bloqueia (debt_not_acknowledged)", async () => {
     reset()
