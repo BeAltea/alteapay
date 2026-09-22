@@ -8,6 +8,7 @@ import {
   extractVariables,
   validateVariables,
   validatePurposeRequirements,
+  validateDebtFieldsRequirements,
 } from "./variables"
 import type { TemplateInput, TemplateValidationResult, TemplateValidationError } from "./types"
 
@@ -57,9 +58,17 @@ export function validateTemplateInput(input: TemplateInput): TemplateValidationR
   }
 
   const textFallback = input.textFallback ?? ""
+  const allowDebtFields = input.allowDebtFields === true
 
-  // --- Variáveis (allowlist + proibidas). Roda em TODOS os campos textuais. ---
-  const varResult = validateVariables({ subject, preheader, html, textFallback })
+  // --- Variáveis (allowlist de 2 níveis + proibidas). Roda em TODOS os campos. ---
+  // GATE de débito na GRAVAÇÃO: canal 'email' (todo template daqui é de e-mail),
+  // propósito do input e a flag allow_debt_fields. As DEBT vars só passam com o
+  // gate aberto (validateVariables aplica a precedência DEBT > FORBIDDEN_HINTS e
+  // FORBIDDEN_ALWAYS > tudo).
+  const varResult = validateVariables(
+    { subject, preheader, html, textFallback },
+    { allowDebtFields, purpose: input.purpose, channel: "email" },
+  )
   for (const message of varResult.errors) {
     errors.push({ field: "variables", message })
   }
@@ -68,6 +77,17 @@ export function validateTemplateInput(input: TemplateInput): TemplateValidationR
   const purposeResult = validatePurposeRequirements(input.purpose, { subject, preheader, html, textFallback })
   for (const message of purposeResult.errors) {
     errors.push({ field: "purpose", message })
+  }
+
+  // --- Regras EXTRAS de allow_debt_fields (links obrigatórios + sem DEBT no header). ---
+  const debtResult = validateDebtFieldsRequirements(allowDebtFields, input.purpose, {
+    subject,
+    preheader,
+    html,
+    textFallback,
+  })
+  for (const message of debtResult.errors) {
+    errors.push({ field: "variables", message })
   }
 
   if (errors.length > 0) {

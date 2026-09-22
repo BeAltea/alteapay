@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Badge } from "@/components/ui/badge"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
@@ -56,6 +57,9 @@ interface EditorState {
   preheader: string
   html: string
   textFallback: string
+  /** Libera dados do débito no corpo (valor/nome/documento mascarado/vencimento).
+   * Só para e-mail de negociação; por padrão OFF (template continua neutro). */
+  allowDebtFields: boolean
 }
 
 const EMPTY: EditorState = {
@@ -67,6 +71,7 @@ const EMPTY: EditorState = {
   preheader: "",
   html: '<!DOCTYPE html>\n<html>\n<head><meta charset="utf-8"></head>\n<body>\n  <p>Olá, {{primeiro_nome}}!</p>\n</body>\n</html>',
   textFallback: "",
+  allowDebtFields: false,
 }
 
 export function TemplateEditor({
@@ -115,6 +120,7 @@ export function TemplateEditor({
           preheader: v?.preheader ?? "",
           html: v?.html ?? EMPTY.html,
           textFallback: v?.textFallback ?? "",
+          allowDebtFields: Boolean(t.allowDebtFields),
         })
       } catch (e) {
         toast({ title: "Erro", description: e instanceof Error ? e.message : "Falha", variant: "destructive" })
@@ -196,6 +202,8 @@ export function TemplateEditor({
     preheader: state.preheader,
     html: state.html,
     textFallback: state.textFallback,
+    // Só faz sentido em templates de negociação; a rota (D1) ignora fora disso.
+    allowDebtFields: state.purpose === "negotiation" ? state.allowDebtFields : false,
   })
 
   const save = async () => {
@@ -398,6 +406,29 @@ export function TemplateEditor({
                   </div>
                 )}
               </div>
+
+              {state.purpose === "negotiation" && (
+                <div className="rounded-md border border-amber-300/60 bg-amber-50 p-3 dark:border-amber-500/30 dark:bg-amber-950/20">
+                  <div className="flex items-start gap-2">
+                    <Checkbox
+                      id="allow-debt-fields"
+                      checked={state.allowDebtFields}
+                      onCheckedChange={(v) => set("allowDebtFields", v === true)}
+                      className="mt-0.5"
+                    />
+                    <div className="space-y-1">
+                      <Label htmlFor="allow-debt-fields" className="cursor-pointer font-medium">
+                        Permitir dados do débito (só e-mail de negociação)
+                      </Label>
+                      <p className="text-xs text-muted-foreground">
+                        Libera o uso de valor, nome do cliente, documento mascarado e vencimento no
+                        corpo deste template. Use somente em cobrança nominal autorizada — os dados vão
+                        para a caixa de entrada do destinatário.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div className="space-y-1.5">
                 <Label>Assunto</Label>

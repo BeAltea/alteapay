@@ -16,12 +16,14 @@
 import { createServiceClient } from "@/lib/supabase/service"
 import { sanitizeEmailHtml } from "./sanitize"
 import {
-  ALLOWED_VARIABLES,
+  BASIC_VARIABLES,
+  DEBT_VARIABLES,
   REQUIRED_NEGOTIATION_VARIABLES,
   extractVariables,
   renderVariables,
   type AllowedVariable,
 } from "./variables"
+import type { DebtEmailContext } from "./render-context"
 import { buildEmailInviteHtml } from "@/lib/journey/email-dispatch"
 
 type ServiceClient = ReturnType<typeof createServiceClient>
@@ -35,6 +37,8 @@ export interface ResolvedTemplate {
   versionId?: string
   /** nome do template (para o preview/diagnóstico; não vai no e-mail). */
   name?: string
+  /** true quando o template optou por dados do débito (e-mail de cobrança). */
+  allowDebtFields?: boolean
   subject: string
   /** preheader (texto oculto do topo do e-mail); pode ser vazio. */
   preheader: string
@@ -64,6 +68,7 @@ interface TemplateRow {
   name: string
   current_version_id: string | null
   status: string
+  allow_debt_fields?: boolean | null
 }
 interface VersionRow {
   id: string
@@ -93,7 +98,17 @@ async function loadCurrentVersion(
   // Descarta o template se o corpo não traz os links obrigatórios (cai no próximo).
   if (!hasRequiredLinks(subject, preheader, html, text)) return null
 
-  return { source: "builtin", templateId: template.id, versionId: version.id, name: template.name, subject, preheader, html, text }
+  return {
+    source: "builtin",
+    templateId: template.id,
+    versionId: version.id,
+    name: template.name,
+    allowDebtFields: template.allow_debt_fields === true,
+    subject,
+    preheader,
+    html,
+    text,
+  }
 }
 
 /** Padrão do CEDENTE: email_template_defaults(company_id, purpose='negotiation'). */
@@ -111,7 +126,7 @@ async function resolveCompanyDefault(
 
   const { data: template } = await supabase
     .from("email_templates")
-    .select("id, name, current_version_id, status")
+    .select("id, name, current_version_id, status, allow_debt_fields")
     .eq("id", def.template_id)
     .maybeSingle<TemplateRow>()
   if (!template || template.status === "archived") return null
@@ -129,7 +144,7 @@ async function resolveCompanyDefault(
 async function resolveGlobalDefault(supabase: ServiceClient): Promise<ResolvedTemplate | null> {
   const { data: templates } = await supabase
     .from("email_templates")
-    .select("id, name, current_version_id, status")
+    .select("id, name, current_version_id, status, allow_debt_fields")
     .is("company_id", null)
     .eq("purpose", NEGOTIATION_PURPOSE)
     .neq("status", "archived")
@@ -164,6 +179,8 @@ function builtinTemplate(vars: {
   return {
     source: "builtin",
     name: "Convite padrão AlteaPay",
+    // Fallback F4: convite embutido NUNCA carrega dados de débito.
+    allowDebtFields: false,
     subject: `Negociação disponível - ${vars.creditorName}`,
     preheader: "",
     html,
@@ -221,39 +238,90 @@ export interface RenderedTemplate {
   text: string
   /** true quando o render caiu para o builtin por conteúdo inválido no template. */
   fellBackToBuiltin?: boolean
-  /** motivo do fallback (variável proibida / sem links) — só código, sem PII. */
+  /**
+   * motivo do fallback/falha — só código, sem PII:
+   *   variavel_proibida | sem_links | render_incomplete.
+   */
   reason?: string
+  /** grupos de variáveis injetados (auditoria C12): ["basic"] | ["basic","debt"]. */
+  variableGroups?: ("basic" | "debt")[]
 }
 
-const ALLOWED = new Set<string>(ALLOWED_VARIABLES)
+const BASIC_SET = new Set<string>(BASIC_VARIABLES)
+const DEBT_SET = new Set<string>(DEBT_VARIABLES)
 
-/** Alguma variável FORA da allowlist referenciada no template resolvido? */
-function firstForbiddenVariable(subject: string, preheader: string, html: string, text: string): string | null {
+/**
+ * Primeira variável NÃO PERMITIDA neste render, considerando o gate de débito:
+ *   - básica → sempre permitida;
+ *   - débito → só permitida quando allowDebtFields (o banco não deveria ter DEBT
+ *     var num template sem allow_debt_fields, mas re-checamos no render);
+ *   - qualquer outra → proibida.
+ */
+function firstForbiddenVariable(
+  allowDebtFields: boolean,
+  subject: string,
+  preheader: string,
+  html: string,
+  text: string,
+): string | null {
   for (const name of extractVariables(subject, preheader ?? "", html, text ?? "")) {
-    if (!ALLOWED.has(name)) return name
+    if (BASIC_SET.has(name)) continue
+    if (DEBT_SET.has(name) && allowDebtFields) continue
+    return name
   }
   return null
+}
+
+/** Escape HTML de um valor interpolado (texto e atributos com aspas duplas). */
+function escapeHtmlValue(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+}
+
+/** Sobrou algum token `{{...}}` (ou `{{`/`}}` solto) no conteúdo? */
+function hasLeftoverToken(...parts: string[]): boolean {
+  return parts.some((p) => p.includes("{{") || p.includes("}}"))
 }
 
 /**
  * Renderiza um template resolvido com as variáveis da ALLOWLIST e RE-SANITIZA o
  * HTML (defesa em profundidade — nunca confiar no que veio do banco).
  *
+ * DUAS camadas de variável:
+ *   - BÁSICAS (7): sempre injetadas (link/nome/marca/…).
+ *   - DÉBITO (5): injetadas SÓ quando o template tem allowDebtFields E o chamador
+ *     forneceu `debtCtx` (valores já resolvidos por resolveDebtEmailContext). Os
+ *     valores de débito são HTML-ESCAPADOS antes de interpolar.
+ *
  * Rejeita (fellBackToBuiltin) quando:
- *   - o template referencia uma variável PROIBIDA/desconhecida (o banco não
- *     deveria ter isso, mas re-checamos no render e logamos SEM PII);
+ *   - o template referencia uma variável PROIBIDA/desconhecida (gate-aware);
  *   - o corpo perdeu os links obrigatórios.
- * Nesses casos, se `builtin` for fornecido, devolve o corpo embutido; senão,
- * marca ok=false para o chamador decidir. O builtin (source='builtin') já vem
- * do dispatch e passa direto (não tem tokens {{...}}), mas ainda é sanitizado.
+ *
+ * FALHA FECHADA (ok=false, reason='render_incomplete', SEM fallback):
+ *   - allowDebtFields mas nenhum debtCtx (o chamador deveria ter excluído o
+ *     devedor) → não podemos emitir e-mail com campos de débito vazios;
+ *   - sobrou `{{`/`}}` no HTML/texto após o render (varredura final).
  */
 export function renderTemplate(
   resolved: ResolvedTemplate,
   vars: TemplateVars,
   builtin?: { firstName?: string; brandName: string; creditorName: string; link: string },
+  debtCtx?: DebtEmailContext,
 ): RenderedTemplate {
-  // Guarda: variável proibida no template persistido (não deveria acontecer).
-  const forbidden = firstForbiddenVariable(resolved.subject, resolved.preheader, resolved.html, resolved.text)
+  const allowDebtFields = resolved.allowDebtFields === true
+
+  // Guarda: variável não permitida no template persistido (gate-aware).
+  const forbidden = firstForbiddenVariable(
+    allowDebtFields,
+    resolved.subject,
+    resolved.preheader,
+    resolved.html,
+    resolved.text,
+  )
   if (forbidden && resolved.source !== "builtin") {
     console.warn(`[email/resolve] template ${resolved.source} descartado: variável fora da allowlist {{${forbidden}}}`)
     if (builtin) {
@@ -276,21 +344,59 @@ export function renderTemplate(
     return { ok: false, subject: "", html: "", text: "", reason: "sem_links" }
   }
 
-  return { ok: true, ...renderResolved(resolved, vars) }
+  // FALHA FECHADA: template de cobrança sem contexto de débito → não envia. Nunca
+  // renderizamos {{valor_divida}} / "R$ 0,00" / "-" / undefined. É o chamador que
+  // deveria ter excluído o devedor (ok:false) antes de chegar aqui.
+  if (allowDebtFields && resolved.source !== "builtin" && !debtCtx) {
+    console.warn(`[email/resolve] template ${resolved.source} com allow_debt_fields sem contexto de débito → render_incomplete`)
+    return { ok: false, subject: "", html: "", text: "", reason: "render_incomplete" }
+  }
+
+  const rendered = renderResolved(resolved, vars, allowDebtFields ? debtCtx : undefined)
+
+  // Varredura FINAL: qualquer {{ / }} que sobrou (variável não resolvida) → não
+  // envia. É um TESTE, não um comentário: um token remanescente é bug de dados.
+  if (hasLeftoverToken(rendered.html, rendered.text, rendered.subject)) {
+    console.warn(`[email/resolve] token {{...}} remanescente após render → render_incomplete`)
+    return { ok: false, subject: "", html: "", text: "", reason: "render_incomplete" }
+  }
+
+  return { ok: true, ...rendered }
 }
 
-/** Substitui as variáveis da allowlist e RE-SANITIZA o HTML (ordem render→sanitize). */
-function renderResolved(resolved: ResolvedTemplate, vars: TemplateVars): { subject: string; html: string; text: string } {
-  // Só valores da allowlist entram no render (nunca PII/valores do débito).
+/**
+ * Substitui as variáveis (basic + debt quando fornecido) e RE-SANITIZA o HTML.
+ * Ordem: escape dos valores de DÉBITO → render → sanitize. Os valores de débito
+ * são HTML-escapados (não são URLs; entram como texto), enquanto os básicos
+ * (links) seguem o caminho render→sanitize existente (o sanitizador escapa
+ * atributos). Devolve os grupos de variáveis efetivamente injetados (C12).
+ */
+function renderResolved(
+  resolved: ResolvedTemplate,
+  vars: TemplateVars,
+  debtCtx?: DebtEmailContext,
+): { subject: string; html: string; text: string; variableGroups: ("basic" | "debt")[] } {
   const safeVars: Record<string, string> = {}
-  for (const key of ALLOWED_VARIABLES) {
+  // básicas: só valores da allowlist entram (nunca PII).
+  for (const key of BASIC_VARIABLES) {
     const value = vars[key]
     if (typeof value === "string") safeVars[key] = value
   }
-  // Ordem render → sanitize: valores injetados TAMBÉM passam pelo sanitizador,
-  // então nem a substituição pode introduzir markup perigoso (igual ao preview).
+  const groups: ("basic" | "debt")[] = ["basic"]
+
+  // débito: injeta os 5 valores JÁ formatados, HTML-escapados.
+  if (debtCtx) {
+    safeVars.nome_cliente = escapeHtmlValue(debtCtx.nome_cliente)
+    safeVars.documento_mascarado = escapeHtmlValue(debtCtx.documento_mascarado)
+    safeVars.valor_divida = escapeHtmlValue(debtCtx.valor_divida)
+    safeVars.vencimento_original = escapeHtmlValue(debtCtx.vencimento_original)
+    safeVars.qtd_faturas = escapeHtmlValue(debtCtx.qtd_faturas)
+    groups.push("debt")
+  }
+
+  // Ordem render → sanitize: valores injetados TAMBÉM passam pelo sanitizador.
   const subject = renderVariables(resolved.subject, safeVars)
   const html = sanitizeEmailHtml(renderVariables(resolved.html, safeVars))
   const text = renderVariables(resolved.text ?? "", safeVars)
-  return { subject, html, text }
+  return { subject, html, text, variableGroups: groups }
 }

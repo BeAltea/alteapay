@@ -10,6 +10,7 @@ function base(overrides: Partial<TemplateInput> = {}): TemplateInput {
     scope: "global",
     companyId: null,
     purpose: "communication",
+    allowDebtFields: false,
     subject: "Olá {{primeiro_nome}}",
     preheader: "Prévia",
     html: "<p>Olá {{primeiro_nome}}, tudo bem?</p>",

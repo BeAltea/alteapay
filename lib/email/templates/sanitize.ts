@@ -17,6 +17,9 @@ const ALLOWED_TAGS = new Set<string>([
   "head",
   "body",
   "table",
+  // <tbody> é estrutura de tabela benigna (layout de e-mail table-based). Sem
+  // qualquer vetor de script. Adicionada na onda VMAX (G0).
+  "tbody",
   "tr",
   "td",
   "div",
@@ -49,6 +52,14 @@ const ALLOWED_ATTRS = new Set<string>([
   "bgcolor",
   "target",
   "rel",
+  // Atributos benignos de LAYOUT de e-mail table-based (onda VMAX / G0). Não
+  // abrem vetor de script: são só apresentação/estrutura/acessibilidade. Os
+  // bloqueios de on*/javascript:/data:não-imagem/@import/expression/<script>
+  // continuam intactos.
+  "cellpadding",
+  "cellspacing",
+  "role",
+  "valign",
 ])
 
 /** Tags cujo CONTEÚDO também é descartado (não só a tag). Vetores de execução. */

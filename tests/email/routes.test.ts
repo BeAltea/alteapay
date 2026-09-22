@@ -130,7 +130,8 @@ describe("preview", () => {
     const data = await res.json()
     expect(data.previewHtml.toLowerCase()).not.toContain("<script")
     expect(data.canSave).toBe(false)
-    expect(data.warnings.join(" ")).toMatch(/valor da dívida/i)
+    // purpose=communication → variável de débito nunca é permitida (dois níveis)
+    expect(data.warnings.join(" ")).toMatch(/dado do débito/i)
   })
 })
 

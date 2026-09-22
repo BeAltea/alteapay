@@ -5,7 +5,11 @@
 // avisar sobre bloqueios antes de salvar.
 import { NextRequest, NextResponse } from "next/server"
 import { buildPreviewHtml } from "@/lib/email/templates/preview"
-import { validateVariables, validatePurposeRequirements } from "@/lib/email/templates/variables"
+import {
+  validateVariables,
+  validatePurposeRequirements,
+  validateDebtFieldsRequirements,
+} from "@/lib/email/templates/variables"
 import type { TemplatePurpose } from "@/lib/email/templates/variables"
 import { requireSuperAdmin, noCacheHeaders } from "../_guard"
 
@@ -16,7 +20,14 @@ export async function POST(request: NextRequest) {
   const guard = await requireSuperAdmin()
   if (!guard.ok) return guard.response
 
-  let body: { subject?: string; preheader?: string; html?: string; textFallback?: string; purpose?: string }
+  let body: {
+    subject?: string
+    preheader?: string
+    html?: string
+    textFallback?: string
+    purpose?: string
+    allowDebtFields?: boolean
+  }
   try {
     body = await request.json()
   } catch {
@@ -28,10 +39,17 @@ export async function POST(request: NextRequest) {
   const html = body.html ?? ""
   const textFallback = body.textFallback ?? ""
   const purpose: TemplatePurpose = body.purpose === "negotiation" ? "negotiation" : "communication"
+  const allowDebtFields = body.allowDebtFields === true
 
-  const varResult = validateVariables({ subject, preheader, html, textFallback })
+  // GATE de débito no preview: canal 'email', propósito, flag. As DEBT vars só não
+  // acusam warning quando o gate abre (mesma regra da gravação).
+  const varResult = validateVariables(
+    { subject, preheader, html, textFallback },
+    { allowDebtFields, purpose, channel: "email" },
+  )
   const purposeResult = validatePurposeRequirements(purpose, { subject, preheader, html, textFallback })
-  const warnings = [...varResult.errors, ...purposeResult.errors]
+  const debtResult = validateDebtFieldsRequirements(allowDebtFields, purpose, { subject, preheader, html, textFallback })
+  const warnings = [...varResult.errors, ...purposeResult.errors, ...debtResult.errors]
 
   const previewHtml = buildPreviewHtml({ subject, preheader, html })
 

@@ -18,6 +18,8 @@ export interface EmailTemplate {
   name: string
   purpose: TemplatePurpose
   status: TemplateStatus
+  /** Libera as 5 DEBT_VARIABLES no e-mail de cobrança (default false). */
+  allowDebtFields: boolean
   currentVersionId: string | null
   createdBy: string | null
   createdAt: string
@@ -51,6 +53,8 @@ export interface TemplateInput {
   scope: TemplateScope
   companyId: string | null
   purpose: TemplatePurpose
+  /** Liga as 5 variáveis de débito (só e-mail de cobrança). Default false. */
+  allowDebtFields: boolean
   subject: string
   preheader: string
   html: string
