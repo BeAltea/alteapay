@@ -4,6 +4,16 @@ import { type NextRequest, NextResponse } from "next/server"
 
 export const dynamic = "force-dynamic"
 
+// `debts` não tem coluna `days_overdue` no schema real — computa-se a partir de
+// `due_date` (dias inteiros de atraso, nunca negativo).
+function daysOverdueFrom(dueDate: string | null): number {
+  if (!dueDate) return 0
+  const due = Date.parse(dueDate)
+  if (!Number.isFinite(due)) return 0
+  const diff = Date.now() - due
+  return Math.max(0, Math.floor(diff / 86_400_000))
+}
+
 export async function POST(request: NextRequest) {
   try {
     const supabase = await createClient()
@@ -25,8 +35,8 @@ export async function POST(request: NextRequest) {
       .from("debts")
       .select(`
         id,
-        current_amount,
-        days_overdue,
+        amount,
+        due_date,
         customer_id,
         customers (
           id,
@@ -59,8 +69,8 @@ export async function POST(request: NextRequest) {
     const classifications = []
     for (const debt of debts) {
       const criteria = createClassificationCriteria({
-        daysOverdue: debt.days_overdue || 0,
-        currentAmount: debt.current_amount,
+        daysOverdue: daysOverdueFrom(debt.due_date),
+        currentAmount: debt.amount,
         // In a real implementation, you would fetch customer history here
         customerHistory: {
           previousPayments: 0,
@@ -85,8 +95,8 @@ export async function POST(request: NextRequest) {
     // Get classification stats
     const criteriaList = debts.map((debt) =>
       createClassificationCriteria({
-        daysOverdue: debt.days_overdue || 0,
-        currentAmount: debt.current_amount,
+        daysOverdue: daysOverdueFrom(debt.due_date),
+        currentAmount: debt.amount,
       }),
     )
     const stats = classificationEngine.getClassificationStats(criteriaList)
@@ -119,7 +129,7 @@ export async function GET(request: NextRequest) {
     // Get classification statistics
     const { data: debts, error } = await supabase
       .from("debts")
-      .select("classification, current_amount, days_overdue")
+      .select("classification, amount")
       .eq("user_id", user.id)
 
     if (error) {
@@ -133,7 +143,7 @@ export async function GET(request: NextRequest) {
       medium: debts.filter((d) => d.classification === "medium").length,
       high: debts.filter((d) => d.classification === "high").length,
       critical: debts.filter((d) => d.classification === "critical").length,
-      totalAmount: debts.reduce((sum, debt) => sum + (debt.current_amount || 0), 0),
+      totalAmount: debts.reduce((sum, debt) => sum + (debt.amount || 0), 0),
     }
 
     return NextResponse.json({ stats })

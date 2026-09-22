@@ -13,7 +13,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
 import { getPrompt, answerPrompt } from "@/lib/journey/prompts"
-import { recordAcknowledgement, startN8nNegotiation } from "@/lib/journey/acknowledgement"
+import { buildAckContext, recordAcknowledgement, startN8nNegotiation } from "@/lib/journey/acknowledgement"
 import { engineName } from "@/lib/negotiation/engine"
 import { BTN_HANDOFF } from "@/lib/journey/buttons"
 
@@ -69,11 +69,24 @@ export async function POST(req: NextRequest) {
       } else if (res.onNotRecognized === "human") {
         await transferToHuman(ctx, "debt_not_recognized", "customer")
       }
+      // Reply fixo local (n8n ainda não plugado): direciona o cliente ao credor.
+      let creditorName = "empresa credora"
+      try {
+        const ackCtx = await buildAckContext({
+          companyId: ctx.companyId,
+          customerId: ctx.customerId,
+          debtIds: [ctx.debtId],
+        })
+        creditorName = ackCtx.creditorName
+      } catch {
+        /* fallback silencioso: mantém o texto genérico */
+      }
       return NextResponse.json({
         ok: true,
         acknowledged: false,
         button_id: buttonId,
         on_not_recognized: res.onNotRecognized ?? "continue",
+        reply: `Obrigado pelo seu retorno. Para esclarecimentos sobre esta cobrança, entre em contato diretamente com a ${creditorName}.`,
       })
     }
     // "Sim, reconheço" (button 1): handoff ao n8n (engine_owner='n8n' + emite
@@ -91,7 +104,13 @@ export async function POST(req: NextRequest) {
     } catch (err) {
       console.warn("[chat:button] negotiation.start falhou (fallback assistido):", (err as Error).message)
     }
-    return NextResponse.json({ ok: true, acknowledged: true, button_id: buttonId, engine_owner: engineOwner })
+    return NextResponse.json({
+      ok: true,
+      acknowledged: true,
+      button_id: buttonId,
+      engine_owner: engineOwner,
+      reply: "Perfeito! Então vamos trabalhar juntos para sanar o seu débito.",
+    })
   }
 
   // Handoff genérico ([99]) em qualquer prompt: transfere e responde.

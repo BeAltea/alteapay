@@ -32,13 +32,19 @@ function formatDatePt(iso: string | null): string {
 }
 
 export interface AckContext {
+  firstName: string // primeiro nome do cliente (vazio se indisponível)
   creditorName: string
   updatedValue: number // reais (a UI/n8n formata; cents só na borda n8n)
   invoiceCount: number
   oldestDueDate: string | null
 }
 
-/** Resumo objetivo da dívida (credor, valor atualizado, N faturas, vencimento). */
+/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver. */
+function firstNameOf(name: string | null | undefined): string {
+  return (name ?? "").trim().split(/\s+/)[0] ?? ""
+}
+
+/** Resumo objetivo da dívida (cliente, credor, valor atualizado, vencimento). */
 export async function buildAckContext(input: {
   companyId: string
   customerId: string
@@ -71,9 +77,10 @@ export async function buildAckContext(input: {
 
   const { data: customer } = await supabase
     .from("customers")
-    .select("document")
+    .select("name, document")
     .eq("id", input.customerId)
     .maybeSingle()
+  const firstName = firstNameOf(customer?.name)
   const doc = (customer?.document ?? "").replace(/\D/g, "")
   const { data: invoices } = await supabase
     .from("vmax_invoices")
@@ -85,6 +92,7 @@ export async function buildAckContext(input: {
   const oldestDebtDue = (debts ?? []).map((d) => d.due_date).filter(Boolean).sort()[0] ?? null
 
   return {
+    firstName,
     creditorName,
     updatedValue,
     invoiceCount: invoices?.length ?? (debts?.length ?? 0),
@@ -102,12 +110,17 @@ export function acknowledgementButtons(showHandoff: boolean): Button[] {
   return buttons
 }
 
-/** Texto aprovado (GATE R0) do prompt de reconhecimento. */
+/**
+ * Texto do prompt de reconhecimento — mensagem ÚNICA (saudação + resumo +
+ * pergunta). Sem contagem de faturas. Se firstName vazio, cai no genérico.
+ */
 export function acknowledgementQuestion(ctx: AckContext): string {
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
   return (
-    `${ctx.creditorName} · valor atualizado ${BRL(ctx.updatedValue)}, ` +
-    `${ctx.invoiceCount} fatura(s), vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}. ` +
-    `Antes de começarmos: você reconhece esta cobrança em seu nome?`
+    `${greeting} Temos uma dívida em seu nome da empresa ${ctx.creditorName}. ` +
+    `Valor atualizado ${BRL(ctx.updatedValue)}, ` +
+    `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}. ` +
+    `Você reconhece esta cobrança em seu nome?`
   )
 }
 

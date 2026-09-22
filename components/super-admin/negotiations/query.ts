@@ -304,14 +304,13 @@ async function aggregateDebts(
   const consume = (rows: Array<{
     customer_id: string
     amount: number | null
-    current_amount: number | null
     due_date: string | null
     status: string | null
   }>) => {
     for (const d of rows) {
       const status = (d.status ?? "").toLowerCase()
       if (status === "paid" || status === "written_off") continue
-      const open = Number(d.current_amount ?? d.amount ?? 0)
+      const open = Number(d.amount ?? 0)
       const prev = debtAgg.get(d.customer_id) ?? { open: 0, oldestDue: null }
       prev.open += Number.isFinite(open) ? open : 0
       if (d.due_date && (!prev.oldestDue || d.due_date < prev.oldestDue)) {
@@ -325,7 +324,7 @@ async function aggregateDebts(
     for (const part of chunk(Array.from(only))) {
       const { data } = await (supabase as any)
         .from("debts")
-        .select("customer_id, amount, current_amount, due_date, status")
+        .select("customer_id, amount, due_date, status")
         .in("customer_id", part)
       consume((data ?? []) as any)
     }
@@ -337,7 +336,7 @@ async function aggregateDebts(
   for (;;) {
     let q = (supabase as any)
       .from("debts")
-      .select("customer_id, amount, current_amount, due_date, status")
+      .select("customer_id, amount, due_date, status")
     if (companyId) q = q.eq("company_id", companyId)
     q = q.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
     const { data } = await q
