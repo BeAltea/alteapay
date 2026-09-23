@@ -79,6 +79,25 @@ export async function chatSend(
 
   const supabase = createServiceClient()
 
+  // Dedupe por CONTEÚDO: fluxos n8n reentrantes (session.start redisparado a cada
+  // re-entrada do devedor) empurram a MESMA mensagem com event_ids DIFERENTES — o
+  // dedupe por event_id acima não pega, e a tela mostrava a msg repetida. Se uma
+  // mensagem de assistente IDÊNTICA já foi gravada nesta sessão nos últimos 15min,
+  // não re-insere. Só para mensagem pura de texto (menus/prompts nunca deduplicam).
+  if (text && !args.prompt) {
+    const since = new Date(Date.now() - 15 * 60_000).toISOString()
+    const { data: dup } = await supabase
+      .from("chat_messages")
+      .select("id")
+      .eq("session_id", ctx.sessionId)
+      .eq("role", "assistant")
+      .eq("text", text)
+      .gte("created_at", since)
+      .limit(1)
+      .maybeSingle()
+    if (dup?.id) return { ok: true, message_id: dup.id, duplicate: true }
+  }
+
   let prompt: PromptRow | null = null
   if (args.prompt) {
     const created = await createPrompt({

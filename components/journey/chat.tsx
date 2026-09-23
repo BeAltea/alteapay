@@ -44,6 +44,18 @@ function safeExternalAction(raw: unknown): MsgAction | null {
   return { type: "external_link", label, href }
 }
 
+/** Render simples de **negrito** (o n8n envia markdown). Preserva quebras de linha
+ *  via whitespace-pre-line na bolha. Não injeta HTML. */
+function renderRichText(text: string) {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+    part.length > 4 && part.startsWith("**") && part.endsWith("**") ? (
+      <strong key={i}>{part.slice(2, -2)}</strong>
+    ) : (
+      <span key={i}>{part}</span>
+    ),
+  )
+}
+
 const IDLE_MS = 5 * 60_000 // 5 minutos sem interação
 const KEEPALIVE_MS = 10 * 60_000 // renova o cookie a cada 10min (só aba visível)
 
@@ -331,11 +343,11 @@ export function JourneyChat() {
               }
               className={
                 m.from === "customer"
-                  ? "max-w-[85%] rounded-2xl rounded-br-sm px-3.5 py-2 text-sm text-white"
-                  : "max-w-[85%] rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800"
+                  ? "max-w-[85%] whitespace-pre-line rounded-2xl rounded-br-sm px-3.5 py-2 text-sm text-white"
+                  : "max-w-[85%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800"
               }
             >
-              {m.text}
+              {renderRichText(m.text)}
             </div>
             {/* Botão-link externo anexado à bolha (ex.: quitação → #contato). */}
             {m.from === "assistant" && m.action ? (
