@@ -63,17 +63,24 @@ export function buildProviderSelector(
   }
 }
 
-export async function processCampaignMessage(messageId: string): Promise<"sent" | "suppressed" | "failed" | "skipped"> {
+export async function processCampaignMessage(
+  messageId: string,
+): Promise<"sent" | "suppressed" | "failed" | "skipped" | "paused"> {
   const supabase = createServiceClient()
   const { data: msg } = await supabase
     .from("whatsapp_messages")
-    .select("*, whatsapp_campaigns!inner(id, company_id, template_key, provider, status)")
+    .select("*, whatsapp_campaigns!inner(id, company_id, template_key, provider, status, counts)")
     .eq("id", messageId)
     .maybeSingle()
   if (!msg) return "skipped"
-  if (msg.status !== "queued") return "skipped" // idempotência de reprocesso
+  // W2 — idempotência NOSSA: RELÊ o status ANTES de qualquer disparo e ABORTA se
+  // a mensagem já foi aceita pelo provider (sent/accepted) ou já teve desfecho
+  // (suppressed/failed). O UNIQUE(campaign_id,customer_id) é a trava DURA (dois
+  // inserts colidem); este guard evita a 2ª CHAMADA ao provider quando o mesmo
+  // (campaign,customer) é reprocessado (retry BullMQ, double-click no inline).
+  if (msg.status !== "queued") return "skipped"
   const campaign = msg.whatsapp_campaigns as {
-    id: string; company_id: string; template_key: string; provider: string; status: string
+    id: string; company_id: string; template_key: string; provider: string; status: string; counts?: Record<string, unknown>
   }
   if (!["running", "scheduled"].includes(campaign.status)) return "skipped" // pausada/cancelada
 
@@ -207,11 +214,27 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
     throw new Error(`voxuy_retryable:${result.error ?? "unknown"}`)
   }
 
-  // 401/403 = erro de configuração (§1.5): falha a mensagem E PAUSA a campanha
-  // (não fica batendo com token errado). 400/validation/unexpected: falha final.
-  if (result.errorClass === "config") {
+  // W2 — consumidor de pauseCampaign (§3). O provider sinaliza credencial
+  // inválida (401/403/404) de DUAS formas: errorClass 'config' E o flag explícito
+  // result.raw.pauseCampaign=true. Consumimos AMBOS: marcamos a campanha `paused`
+  // com o motivo (counts.pause_reason, queryável — não há coluna dedicada) e
+  // devolvemos "paused" para o chamador INLINE PARAR de iterar (não bater de novo
+  // no provider com a mesma credencial inválida). O worker também recebe "paused"
+  // e a próxima mensagem cai no guard `campaign.status not in (running,scheduled)`.
+  const pauseFlag = (result.raw as { pauseCampaign?: boolean } | undefined)?.pauseCampaign === true
+  const mustPause = result.errorClass === "config" || pauseFlag
+  if (mustPause) {
+    // reason SEM PII: só a classe do erro (nunca a message do provider, que pode
+    // ser sensível, nem a URL-credencial).
+    const pauseReason = `provider_config_error:${result.errorClass ?? "config"}`
+    // O motivo vive em counts.pause_reason (queryável pela UI) — não há evento
+    // dedicado `campaign.paused` no enum de jornada; a auditoria fica no
+    // message.failed abaixo (errorClass) + o campo pause_reason da campanha.
     await supabase.from("whatsapp_campaigns")
-      .update({ status: "paused" })
+      .update({
+        status: "paused",
+        counts: { ...(campaign.counts ?? {}), pause_reason: pauseReason, paused_at: now },
+      })
       .eq("id", campaign.id)
       .in("status", ["running", "scheduled"])
   }
@@ -227,7 +250,10 @@ export async function processCampaignMessage(messageId: string): Promise<"sent" 
     type: "message.failed", actor: "system",
     payload: { channel: "whatsapp", error: result.error ?? "send_failed", errorClass: result.errorClass, traceId: result.traceId },
   })
-  return "failed"
+  // Credencial inválida: devolve "paused" (não "failed") para o inline abortar o
+  // laço. A mensagem em si fica 'failed' (registro do que ocorreu), mas o desfecho
+  // de CONTROLE do laço é a pausa.
+  return mustPause ? "paused" : "failed"
 }
 
 // ===========================================================================
@@ -344,15 +370,22 @@ async function ensureChannelMessage(
   return { id: msg.id }
 }
 
-/** Envia UMA decisão de WhatsApp (fila ou inline). Isolado por canal. */
+/**
+ * Envia UMA decisão de WhatsApp (fila ou inline). Isolado por canal.
+ *
+ * Devolve `{ item, paused }`. `paused=true` quando o INLINE recebeu credencial
+ * inválida do provider (processCampaignMessage devolveu "paused"): o chamador
+ * (runHubSend) PARA de iterar o canal WhatsApp (não bate de novo no provider
+ * com a mesma credencial). No modo `queue` nunca pausa aqui (o worker consome).
+ */
 async function sendWhatsAppDecision(
   supabase: ReturnType<typeof createServiceClient>,
   ctx: HubSendContext,
   d: { customerId: string; debtIds?: string[]; phoneE164?: string },
-): Promise<HubSendItem> {
+): Promise<{ item: HubSendItem; paused: boolean }> {
   const ensured = await ensureChannelMessage(supabase, ctx, { ...d, channel: "whatsapp" })
-  if ("skipped" in ensured) return ensured.skipped
-  if ("failed" in ensured) return ensured.failed
+  if ("skipped" in ensured) return { item: ensured.skipped, paused: false }
+  if ("failed" in ensured) return { item: ensured.failed, paused: false }
   const messageId = ensured.id
   const jobId = hubJobId(ctx.campaignId, d.customerId, "whatsapp")
   if (ctx.dispatchMode === "queue") {
@@ -361,14 +394,28 @@ async function sendWhatsAppDecision(
       { kind: "campaign-message", messageId },
       { jobId },
     )
-    return { customerId: d.customerId, channel: "whatsapp", status: "sent", reason: "queued", messageId, jobId }
+    return {
+      item: { customerId: d.customerId, channel: "whatsapp", status: "sent", reason: "queued", messageId, jobId },
+      paused: false,
+    }
   }
   const outcome = await processCampaignMessage(messageId)
+  // "paused" (credencial inválida) → item 'failed' com motivo estável + sinal de
+  // pausa para o laço abortar.
+  const status: HubSendItem["status"] =
+    outcome === "sent" ? "sent"
+    : outcome === "suppressed" ? "suppressed"
+    : outcome === "skipped" ? "skipped"
+    : "failed"
   return {
-    customerId: d.customerId,
-    channel: "whatsapp",
-    status: outcome === "sent" ? "sent" : outcome === "suppressed" ? "suppressed" : outcome === "skipped" ? "skipped" : "failed",
-    messageId,
+    item: {
+      customerId: d.customerId,
+      channel: "whatsapp",
+      status,
+      messageId,
+      ...(outcome === "paused" ? { reason: "campanha_pausada_credencial_invalida" } : {}),
+    },
+    paused: outcome === "paused",
   }
 }
 
@@ -712,24 +759,52 @@ export async function runHubSend(input: {
     return { campaignId: input.campaignId, mode, dispatchMode: input.dispatchMode, dryRun: input.dryRun, items, summary: tallySummary(items) }
   }
 
+  // W2 (inline): a campanha precisa estar `running` ANTES do laço, porque o
+  // envio INLINE do WhatsApp chama processCampaignMessage, que RECUSA (skipped)
+  // qualquer campanha fora de running/scheduled. No modo queue isto também é
+  // correto (o worker checa o mesmo guard). Só promove draft/scheduled → running
+  // (nunca reabre uma campanha paused/cancelada por config-error anterior).
+  await supabase
+    .from("whatsapp_campaigns")
+    .update({ status: "running", started_at: campaign.started_at ?? new Date().toISOString() })
+    .eq("id", input.campaignId)
+    .in("status", ["draft", "scheduled"])
+
   // ---- envio real, POR CANAL, em sequências INDEPENDENTES.
   // Cada canal roda seu próprio laço; um throw dentro de um canal é capturado e
   // vira item 'failed' daquele (devedor, canal), sem abortar o outro canal.
+  //
+  // §3: quando o WhatsApp devolve `paused` (credencial inválida, 401/403/404),
+  // PARAMOS de iterar o canal WhatsApp neste envio (não bater de novo no provider
+  // com a mesma credencial). A campanha já foi marcada `paused` dentro de
+  // processCampaignMessage; os devedores restantes do canal ficam `skipped`
+  // (motivo estável) — o e-mail (outro canal) segue normalmente (E3).
   for (const channel of channels) {
+    let channelPaused = false
     for (const r of reverified) {
       const d = r.decisions.find((x) => x.channel === channel && x.eligible)
       if (!d) continue
+      if (channelPaused && channel === "whatsapp") {
+        // canal já pausado neste envio: registra o restante sem chamar o provider.
+        items.push({ customerId: d.customerId, channel, status: "skipped", reason: "campanha_pausada_credencial_invalida" })
+        continue
+      }
       try {
-        const item =
-          channel === "whatsapp"
-            ? await sendWhatsAppDecision(supabase, ctx, { customerId: d.customerId, debtIds: d.debtIds, phoneE164: d.phoneE164 })
-            : await sendEmailDecision(supabase, ctx, {
-                customerId: d.customerId,
-                debtIds: d.debtIds,
-                email: d.email,
-                firstName: emailFirstNames.get(d.customerId) ?? "",
-              })
-        items.push(item)
+        if (channel === "whatsapp") {
+          const { item, paused } = await sendWhatsAppDecision(supabase, ctx, {
+            customerId: d.customerId, debtIds: d.debtIds, phoneE164: d.phoneE164,
+          })
+          items.push(item)
+          if (paused) channelPaused = true // trava: não chama o provider de novo
+        } else {
+          const item = await sendEmailDecision(supabase, ctx, {
+            customerId: d.customerId,
+            debtIds: d.debtIds,
+            email: d.email,
+            firstName: emailFirstNames.get(d.customerId) ?? "",
+          })
+          items.push(item)
+        }
       } catch (e) {
         // isolamento entre canais (E3): a exceção não escapa e não afeta o outro.
         items.push({ customerId: d.customerId, channel, status: "failed", reason: (e as Error)?.message ?? "send_failed" })

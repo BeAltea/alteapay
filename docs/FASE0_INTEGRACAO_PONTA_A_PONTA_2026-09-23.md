@@ -13,7 +13,7 @@
 | **A3** | `button.id` string vs D19 numérico | Hoje o payload não manda `button` estruturado no `chat.turn` (só em prompts). | Enviar aditivo `button = {id:"SIM", numeric_id:1, text:"..."}`. |
 | **A4** | `aging_days` incoerente | `aging_days` deve ser calculado no disparo, em America/Sao_Paulo, do `due_date` original. | Calcular no envio; teste que compara com `due_date`. |
 | **A5** | `channel:"webchat"` vs enum interno | Interno: `web_public_link`/`web_campaign`/`web_generic`/`admin_preview`. | Mapa explícito (Apêndice B do prompt): interno→`webchat`. |
-| **A6** | webhook n8n sem auth? | **PROBE CONFIRMA: SEM Basic Auth E SEM validação HMAC** — o n8n devolve **200** a assinatura adulterada, timestamp velho e request sem Authorization. **É GATE.** | **BLOQUEANTE: o time n8n precisa ligar Basic Auth (D31) + nó de validação HMAC no Webhook antes de qualquer dado real.** |
+| **A6** | webhook n8n sem auth? | **PROBE CONFIRMA: SEM Basic Auth E SEM validação HMAC** — o n8n devolve **200** a assinatura adulterada, timestamp velho e request sem Authorization. | **RESOLVIDO 2026-09-23 (Fabio): risco aceito — o n8n removeu a auth, seguimos "apenas com o endpoint". GATE X0 rebaixado para CONECTIVIDADE (probe atualizado). A URL do endpoint é a única proteção → segue tratada como SEGREDO (nunca logada). Nosso outbound ainda assina (HMAC) e manda Basic Auth se os envs existirem; o n8n ignora.** |
 | **A7** | `session_state` incoerente na captura | Tratar como teste manual; `session_state` é projetado do estado real. | Teste: turno de pagamento com `identity_verified=false` não existe. |
 
 ---
@@ -53,7 +53,7 @@
 
 ## GATE G0 — o que falta decidir/consertar antes de qualquer código
 
-1. **🔴 SEGURANÇA (A6, bloqueante):** o time n8n precisa **ligar Basic Auth + nó de validação HMAC** no Webhook. Hoje qualquer um posta. **Sem isso, nada de dado real.**
+1. **🟡 SEGURANÇA (A6) — RESOLVIDO por decisão (2026-09-23):** o n8n removeu a auth; seguimos **apenas com o endpoint** (risco aceito, "por enquanto"). GATE X0 vira conectividade. A URL do endpoint é a única proteção → **segredo** (nunca logar). Quando quiserem endurecer: ligar Basic Auth + validação HMAC no Webhook (o probe volta a exigir).
 2. **A1 (time n8n, por escrito):** confirmar que texto usa `amount_formatted` e conta usa `amount_cents`; o ASAAS recebe **reais** (o banco é reais).
 3. **N9 (Fabio):** máscara canônica — manter a nossa `***.456.789-**` OU adotar a do exemplo `390.***.**7-05`?
 4. **A2 (Fabio):** texto oficial do `official_channel_label` da VMAX.

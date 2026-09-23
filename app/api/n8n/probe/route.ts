@@ -1,8 +1,13 @@
 // Probe do fluxo-cérebro n8n (papel A) — GATE X0. Roda no runtime de PRODUÇÃO
-// (onde os N8N_* existem), exercitando o MESMO esquema HMAC+Basic Auth da plataforma
-// (lib/negotiation/n8n.ts). Devolve SOMENTE status/latência/veredito por caso — NUNCA
-// a URL, o segredo, a senha ou o header Authorization. Auth server-a-servidor por
-// Bearer CRON_SECRET. Espelha scripts/ops/n8n-probe.ts.
+// (onde os N8N_* existem), exercitando o MESMO esquema de headers da plataforma
+// (lib/negotiation/n8n.ts). Devolve SOMENTE status/latência/veredito por caso —
+// NUNCA a URL, o segredo, a senha ou o header Authorization. Auth server-a-servidor
+// por Bearer CRON_SECRET.
+//
+// DECISÃO 2026-09-23 (Fabio): o lado do n8n REMOVEU a autenticação; seguimos
+// "apenas com o endpoint". Portanto o GATE X0 é CONECTIVIDADE (o endpoint responde
+// 200 a um ping). Os casos de auth são INFORMATIVOS — o n8n não valida nada, então
+// espera-se 200 em todos; é risco aceito (a URL é a única proteção e segue segredo).
 import { NextRequest, NextResponse } from "next/server"
 import { createHmac, randomUUID } from "node:crypto"
 
@@ -14,52 +19,70 @@ const nowSeconds = () => Math.floor(Date.now() / 1000)
 const sign = (rawBody: string, ts: string, secret: string) =>
   "sha256=" + createHmac("sha256", secret).update(`${ts}.${rawBody}`, "utf8").digest("hex")
 
-interface Env { url: string; secret: string; basicAuth: string }
+interface Env {
+  url: string
+  secret: string | null
+  basicAuth: string | null
+}
 
 type Case = {
   name: string
+  gating: boolean // true = decide o GATE X0; false = informativo
   expectation: string
   verdict: (status: number) => boolean
   headers: (env: Env, body: string) => Record<string, string>
 }
 
+function baseHeaders(env: Env, body: string, ts: string, signature?: string): Record<string, string> {
+  const h: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-alteapay-timestamp": ts,
+    "x-alteapay-event-id": randomUUID(),
+  }
+  if (env.secret) h["x-alteapay-signature"] = signature ?? sign(body, ts, env.secret)
+  if (env.basicAuth) h.Authorization = env.basicAuth
+  return h
+}
+
 const CASES: Case[] = [
   {
-    name: "ok (assinado + Basic Auth)",
+    name: "conectividade (ping bem-formado)",
+    gating: true,
     expectation: "200",
+    verdict: (s) => s === 200,
+    headers: (env, body) => baseHeaders(env, body, String(nowSeconds())),
+  },
+  {
+    name: "assinatura adulterada [informativo]",
+    gating: false,
+    expectation: "n8n sem auth (aceito)",
     verdict: (s) => s === 200,
     headers: (env, body) => {
       const ts = String(nowSeconds())
-      return { "Content-Type": "application/json", "x-alteapay-signature": sign(body, ts, env.secret), "x-alteapay-timestamp": ts, "x-alteapay-event-id": randomUUID(), Authorization: env.basicAuth }
+      let sig: string | undefined
+      if (env.secret) {
+        const good = sign(body, ts, env.secret)
+        sig = good.slice(0, -1) + (good.slice(-1) === "0" ? "1" : "0")
+      }
+      return baseHeaders(env, body, ts, sig)
     },
   },
   {
-    name: "assinatura adulterada",
-    expectation: "recusa 401/403",
-    verdict: (s) => s === 401 || s === 403,
-    headers: (env, body) => {
-      const ts = String(nowSeconds())
-      const good = sign(body, ts, env.secret)
-      const tampered = good.slice(0, -1) + (good.slice(-1) === "0" ? "1" : "0")
-      return { "Content-Type": "application/json", "x-alteapay-signature": tampered, "x-alteapay-timestamp": ts, "x-alteapay-event-id": randomUUID(), Authorization: env.basicAuth }
-    },
+    name: "timestamp fora da janela (-600s) [informativo]",
+    gating: false,
+    expectation: "n8n sem auth (aceito)",
+    verdict: (s) => s === 200,
+    headers: (env, body) => baseHeaders(env, body, String(nowSeconds() - 600)),
   },
   {
-    name: "timestamp fora da janela (-600s)",
-    expectation: "recusa 401/403",
-    verdict: (s) => s === 401 || s === 403,
+    name: "sem Authorization [informativo]",
+    gating: false,
+    expectation: "n8n sem auth (aceito)",
+    verdict: (s) => s === 200,
     headers: (env, body) => {
-      const ts = String(nowSeconds() - 600)
-      return { "Content-Type": "application/json", "x-alteapay-signature": sign(body, ts, env.secret), "x-alteapay-timestamp": ts, "x-alteapay-event-id": randomUUID(), Authorization: env.basicAuth }
-    },
-  },
-  {
-    name: "sem Authorization",
-    expectation: "401",
-    verdict: (s) => s === 401,
-    headers: (env, body) => {
-      const ts = String(nowSeconds())
-      return { "Content-Type": "application/json", "x-alteapay-signature": sign(body, ts, env.secret), "x-alteapay-timestamp": ts, "x-alteapay-event-id": randomUUID() }
+      const h = baseHeaders(env, body, String(nowSeconds()))
+      delete h.Authorization
+      return h
     },
   },
 ]
@@ -69,21 +92,19 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
   const url = process.env.N8N_CHAT_FLOW_URL
-  const secret = process.env.N8N_WEBHOOK_SECRET
+  if (!url) return NextResponse.json({ ok: false, error: "env ausente", missing: ["N8N_CHAT_FLOW_URL"] }, { status: 500 })
+
+  const secret = process.env.N8N_WEBHOOK_SECRET ?? null
   const user = process.env.N8N_BASIC_AUTH_USER
   const password = process.env.N8N_BASIC_AUTH_PASSWORD
-  const missing = [
-    !url && "N8N_CHAT_FLOW_URL",
-    !secret && "N8N_WEBHOOK_SECRET",
-    !user && "N8N_BASIC_AUTH_USER",
-    !password && "N8N_BASIC_AUTH_PASSWORD",
-  ].filter(Boolean)
-  if (missing.length) return NextResponse.json({ ok: false, error: "envs ausentes", missing }, { status: 500 })
-
-  const env: Env = { url: url!, secret: secret!, basicAuth: `Basic ${Buffer.from(`${user}:${password}`, "utf8").toString("base64")}` }
+  const env: Env = {
+    url,
+    secret,
+    basicAuth: user && password ? `Basic ${Buffer.from(`${user}:${password}`, "utf8").toString("base64")}` : null,
+  }
   const body = JSON.stringify({ action: "ping" })
 
-  const results: Array<{ name: string; expected: string; status: number | null; error: string | null; latency_ms: number; pass: boolean }> = []
+  const results: Array<{ name: string; gating: boolean; expected: string; status: number | null; error: string | null; latency_ms: number; verdict: string }> = []
   for (const c of CASES) {
     const t0 = Date.now()
     let status: number | null = null
@@ -95,9 +116,19 @@ export async function POST(request: NextRequest) {
     } catch (e) {
       error = e instanceof Error && e.name === "TimeoutError" ? "timeout" : "network_error"
     }
-    results.push({ name: c.name, expected: c.expectation, status, error, latency_ms: Date.now() - t0, pass: status != null && c.verdict(status) })
+    const ok = status != null && c.verdict(status)
+    results.push({
+      name: c.name,
+      gating: c.gating,
+      expected: c.expectation,
+      status,
+      error,
+      latency_ms: Date.now() - t0,
+      verdict: c.gating ? (ok ? "GATE_OK" : "GATE_FAIL") : "info",
+    })
   }
 
-  const allPass = results.every((r) => r.pass)
-  return NextResponse.json({ ok: true, gate_x0: allPass ? "PASSA" : "FALHA", allPass, results })
+  const gate = results.find((r) => r.gating)
+  const gatePass = gate?.verdict === "GATE_OK"
+  return NextResponse.json({ ok: true, gate_x0: gatePass ? "PASSA" : "FALHA", gatePass, note: "n8n sem auth (aceito 2026-09-23); GATE = conectividade", results })
 }

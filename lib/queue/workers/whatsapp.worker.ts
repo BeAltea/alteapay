@@ -25,6 +25,15 @@ export const whatsappWorker = WorkerManager.registerWorker<WhatsAppJobData>(
     if (job.name === 'campaign-message' || (job.data as unknown as { kind?: string }).kind === 'campaign-message') {
       const { processCampaignMessage } = await import('@/lib/journey/campaign-send');
       const outcome = await processCampaignMessage((job.data as unknown as { messageId: string }).messageId);
+      // §3 — consumidor de pauseCampaign no worker: o outcome "paused" significa
+      // que o provider devolveu credencial inválida (401/403/404) e a campanha JÁ
+      // foi marcada `paused` dentro de processCampaignMessage. Os próximos jobs da
+      // MESMA campanha caem no guard `campaign.status not in (running,scheduled)`
+      // e retornam "skipped" — logo o worker PARA de bater no provider com a
+      // credencial inválida sem cancelar jobs à mão. Só sinalizamos no log.
+      if (outcome === 'paused') {
+        console.warn(`[WHATSAPP] campanha pausada (credencial invalida) via job ${job.id}`);
+      }
       return { campaign: true, outcome };
     }
     const supabase = createServiceClient();

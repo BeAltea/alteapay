@@ -1,30 +1,26 @@
 /**
- * n8n-probe — sonda de conectividade + segurança do fluxo-cérebro n8n (papel A).
+ * n8n-probe — sonda de conectividade do fluxo-cérebro n8n (papel A).
  *
- * Envia um `ping` ASSINADO ao Webhook trigger em N8N_CHAT_FLOW_URL, exercitando
- * o MESMO esquema que a plataforma usa em produção (lib/negotiation/n8n.ts):
- *   - HMAC-SHA256 de `${timestamp}.${body}` no header x-alteapay-signature
- *     (`sha256=<hex>`), timestamp em segundos em x-alteapay-timestamp, um
- *     x-alteapay-event-id único, e Authorization: Basic base64(user:pass) (UTF-8).
+ * DECISÃO 2026-09-23 (Fabio): o lado do n8n REMOVEU a autenticação; seguimos
+ * "apenas com o endpoint". Portanto o GATE X0 agora é CONECTIVIDADE: basta o
+ * endpoint responder 200 a um ping bem-formado. Os casos de auth (assinatura
+ * adulterada / timestamp velho / sem Authorization) viram INFORMATIVOS — como o
+ * n8n não valida nada, espera-se que TODOS retornem 200; isso é risco aceito
+ * (a URL do endpoint é a única proteção e continua sendo segredo).
  *
- * Roda 4 casos e imprime SOMENTE status HTTP + latência + veredito. NUNCA
- * imprime a URL, o segredo, a senha nem o header Authorization.
+ * Envia um `ping` ao Webhook trigger em N8N_CHAT_FLOW_URL exercitando o MESMO
+ * esquema de headers que a plataforma usa (lib/negotiation/n8n.ts) — a assinatura
+ * HMAC e o Basic Auth são enviados quando os envs existem, mas o n8n os ignora.
  *
- *   1. ok               — request bem-formado           → espera 200 {ok:true}/{success:true}
- *   2. assinatura ruim  — HMAC adulterado               → o fluxo deve RECUSAR (401/403)
- *   3. timestamp velho  — ts = agora-600s (fora ±300s)  → o fluxo deve RECUSAR (401/403)
- *   4. sem Authorization — Basic Auth omitido           → espera 401 (Basic Auth do n8n)
+ * Imprime SOMENTE status HTTP + latência + veredito. NUNCA imprime a URL, o
+ * segredo, a senha nem o header Authorization.
  *
- * Tudo vem de process.env; envs ausentes → console.error + exit(1).
+ * Uso:  pnpm exec tsx scripts/ops/n8n-probe.ts
  *
- * Uso:
- *   pnpm exec tsx scripts/ops/n8n-probe.ts
- *
- * Requer no ambiente (nunca hardcode):
- *   N8N_CHAT_FLOW_URL         URL do Webhook trigger do fluxo-cérebro
- *   N8N_WEBHOOK_SECRET        segredo HMAC compartilhado
- *   N8N_BASIC_AUTH_USER       usuário do Basic Auth do trigger n8n
- *   N8N_BASIC_AUTH_PASSWORD   senha do Basic Auth do trigger n8n
+ * Envs (nunca hardcode):
+ *   N8N_CHAT_FLOW_URL         (obrigatório) URL do Webhook trigger
+ *   N8N_WEBHOOK_SECRET        (opcional)    segredo HMAC — enviado se presente
+ *   N8N_BASIC_AUTH_USER/…_PASSWORD (opcional) Basic Auth — enviado se presente
  */
 
 import { createHmac, randomUUID } from "node:crypto"
@@ -33,30 +29,25 @@ const TIMEOUT_MS = 20_000
 
 type EnvBundle = {
   url: string
-  secret: string
-  basicAuth: string // "Basic <base64>"
+  secret: string | null
+  basicAuth: string | null // "Basic <base64>" ou null
 }
 
-/** Lê e valida as envs. Faltando qualquer uma → erro + exit 1. NUNCA loga valores. */
+/** Lê as envs. Só N8N_CHAT_FLOW_URL é obrigatória. NUNCA loga valores. */
 function readEnv(): EnvBundle {
   const url = process.env.N8N_CHAT_FLOW_URL
-  const secret = process.env.N8N_WEBHOOK_SECRET
+  const secret = process.env.N8N_WEBHOOK_SECRET ?? null
   const user = process.env.N8N_BASIC_AUTH_USER
   const password = process.env.N8N_BASIC_AUTH_PASSWORD
 
-  const missing: string[] = []
-  if (!url) missing.push("N8N_CHAT_FLOW_URL")
-  if (!secret) missing.push("N8N_WEBHOOK_SECRET")
-  if (!user) missing.push("N8N_BASIC_AUTH_USER")
-  if (!password) missing.push("N8N_BASIC_AUTH_PASSWORD")
-  if (missing.length > 0) {
-    console.error(`[n8n-probe] envs ausentes: ${missing.join(", ")}`)
+  if (!url) {
+    console.error("[n8n-probe] env ausente: N8N_CHAT_FLOW_URL")
     process.exit(1)
   }
-
   // Buffer(...,'utf8') — não btoa — para suportar credenciais não-ASCII.
-  const token = Buffer.from(`${user}:${password}`, "utf8").toString("base64")
-  return { url: url as string, secret: secret as string, basicAuth: `Basic ${token}` }
+  const basicAuth =
+    user && password ? `Basic ${Buffer.from(`${user}:${password}`, "utf8").toString("base64")}` : null
+  return { url, secret, basicAuth }
 }
 
 /** Assinatura HMAC-SHA256 de `${timestamp}.${rawBody}` (mesmo esquema da plataforma). */
@@ -66,85 +57,66 @@ function sign(rawBody: string, timestamp: string, secret: string): string {
 
 type Case = {
   name: string
+  /** true = este caso decide o GATE X0. false = informativo (n8n sem auth). */
+  gating: boolean
   expectation: string
-  /** true se o status recebido satisfaz a expectativa deste caso. */
   verdict: (status: number) => boolean
   build: (env: EnvBundle, body: string) => { headers: Record<string, string> }
 }
 
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 
+function baseHeaders(env: EnvBundle, body: string, ts: string, signature?: string): Record<string, string> {
+  const h: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-alteapay-timestamp": ts,
+    "x-alteapay-event-id": randomUUID(),
+  }
+  if (env.secret) h["x-alteapay-signature"] = signature ?? sign(body, ts, env.secret)
+  if (env.basicAuth) h.Authorization = env.basicAuth
+  return h
+}
+
 const CASES: Case[] = [
   {
-    name: "ok (assinado + Basic Auth)",
-    expectation: "200 {ok/success:true}",
+    name: "conectividade (ping bem-formado)",
+    gating: true,
+    expectation: "200",
+    verdict: (s) => s === 200,
+    build: (env, body) => ({ headers: baseHeaders(env, body, String(nowSeconds())) }),
+  },
+  {
+    name: "assinatura adulterada [informativo]",
+    gating: false,
+    expectation: "n8n sem auth → 200",
     verdict: (s) => s === 200,
     build: (env, body) => {
       const ts = String(nowSeconds())
-      return {
-        headers: {
-          "Content-Type": "application/json",
-          "x-alteapay-signature": sign(body, ts, env.secret),
-          "x-alteapay-timestamp": ts,
-          "x-alteapay-event-id": randomUUID(),
-          Authorization: env.basicAuth,
-        },
+      let sig: string | undefined
+      if (env.secret) {
+        const good = sign(body, ts, env.secret)
+        sig = good.slice(0, -1) + (good.slice(-1) === "0" ? "1" : "0")
       }
+      return { headers: baseHeaders(env, body, ts, sig) }
     },
   },
   {
-    name: "assinatura adulterada",
-    expectation: "recusa (401/403)",
-    verdict: (s) => s === 401 || s === 403,
+    name: "timestamp velho (-600s) [informativo]",
+    gating: false,
+    expectation: "n8n sem auth → 200",
+    verdict: (s) => s === 200,
+    build: (env, body) => ({ headers: baseHeaders(env, body, String(nowSeconds() - 600)) }),
+  },
+  {
+    name: "sem Authorization [informativo]",
+    gating: false,
+    expectation: "n8n sem auth → 200",
+    verdict: (s) => s === 200,
     build: (env, body) => {
       const ts = String(nowSeconds())
-      const good = sign(body, ts, env.secret)
-      // adultera o último caractere hex mantendo o formato sha256=<hex>
-      const last = good.slice(-1)
-      const tampered = good.slice(0, -1) + (last === "0" ? "1" : "0")
-      return {
-        headers: {
-          "Content-Type": "application/json",
-          "x-alteapay-signature": tampered,
-          "x-alteapay-timestamp": ts,
-          "x-alteapay-event-id": randomUUID(),
-          Authorization: env.basicAuth,
-        },
-      }
-    },
-  },
-  {
-    name: "timestamp fora da janela (-600s)",
-    expectation: "recusa (401/403)",
-    verdict: (s) => s === 401 || s === 403,
-    build: (env, body) => {
-      const ts = String(nowSeconds() - 600) // 10 min no passado (janela é ±300s)
-      return {
-        headers: {
-          "Content-Type": "application/json",
-          "x-alteapay-signature": sign(body, ts, env.secret), // assinatura válida p/ ESSE ts
-          "x-alteapay-timestamp": ts,
-          "x-alteapay-event-id": randomUUID(),
-          Authorization: env.basicAuth,
-        },
-      }
-    },
-  },
-  {
-    name: "sem Authorization (Basic Auth omitido)",
-    expectation: "401",
-    verdict: (s) => s === 401,
-    build: (env, body) => {
-      const ts = String(nowSeconds())
-      return {
-        headers: {
-          "Content-Type": "application/json",
-          "x-alteapay-signature": sign(body, ts, env.secret),
-          "x-alteapay-timestamp": ts,
-          "x-alteapay-event-id": randomUUID(),
-          // Authorization propositalmente ausente
-        },
-      }
+      const h = baseHeaders(env, body, ts)
+      delete h.Authorization
+      return { headers: h }
     },
   },
 ]
@@ -156,47 +128,35 @@ async function runCase(env: EnvBundle, c: Case): Promise<boolean> {
   let status = 0
   let label = ""
   try {
-    const resp = await fetch(env.url, {
-      method: "POST",
-      headers,
-      body,
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    })
+    const resp = await fetch(env.url, { method: "POST", headers, body, signal: AbortSignal.timeout(TIMEOUT_MS) })
     status = resp.status
-    // drena o corpo para liberar a conexão; o conteúdo NÃO é impresso (pode ecoar segredo).
-    await resp.text().catch(() => "")
+    await resp.text().catch(() => "") // drena; conteúdo NÃO é impresso (pode ecoar segredo)
   } catch (err) {
     label = err instanceof Error && err.name === "TimeoutError" ? "timeout" : "network_error"
   }
   const latency = Date.now() - t0
-
+  const kind = c.gating ? "GATE" : "info"
   if (label) {
-    // Falha de rede/timeout — sem status. Não é aprovação.
-    console.log(`  [FALHA] ${c.name.padEnd(38)} ${label.padEnd(6)} ${latency}ms  (esperado: ${c.expectation})`)
-    return false
+    console.log(`  [FALHA/${kind}] ${c.name.padEnd(40)} ${label.padEnd(6)} ${latency}ms`)
+    return c.gating ? false : true // caso informativo não derruba o gate
   }
   const pass = c.verdict(status)
-  const tag = pass ? "OK  " : "FAIL"
-  console.log(
-    `  [${tag}] ${c.name.padEnd(38)} HTTP ${status}  ${latency}ms  (esperado: ${c.expectation})`,
-  )
-  return pass
+  const tag = c.gating ? (pass ? "OK  " : "FAIL") : "info"
+  console.log(`  [${tag}/${kind}] ${c.name.padEnd(40)} HTTP ${status}  ${latency}ms  (${c.expectation})`)
+  return c.gating ? pass : true
 }
 
 async function main(): Promise<void> {
   const env = readEnv()
   console.log("[n8n-probe] alvo: N8N_CHAT_FLOW_URL (valor omitido por segurança)")
-  console.log("[n8n-probe] ping assinado — 4 casos:\n")
+  console.log("[n8n-probe] GATE = conectividade; casos de auth são informativos (n8n sem auth, aceito):\n")
 
-  let allPass = true
-  for (const c of CASES) {
-    // sequencial para uma leitura de latência limpa por caso
-    const pass = await runCase(env, c)
-    allPass = allPass && pass
-  }
+  const gate = CASES.find((c) => c.gating)!
+  const gatePass = await runCase(env, gate)
+  for (const c of CASES.filter((c) => !c.gating)) await runCase(env, c)
 
-  console.log(`\n[n8n-probe] resultado: ${allPass ? "TODOS OS CASOS OK" : "HÁ CASOS FORA DO ESPERADO"}`)
-  process.exit(allPass ? 0 : 1)
+  console.log(`\n[n8n-probe] GATE X0 (conectividade): ${gatePass ? "PASSA" : "FALHA"}`)
+  process.exit(gatePass ? 0 : 1)
 }
 
 void main()

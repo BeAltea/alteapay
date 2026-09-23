@@ -50,6 +50,24 @@ export async function applyNormalizedEvent(
         type: (`message.${ev.type}`) as "message.sent" | "message.delivered" | "message.read" | "message.failed",
         actor: "provider", occurredAt: now,
       })
+      // W4 — invalidWhatsApp → SUPRESSÃO. O inbound Enterprise mapeia
+      // contact.invalidWhatsApp=true → failed(error="invalid_whatsapp") (ver
+      // lib/whatsapp/voxuy/inbound.ts). Aqui esse desfecho ATIVA a supressão do
+      // NÚMERO (scope=phone, channel=whatsapp): o telefone não tem WhatsApp
+      // válido, então não deve mais ser selecionado (evaluateEligibility /
+      // recheck consultam isSuppressed). Idempotente (addSuppression não duplica).
+      if (ev.type === "failed" && ev.error === "invalid_whatsapp" && msg.phone_e164) {
+        await addSuppression({
+          companyId: msg.company_id,
+          scope: "phone",
+          phoneE164: msg.phone_e164,
+          customerId: msg.customer_id,
+          channel: "whatsapp",
+          reason: "manual", // sem WhatsApp válido: supressão técnica do número
+          source: provider === "voxuy" ? "voxuy" : "webhook",
+          metadata: { cause: "invalid_whatsapp" },
+        })
+      }
       return
     }
     if (ev.type === "clicked") {

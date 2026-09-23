@@ -38,8 +38,11 @@ const baseInput: SendCampaignMessageInput = {
   voxuyEvent: 63,
 }
 
-// URL-credencial (contém o companyId embutido). É SEGREDO — nunca deve vazar em log.
-const SECRET_URL = "https://sistema.voxuy.com/api/COMPANY_SECRET_9f3a/inbound"
+// URL-credencial (formato CANÔNICO: webhooks.voxuy.com/voxuyapi/<uuid>). O uuid
+// É O SEGREDO (identifica a conta) — nunca deve vazar em log. O uuid abaixo usa
+// só chars hex válidos ([0-9a-f-]) e embute "deadbeef" p/ caçá-lo nos logs.
+const SECRET_TOKEN = "deadbeef-cafe-babe-f00d-9f3a1b2c3d4e"
+const SECRET_URL = `https://webhooks.voxuy.com/voxuyapi/${SECRET_TOKEN}`
 
 const enterpriseConfig: VoxuyApiConfig = {
   dialect: "enterprise_v1",
@@ -191,6 +194,40 @@ describe("assertFinalPayloadSafe (trava de PII/valor)", () => {
   it("barra telefone fora de E.164 (legado)", () => {
     expect(() => assertFinalPayloadSafe({ phone: "11912341234" })).toThrow(/E\.164/)
   })
+
+  // W1.2 — variables estrito: SÓ as 3 chaves previstas.
+  it("aceita contact.variables com EXATAMENTE as 3 chaves", () => {
+    expect(() =>
+      assertFinalPayloadSafe({
+        flowId: 1,
+        contact: {
+          phoneNumber: "+5511912341234",
+          variables: { link_negociacao: "https://x/n/A", primeiro_nome: "F", credor: "V" },
+        },
+      }),
+    ).not.toThrow()
+  })
+
+  it("W1.2 — barra QUALQUER chave extra em contact.variables (ex.: cpf/valor)", () => {
+    expect(() =>
+      assertFinalPayloadSafe({
+        flowId: 1,
+        contact: {
+          phoneNumber: "+5511912341234",
+          variables: { link_negociacao: "https://x/n/A", primeiro_nome: "F", credor: "V", cpf: "123" },
+        },
+      }),
+    ).toThrow()
+    expect(() =>
+      assertFinalPayloadSafe({
+        flowId: 1,
+        contact: {
+          phoneNumber: "+5511912341234",
+          variables: { link_negociacao: "https://x/n/A", primeiro_nome: "F", credor: "V", valor: "6990" },
+        },
+      }),
+    ).toThrow()
+  })
 })
 
 describe("classifyEnterpriseResponse (success minúsculo + message truncada)", () => {
@@ -222,6 +259,13 @@ describe("classifyEnterpriseResponse (success minúsculo + message truncada)", (
     expect(classifyEnterpriseResponse(403, {}, true).errorClass).toBe("config")
     expect(classifyEnterpriseResponse(429, {}, true).errorClass).toBe("retryable")
     expect(classifyEnterpriseResponse(503, "<html>", false).errorClass).toBe("retryable")
+  })
+
+  // W1.4 — 5xx (500/502/503) sempre retryável, independente do corpo.
+  it("W1.4 — 500/502/503 => retryable", () => {
+    expect(classifyEnterpriseResponse(500, {}, true).errorClass).toBe("retryable")
+    expect(classifyEnterpriseResponse(502, "<html>bad gateway</html>", false).errorClass).toBe("retryable")
+    expect(classifyEnterpriseResponse(503, { success: false }, true).errorClass).toBe("retryable")
   })
 })
 
@@ -280,6 +324,19 @@ describe("VoxuyApiProvider — dialeto enterprise_v1 (DEFAULT)", () => {
     expect(ffetch.calls).toHaveLength(0)
   })
 
+  // W1.1 — URL fora do formato canônico (host errado) => erro de config na
+  // construção do dispatch; NADA sai e a URL não vaza no resultado/erro.
+  it("W1.1 — URL não-canônica (host errado) => config, nada enviado, sem vazar a URL", async () => {
+    const WRONG = "https://sistema.voxuy.com/api/COMPANY_SECRET/inbound"
+    const p = new VoxuyApiProvider({ ...enterpriseConfig, webhookUrl: WRONG })
+    const r = await p.sendCampaignMessage(baseInput)
+    expect(r.accepted).toBe(false)
+    expect(r.errorClass).toBe("config")
+    expect(ffetch.calls).toHaveLength(0)
+    expect(r.error ?? "").not.toContain(WRONG)
+    expect(r.error ?? "").not.toContain("COMPANY_SECRET")
+  })
+
   it("A URL (segredo) NUNCA aparece em log — sucesso e timeout", async () => {
     const logs: string[] = []
     const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
@@ -295,7 +352,8 @@ describe("VoxuyApiProvider — dialeto enterprise_v1 (DEFAULT)", () => {
       spy.mockRestore()
     }
     const joined = logs.join("\n")
-    expect(joined).not.toContain("COMPANY_SECRET_9f3a")
+    expect(joined).not.toContain(SECRET_TOKEN)
+    expect(joined).not.toContain("deadbeef")
     expect(joined).not.toContain(SECRET_URL)
   })
 
@@ -317,6 +375,24 @@ describe("VoxuyApiProvider — dialeto enterprise_v1 (DEFAULT)", () => {
   it("429 => retryable (sem pauseCampaign)", async () => {
     vi.stubGlobal("fetch", fakeFetch(429, "{}").fn)
     const r = await new VoxuyApiProvider(enterpriseConfig).sendCampaignMessage(baseInput)
+    expect(r.errorClass).toBe("retryable")
+    expect((r.raw as { pauseCampaign?: boolean }).pauseCampaign).toBe(false)
+  })
+
+  // W1.4 — resposta 5xx do provider => failed RETRIÁVEL (retriable:true) e NUNCA
+  // pausa a campanha (pauseCampaign:false). O BullMQ reprocessa com backoff.
+  it("W1.4 — 500 => failed retriável, sem pausar a campanha", async () => {
+    vi.stubGlobal("fetch", fakeFetch(500, "Internal Server Error").fn)
+    const r = await new VoxuyApiProvider(enterpriseConfig).sendCampaignMessage(baseInput)
+    expect(r.accepted).toBe(false)
+    expect(r.errorClass).toBe("retryable")
+    expect((r.raw as { pauseCampaign?: boolean }).pauseCampaign).toBe(false)
+  })
+
+  it("W1.4 — 503 (corpo não-JSON) => failed retriável, sem pausar a campanha", async () => {
+    vi.stubGlobal("fetch", fakeFetch(503, "<html>503 Service Unavailable</html>").fn)
+    const r = await new VoxuyApiProvider(enterpriseConfig).sendCampaignMessage(baseInput)
+    expect(r.accepted).toBe(false)
     expect(r.errorClass).toBe("retryable")
     expect((r.raw as { pauseCampaign?: boolean }).pauseCampaign).toBe(false)
   })

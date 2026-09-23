@@ -11,6 +11,23 @@
 
 import { z } from "zod"
 
+// Formato CANÔNICO da URL-credencial do Enterprise. A URL É A CREDENCIAL
+// (contém o companyId embutido) → tratamos como SEGREDO e NUNCA a logamos.
+// Além de segredo, o formato é FIXO: host `webhooks.voxuy.com`, path
+// `/voxuyapi/<uuid>` (36 chars hex/hífen). Qualquer outra coisa é recusada na
+// CONSTRUÇÃO (protege contra host errado / URL colada de outro lugar). A
+// mensagem de erro NUNCA contém a URL — só diz "formato inesperado".
+export const VOXUY_WEBHOOK_URL_RE = /^https:\/\/webhooks\.voxuy\.com\/voxuyapi\/[0-9a-f-]{36}$/
+
+/**
+ * Valida a URL-credencial contra o formato canônico. Devolve `true`/`false`
+ * SEM NUNCA ecoar a URL. Use na construção do provider (enterprise_v1) para
+ * recusar host/format errados antes de qualquer disparo.
+ */
+export function isCanonicalVoxuyWebhookUrl(url: string | null | undefined): boolean {
+  return typeof url === "string" && VOXUY_WEBHOOK_URL_RE.test(url)
+}
+
 const envSchema = z.object({
   // URL completa de Integrações → API da Voxuy (contém o companyId embutido).
   // No Enterprise ela É A CREDENCIAL (não há apiToken/Bearer no corpo).
@@ -210,7 +227,12 @@ export function loadVoxuyApiConfig(env: NodeJS.ProcessEnv = process.env): VoxuyA
   const missing: string[] = []
   // A URL-credencial é exigida por enterprise_v1 (é a credencial) e por
   // transaction_v1. O dialeto custom traz a URL do próprio request_config.
-  if (dialect === "enterprise_v1" || dialect === "transaction_v1") {
+  // enterprise_v1: EXIGE o formato canônico (host webhooks.voxuy.com +
+  // /voxuyapi/<uuid>) — recusa host errado. transaction_v1 (legado) usa outra
+  // forma de URL, então só exige https. A mensagem nunca contém a URL.
+  if (dialect === "enterprise_v1") {
+    if (!isCanonicalVoxuyWebhookUrl(webhookUrl)) missing.push("VOXUY_WEBHOOK_URL")
+  } else if (dialect === "transaction_v1") {
     if (!webhookUrl || !webhookUrl.startsWith("https://")) missing.push("VOXUY_WEBHOOK_URL")
   }
   if (dialect === "transaction_v1" && !apiToken) missing.push("VOXUY_API_TOKEN")

@@ -47,6 +47,7 @@ import {
   type VoxuyResponseOutcome,
 } from "./provider"
 import {
+  isCanonicalVoxuyWebhookUrl,
   loadVoxuyApiConfig,
   VoxuyConfigError,
   type VoxuyApiConfig,
@@ -85,13 +86,26 @@ const forbiddenNonNull = (name: string) =>
     message: `${name} deve ser null (nunca enviar valor)`,
   })
 
+// `variables` do enterprise_v1: EXATAMENTE as 3 chaves previstas — nada além.
+// `.strict()` faz qualquer chave extra (ex.: cpf/valor colado por engano) virar
+// erro de validação ANTES de sair do processo (defesa de saída, W1.2).
+const enterpriseVariablesGuardSchema = z
+  .object({
+    link_negociacao: z.string(),
+    primeiro_nome: z.string(),
+    credor: z.string(),
+  })
+  .strict()
+
 // contact aninhado do enterprise_v1: telefone E.164 obrigatório, sem document.
+// Quando `variables` está presente, é validado ESTRITO (só as 3 chaves).
 const contactGuardSchema = z
   .object({
     phoneNumber: z.string().regex(E164, "contact.phoneNumber deve ser E.164"),
     document: forbiddenNonNull("contact.document"),
     cpf: forbiddenNonNull("contact.cpf"),
     email: forbiddenNonNull("contact.email"),
+    variables: enterpriseVariablesGuardSchema.optional(),
   })
   .passthrough()
 
@@ -289,10 +303,12 @@ export class VoxuyApiProvider implements WhatsAppProvider {
     const link = input.variables.consult_url
 
     if (dialect === "enterprise_v1") {
-      // A URL É A CREDENCIAL (contém o companyId). Só HTTPS. Sem apiToken/Bearer.
+      // A URL É A CREDENCIAL (contém o companyId). Formato CANÔNICO obrigatório
+      // (host webhooks.voxuy.com + /voxuyapi/<uuid>) — recusa host errado. Sem
+      // apiToken/Bearer. VoxuyConfigError nunca ecoa a URL (só o NOME).
       const url = this.config?.webhookUrl ?? "https://mock.local/voxuy"
       if (!isMockMode("voxuy")) {
-        if (!this.config?.webhookUrl || !url.startsWith("https://")) {
+        if (!isCanonicalVoxuyWebhookUrl(this.config?.webhookUrl)) {
           throw new VoxuyConfigError(["VOXUY_WEBHOOK_URL"])
         }
       }
@@ -614,7 +630,9 @@ export function classifyEnterpriseResponse(
     // 400 => validação; guarda a message truncada (não valores estruturados).
     return { accepted: false, errorClass: "validation", note: message }
   }
-  if (httpStatus === 401 || httpStatus === 403) {
+  if (httpStatus === 401 || httpStatus === 403 || httpStatus === 404) {
+    // 404 = URL de integração não encontrada → credencial/endpoint inválido:
+    // fatal, pausa a campanha (runbook Apêndice C), não repete com a mesma URL.
     return { accepted: false, errorClass: "config" }
   }
   if (httpStatus === 429 || httpStatus >= 500) {

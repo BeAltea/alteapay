@@ -489,7 +489,9 @@ describe("buildProviderSelector (T3-2)", () => {
   })
 
   it("voxuy_api: injeta voxuy_flow_id do tenant no apiConfig", async () => {
-    process.env.VOXUY_WEBHOOK_URL = "https://webhook.voxuy.example/abc"
+    // URL-credencial no formato CANÔNICO exigido pelo enterprise_v1 (W1.1):
+    // webhooks.voxuy.com/voxuyapi/<uuid>. O uuid é sintético (só hex/hífen).
+    process.env.VOXUY_WEBHOOK_URL = "https://webhooks.voxuy.com/voxuyapi/deadbeef-cafe-babe-f00d-9f3a1b2c3d4e"
     process.env.VOXUY_FLOW_ID = "7"
     process.env.VOXUY_DIALECT = "enterprise_v1"
     const { buildProviderSelector } = await import("@/lib/journey/campaign-send")
@@ -506,7 +508,9 @@ describe("buildProviderSelector (T3-2)", () => {
   })
 
   it("voxuy_api sem tenant flowId: cai no env VOXUY_FLOW_ID", async () => {
-    process.env.VOXUY_WEBHOOK_URL = "https://webhook.voxuy.example/abc"
+    // URL-credencial no formato CANÔNICO exigido pelo enterprise_v1 (W1.1):
+    // webhooks.voxuy.com/voxuyapi/<uuid>. O uuid é sintético (só hex/hífen).
+    process.env.VOXUY_WEBHOOK_URL = "https://webhooks.voxuy.com/voxuyapi/deadbeef-cafe-babe-f00d-9f3a1b2c3d4e"
     process.env.VOXUY_FLOW_ID = "7"
     process.env.VOXUY_DIALECT = "enterprise_v1"
     const { buildProviderSelector } = await import("@/lib/journey/campaign-send")
