@@ -51,9 +51,10 @@ function toBody(
   channels: SendChannel[],
   dedupe: boolean,
   dryRun: boolean,
+  allowResend: boolean,
   idempotencyKey?: string | null,
 ): SendRequestBody {
-  const base = { companyId, channels, dedupe, dryRun, ...(idempotencyKey ? { idempotencyKey } : {}) }
+  const base = { companyId, channels, dedupe, dryRun, allowResend, ...(idempotencyKey ? { idempotencyKey } : {}) }
   return selection.kind === "ids"
     ? { ...base, customerIds: selection.customerIds }
     : { ...base, allFiltered: { filters: selection.filters, expectedCount: selection.expectedCount } }
@@ -75,6 +76,7 @@ export function SendNegotiationDialog({
   const [email, setEmail] = useState(true)
   const [dedupe, setDedupe] = useState(false)
   const [dryRun, setDryRun] = useState(false)
+  const [allowResend, setAllowResend] = useState(false)
   const [result, setResult] = useState<SendResponse | null>(null)
   // Envio em andamento (A3.3): barra de progresso + contagem. Como /send é uma
   // request única em lote (o servidor processa todos e responde uma vez), o
@@ -114,7 +116,7 @@ export function SendNegotiationDialog({
       const res = await fetch("/api/super-admin/negotiations/send-preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toBody(selection, companyId, ch, next?.dedupe ?? dedupe, true)),
+        body: JSON.stringify(toBody(selection, companyId, ch, next?.dedupe ?? dedupe, true, allowResend)),
       })
       if (!res.ok) {
         setError(`Falha ao pré-visualizar (${res.status}).`)
@@ -153,6 +155,7 @@ export function SendNegotiationDialog({
     setEmail(true)
     setDedupe(false)
     setDryRun(false)
+    setAllowResend(false)
     if (progressTimer.current) {
       clearInterval(progressTimer.current)
       progressTimer.current = null
@@ -173,7 +176,7 @@ export function SendNegotiationDialog({
       const res = await fetch("/api/super-admin/negotiations/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toBody(selection, companyId, channels, dedupe, dryRun, idempotencyKey)),
+        body: JSON.stringify(toBody(selection, companyId, channels, dedupe, dryRun, allowResend, idempotencyKey)),
       })
       if (!res.ok) {
         const msg = await res.json().catch(() => null)
@@ -322,6 +325,10 @@ export function SendNegotiationDialog({
                 <label className="flex items-center gap-2 text-sm">
                   <Checkbox checked={dryRun} onCheckedChange={(v) => setDryRun(!!v)} />
                   Simular (dry run) — não envia nada, só reporta o resultado por canal
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <Checkbox checked={allowResend} onCheckedChange={(v) => setAllowResend(!!v)} />
+                  Permitir reenvio (ignorar janela de cooldown)
                 </label>
               </>
             ) : null}

@@ -47,6 +47,10 @@ export async function evaluateEligibility(input: {
   customerIds: string[]
   cooldownDays: number
   minDebtValue: number
+  /** Override explícito do dono: quando true, PULA apenas a exclusão de cooldown
+   * (reenvio ao mesmo devedor dentro da janela). As demais exclusões continuam
+   * valendo. Default false. */
+  allowResend?: boolean
 }): Promise<EligibilityResult[]> {
   const supabase = createServiceClient()
   const results: EligibilityResult[] = []
@@ -110,17 +114,20 @@ export async function evaluateEligibility(input: {
     // V10: cooldown avaliado POR CLIENTE **e** POR TELEFONE. Uma segunda
     // transação para o mesmo número cancelaria o funil anterior (V3/L4), então
     // um contato recente naquele telefone (mesmo de outro cliente) barra.
-    const since = new Date(Date.now() - input.cooldownDays * 86400_000).toISOString()
-    const { data: recent } = await supabase
-      .from("whatsapp_messages")
-      .select("id")
-      .eq("company_id", input.companyId)
-      .or(`customer_id.eq.${customerId},phone_e164.eq.${phone}`)
-      .gte("queued_at", since)
-      .limit(1)
-    if (recent && recent.length > 0) {
-      results.push({ customerId, eligible: false, reason: "cooldown" })
-      continue
+    // allowResend (override explícito do dono): PULA apenas esta exclusão.
+    if (!input.allowResend) {
+      const since = new Date(Date.now() - input.cooldownDays * 86400_000).toISOString()
+      const { data: recent } = await supabase
+        .from("whatsapp_messages")
+        .select("id")
+        .eq("company_id", input.companyId)
+        .or(`customer_id.eq.${customerId},phone_e164.eq.${phone}`)
+        .gte("queued_at", since)
+        .limit(1)
+      if (recent && recent.length > 0) {
+        results.push({ customerId, eligible: false, reason: "cooldown" })
+        continue
+      }
     }
     results.push({
       customerId, eligible: true, phoneE164: phone,
@@ -329,6 +336,12 @@ interface EvaluateHubInput {
   minDebtValue: number
   /** id da campanha em curso (exclui quem já tem mensagem nela). */
   campaignId?: string | null
+  /** Override explícito do dono: quando true, PULA apenas a exclusão de cooldown
+   * (reenvio ao mesmo devedor dentro da janela). As demais exclusões continuam
+   * valendo (suprimido, sem_divida_aberta, cobranca_viva, caso_aberto,
+   * valor_minimo, sem_contato). NÃO mexe no piso Math.max(1,...) do cooldownDays.
+   * Default false. */
+  allowResend?: boolean
 }
 
 /**
@@ -435,18 +448,21 @@ export async function evaluateHubEligibility(
     }
 
     // ---- cooldown POR CLIENTE e POR TELEFONE (contato recente barra)
-    const cdOrs: string[] = [`customer_id.eq.${customerId}`]
-    if (phone) cdOrs.push(`phone_e164.eq.${phone}`)
-    const { data: recent } = await supabase
-      .from("whatsapp_messages")
-      .select("id")
-      .eq("company_id", input.companyId)
-      .or(cdOrs.join(","))
-      .gte("queued_at", since)
-      .limit(1)
-    if (recent && recent.length > 0) {
-      results.push({ customerId, eligible: false, reason: "cooldown" })
-      continue
+    // allowResend (override explícito do dono): PULA apenas esta exclusão.
+    if (!input.allowResend) {
+      const cdOrs: string[] = [`customer_id.eq.${customerId}`]
+      if (phone) cdOrs.push(`phone_e164.eq.${phone}`)
+      const { data: recent } = await supabase
+        .from("whatsapp_messages")
+        .select("id")
+        .eq("company_id", input.companyId)
+        .or(cdOrs.join(","))
+        .gte("queued_at", since)
+        .limit(1)
+      if (recent && recent.length > 0) {
+        results.push({ customerId, eligible: false, reason: "cooldown" })
+        continue
+      }
     }
 
     results.push({
@@ -580,6 +596,10 @@ export async function createHubCampaign(input: {
   channels?: HubChannel[]
   /** F1: "não duplicar" — quem tem os dois contatos vai só por WhatsApp. */
   dedupe?: boolean
+  /** Override explícito do dono: PULA apenas a exclusão de cooldown ao avaliar o
+   * snapshot (reenvio ao mesmo devedor dentro da janela). As demais exclusões
+   * continuam valendo. Default false. */
+  allowResend?: boolean
   /** A1: chave de idempotência por submissão (gerada 1x na abertura do diálogo).
    * Double-click/retry com a MESMA chave reusam a MESMA campanha (nunca duplicam
    * o envio, incl. e-mail SendGrid real). Corrida resolvida pela UNIQUE no banco. */
@@ -596,6 +616,7 @@ export async function createHubCampaign(input: {
   const hub = await loadTenantHubConfig(input.companyId)
   const channels: HubChannel[] = input.channels && input.channels.length > 0 ? input.channels : ["whatsapp", "email"]
   const dedupe = input.dedupe ?? false
+  const allowResend = input.allowResend ?? false
   const idempotencyKey = input.idempotencyKey?.trim() || null
 
   // Multi-canal (F1) — fonte da verdade do envio por canal.
@@ -606,6 +627,7 @@ export async function createHubCampaign(input: {
     minDebtValue: hub.minDebtValue,
     channels,
     dedupe,
+    allowResend,
   })
   const channelCounts = summarizeHubChannels(channelDecisions, channels)
 
@@ -615,6 +637,7 @@ export async function createHubCampaign(input: {
     customerIds: input.customerIds,
     cooldownDays: hub.cooldownDays,
     minDebtValue: hub.minDebtValue,
+    allowResend,
   })
   const counts = summarizeHubEligibility(evaluated)
 
@@ -831,18 +854,23 @@ export async function evaluateHubChannels(
     }
 
     // ---- cooldown POR CLIENTE e POR TELEFONE (barra os dois)
-    const cdOrs: string[] = [`customer_id.eq.${customerId}`]
-    if (phone) cdOrs.push(`phone_e164.eq.${phone}`)
-    const { data: recent } = await supabase
-      .from("whatsapp_messages")
-      .select("id")
-      .eq("company_id", input.companyId)
-      .or(cdOrs.join(","))
-      .gte("queued_at", since)
-      .limit(1)
-    if (recent && recent.length > 0) {
-      emit("cooldown")
-      continue
+    // allowResend (override explícito do dono): PULA apenas esta exclusão. As
+    // demais (suprimido, sem_divida_aberta, valor_minimo, caso_aberto,
+    // ja_contatado_campanha, sem_contato) continuam valendo.
+    if (!input.allowResend) {
+      const cdOrs: string[] = [`customer_id.eq.${customerId}`]
+      if (phone) cdOrs.push(`phone_e164.eq.${phone}`)
+      const { data: recent } = await supabase
+        .from("whatsapp_messages")
+        .select("id")
+        .eq("company_id", input.companyId)
+        .or(cdOrs.join(","))
+        .gte("queued_at", since)
+        .limit(1)
+      if (recent && recent.length > 0) {
+        emit("cooldown")
+        continue
+      }
     }
 
     // ---- cobrança viva (INFORMATIVO)

@@ -44,6 +44,10 @@ interface SendBody extends SelectionBody {
   channels?: string[]
   dedupe?: boolean
   dryRun?: boolean
+  /** Override explícito do dono: quando true, ignora APENAS a janela de cooldown
+   * de contato (permite reenviar ao mesmo devedor dentro da janela). As demais
+   * exclusões (supressão, cobrança viva, sem contato, etc.) seguem valendo. */
+  allowResend?: boolean
   /** A1: chave de idempotência gerada 1x pelo diálogo. Double-click/retry com a
    * mesma chave reusam a mesma campanha (não duplicam envio real). */
   idempotencyKey?: string
@@ -144,6 +148,7 @@ export async function POST(request: NextRequest) {
     }
     const dedupe = body.dedupe === true
     const dryRun = body.dryRun === true
+    const allowResend = body.allowResend === true
 
     const hub = await loadTenantHubConfig(companyId)
     const dispatchMode = resolveDispatch()
@@ -177,10 +182,11 @@ export async function POST(request: NextRequest) {
       provider: hub.provider,
       channels,
       dedupe,
+      allowResend,
       // dryRun não consome/colide com a chave do envio real.
       idempotencyKey: dryRun ? null : (typeof body.idempotencyKey === "string" ? body.idempotencyKey : null),
     })
-    const hubResult = await runHubSend({ campaignId, companyId, dispatchMode, dryRun })
+    const hubResult = await runHubSend({ campaignId, companyId, dispatchMode, dryRun, allowResend })
 
     // counts (=summary) + results POR (DEVEDOR, CANAL) com documento MASCARADO.
     const items: HubSendItem[] = hubResult.items

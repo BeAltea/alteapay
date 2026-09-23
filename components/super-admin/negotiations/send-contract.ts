@@ -30,6 +30,10 @@ export interface SendRequestBody {
   channels?: SendChannel[]
   /** "Não duplicar": quem tem os dois contatos vai só por WhatsApp (default false). */
   dedupe?: boolean
+  /** "Permitir reenvio": ignora APENAS a janela de cooldown de contato — permite
+   * disparar de novo ao mesmo devedor. As demais exclusões (supressão, cobrança
+   * viva, sem contato, etc.) seguem valendo. Default false. */
+  allowResend?: boolean
   dryRun: boolean
   /** A1: chave de idempotência (1x por abertura do diálogo). Double-click/retry com
    * a mesma chave reusam a mesma campanha — não duplicam o envio (incl. e-mail real). */

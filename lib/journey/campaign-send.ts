@@ -609,6 +609,11 @@ export async function runHubSend(input: {
   companyId: string
   dispatchMode: "inline" | "queue"
   dryRun: boolean
+  /** Override explícito do dono: quando true, a reverificação de envio PULA apenas
+   * a exclusão de cooldown (reenvio ao mesmo devedor dentro da janela de contato).
+   * As demais exclusões (suprimido, sem_divida_aberta, cobranca_viva, caso_aberto,
+   * valor_minimo, sem_contato) continuam valendo. Default false. */
+  allowResend?: boolean
 }): Promise<HubSendResult> {
   const supabase = createServiceClient()
   const { data: campaign, error } = await supabase
@@ -674,6 +679,8 @@ export async function runHubSend(input: {
     campaignId: input.campaignId,
     channels,
     dedupe,
+    // Override explícito do dono: PULA apenas a exclusão de cooldown na reverificação.
+    allowResend: input.allowResend ?? false,
   })
 
   const ctx: HubSendContext = {

@@ -482,6 +482,79 @@ describe("runHubSend — template padrão por cedente (F4)", () => {
   })
 })
 
+describe("runHubSend — allowResend (override do cooldown)", () => {
+  // Snapshot idêntico ao dos outros testes de runHubSend: só carrega os
+  // customerIds; runHubSend REVERIFICA tudo (inclusive o cooldown) no envio.
+  async function makeCampaign(channels: string[], customerIds: string[], dedupe = false) {
+    const cid = `camp_${Math.random().toString(36).slice(2, 8)}`
+    db.whatsapp_campaigns.push({
+      id: cid, company_id: CO, provider: "mock", template_key: "hub_link", status: "draft",
+      selection_snapshot: {
+        send_mode: "whatsapp_chat", channels, dedupe,
+        channel_decisions: customerIds.map((customerId) => ({ customerId, decisions: [], hasBothContacts: false })),
+      },
+      counts: {}, started_at: null,
+    })
+    return cid
+  }
+
+  /** Marca um contato RECENTE (dentro da janela de cooldown) para o devedor, numa
+   * campanha ANTERIOR (não a atual — senão dispararia ja_contatado_campanha, que a
+   * flag não ignora). queued_at = agora → dentro de qualquer cooldownDays >= 1. */
+  function seedRecentContact(customerId: string, phoneE164: string) {
+    ;(db.whatsapp_messages ??= []).push({
+      id: `prev_${customerId}`, company_id: CO, campaign_id: "camp_anterior",
+      customer_id: customerId, phone_e164: phoneE164, channel: "whatsapp",
+      status: "sent", queued_at: new Date().toISOString(),
+    })
+  }
+
+  it("allowResend=true: devedor com contato recente (dentro do cooldown) fica ELEGÍVEL", async () => {
+    seedCustomer("recente", { phone: "11999998888", email: null })
+    seedRecentContact("recente", "+5511999998888")
+    const cid = await makeCampaign(["whatsapp"], ["recente"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false, allowResend: true })
+    // com o override, o cooldown é pulado: o devedor volta a ser elegível e enfileira.
+    expect(res.summary.sent).toBe(1)
+    const item = res.items.find((i) => i.customerId === "recente" && i.channel === "whatsapp")!
+    expect(item.status).toBe("sent")
+    expect(res.items.some((i) => i.reason === "cooldown")).toBe(false)
+  })
+
+  it("allowResend=false (default): mesmo devedor continua EXCLUÍDO por cooldown", async () => {
+    seedCustomer("recente", { phone: "11999998888", email: null })
+    seedRecentContact("recente", "+5511999998888")
+    const cid = await makeCampaign(["whatsapp"], ["recente"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    // allowResend omitido → default false.
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false })
+    expect(res.summary.sent).toBe(0)
+    expect(res.summary.skipped).toBe(1)
+    const item = res.items.find((i) => i.customerId === "recente" && i.channel === "whatsapp")!
+    expect(item.status).toBe("skipped")
+    expect(item.reason).toBe("cooldown")
+    expect(queued.length).toBe(0)
+  })
+
+  it("allowResend=true NÃO derruba as outras exclusões (ex.: sem_divida_aberta segue barrando)", async () => {
+    // devedor com contato recente E sem dívida aberta: a flag pula o cooldown, mas
+    // sem_divida_aberta continua barrando os dois canais.
+    ;(db.customers ??= []).push({ id: "semdiv", company_id: CO, phone: "11988887777", email: null })
+    seedRecentContact("semdiv", "+5511988887777")
+    // (sem seedCustomer → sem linha em db.debts → sem dívida aberta)
+    const cid = await makeCampaign(["whatsapp"], ["semdiv"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({ campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false, allowResend: true })
+    expect(res.summary.sent).toBe(0)
+    const item = res.items.find((i) => i.customerId === "semdiv" && i.channel === "whatsapp")!
+    expect(item.status).toBe("skipped")
+    // a exclusão não é cooldown (foi pulada) — é sem_divida_aberta.
+    expect(item.reason).toBe("sem_divida_aberta")
+    expect(queued.length).toBe(0)
+  })
+})
+
 describe("buildProviderSelector (T3-2)", () => {
   it("mock: devolve a string, sem carregar credencial", async () => {
     const { buildProviderSelector } = await import("@/lib/journey/campaign-send")
