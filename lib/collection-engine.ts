@@ -23,7 +23,8 @@ export async function processCollectionByScore(params: {
 
   try {
     // 1. Chamar endpoint /score-check para obter recovery_score
-    const scoreResponse = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/score-check`, {
+    const appBaseUrl = (process.env.NEXT_PUBLIC_APP_URL ?? "").replace(/\/+$/, "")
+    const scoreResponse = await fetch(`${appBaseUrl}/api/score-check`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -202,7 +203,7 @@ async function dispatchAutoMessage(params: any) {
     throw new Error("Cliente não encontrado")
   }
 
-  const paymentLink = `${process.env.NEXT_PUBLIC_APP_URL}/user-dashboard/debts/${params.debtId}`
+  const paymentLink = `${(process.env.NEXT_PUBLIC_APP_URL ?? "").replace(/\/+$/, "")}/user-dashboard/debts/${params.debtId}`
 
   // Enviar por Email
   if (debt.customer.email) {

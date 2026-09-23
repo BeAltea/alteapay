@@ -97,7 +97,7 @@ export async function sendCollectionNotification({
           ? new Date(vmaxRecord.Vecto).toLocaleDateString("pt-BR")
           : "Vencida",
         companyName,
-        paymentLink: `${process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com"}/user-dashboard/debts/${debtId}`,
+        paymentLink: `${(process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com").replace(/\/+$/, "")}/user-dashboard/debts/${debtId}`,
       })
 
       messageContent = `Email de cobrança enviado para ${customerEmail}`
@@ -112,7 +112,7 @@ export async function sendCollectionNotification({
         customerName,
         debtAmount: parsedAmount,
         companyName,
-        paymentLink: `${process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com"}/user-dashboard`,
+        paymentLink: `${(process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com").replace(/\/+$/, "")}/user-dashboard`,
       })
 
       messageContent = body

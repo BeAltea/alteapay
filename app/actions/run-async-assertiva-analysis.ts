@@ -103,7 +103,7 @@ export async function runAsyncAssertivaAnalysis(params: AsyncAnalysisParams) {
     const baseUrl = process.env.ASSERTIVA_BASE_URL
     const clientId = process.env.ASSERTIVA_CLIENT_ID
     const clientSecret = process.env.ASSERTIVA_CLIENT_SECRET
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com"
+    const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com").replace(/\/+$/, "")
 
     if (!baseUrl || !clientId || !clientSecret) {
       throw new Error("Credenciais da Assertiva não configuradas")

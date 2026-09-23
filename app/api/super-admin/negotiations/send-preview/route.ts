@@ -147,7 +147,7 @@ export async function POST(request: NextRequest) {
     })
     const counts = summarizeHubChannels(decisions, channels as HubChannel[])
 
-    const base = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"
+    const base = (process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000").replace(/\/+$/, "")
     const publicLink = hub.publicLinkCode && hub.publicLinkEnabled ? `${base}/n/${hub.publicLinkCode}` : null
 
     // documentos mascarados de TODOS os excluídos (qualquer canal), uma vez só.

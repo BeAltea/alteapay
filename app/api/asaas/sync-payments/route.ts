@@ -41,7 +41,7 @@ async function getBaseUrl(): Promise<string> {
     const proto = h.get("x-forwarded-proto") || "https"
     if (host) return `${proto}://${host}`
   } catch {}
-  return process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+  return (process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000").replace(/\/+$/, "")
 }
 
 interface AsaasPaymentResult {

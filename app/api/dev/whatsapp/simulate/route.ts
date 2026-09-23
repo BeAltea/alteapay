@@ -10,7 +10,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "not found" }, { status: 404 })
   }
   const body = await req.text()
-  const base = process.env.NEXT_PUBLIC_APP_URL ?? `http://127.0.0.1:${process.env.PORT ?? 3000}`
+  const base = (process.env.NEXT_PUBLIC_APP_URL ?? `http://127.0.0.1:${process.env.PORT ?? 3000}`).replace(/\/+$/, "")
   const res = await fetch(`${base}/api/webhooks/whatsapp/mock`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

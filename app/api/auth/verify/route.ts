@@ -8,7 +8,7 @@ export async function GET(request: NextRequest) {
   const token = searchParams.get("token")
   const type = searchParams.get("type")
   
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || request.nextUrl.origin
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/+$/, "") || request.nextUrl.origin
   
   // Se tiver token de recovery, redireciona para processar
   if (token && type === "recovery") {

@@ -33,7 +33,9 @@ import {
 } from "./campaigns"
 
 function appBaseUrl(): string {
-  return process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"
+  // Remove barra(s) final(is): NEXT_PUBLIC_APP_URL pode vir "https://alteapay.com/"
+  // e concatenar "/n/..." geraria "//n/..." (que cai no not-found).
+  return (process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000").replace(/\/+$/, "")
 }
 
 /**
@@ -294,8 +296,7 @@ function hubJobId(campaignId: string, customerId: string, channel: HubChannel): 
 /** Monta o link público único do cedente (/n/{code}). */
 function publicLink(code: string | null): string | null {
   if (!code) return null
-  const base = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"
-  return `${base}/n/${code}`
+  return `${appBaseUrl()}/n/${code}`
 }
 
 /** Contexto de branding/link compartilhado por todos os envios de uma campanha. */

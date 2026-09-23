@@ -61,7 +61,7 @@ export async function POST(request: Request) {
   const secret = process.env.WHATSAPP_APP_SECRET || "mock-app-secret"
   const signature = `sha256=${createHmac("sha256", secret).update(raw, "utf8").digest("hex")}`
 
-  const base = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+  const base = (process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000").replace(/\/+$/, "")
   const resp = await fetch(`${base}/api/webhooks/whatsapp`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Hub-Signature-256": signature },

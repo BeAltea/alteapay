@@ -41,7 +41,7 @@ export async function createAsaasPaymentLink(data: AsaasPaymentData): Promise<As
   // Por enquanto, retorna um link mock
   return {
     id: `mock_${Date.now()}`,
-    url: `${process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com"}/payment/${data.externalReference}`,
+    url: `${(process.env.NEXT_PUBLIC_APP_URL || "https://alteapay.com").replace(/\/+$/, "")}/payment/${data.externalReference}`,
     expirationDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
   }
 }
