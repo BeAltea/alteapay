@@ -621,6 +621,15 @@ export async function runHubSend(input: {
    * As demais exclusões (suprimido, sem_divida_aberta, cobranca_viva, caso_aberto,
    * valor_minimo, sem_contato) continuam valendo. Default false. */
   allowResend?: boolean
+  /**
+   * Progresso item-a-item do laço INLINE (streaming). Chamado UMA vez por item
+   * REALMENTE processado no envio (não pelas exclusões pré-computadas nem pelo
+   * dry-run), na ordem em que os itens são finalizados. `done` é a contagem
+   * acumulada de itens processados; `total` é o total previsto de itens a
+   * processar; `item` é o desfecho daquele (devedor, canal). Um erro do callback
+   * é engolido (o envio nunca falha por causa do progresso). Opcional: sem ele,
+   * o comportamento é idêntico ao de hoje. */
+  onProgress?: (done: number, total: number, item: HubSendItem) => void | Promise<void>
 }): Promise<HubSendResult> {
   const supabase = createServiceClient()
   const { data: campaign, error } = await supabase
@@ -793,6 +802,25 @@ export async function runHubSend(input: {
   // com a mesma credencial). A campanha já foi marcada `paused` dentro de
   // processCampaignMessage; os devedores restantes do canal ficam `skipped`
   // (motivo estável) — o e-mail (outro canal) segue normalmente (E3).
+  //
+  // Progresso (streaming): `total` é o nº de (devedor, canal) ELEGÍVEIS a
+  // processar; `done` avança a cada item finalizado (incl. os `skipped` por
+  // canal pausado), na ordem em que ocorrem. onProgress é opcional e best-effort
+  // (um erro no callback nunca aborta o envio).
+  const total = reverified.reduce(
+    (acc, r) => acc + channels.reduce((a, ch) => a + (r.decisions.some((x) => x.channel === ch && x.eligible) ? 1 : 0), 0),
+    0,
+  )
+  let done = 0
+  const emitProgress = async (item: HubSendItem) => {
+    done += 1
+    if (!input.onProgress) return
+    try {
+      await input.onProgress(done, total, item)
+    } catch {
+      // o progresso é informativo: nunca deixa o envio falhar por causa dele.
+    }
+  }
   for (const channel of channels) {
     let channelPaused = false
     for (const r of reverified) {
@@ -800,7 +828,9 @@ export async function runHubSend(input: {
       if (!d) continue
       if (channelPaused && channel === "whatsapp") {
         // canal já pausado neste envio: registra o restante sem chamar o provider.
-        items.push({ customerId: d.customerId, channel, status: "skipped", reason: "campanha_pausada_credencial_invalida" })
+        const item: HubSendItem = { customerId: d.customerId, channel, status: "skipped", reason: "campanha_pausada_credencial_invalida" }
+        items.push(item)
+        await emitProgress(item)
         continue
       }
       try {
@@ -810,6 +840,7 @@ export async function runHubSend(input: {
           })
           items.push(item)
           if (paused) channelPaused = true // trava: não chama o provider de novo
+          await emitProgress(item)
         } else {
           const item = await sendEmailDecision(supabase, ctx, {
             customerId: d.customerId,
@@ -818,10 +849,13 @@ export async function runHubSend(input: {
             firstName: emailFirstNames.get(d.customerId) ?? "",
           })
           items.push(item)
+          await emitProgress(item)
         }
       } catch (e) {
         // isolamento entre canais (E3): a exceção não escapa e não afeta o outro.
-        items.push({ customerId: d.customerId, channel, status: "failed", reason: (e as Error)?.message ?? "send_failed" })
+        const item: HubSendItem = { customerId: d.customerId, channel, status: "failed", reason: (e as Error)?.message ?? "send_failed" }
+        items.push(item)
+        await emitProgress(item)
       }
     }
   }

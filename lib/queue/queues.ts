@@ -23,6 +23,32 @@ function getConnection(): IORedis {
   return _connection;
 }
 
+/**
+ * Ping rápido no Redis reusando a MESMA conexão lazy das filas. Usado para
+ * decidir, na hora do envio do hub, se o modo `queue` é viável (workers/Upstash
+ * de pé) ou se devemos cair para o inline. Resolve `true` se o PING responde
+ * dentro de `timeoutMs`; `false` se falha, dá timeout ou a conexão erra. NUNCA
+ * lança — o chamador só precisa de um booleano. Não expõe segredo (só o host/porta
+ * já vivem no REDIS_URL; aqui não logamos nem retornamos nada da URL).
+ */
+export async function pingRedis(timeoutMs = 1500): Promise<boolean> {
+  const conn = getConnection();
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    conn
+      .ping()
+      .then((res) => done(res === 'PONG' || res === 'pong' || !!res))
+      .catch(() => done(false));
+  });
+}
+
 export const emailQueue = new Queue(QUEUE_CONFIG.email.name, {
   connection: getConnection(),
   defaultJobOptions: {

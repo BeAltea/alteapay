@@ -10,6 +10,7 @@ export {
   assertivaLocalizeQueue,
   bulkEmailQueue,
   bulkNegotiationsQueue,
+  pingRedis,
 } from './queues';
 export { QUEUE_CONFIG, ASAAS_NOTIFICATION_DEFAULTS } from './config';
 export type { EmailJobData } from './workers/email.worker';

@@ -24,6 +24,7 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { maskDocument } from "@/lib/journey/document"
 import { createHubCampaign, loadTenantHubConfig } from "@/lib/journey/campaigns"
 import { runHubSend, type HubSendItem } from "@/lib/journey/campaign-send"
+import { pingRedis } from "@/lib/queue"
 import { resolveSelection, type SelectionBody } from "../selection"
 import type {
   SendChannel,
@@ -86,6 +87,41 @@ function resolveDispatch(): "inline" | "queue" {
   // request; queue enfileira). Qualquer um dos dois em 'inline' liga o modo inline.
   const raw = (process.env.EMAIL_SEND_MODE ?? process.env.DISPATCH_MODE ?? "queue").toLowerCase()
   return raw === "inline" ? "inline" : "queue"
+}
+
+/** Timeout do ping de saúde do Redis (ms). Curto de propósito: só queremos saber
+ * se dá para enfileirar AGORA; se o Upstash/worker estão fora, caímos no inline
+ * sem travar a request. */
+const REDIS_PING_TIMEOUT_MS = Number(process.env.REDIS_PING_TIMEOUT_MS ?? "1500")
+
+/**
+ * Modo de envio EFETIVO. Parte do modo resolvido por env (resolveDispatch) e,
+ * quando ele é `queue`, faz um PING rápido no Redis: se o Redis não responde
+ * (fora do ar / timeout), FORÇA `inline` — assim lotes pequenos saem mesmo com o
+ * Upstash/worker desligados, em vez de enfileirar num Redis morto. Se já era
+ * `inline`, segue direto (sem ping). Se o Redis está OK, o modo `queue` é mantido
+ * intacto. NÃO expõe segredo no log (só o fato binário do ping).
+ */
+async function resolveEffectiveDispatch(): Promise<{ mode: "inline" | "queue"; forcedInline: boolean }> {
+  const envMode = resolveDispatch()
+  if (envMode === "inline") return { mode: "inline", forcedInline: false }
+  const alive = await pingRedis(REDIS_PING_TIMEOUT_MS)
+  if (alive) return { mode: "queue", forcedInline: false }
+  console.warn(
+    "[negotiations/send] Redis indisponível (ping falhou/timeout): forçando envio inline neste lote (fallback automático).",
+  )
+  return { mode: "inline", forcedInline: true }
+}
+
+/** Header que liga o streaming NDJSON (progresso item-a-item). Ausente = JSON de
+ * hoje (compat com callers/testes existentes). Defensivo: se o objeto de request
+ * não expõe headers (mocks antigos), trata como não-stream. */
+function wantsStream(request: NextRequest): boolean {
+  try {
+    return request.headers?.get("x-stream") === "1"
+  } catch {
+    return false
+  }
 }
 
 const ALL: SendChannel[] = ["whatsapp", "email"]
@@ -151,10 +187,13 @@ export async function POST(request: NextRequest) {
     const allowResend = body.allowResend === true
 
     const hub = await loadTenantHubConfig(companyId)
-    const dispatchMode = resolveDispatch()
+    // Modo EFETIVO: env decide inline/queue; quando `queue`, um ping rápido no
+    // Redis pode FORÇAR inline (Upstash/worker fora) — fallback automático.
+    const { mode: dispatchMode, forcedInline } = await resolveEffectiveDispatch()
 
     // inline só para super_admin (E2/§4): dispara na request, teto + rate-limit.
-    // Acima do teto: orienta dividir em lotes (não trunca silenciosamente).
+    // Acima do teto: orienta dividir em lotes (não trunca silenciosamente). Vale
+    // TAMBÉM para o inline forçado pelo fallback (o teto protege o lote síncrono).
     if (dispatchMode === "inline" && !dryRun) {
       if (role !== "super_admin") {
         return NextResponse.json({ error: "inline dispatch restrito a super_admin" }, { status: 403, headers: noCache })
@@ -165,6 +204,7 @@ export async function POST(request: NextRequest) {
             error: `Envio inline limitado a ${INLINE_DISPATCH_MAX_BATCH} devedores por lote (recebidos ${customerIds.length}). Divida a seleção em lotes de até ${INLINE_DISPATCH_MAX_BATCH}.`,
             maxBatch: INLINE_DISPATCH_MAX_BATCH,
             received: customerIds.length,
+            ...(forcedInline ? { forcedInline: true } : {}),
           },
           { status: 400, headers: noCache },
         )
@@ -186,34 +226,99 @@ export async function POST(request: NextRequest) {
       // dryRun não consome/colide com a chave do envio real.
       idempotencyKey: dryRun ? null : (typeof body.idempotencyKey === "string" ? body.idempotencyKey : null),
     })
-    const hubResult = await runHubSend({ campaignId, companyId, dispatchMode, dryRun, allowResend })
 
-    // counts (=summary) + results POR (DEVEDOR, CANAL) com documento MASCARADO.
-    const items: HubSendItem[] = hubResult.items
-    const docs = await maskedDocuments(companyId, Array.from(new Set(items.map((i) => i.customerId))))
-    const results: SendResultRow[] = items.map((i) => ({
-      customerId: i.customerId,
-      documentMasked: docs.get(i.customerId) ?? "***",
-      channel: i.channel ?? null,
-      outcome: toOutcome(i.status),
-      detail: i.reason ?? null,
-    }))
-    const counts = hubResult.summary
-
-    return NextResponse.json(
-      {
+    // Monta o payload JSON final (idêntico ao de hoje) a partir do resultado do
+    // hub. Usado tanto pela resposta não-stream quanto pelo evento `done` do stream.
+    const buildPayload = async (hubResult: Awaited<ReturnType<typeof runHubSend>>) => {
+      const items: HubSendItem[] = hubResult.items
+      const docs = await maskedDocuments(companyId, Array.from(new Set(items.map((i) => i.customerId))))
+      const results: SendResultRow[] = items.map((i) => ({
+        customerId: i.customerId,
+        documentMasked: docs.get(i.customerId) ?? "***",
+        channel: i.channel ?? null,
+        outcome: toOutcome(i.status),
+        detail: i.reason ?? null,
+      }))
+      return {
         dryRun,
         channels,
         dedupe,
         dispatchMode,
+        forcedInline,
         campaignId,
-        counts,
+        counts: hubResult.summary,
         results,
-      },
-      { headers: noCache },
-    )
+      }
+    }
+
+    // STREAMING (NDJSON): só quando o cliente pede (x-stream:1) E o envio é inline
+    // real (não dry-run) — o único caminho com laço item-a-item. Cada item emite
+    // uma linha `progress`; ao fim, uma linha `done` com o MESMO payload JSON.
+    if (wantsStream(request) && dispatchMode === "inline" && !dryRun) {
+      return streamSend({ campaignId, companyId, dispatchMode, allowResend, buildPayload })
+    }
+
+    // Não-stream (compat): roda até o fim e devolve o JSON de hoje.
+    const hubResult = await runHubSend({ campaignId, companyId, dispatchMode, dryRun, allowResend })
+    return NextResponse.json(await buildPayload(hubResult), { headers: noCache })
   } catch (error: any) {
     console.error("[negotiations/send] erro:", error?.message)
     return NextResponse.json({ error: error?.message ?? "Erro interno" }, { status: 500, headers: noCache })
   }
+}
+
+/**
+ * Resposta em STREAM NDJSON do envio inline. Emite uma linha JSON por item
+ * processado (`{"type":"progress","done","total","item":{customerId,channel,status}}`)
+ * e, ao fim, `{"type":"done","result":{...payload...}}` — o MESMO objeto que a
+ * resposta não-stream devolveria. Um erro no meio vira `{"type":"error","error"}`
+ * na última linha (o cliente consegue exibir e oferecer nova tentativa). O item
+ * NUNCA carrega documento em claro — só customerId/channel/status (a lista com
+ * documento mascarado vai no payload final, montado por buildPayload).
+ */
+function streamSend(args: {
+  campaignId: string
+  companyId: string
+  dispatchMode: "inline" | "queue"
+  allowResend: boolean
+  buildPayload: (hubResult: Awaited<ReturnType<typeof runHubSend>>) => Promise<Record<string, unknown>>
+}): Response {
+  const { campaignId, companyId, dispatchMode, allowResend, buildPayload } = args
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const write = (obj: unknown) => controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"))
+      try {
+        const hubResult = await runHubSend({
+          campaignId,
+          companyId,
+          dispatchMode,
+          dryRun: false,
+          allowResend,
+          onProgress: (done, total, item) => {
+            // linha de progresso: sem PII (só o customerId opaco + canal + status).
+            write({
+              type: "progress",
+              done,
+              total,
+              item: { customerId: item.customerId, channel: item.channel ?? null, status: item.status },
+            })
+          },
+        })
+        const result = await buildPayload(hubResult)
+        write({ type: "done", result })
+      } catch (error: any) {
+        write({ type: "error", error: error?.message ?? "Erro interno" })
+      } finally {
+        controller.close()
+      }
+    },
+  })
+  return new Response(stream, {
+    headers: {
+      ...noCache,
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "X-Accel-Buffering": "no",
+    },
+  })
 }

@@ -195,3 +195,32 @@ export function failureRows(
       reason: detailLabel(r.detail),
     }))
 }
+
+/** Desfechos de UM canal no resultado (para o resumo por canal do painel de
+ * sucesso). `sent` = aceitos/enviados; `failed`/`suppressed`/`skipped` idem ao
+ * contrato bruto. */
+export interface ChannelResultSummary {
+  channel: SendChannel
+  sent: number
+  failed: number
+  suppressed: number
+  skipped: number
+}
+
+/**
+ * Resumo por CANAL a partir das linhas do resultado (painel de sucesso).
+ * Conta cada (devedor, canal) pelo seu desfecho. Só inclui os canais que
+ * aparecem no resultado (ordem canônica WhatsApp → e-mail). Puro e testável.
+ */
+export function summarizeByChannel(result: SendResponse): ChannelResultSummary[] {
+  const byChannel = new Map<SendChannel, ChannelResultSummary>()
+  for (const r of result.results) {
+    if (r.channel !== "whatsapp" && r.channel !== "email") continue
+    const acc =
+      byChannel.get(r.channel) ??
+      { channel: r.channel, sent: 0, failed: 0, suppressed: 0, skipped: 0 }
+    acc[r.outcome] += 1
+    byChannel.set(r.channel, acc)
+  }
+  return ALL_CHANNELS.filter((c) => byChannel.has(c)).map((c) => byChannel.get(c)!)
+}

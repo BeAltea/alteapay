@@ -50,6 +50,13 @@ vi.mock("@/app/api/super-admin/negotiations/selection", () => ({
   resolveSelection: async (body: any) => ({ customerIds: body.customerIds ?? [] }),
 }))
 
+// pingRedis: por default o Redis está OK (ping true) — assim o modo `queue`
+// permanece intacto nestes testes (o fallback inline é coberto em
+// send-redis-fallback.test.ts). Também evita abrir conexão real no import.
+vi.mock("@/lib/queue", () => ({
+  pingRedis: async () => true,
+}))
+
 // hub config + campanha (o foco é a trava da rota, não a avaliação).
 vi.mock("@/lib/journey/campaigns", () => ({
   loadTenantHubConfig: async () => ({

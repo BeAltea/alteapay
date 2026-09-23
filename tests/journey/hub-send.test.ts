@@ -555,6 +555,89 @@ describe("runHubSend — allowResend (override do cooldown)", () => {
   })
 })
 
+describe("runHubSend — onProgress (streaming item-a-item)", () => {
+  // Snapshot idêntico aos outros: só os customerIds; runHubSend REVERIFICA tudo.
+  async function makeCampaign(channels: string[], customerIds: string[], dedupe = false) {
+    const cid = `camp_${Math.random().toString(36).slice(2, 8)}`
+    db.whatsapp_campaigns.push({
+      id: cid, company_id: CO, provider: "mock", template_key: "hub_link", status: "draft",
+      selection_snapshot: {
+        send_mode: "whatsapp_chat", channels, dedupe,
+        channel_decisions: customerIds.map((customerId) => ({ customerId, decisions: [], hasBothContacts: false })),
+      },
+      counts: {}, started_at: null,
+    })
+    return cid
+  }
+
+  it("chama onProgress UMA vez por item processado, com done crescente e o mesmo total", async () => {
+    // 2 devedores só-WhatsApp + 1 só-e-mail = 3 itens elegíveis a processar.
+    seedCustomer("wa1", { phone: "11999998888", email: "naotem@vmax" })
+    seedCustomer("wa2", { phone: "11999997777", email: "naotem@vmax" })
+    seedCustomer("mail1", { phone: "1122", email: "mail1@dominio.com" })
+    const cid = await makeCampaign(["whatsapp", "email"], ["wa1", "wa2", "mail1"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+
+    const calls: Array<{ done: number; total: number; customerId: string; channel?: string; status: string }> = []
+    const res = await runHubSend({
+      campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false,
+      onProgress: (done, total, item) => {
+        calls.push({ done, total, customerId: item.customerId, channel: item.channel, status: item.status })
+      },
+    })
+
+    // 3 itens elegíveis → 3 chamadas (uma por item), na ordem em que ocorrem.
+    expect(calls.length).toBe(3)
+    // done cresce 1,2,3 e total é constante = 3 em todas.
+    expect(calls.map((c) => c.done)).toEqual([1, 2, 3])
+    expect(calls.every((c) => c.total === 3)).toBe(true)
+    // o número de chamadas bate com o número de itens processados (sent nesse cenário).
+    expect(res.summary.sent).toBe(3)
+    // a última chamada reflete o item final (done === total).
+    expect(calls[calls.length - 1].done).toBe(calls[calls.length - 1].total)
+  })
+
+  it("ordena por CANAL: todos os itens do 1º canal antes do 2º (WhatsApp → e-mail)", async () => {
+    // devedor com os dois contatos → 1 item WhatsApp + 1 item e-mail.
+    seedCustomer("both", { phone: "11999997777", email: "both@dominio.com" })
+    const cid = await makeCampaign(["whatsapp", "email"], ["both"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+
+    const order: Array<string | undefined> = []
+    await runHubSend({
+      campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false,
+      onProgress: (_d, _t, item) => { order.push(item.channel) },
+    })
+    // o laço externo é por canal: WhatsApp primeiro, depois e-mail.
+    expect(order).toEqual(["whatsapp", "email"])
+  })
+
+  it("dryRun NÃO chama onProgress (não há laço item-a-item)", async () => {
+    seedCustomer("wa", { phone: "11999998888" })
+    const cid = await makeCampaign(["whatsapp"], ["wa"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    let n = 0
+    const res = await runHubSend({
+      campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: true,
+      onProgress: () => { n += 1 },
+    })
+    expect(res.summary.sent).toBe(1)
+    expect(n).toBe(0)
+  })
+
+  it("erro no callback NÃO derruba o envio (progresso é best-effort)", async () => {
+    seedCustomer("wa", { phone: "11999998888" })
+    const cid = await makeCampaign(["whatsapp"], ["wa"])
+    const { runHubSend } = await import("@/lib/journey/campaign-send")
+    const res = await runHubSend({
+      campaignId: cid, companyId: CO, dispatchMode: "queue", dryRun: false,
+      onProgress: () => { throw new Error("callback_explodiu") },
+    })
+    // o item foi enviado apesar do callback ter estourado.
+    expect(res.summary.sent).toBe(1)
+  })
+})
+
 describe("buildProviderSelector (T3-2)", () => {
   it("mock: devolve a string, sem carregar credencial", async () => {
     const { buildProviderSelector } = await import("@/lib/journey/campaign-send")
