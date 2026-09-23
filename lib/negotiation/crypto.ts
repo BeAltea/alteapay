@@ -29,7 +29,11 @@ export interface ChatSessionClaims {
 }
 
 export const CHAT_COOKIE_NAME = "alteapay_chat_session"
-export const CHAT_JWT_TTL_SECONDS = 2 * 60 * 60
+// Rede de segurança: se ALGUM caminho de auth cair neste default (em vez do TTL
+// do tenant), a sessão do devedor NÃO pode expirar em minutos — perder a sessão
+// perde o acesso à negociação. 30 dias é o piso generoso (o tenant costuma
+// mandar session_ttl_minutes explícito; a VMAX usa 30 dias).
+export const CHAT_JWT_TTL_SECONDS = 30 * 24 * 60 * 60
 
 export function signChatJwt(claims: Omit<ChatSessionClaims, "exp">, ttlSeconds = CHAT_JWT_TTL_SECONDS): string {
   const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }))

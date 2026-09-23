@@ -21,6 +21,11 @@ interface ChatMsg {
   from: "customer" | "assistant"
   text: string
   action?: MsgAction | null
+  // prompt_id da pergunta que originou esta bolha (quando é a mensagem do prompt).
+  // Enquanto o prompt está 'active', a pergunta é mostrada no bloco de botões — a
+  // bolha correspondente é omitida para não duplicar. Respondido o prompt (sem
+  // active_prompt), a bolha aparece e mantém o resumo no histórico.
+  promptId?: string | null
 }
 
 /** Só aceitamos links externos http(s) — nunca javascript:/relativos suspeitos. */
@@ -34,10 +39,8 @@ function safeExternalAction(raw: unknown): MsgAction | null {
   return { type: "external_link", label, href }
 }
 
-let msgSeq = 0
-const nextId = () => `m${Date.now()}_${msgSeq++}`
-
 const IDLE_MS = 5 * 60_000 // 5 minutos sem interação
+const KEEPALIVE_MS = 10 * 60_000 // renova o cookie a cada 10min (só aba visível)
 
 export function JourneyChat() {
   // Sem saudação hardcoded: a 1ª (e única) mensagem inicial é o prompt de
@@ -127,6 +130,7 @@ export function JourneyChat() {
         text: string
         created_at: string
         button_id: number | null
+        prompt_id?: string | null
         action?: unknown
       }> = Array.isArray(data?.messages) ? data.messages : []
       for (const m of pushed) {
@@ -140,6 +144,7 @@ export function JourneyChat() {
             from: m.role === "customer" ? "customer" : "assistant",
             text: m.text,
             action: safeExternalAction(m.action),
+            promptId: m.prompt_id ?? null,
           },
         ])
       }
@@ -163,6 +168,40 @@ export function JourneyChat() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // KEEP-ALIVE: enquanto a aba está aberta e visível, renova o cookie a cada
+  // 10min para o `exp` do JWT NUNCA vencer em uso — a sessão da negociação não
+  // pode cair sozinha. Só dispara com a aba visível (não gasta request em aba
+  // de fundo) e não roda depois de encerrada a conversa. Um 401 aqui (cookie já
+  // inválido) abre o MODAL "Entrar novamente" — nunca redireciona sozinho.
+  useEffect(() => {
+    async function keepAlive() {
+      if (document.visibilityState !== "visible") return
+      if (endedRef.current || modalRef.current) return
+      try {
+        const res = await fetch("/api/chat/keepalive", { method: "POST" })
+        if (res.status === 401) {
+          stopPoll()
+          modalRef.current = "expired"
+          setIdleModalState("expired")
+        }
+      } catch {
+        /* silencioso: uma falha de rede não derruba a sessão; tenta de novo depois */
+      }
+    }
+    // Renova também ao voltar o foco à aba (cobre o sono longo entre intervalos).
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void keepAlive()
+    }
+    const id = setInterval(() => {
+      void keepAlive()
+    }, KEEPALIVE_MS)
+    document.addEventListener("visibilitychange", onVisible)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener("visibilitychange", onVisible)
+    }
+  }, [])
+
   // "Continuar" do modal de inatividade: fecha o modal, re-arma o timer e retoma
   // o polling exatamente de onde parou (nada é perdido).
   function resumeFromIdle() {
@@ -172,12 +211,14 @@ export function JourneyChat() {
     void pollMessages()
   }
 
-  // Clique no reconhecimento (Sim/Não). PRESERVA o histórico: a pergunta e a
-  // resposta escolhida viram mensagens fixas; o `reply` do backend (texto fixo
-  // local) também. Depois, conversa encerrada — sem chat livre nem ofertas.
+  // Clique no reconhecimento (Sim/Não). HISTÓRICO VEM DO SERVIDOR: o servidor
+  // persiste em chat_messages a pergunta+resumo (na criação do prompt), o clique
+  // do cliente e a resposta do assistente — então NÃO empurramos bolhas locais
+  // (evita duplicar). Um poll logo após o POST traz as 3; só então encerramos.
+  // Assim uma sessão reaberta reconstrói o contexto completo (pergunta → clique →
+  // resposta), não apenas a última mensagem.
   async function clickButton(promptId: string, buttonId: number): Promise<PromptClickResult> {
     resetIdle()
-    const current = activePrompt
     try {
       const res = await fetch("/api/chat/button", {
         method: "POST",
@@ -194,22 +235,14 @@ export function JourneyChat() {
       }
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
-        const chosen = current?.buttons.find((b) => b.id === buttonId)?.label ?? ""
-        setMessages((m) => {
-          const add: ChatMsg[] = []
-          // 1) a pergunta (com o resumo da dívida) fica PERMANENTE no histórico
-          if (current?.question) add.push({ id: nextId(), from: "assistant", text: current.question })
-          // 2) a resposta escolhida pelo cliente
-          if (chosen) add.push({ id: nextId(), from: "customer", text: chosen })
-          // 3) o retorno do assistente
-          if (typeof data?.reply === "string" && data.reply.trim())
-            add.push({ id: nextId(), from: "assistant", text: data.reply })
-          return [...m, ...add]
-        })
-        endedRef.current = true
+        // O prompt já foi respondido no servidor: puxa as mensagens persistidas
+        // (pergunta + clique + resposta) antes de encerrar. Com o active_prompt já
+        // 'answered', a pergunta deixa de ser omitida e vira histórico.
         setActivePrompt(null)
+        await pollMessages()
+        endedRef.current = true
         setEnded(true)
-        stopPoll() // encerrado: não busca mais (evita duplicar a resposta do servidor)
+        stopPoll() // encerrado: as mensagens já vieram do servidor (sem duplicar)
         return { ok: true }
       }
       // 409 prompt_not_active: recarrega o prompt ativo atual.
@@ -229,7 +262,12 @@ export function JourneyChat() {
         className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm"
         style={{ minHeight: 320 }}
       >
-        {messages.map((m) => (
+        {messages
+          // Enquanto o prompt está ATIVO, sua pergunta já é mostrada no bloco de
+          // botões abaixo — omite a bolha persistida correspondente para não
+          // duplicar. Respondido o prompt (sem active_prompt), a bolha aparece.
+          .filter((m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id))
+          .map((m) => (
           <div
             key={m.id}
             className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}

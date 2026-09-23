@@ -107,6 +107,9 @@ export interface TenantChatConfig {
   debt_selection: "consolidated" | "choose"
   n8n_chat_flow_url: string | null
   auth_require_otp: boolean
+  // TTL da sessão do chat (minutos). Governa o `exp` do JWT e o maxAge do cookie
+  // em TODOS os caminhos de auth. Ausente → cai no default generoso (30 dias).
+  session_ttl_minutes: number | null
   created_at: string
   updated_at: string
 }

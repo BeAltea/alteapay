@@ -115,7 +115,10 @@ export async function POST(request: Request) {
     }).catch((err) => console.warn("[negotiation:resolve] auditoria de acesso:", err.message))
   }
 
-  const jwt = signChatJwt({ sid: session.id, cid: session.company_id })
+  // TTL do tenant (mesmo critério dos demais caminhos de auth). NUNCA cai no
+  // default curto: o `exp` do JWT e o maxAge do cookie usam session_ttl_minutes.
+  const ttlSeconds = (tenant?.session_ttl_minutes ?? CHAT_JWT_TTL_SECONDS / 60) * 60
+  const jwt = signChatJwt({ sid: session.id, cid: session.company_id }, ttlSeconds)
   const response = NextResponse.json(
     {
       success: true,
@@ -155,7 +158,7 @@ export async function POST(request: Request) {
     httpOnly: true,
     secure: isHttps,
     sameSite: session.frontend_mode === "whitelabel" && isHttps ? "none" : "lax",
-    maxAge: CHAT_JWT_TTL_SECONDS,
+    maxAge: ttlSeconds,
     path: "/",
   })
   return response

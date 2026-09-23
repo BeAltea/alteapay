@@ -361,11 +361,12 @@ export async function bootstrapAcknowledgementPrompt(input: {
     customerId: input.customerId,
     debtIds: input.debtIds,
   })
+  const question = acknowledgementQuestion(ackCtx)
   const created = await createPrompt({
     companyId: input.companyId,
     sessionId: input.sessionId,
     kind: "debt_acknowledgement",
-    question: acknowledgementQuestion(ackCtx),
+    question,
     buttons: acknowledgementButtons(cfg?.show_handoff_button === true),
     context: {
       creditor_name: ackCtx.creditorName,
@@ -377,7 +378,68 @@ export async function bootstrapAcknowledgementPrompt(input: {
     createdBy: "platform",
   })
   if (!created.ok) return { ok: false, error: created.error }
+
+  // Persiste a PERGUNTA (resumo + Sim/Não) como chat_messages(role='assistant'),
+  // ligada ao prompt via prompt_id. Enquanto o prompt está 'active' a UI a mostra
+  // no bloco de botões; depois de respondido, este registro mantém o resumo no
+  // histórico — sem ele, uma sessão reaberta só traria o clique do cliente.
+  await persistAssistantMessage({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    text: question,
+    promptId: created.prompt.id,
+  })
+
   return { ok: true, created: true, prompt: created.prompt }
+}
+
+/**
+ * Grava uma mensagem do assistente em chat_messages (engine='platform', fluxo
+ * assistido). Reusa o mesmo caminho que /api/chat/messages lê. Idempotente por
+ * `prompt_id` quando informado (a pergunta do reconhecimento é gravada uma única
+ * vez, mesmo que o bootstrap rode de novo). O texto já é neutro/sem PII (o resumo
+ * do reconhecimento não expõe documento). NUNCA lança — uma falha aqui não pode
+ * derrubar a criação do prompt nem o processamento do clique.
+ */
+export async function persistAssistantMessage(input: {
+  companyId: string
+  sessionId: string
+  text: string
+  promptId?: string | null
+}): Promise<string | null> {
+  const text = (input.text ?? "").trim()
+  if (!text) return null
+  const supabase = createServiceClient()
+  try {
+    // idempotência: a pergunta de um prompt é gravada uma única vez.
+    if (input.promptId) {
+      const { data: existing } = await supabase
+        .from("chat_messages")
+        .select("id")
+        .eq("session_id", input.sessionId)
+        .eq("prompt_id", input.promptId)
+        .eq("role", "assistant")
+        .limit(1)
+        .maybeSingle()
+      if (existing) return (existing as { id: string }).id
+    }
+    const { data } = await supabase
+      .from("chat_messages")
+      .insert({
+        company_id: input.companyId,
+        session_id: input.sessionId,
+        role: "assistant",
+        text,
+        engine: "platform",
+        prompt_id: input.promptId ?? null,
+      })
+      .select("id")
+      .single()
+    return (data as { id: string } | null)?.id ?? null
+  } catch (err) {
+    console.warn("[journey] persistAssistantMessage falhou:", (err as Error).message)
+    return null
+  }
 }
 
 /**

@@ -13,7 +13,12 @@ import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
 import { getPrompt, answerPrompt } from "@/lib/journey/prompts"
-import { buildAckContext, recordAcknowledgement, startN8nNegotiation } from "@/lib/journey/acknowledgement"
+import {
+  buildAckContext,
+  persistAssistantMessage,
+  recordAcknowledgement,
+  startN8nNegotiation,
+} from "@/lib/journey/acknowledgement"
 import { engineName } from "@/lib/negotiation/engine"
 import { BTN_HANDOFF } from "@/lib/journey/buttons"
 
@@ -81,12 +86,21 @@ export async function POST(req: NextRequest) {
       } catch {
         /* fallback silencioso: mantém o texto genérico */
       }
+      const notRecognizedReply = `Obrigado pelo seu retorno. Para esclarecimentos sobre esta cobrança, entre em contato diretamente com a ${creditorName}.`
+      // Persiste a resposta do assistente no histórico (o clique do cliente já foi
+      // gravado por answerPrompt dentro de recordAcknowledgement). Assim a sessão
+      // reaberta reconstrói [pergunta+resumo] → [clique] → [resposta].
+      await persistAssistantMessage({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        text: notRecognizedReply,
+      })
       return NextResponse.json({
         ok: true,
         acknowledged: false,
         button_id: buttonId,
         on_not_recognized: res.onNotRecognized ?? "continue",
-        reply: `Obrigado pelo seu retorno. Para esclarecimentos sobre esta cobrança, entre em contato diretamente com a ${creditorName}.`,
+        reply: notRecognizedReply,
       })
     }
     // "Sim, reconheço" (button 1): handoff ao n8n (engine_owner='n8n' + emite
@@ -104,12 +118,23 @@ export async function POST(req: NextRequest) {
     } catch (err) {
       console.warn("[chat:button] negotiation.start falhou (fallback assistido):", (err as Error).message)
     }
+    const recognizedReply = "Perfeito! Então vamos trabalhar juntos para sanar o seu débito."
+    // Só persiste o reply assistido quando o engine é o assistido (platform). Com
+    // o n8n dono, o próprio fluxo empurra as mensagens seguintes via chat.send —
+    // gravar aqui duplicaria a conversa. O clique do cliente já foi gravado.
+    if (engineOwner === "platform") {
+      await persistAssistantMessage({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        text: recognizedReply,
+      })
+    }
     return NextResponse.json({
       ok: true,
       acknowledged: true,
       button_id: buttonId,
       engine_owner: engineOwner,
-      reply: "Perfeito! Então vamos trabalhar juntos para sanar o seu débito.",
+      reply: recognizedReply,
     })
   }
 
