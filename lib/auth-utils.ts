@@ -6,6 +6,28 @@ import { createClient } from "@/lib/supabase/client"
 const SESSION_START_KEY = "altea_session_start"
 const LAST_ACTIVITY_KEY = "altea_last_activity"
 
+// Prefixos das rotas da JORNADA DO DEVEDOR (/n/{code}, /c/{token}, /t/{slug},
+// /negociar). Essas páginas NÃO usam sessão Supabase de admin — o devedor
+// autentica via cookie próprio de chat (`alteapay_chat_session` + modal em
+// components/journey/chat.tsx). O AuthProvider e o SessionMonitor (timeout de
+// inatividade/máximo do admin) devem ser NO-OP nessas rotas: nunca chamar
+// getUser, nunca iniciar o timer, NUNCA secureSignOut/redirect p/ /auth/login.
+const JOURNEY_PATH_PREFIXES = ["/n/", "/c/", "/t/", "/negociar"]
+
+/**
+ * Retorna true se o path informado (ou o pathname atual do window) pertence à
+ * jornada do devedor e, portanto, deve ficar totalmente isento do mecanismo de
+ * sessão/timeout do admin.
+ */
+export function isJourneyPath(pathname?: string | null): boolean {
+  const path =
+    pathname ?? (typeof window !== "undefined" ? window.location.pathname : "")
+  if (!path) return false
+  return JOURNEY_PATH_PREFIXES.some(
+    (prefix) => path === prefix || path.startsWith(prefix),
+  )
+}
+
 /**
  * Records the session start time
  */

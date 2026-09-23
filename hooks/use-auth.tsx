@@ -4,7 +4,7 @@ import type React from "react"
 import { createContext, useContext, useState, useEffect, useRef } from "react"
 import { createClient } from "@/lib/supabase/client"
 import type { User } from "@supabase/supabase-js"
-import { secureSignOut, recordSessionStart } from "@/lib/auth-utils"
+import { secureSignOut, recordSessionStart, isJourneyPath } from "@/lib/auth-utils"
 
 interface Profile {
   id: string
@@ -35,6 +35,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const mountedRef = useRef(true)
 
   useEffect(() => {
+    // Rotas da jornada do devedor (/n/, /c/, /t/, /negociar) NÃO usam sessão
+    // Supabase de admin. Não rodar getUser/onAuthStateChange/recordSessionStart
+    // aqui — o chat do devedor tem a própria sessão (cookie + modal). Sem isso, o
+    // auth do admin do operador logado vaza para dentro do chat e o dispara.
+    if (isJourneyPath()) {
+      setLoading(false)
+      return
+    }
+
     mountedRef.current = true
 
     const fetchUser = async () => {

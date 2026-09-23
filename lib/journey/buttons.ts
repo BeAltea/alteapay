@@ -8,11 +8,19 @@
 //   98 = Voltar
 //   99 = Atendente (handoff)
 //
+// Fluxo Consultar/Negociar (dono pediu — o prompt inicial deixa de ser Sim/Não
+// isolado): reusa os ids de "item de lista" 2 e 3 no prompt kind 'debt_consult'.
+//   2 = Consultar Dívida (mostra o resumo, sem iniciar o n8n)
+//   3 = Negociar Dívida  (mostra o resumo E inicia a negociação no n8n)
+// "Não reconheço a dívida" reusa o BTN_NO (0). Assim o catálogo booleano
+// (1/0/99) segue intacto para os demais prompts.
+//
 // prompt_kind conhecidos; kinds novos vindos do n8n são aceitos e registrados
 // (o servidor não impõe um enum fechado, só valida a estrutura dos botões).
 
 export type PromptKind =
   | "debt_acknowledgement"
+  | "debt_consult"
   | "offer_choice"
   | "payment_method_choice"
   | "payment_confirmation"
@@ -20,6 +28,7 @@ export type PromptKind =
 
 export const KNOWN_PROMPT_KINDS: readonly PromptKind[] = [
   "debt_acknowledgement",
+  "debt_consult",
   "offer_choice",
   "payment_method_choice",
   "payment_confirmation",
@@ -28,6 +37,8 @@ export const KNOWN_PROMPT_KINDS: readonly PromptKind[] = [
 
 export const BTN_YES = 1
 export const BTN_NO = 0
+export const BTN_CONSULT = 2
+export const BTN_NEGOTIATE = 3
 export const BTN_BACK = 98
 export const BTN_HANDOFF = 99
 

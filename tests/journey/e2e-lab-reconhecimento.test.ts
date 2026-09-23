@@ -1,9 +1,10 @@
-// R4 — E2E de laboratório do RECONHECIMENTO + pagamento comandado (variante A).
+// R4 — E2E de laboratório do fluxo Consultar/Negociar + pagamento comandado.
 // Exercita as bibliotecas reais com DB em memória (fake supabase) e integrações
-// mockadas. Cobre os casos do spec R4:
-//   - Sim completo → payment.create cobra (guard passa);
-//   - Não com continue → registra, não bloqueia navegação, MAS bloqueia payment.create;
-//   - payment.create após "Não" recusado (409 debt_not_acknowledged);
+// mockadas. O prompt inicial é debt_consult (Consultar [2] / Negociar [3]):
+//   - Negociar [3] reconhece → payment.create cobra (guard passa);
+//   - Consultar [2] → menu pós-consulta → Não reconheço [0] com continue:
+//     registra, não bloqueia navegação, MAS bloqueia payment.create;
+//   - payment.create após "Não reconheço" recusado (409 debt_not_acknowledged);
 //   - reenvio de payment.create → mesmo agreement/link, idempotent:true, 0 cobrança nova;
 //   - clique antigo (prompt superseded) → 409 prompt_not_active;
 //   - chat.send do n8n aparece nas mensagens.
@@ -96,17 +97,48 @@ async function ackPrompt() {
   return r.prompt.id
 }
 
+/** Reconhece via "Negociar Dívida" [3] (answerPrompt + handleDebtNegotiate),
+ * exatamente como a rota /api/chat/button conduz o fluxo Consultar/Negociar. */
+async function recognizeViaNegotiate(promptId: string) {
+  const { answerPrompt } = await import("@/lib/journey/prompts")
+  const { handleDebtNegotiate } = await import("@/lib/journey/acknowledgement")
+  const answered = await answerPrompt({ sessionId: SID, companyId: CO, promptId, buttonId: 3 })
+  if (!answered.ok) throw new Error(`answerPrompt failed: ${answered.code}`)
+  return handleDebtNegotiate({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, debtIds: [DEBT], promptId, buttonId: 3 })
+}
+
+/**
+ * "Não reconheço a dívida" [0]: como no fluxo real, o botão [0] só aparece no
+ * menu PÓS-CONSULTA. Então: Consultar [2] → reabre o menu (Negociar/Não
+ * reconheço) → responde [0] nesse novo prompt.
+ */
+async function notRecognize(initialPromptId: string) {
+  const { answerPrompt, getActivePrompt } = await import("@/lib/journey/prompts")
+  const { handleDebtConsult, handleDebtNotRecognized } = await import("@/lib/journey/acknowledgement")
+  // Consultar [2]
+  const consultAnswered = await answerPrompt({ sessionId: SID, companyId: CO, promptId: initialPromptId, buttonId: 2 })
+  if (!consultAnswered.ok) throw new Error(`answerPrompt(consult) failed: ${consultAnswered.code}`)
+  await handleDebtConsult({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, debtIds: [DEBT], primaryDebtId: DEBT })
+  // menu pós-consulta (novo prompt ativo) → responde [0]
+  const post = await getActivePrompt(SID)
+  if (!post) throw new Error("post-consult prompt not created")
+  const answered = await answerPrompt({ sessionId: SID, companyId: CO, promptId: post.id, buttonId: 0 })
+  if (!answered.ok) throw new Error(`answerPrompt(no) failed: ${answered.code}`)
+  return handleDebtNotRecognized({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, promptId: post.id, buttonId: 0 })
+}
+
 describe("E2E reconhecimento — SIM completo até cobrança", () => {
   beforeEach(seed)
 
-  it("bootstrap → clique 1 (Sim) → payment.create cobra 1x", async () => {
+  it("bootstrap → Negociar [3] (reconhece) → payment.create cobra 1x", async () => {
     const promptId = await ackPrompt()
-    expect(db.chat_prompts[0].kind).toBe("debt_acknowledgement")
+    expect(db.chat_prompts[0].kind).toBe("debt_consult")
 
-    const { recordAcknowledgement } = await import("@/lib/journey/acknowledgement")
-    const ack = await recordAcknowledgement({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, promptId, buttonId: 1 })
-    expect(ack.ok && ack.acknowledged).toBe(true)
+    const neg = await recognizeViaNegotiate(promptId)
+    expect(neg.ok).toBe(true)
     refreshView()
+    // reconhecimento gravado (append-log) via Negociar
+    expect(db.debt_acknowledgement_latest.some((v) => v.acknowledged === true)).toBe(true)
 
     const { paymentCreate } = await import("@/lib/journey/payment-actions")
     const r = await paymentCreate(ctx, "off-1")
@@ -122,12 +154,11 @@ describe("E2E reconhecimento — SIM completo até cobrança", () => {
 describe("E2E reconhecimento — NÃO (continue) bloqueia pagamento", () => {
   beforeEach(seed)
 
-  it("clique 0 (Não) registra e NÃO bloqueia navegação; payment.create → 409 debt_not_acknowledged", async () => {
+  it("Não reconheço [0] registra e NÃO bloqueia navegação; payment.create → 409 debt_not_acknowledged", async () => {
     const promptId = await ackPrompt()
-    const { recordAcknowledgement } = await import("@/lib/journey/acknowledgement")
-    const ack = await recordAcknowledgement({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, promptId, buttonId: 0 })
-    expect(ack.ok).toBe(true)
-    if (ack.ok) expect(ack.onNotRecognized).toBe("continue") // navegação livre
+    const res = await notRecognize(promptId)
+    expect(res.ok).toBe(true)
+    expect(res.onNotRecognized).toBe("continue") // navegação livre
     refreshView()
 
     const { paymentCreate } = await import("@/lib/journey/payment-actions")
@@ -146,8 +177,7 @@ describe("E2E reconhecimento — idempotência do payment.create (session,offer)
 
   it("reenvio → mesmo agreement/link, idempotent:true, 0 cobrança nova", async () => {
     const promptId = await ackPrompt()
-    const { recordAcknowledgement } = await import("@/lib/journey/acknowledgement")
-    await recordAcknowledgement({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, promptId, buttonId: 1 })
+    await recognizeViaNegotiate(promptId)
     refreshView()
 
     const { paymentCreate } = await import("@/lib/journey/payment-actions")

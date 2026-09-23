@@ -1424,6 +1424,10 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
               </div>
             )}
 
+            {/* Horizontal scroll wrapper so the fixed-width desktop columns keep
+                aligned (header ↔ rows) and become scrollable on narrower screens. */}
+            <div className="overflow-x-auto">
+            <div className="lg:min-w-[1160px]">
             {/* Selection dropdown and column headers */}
             <div className="flex items-center gap-2 mb-3 pb-3 border-b">
               {/* Selection dropdown */}
@@ -1583,7 +1587,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                 </button>
                 <span className="w-[110px] flex-shrink-0 whitespace-nowrap">Status Neg.</span>
                 <span className="w-[100px] flex-shrink-0 whitespace-nowrap">Status Dív.</span>
-                <span className="w-[100px] flex-shrink-0 whitespace-nowrap" title="Já recebeu negociação por WhatsApp e/ou e-mail">Enviado</span>
+                <span className="w-[84px] flex-shrink-0 whitespace-nowrap" title="Já recebeu negociação por WhatsApp e/ou e-mail">Enviado</span>
                 <button
                   onClick={() => toggleSort("dueDate")}
                   className="w-[95px] flex-shrink-0 flex items-center gap-1 hover:text-foreground transition-colors whitespace-nowrap"
@@ -1698,7 +1702,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                         )}
                       </div>
                       {/* Enviado (WhatsApp/e-mail) */}
-                      <div className="w-[100px] flex-shrink-0">
+                      <div className="w-[84px] flex-shrink-0">
                         {renderSentChannels(customer.last_whatsapp_sent_at, customer.last_email_sent_at)}
                       </div>
                       {/* Vencimento */}
@@ -1830,6 +1834,8 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                 <p className="text-muted-foreground">Nenhum cliente encontrado com os filtros atuais.</p>
               </div>
             )}
+            </div>
+            </div>
           </CardContent>
         </Card>
       )}

@@ -10,6 +10,7 @@ import {
   getSessionStart,
   getLastActivity,
   isSessionValid,
+  isJourneyPath,
 } from "@/lib/auth-utils"
 
 // Configuration
@@ -115,10 +116,14 @@ export function SessionMonitor({ enabled = true }: SessionMonitorProps) {
   }, [toast])
 
   useEffect(() => {
-    // Skip on public/auth pages
+    // Skip on public/auth pages e nas rotas da jornada do devedor (/n/, /c/,
+    // /t/, /negociar): o devedor não é admin e não tem sessão Supabase — o
+    // timeout de inatividade/máximo e o secureSignOut (redirect p/ /auth/login)
+    // NUNCA podem disparar dentro do chat do devedor.
     if (
       pathname?.startsWith("/auth/") ||
       pathname === "/" ||
+      isJourneyPath(pathname) ||
       !enabled
     ) {
       return
@@ -155,7 +160,12 @@ export function SessionMonitor({ enabled = true }: SessionMonitorProps) {
 
   // Handle visibility change (tab focus/blur)
   useEffect(() => {
-    if (pathname?.startsWith("/auth/") || pathname === "/" || !enabled) {
+    if (
+      pathname?.startsWith("/auth/") ||
+      pathname === "/" ||
+      isJourneyPath(pathname) ||
+      !enabled
+    ) {
       return
     }
 

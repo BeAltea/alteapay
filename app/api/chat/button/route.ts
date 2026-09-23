@@ -15,12 +15,15 @@ import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/
 import { getPrompt, answerPrompt } from "@/lib/journey/prompts"
 import {
   buildAckContext,
+  handleDebtConsult,
+  handleDebtNegotiate,
+  handleDebtNotRecognized,
   persistAssistantMessage,
   recordAcknowledgement,
   startN8nNegotiation,
 } from "@/lib/journey/acknowledgement"
 import { engineName } from "@/lib/negotiation/engine"
-import { BTN_HANDOFF } from "@/lib/journey/buttons"
+import { BTN_CONSULT, BTN_HANDOFF, BTN_NEGOTIATE, BTN_NO } from "@/lib/journey/buttons"
 
 export const dynamic = "force-dynamic"
 export const maxDuration = 60
@@ -52,6 +55,81 @@ export async function POST(req: NextRequest) {
 
   const ip = clientIp(req)
   const userAgent = req.headers.get("user-agent")
+
+  // Fluxo Consultar/Negociar (prompt inicial pedido pelo dono): DOIS botões
+  // [2]=Consultar, [3]=Negociar; após consultar, [3]=Negociar + [0]=Não reconheço.
+  //  - Consultar → mostra os dados da dívida + reabre o menu (não inicia n8n);
+  //  - Negociar  → mostra os dados + reconhece "Sim" + inicia o n8n (fallback assistido);
+  //  - Não reconheço [0] → contestação (registra dispute);
+  //  - Atendente [99] → handoff.
+  if (prompt.kind === "debt_consult") {
+    // 1) responde o prompt (marca answered + grava a mensagem do cliente = label).
+    //    A integridade do clique (ativo/botão existe) é validada aqui.
+    const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
+    if (!answered.ok) return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+
+    // debtIds do prompt.context (buildAckContext consolida o valor). Fallback: o
+    // debt primário do ctx quando o contexto não trouxer a lista.
+    const debtIds = Array.isArray((prompt.context as { debt_ids?: unknown } | null)?.debt_ids)
+      ? ((prompt.context as { debt_ids: string[] }).debt_ids)
+      : [ctx.debtId]
+    const primaryDebtId =
+      (typeof (prompt.context as { primary_debt_id?: unknown } | null)?.primary_debt_id === "string"
+        ? (prompt.context as { primary_debt_id: string }).primary_debt_id
+        : null) ?? ctx.debtId
+
+    if (buttonId === BTN_CONSULT) {
+      const out = await handleDebtConsult({
+        companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+        debtId: ctx.debtId, debtIds, primaryDebtId,
+      })
+      return NextResponse.json({ ok: true, button_id: buttonId, action: "consulted", reply: out.reply })
+    }
+
+    if (buttonId === BTN_NEGOTIATE) {
+      const out = await handleDebtNegotiate({
+        companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+        debtId: ctx.debtId, debtIds, promptId, buttonId, ip, userAgent,
+      })
+      return NextResponse.json({
+        ok: true, button_id: buttonId, action: "negotiate",
+        acknowledged: true, engine_owner: out.engineOwner, reply: out.reply,
+      })
+    }
+
+    if (buttonId === BTN_NO) {
+      const out = await handleDebtNotRecognized({
+        companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+        debtId: ctx.debtId, promptId, buttonId, ip, userAgent,
+      })
+      if (out.onNotRecognized === "dispute") {
+        await registerDispute(ctx, { source: "debt_not_recognized" }, "customer")
+      } else if (out.onNotRecognized === "human") {
+        await transferToHuman(ctx, "debt_not_recognized", "customer")
+      }
+      let creditorName = "empresa credora"
+      try {
+        const ackCtx = await buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds: [ctx.debtId] })
+        creditorName = ackCtx.creditorName
+      } catch {
+        /* fallback silencioso: mantém o texto genérico */
+      }
+      const notRecognizedReply = `Obrigado pelo seu retorno. Para esclarecimentos sobre esta cobrança, entre em contato diretamente com a ${creditorName}.`
+      await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: notRecognizedReply })
+      return NextResponse.json({
+        ok: true, button_id: buttonId, action: "not_recognized",
+        acknowledged: false, on_not_recognized: out.onNotRecognized, reply: notRecognizedReply,
+      })
+    }
+
+    if (buttonId === BTN_HANDOFF) {
+      await transferToHuman(ctx, "handoff_button", "customer")
+      return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+    }
+
+    // Botão fora do catálogo esperado do debt_consult: já respondido, sem efeito.
+    return NextResponse.json({ ok: true, button_id: buttonId })
+  }
 
   // Reconhecimento da dívida: caminho dedicado (4 efeitos + comportamento em "Não").
   if (prompt.kind === "debt_acknowledgement") {

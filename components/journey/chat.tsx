@@ -1,10 +1,15 @@
 "use client"
 
-// Chat da jornada (pré-negociação): reconhecimento da dívida em UMA mensagem
-// (saudação + resumo + pergunta Sim/Não). Sem ofertas/desconto e sem chat livre
-// por ora — o fluxo é ver a dívida → reconhecer (Sim/Não) → mensagem final.
-// - HISTÓRICO SEMPRE PRESERVADO: ao responder, a pergunta e a resposta escolhida
-//   viram mensagens fixas (não somem da tela).
+// Chat da jornada: o prompt inicial oferece DOIS botões — "Consultar Dívida" e
+// "Negociar Dívida":
+//   - Consultar → mostra os dados da dívida (valor atualizado, vencimento, nº de
+//     faturas) e reabre o menu (Negociar / Não reconheço a dívida);
+//   - Negociar  → mostra os dados E inicia a negociação no n8n (fallback assistido);
+//   - Não reconheço → caminho de contestação.
+// - HISTÓRICO SEMPRE PRESERVADO: pergunta, clique, dados e respostas vêm do
+//   servidor (chat_messages) — a sessão reaberta reconstrói o contexto COMPLETO,
+//   e mesmo já tendo reconhecido antes, o menu Consultar/Negociar reabre (nunca
+//   trava num estado morto).
 // - Timer de inatividade: 5min sem interação → volta para a tela de login do CHAT
 //   (/n/{code}), NÃO o login da AlteaPay.
 import { useCallback, useEffect, useRef, useState } from "react"
@@ -211,12 +216,17 @@ export function JourneyChat() {
     void pollMessages()
   }
 
-  // Clique no reconhecimento (Sim/Não). HISTÓRICO VEM DO SERVIDOR: o servidor
-  // persiste em chat_messages a pergunta+resumo (na criação do prompt), o clique
-  // do cliente e a resposta do assistente — então NÃO empurramos bolhas locais
-  // (evita duplicar). Um poll logo após o POST traz as 3; só então encerramos.
-  // Assim uma sessão reaberta reconstrói o contexto completo (pergunta → clique →
-  // resposta), não apenas a última mensagem.
+  // Clique num prompt de botões (Consultar/Negociar/Não reconheço). HISTÓRICO VEM
+  // DO SERVIDOR: o servidor persiste em chat_messages a pergunta, o clique do
+  // cliente, os dados da dívida e a resposta — então NÃO empurramos bolhas locais
+  // (evita duplicar). Um poll logo após o POST traz tudo + o PRÓXIMO prompt (se
+  // houver). Assim uma sessão reaberta reconstrói o contexto completo.
+  //
+  // NÃO encerramos mais o chat no clique: o fluxo continua (Consultar reabre o
+  // menu Negociar/Não reconheço; Negociar entra na negociação n8n). O polling
+  // segue vivo e o active_prompt reflete o estado real do servidor. Só marcamos
+  // 'ended' quando a rota sinaliza um desfecho terminal (transferência a humano)
+  // — nunca num passo intermediário do fluxo.
   async function clickButton(promptId: string, buttonId: number): Promise<PromptClickResult> {
     resetIdle()
     try {
@@ -235,14 +245,19 @@ export function JourneyChat() {
       }
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
-        // O prompt já foi respondido no servidor: puxa as mensagens persistidas
-        // (pergunta + clique + resposta) antes de encerrar. Com o active_prompt já
-        // 'answered', a pergunta deixa de ser omitida e vira histórico.
+        // O prompt clicado já foi respondido (answered) no servidor. Limpamos o
+        // prompt local para não travar a UI num prompt morto e puxamos o estado:
+        // mensagens novas (dados da dívida + resposta) + o novo active_prompt (o
+        // menu pós-consulta, quando houver). O poll re-hidrata activePrompt.
         setActivePrompt(null)
         await pollMessages()
-        endedRef.current = true
-        setEnded(true)
-        stopPoll() // encerrado: as mensagens já vieram do servidor (sem duplicar)
+        // Desfecho terminal: só uma transferência a humano encerra a conversa.
+        // Consultar/Negociar/Não reconheço mantêm o chat vivo (menu ou negociação).
+        if (data?.transferred === true) {
+          endedRef.current = true
+          setEnded(true)
+          stopPoll()
+        }
         return { ok: true }
       }
       // 409 prompt_not_active: recarrega o prompt ativo atual.
@@ -303,7 +318,10 @@ export function JourneyChat() {
 
         {activePrompt && !ended ? (
           <div className="pt-1">
-            <PromptButtons prompt={activePrompt} onClick={clickButton} />
+            {/* key por id do prompt: ao trocar de prompt (ex.: Consultar reabre o
+                menu pós-consulta) o componente REMONTA, zerando o estado local
+                'answered'/'pending' — sem isso o novo menu nasceria desabilitado. */}
+            <PromptButtons key={activePrompt.id} prompt={activePrompt} onClick={clickButton} />
           </div>
         ) : null}
       </div>
