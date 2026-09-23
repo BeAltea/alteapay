@@ -98,6 +98,49 @@
       }
     },
 
+    "chat.send": {
+      "descricao": "O fluxo n8n EMPURRA uma mensagem para o chat do devedor (papel B). E o que o n8n usa para CONDUZIR a negociacao: depois do negotiation.start, o n8n conduz e a AlteaPay so EXIBE o que o n8n manda. Suporta markdown **negrito** e quebras de linha (\\n).",
+      "request_body": {
+        "action": "chat.send",
+        "session_id": "<uuid da sessao>",
+        "event_id": "<uuid unico>",
+        "args": {
+          "text": "Ola! Posso te oferecer 10% de desconto a vista. Topa?",
+          "n8n_execution_id": "<id da execucao n8n (opcional, correlacao)>",
+          "payment_ref": { "agreement_id": "<uuid (opcional)>", "asaas_payment_id": "<pay_xxx (opcional)>" }
+        }
+      },
+      "response": { "ok": true, "message_id": "<uuid>", "duplicate": false },
+      "notas": [
+        "Idempotencia DUPLA: por event_id (janela 24h) E por CONTEUDO identico na sessao (15min) — reenviar a mesma mensagem NAO duplica na tela do devedor.",
+        "So texto -> so mensagem. Para PERGUNTA com botoes, use prompt.ask."
+      ]
+    },
+
+    "prompt.ask": {
+      "descricao": "O fluxo n8n EMPURRA uma PERGUNTA com botoes para o chat do devedor. Quando o devedor CLICA num botao, a AlteaPay RELAYA o clique de volta ao n8n como um chat.turn (o n8n continua conduzindo) — a AlteaPay NAO trata a resposta.",
+      "request_body": {
+        "action": "prompt.ask",
+        "session_id": "<uuid da sessao>",
+        "event_id": "<uuid unico>",
+        "args": {
+          "kind": "negotiation",
+          "question": "Como prefere pagar?",
+          "buttons": [
+            { "id": 10, "label": "A vista (10% off)" },
+            { "id": 11, "label": "Parcelar em 3x" }
+          ],
+          "n8n_execution_id": "<id da execucao n8n (opcional)>"
+        }
+      },
+      "campos_buttons": "Cada botao: { id: number, label: string }. Use id 2..97 para itens de lista (0/1/99 sao RESERVADOS: 0=Nao reconheco, 1=Sim, 99=atendente humano). O `id` clicado volta ao n8n via chat.turn.",
+      "response": { "ok": true, "prompt_id": "<uuid>" },
+      "notas": [
+        "So UM prompt ATIVO por sessao: o proximo prompt.ask fecha o anterior automaticamente.",
+        "O clique chega ao n8n como chat.turn (com button.id) — o fluxo decide o proximo passo."
+      ]
+    },
+
     "payment.status": {
       "descricao": "Apenas CONSULTA o link existente, sem criar nada.",
       "request_body": {

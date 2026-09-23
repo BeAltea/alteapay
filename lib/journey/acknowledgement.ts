@@ -806,12 +806,16 @@ export async function startN8nNegotiation(input: {
     debtId: input.debtId,
     eventId,
   })
-  // fire-and-forget: NÃO await no caminho crítico. `void` marca o descarte
-  // proposital da Promise; o rejection já é engolido dentro do dispatch.
-  if (input.waitForDispatch) {
-    await dispatch
-  } else {
+  // ENDURECIDO (2026-09-23): por PADRÃO AGUARDA o disparo — a arquitetura pós-
+  // Negociar depende do negotiation.start CHEGAR no n8n (senão o fluxo nunca
+  // conduz). Como o kickoff usa timeout CURTO (~5s, N8N_KICKOFF_TIMEOUT_MS), o
+  // await é bounded e seguro (< maxDuration=60s), sem o problema do fire-and-forget
+  // em serverless (que podia não executar). `waitForDispatch:false` explícito ainda
+  // permite o modo antigo. O rejection é engolido dentro do dispatch.
+  if (input.waitForDispatch === false) {
     void dispatch
+  } else {
+    await dispatch
   }
 
   // Owner SÍNCRONO = platform: o clique responde já e o reply é sempre

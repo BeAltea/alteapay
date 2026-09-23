@@ -663,7 +663,12 @@ export async function emitNegotiationStart(
     return { ok: true, delivered: false, reason: "engine_unavailable" }
   }
   try {
-    await callN8nFlow(url, payload, flowTimeoutMs())
+    // Kickoff (negotiation.start) usa timeout CURTO: só precisamos ENTREGAR o
+    // disparo (o n8n conduz depois via chat.send/prompt.ask). Assim o handoff é
+    // AWAITADO com segurança (bem abaixo do maxDuration=60s da rota) — confiável em
+    // serverless, sem travar o clique como o antigo flowTimeoutMs (60s).
+    const kickoffTimeoutMs = Number(process.env.N8N_KICKOFF_TIMEOUT_MS || "5000")
+    await callN8nFlow(url, payload, kickoffTimeoutMs)
     return { ok: true, delivered: true, event_id: eventId }
   } catch (err) {
     console.warn(
