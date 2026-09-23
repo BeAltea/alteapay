@@ -51,28 +51,42 @@ export function JourneyChat() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const endedRef = useRef(false)
+  // Modal de inatividade (5min) / sessão expirada — NUNCA redireciona sozinho
+  // perdendo o histórico. O usuário decide (Continuar / Entrar novamente).
+  const [idleModal, setIdleModalState] = useState<null | "idle" | "expired">(null)
+  const modalRef = useRef<null | "idle" | "expired">(null)
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
   }, [messages, activePrompt, ended])
 
-  // Timer de inatividade: 60s sem interação → tela de login do CHAT (não AlteaPay).
+  // Reautenticação do CHAT (só quando o usuário confirma no modal de expiração):
+  // /n/{code}/chat → /n/{code} (o formulário de CPF do próprio chat). NUNCA o
+  // login da AlteaPay, e NUNCA automático.
   const goToChatLogin = useCallback(() => {
-    // /n/{code}/chat → /n/{code}  (o formulário de CPF do próprio chat)
     const parent = window.location.pathname.replace(/\/chat\/?$/, "") || "/"
     window.location.href = parent
   }, [])
 
+  // Inatividade: 5min sem interação → MODAL "Continuar" (a página NÃO expira nem
+  // reseta; o histórico fica salvo). Só re-arma se não há modal aberto e a
+  // conversa não encerrou.
   const resetIdle = useCallback(() => {
     if (idleRef.current) clearTimeout(idleRef.current)
-    idleRef.current = setTimeout(goToChatLogin, IDLE_MS)
-  }, [goToChatLogin])
+    idleRef.current = setTimeout(() => {
+      if (endedRef.current) return
+      modalRef.current = "idle"
+      setIdleModalState("idle")
+    }, IDLE_MS)
+  }, [])
 
   useEffect(() => {
     const events: (keyof WindowEventMap)[] = [
       "mousemove", "mousedown", "keydown", "touchstart", "scroll", "click",
     ]
-    const onActivity = () => resetIdle()
+    const onActivity = () => {
+      if (!modalRef.current && !endedRef.current) resetIdle()
+    }
     events.forEach((e) => window.addEventListener(e, onActivity, { passive: true }))
     resetIdle()
     return () => {
@@ -91,16 +105,18 @@ export function JourneyChat() {
   // Polling das mensagens da sessão + prompt ativo (o reconhecimento é a 1ª
   // interação). Para em visibilitychange e tem teto de 20min. Sem PII.
   async function pollMessages() {
+    if (modalRef.current) return // pausado enquanto o modal (inatividade/expiração) está aberto
     try {
       const url = sinceRef.current
         ? `/api/chat/messages?since=${encodeURIComponent(sinceRef.current)}`
         : "/api/chat/messages"
       const res = await fetch(url)
-      // Sessão do chat expirada/ausente → volta para o login do CHAT (/n/{code}),
-      // NUNCA o login da AlteaPay. Mesma lógica do timer de inatividade.
+      // Sessão do chat expirada/ausente → MODAL de reautenticação (não redireciona
+      // sozinho, NUNCA o login da AlteaPay). Com TTL de 30 dias isto é raro.
       if (res.status === 401) {
         stopPoll()
-        goToChatLogin()
+        modalRef.current = "expired"
+        setIdleModalState("expired")
         return
       }
       if (!res.ok) return
@@ -136,19 +152,25 @@ export function JourneyChat() {
 
   useEffect(() => {
     pollMessages()
-    const startedAt = Date.now()
-    const CAP_MS = 20 * 60 * 1000
+    // Sem teto de tempo: a página NÃO pode expirar. Só pausa quando a aba não
+    // está visível ou quando o modal (inatividade/expiração) está aberto.
     pollRef.current = setInterval(() => {
       if (document.visibilityState !== "visible") return
-      if (Date.now() - startedAt > CAP_MS) {
-        stopPoll()
-        return
-      }
+      if (modalRef.current) return
       pollMessages()
     }, 2500)
     return () => stopPoll()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // "Continuar" do modal de inatividade: fecha o modal, re-arma o timer e retoma
+  // o polling exatamente de onde parou (nada é perdido).
+  function resumeFromIdle() {
+    modalRef.current = null
+    setIdleModalState(null)
+    resetIdle()
+    void pollMessages()
+  }
 
   // Clique no reconhecimento (Sim/Não). PRESERVA o histórico: a pergunta e a
   // resposta escolhida viram mensagens fixas; o `reply` do backend (texto fixo
@@ -162,10 +184,12 @@ export function JourneyChat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt_id: promptId, button_id: buttonId }),
       })
-      // Sessão do chat expirada/ausente → login do CHAT (/n/{code}), nunca AlteaPay.
+      // Sessão do chat expirada/ausente → MODAL de reautenticação (não redireciona
+      // sozinho). Com TTL de 30 dias isto praticamente não ocorre.
       if (res.status === 401) {
         stopPoll()
-        goToChatLogin()
+        modalRef.current = "expired"
+        setIdleModalState("expired")
         return { ok: false, code: "unauthorized" }
       }
       const data = await res.json().catch(() => ({}))
@@ -245,6 +269,48 @@ export function JourneyChat() {
           </div>
         ) : null}
       </div>
+
+      {idleModal ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-sm rounded-xl bg-white p-6 text-center shadow-xl">
+            {idleModal === "idle" ? (
+              <>
+                <p className="text-base font-semibold text-neutral-800">Você ainda está aí?</p>
+                <p className="mt-2 text-sm text-neutral-600">
+                  Sua conversa continua salva. Toque em <strong>Continuar</strong> para retomar de onde parou.
+                </p>
+                <button
+                  type="button"
+                  onClick={resumeFromIdle}
+                  style={{ backgroundColor: "var(--brand-secondary)" }}
+                  className="mt-5 w-full rounded-md px-4 py-2.5 text-sm font-semibold text-white"
+                >
+                  Continuar
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="text-base font-semibold text-neutral-800">Sessão encerrada</p>
+                <p className="mt-2 text-sm text-neutral-600">
+                  Por segurança, entre novamente com seu CPF/CNPJ para continuar a negociação.
+                </p>
+                <button
+                  type="button"
+                  onClick={goToChatLogin}
+                  style={{ backgroundColor: "var(--brand-secondary)" }}
+                  className="mt-5 w-full rounded-md px-4 py-2.5 text-sm font-semibold text-white"
+                >
+                  Entrar novamente
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }
