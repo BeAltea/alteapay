@@ -1,6 +1,16 @@
 "use server"
 
 import { emailQueue } from "@/lib/queue"
+import { sendEmailViaSendGrid } from "@/lib/notifications/sendgrid"
+
+/**
+ * Fallback SEM Redis: quando EMAIL_SEND_MODE=inline (ou REDIS_DISABLED=1), o e-mail
+ * é enviado DIRETO via SendGrid, sem tocar a fila/Upstash nem depender dos workers
+ * Fargate. Essencial para lotes pequenos com a infra de fila desligada.
+ */
+function isEmailInline(): boolean {
+  return process.env.EMAIL_SEND_MODE === "inline" || process.env.REDIS_DISABLED === "1"
+}
 
 interface SendEmailParams {
   to: string | string[]
@@ -60,6 +70,22 @@ export async function sendEmail({
     const htmlContent = html || body || ""
     const textContent = text || stripHtml(htmlContent)
 
+    // Fallback inline (sem Redis/workers): envia direto via SendGrid.
+    if (isEmailInline()) {
+      const r = await sendEmailViaSendGrid({
+        to: recipients,
+        subject,
+        html: htmlContent,
+        text: textContent,
+        replyTo,
+        ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
+      })
+      if (r.success) {
+        return { success: true, messageId: r.messageId, message: "Email enviado (inline via SendGrid)" }
+      }
+      return { success: false, error: r.error || "Falha ao enviar email (inline)" }
+    }
+
     console.log(`[EMAIL QUEUE] Queueing email to ${recipients.length} recipient(s): ${subject}`)
 
     // Add job to queue
@@ -105,6 +131,24 @@ export async function sendBulkEmails(
   }>
 ): Promise<{ success: boolean; queued: number; failed: number; error?: string }> {
   try {
+    // Fallback inline (sem Redis/workers): envia cada e-mail direto via SendGrid,
+    // sequencialmente. Adequado a lotes pequenos (teste, piloto de 25).
+    if (isEmailInline()) {
+      let queued = 0
+      let failed = 0
+      for (const email of emails) {
+        const r = await sendEmailViaSendGrid({
+          to: email.to,
+          subject: email.subject,
+          html: email.html,
+          text: stripHtml(email.html),
+        })
+        if (r.success) queued++
+        else failed++
+      }
+      return { success: failed === 0, queued, failed }
+    }
+
     console.log(`[EMAIL QUEUE] Bulk queueing ${emails.length} emails...`)
 
     const jobs = emails.map((email, index) => ({

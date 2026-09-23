@@ -8,6 +8,8 @@ interface SendGridEmailParams {
   html: string
   text?: string
   replyTo?: string
+  /** Headers SMTP custom (ex.: List-Unsubscribe / List-Unsubscribe-Post). */
+  headers?: Record<string, string>
 }
 
 interface SendGridResponse {
@@ -59,6 +61,7 @@ export async function sendEmailViaSendGrid({
   html,
   text,
   replyTo,
+  headers,
 }: SendGridEmailParams): Promise<SendGridResponse> {
   try {
     console.log("=".repeat(50))
@@ -124,6 +127,11 @@ export async function sendEmailViaSendGrid({
     const effectiveReplyTo = replyTo || config.replyTo
     if (effectiveReplyTo) {
       requestBody.reply_to = { email: effectiveReplyTo }
+    }
+
+    // Headers SMTP custom (List-Unsubscribe etc.) — paridade com o worker da fila.
+    if (headers && Object.keys(headers).length > 0) {
+      requestBody.headers = headers
     }
 
     const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
