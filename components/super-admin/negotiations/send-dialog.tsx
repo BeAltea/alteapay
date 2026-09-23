@@ -23,11 +23,15 @@ import { Progress } from "@/components/ui/progress"
 import {
   detailLabel,
   failureRows,
+  normalizeSendResult,
+  resolveDialogView,
+  sendPanelHeadline,
   summarizeByChannel,
   summarizeForDisplay,
   type ChannelResultSummary,
   type EmailTemplateInfo,
   type SendChannel,
+  type SendPanelTone,
   type SendPreviewExcluded,
   type SendPreviewResponse,
   type SendRequestBody,
@@ -35,20 +39,41 @@ import {
 } from "./send-contract"
 
 /**
+ * Resultado da leitura do stream NDJSON. `result` pode vir null quando o corpo
+ * termina SEM o evento `done` (ex.: proxy/Netlify bufferiza e corta a última
+ * linha) — nesse caso o chamador NÃO descarta o envio: monta um resultado
+ * best-effort a partir do último progresso (o painel SEMPRE aparece). `error` é o
+ * texto do evento `{type:"error"}` do servidor, quando houver. `lastProgress`
+ * guarda o último (done,total) visto — útil para o fallback.
+ */
+interface StreamReadOutcome {
+  result: SendResponse | null
+  error: string | null
+  lastProgress: { done: number; total: number } | null
+  /** true se ao menos UMA linha NDJSON válida foi parseada (confirma que era
+   * mesmo um stream, e não um JSON único disfarçado num content-type errado). */
+  sawNdjson: boolean
+  /** corpo bruto acumulado. Como o reader CONSOME o body (res.json() não pode
+   * mais ser chamado depois), guardamos o texto: se não era NDJSON, o chamador
+   * faz JSON.parse deste texto (uma resposta única). */
+  rawText: string
+}
+
+/**
  * Lê o corpo NDJSON do /send (stream), linha a linha, chamando `onProgress` a
- * cada evento `progress` e devolvendo o `result` do evento `done`. Lança em
- * `error` (o chamador exibe e oferece nova tentativa). Robusto a chunks partidos
- * no meio de uma linha (bufferiza até o \n).
+ * cada evento `progress` e capturando o `result` do evento `done`. NÃO lança: um
+ * envio que processou itens não pode ser perdido só porque a última linha não
+ * chegou — devolve o que conseguiu ler para o chamador decidir. Robusto a chunks
+ * partidos no meio de uma linha (bufferiza até o \n).
  */
 async function readSendStream(
   body: ReadableStream<Uint8Array>,
   onProgress: (done: number, total: number) => void,
-): Promise<SendResponse> {
+): Promise<StreamReadOutcome> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
-  let result: SendResponse | null = null
-  let streamError: string | null = null
+  const out: StreamReadOutcome = { result: null, error: null, lastProgress: null, sawNdjson: false, rawText: "" }
 
   const handleLine = (line: string) => {
     const trimmed = line.trim()
@@ -60,30 +85,40 @@ async function readSendStream(
       return // linha incompleta/ruído: ignora (o buffer cuida das partidas)
     }
     if (evt.type === "progress") {
-      onProgress(evt.done ?? 0, evt.total ?? 0)
+      out.sawNdjson = true
+      const done = evt.done ?? 0
+      const total = evt.total ?? 0
+      out.lastProgress = { done, total }
+      onProgress(done, total)
     } else if (evt.type === "done" && evt.result) {
-      result = evt.result
+      out.sawNdjson = true
+      out.result = evt.result
     } else if (evt.type === "error") {
-      streamError = evt.error ?? "Erro no envio"
+      out.sawNdjson = true
+      out.error = evt.error ?? "Erro no envio"
     }
   }
 
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let idx: number
-    while ((idx = buffer.indexOf("\n")) >= 0) {
-      handleLine(buffer.slice(0, idx))
-      buffer = buffer.slice(idx + 1)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const chunk = decoder.decode(value, { stream: true })
+      out.rawText += chunk
+      buffer += chunk
+      let idx: number
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        handleLine(buffer.slice(0, idx))
+        buffer = buffer.slice(idx + 1)
+      }
     }
+    // flush do resto (última linha sem \n).
+    if (buffer) handleLine(buffer)
+  } catch (e) {
+    // erro de rede no meio do stream: reporta, mas preserva o que já leu.
+    out.error = out.error ?? (e as Error).message
   }
-  // flush do resto (última linha sem \n).
-  if (buffer) handleLine(buffer)
-
-  if (streamError) throw new Error(streamError)
-  if (!result) throw new Error("Envio interrompido: resultado não recebido.")
-  return result
+  return out
 }
 
 type SelectionPayload =
@@ -148,6 +183,11 @@ export function SendNegotiationDialog({
     ...(email ? (["email"] as const) : []),
   ]
   const noChannel = channels.length === 0
+  // Estado do corpo do diálogo (barra / painel de resultado / formulário). A
+  // regra de precedência vive em resolveDialogView (pura e testável): enquanto
+  // envia → barra; terminou → painel; senão → formulário. Assim o painel de
+  // resultado NUNCA fica preso atrás de um `sending` que não baixou.
+  const view = resolveDialogView({ sending, result })
 
   async function loadPreview(next?: { channels?: SendChannel[]; dedupe?: boolean; allowResend?: boolean }) {
     const ch = next?.channels ?? channels
@@ -213,9 +253,13 @@ export function SendNegotiationDialog({
     setSentDone(0)
     setSentTotal(0)
     // Streaming NDJSON: pedimos progresso REAL item-a-item. No dry-run o servidor
-    // ignora o header e devolve o JSON de uma vez (nada é enviado); tratamos os
-    // dois casos: se o corpo NÃO for stream (dry-run/queue), lemos o JSON direto.
+    // ignora o header e devolve o JSON de uma vez (nada é enviado). Tratamos os
+    // dois casos SEM depender só do content-type (proxies podem reescrevê-lo): se
+    // houver corpo legível, tentamos ler como stream; se nenhuma linha NDJSON
+    // vier, caímos no JSON. O painel de resultado SEMPRE aparece ao final — mesmo
+    // que o evento `done` se perca, normalizamos o que chegou.
     const wantStream = !dryRun
+    const fallbackShape = { dryRun, channels } as const
     try {
       const res = await fetch("/api/super-admin/negotiations/send", {
         method: "POST",
@@ -227,26 +271,53 @@ export function SendNegotiationDialog({
       })
       if (!res.ok) {
         const msg = await res.json().catch(() => null)
-        setError(msg?.error ? String(msg.error) : `Falha ao enviar (${res.status}).`)
+        setError(msg?.error ? String(msg.error) : `Falha ao enviar (${res.status}). Tente novamente.`)
         return
       }
+
       const contentType = res.headers.get("content-type") ?? ""
-      let data: SendResponse
-      if (contentType.includes("ndjson") && res.body) {
-        // caminho stream: lê linha a linha e atualiza a barra em tempo real.
-        data = await readSendStream(res.body, (done, total) => {
+      const looksJson = contentType.includes("json") && !contentType.includes("ndjson")
+      let raw: unknown = null
+
+      if (res.body && !looksJson) {
+        // caminho stream (ou content-type ambíguo): lê linha a linha e atualiza a
+        // barra em tempo real. O reader CONSOME o body (res.json() não pode mais
+        // ser chamado); por isso usamos o texto acumulado no fallback.
+        const stream = await readSendStream(res.body, (done, total) => {
           setSentDone(done)
           setSentTotal(total)
         })
+        if (stream.error) {
+          // o servidor sinalizou erro no meio do envio: mostra e oferece retry.
+          setError(`${stream.error} Tente novamente.`)
+          return
+        }
+        if (stream.result) {
+          raw = stream.result
+        } else if (stream.sawNdjson) {
+          // stream terminou sem o evento `done` (proxy cortou a última linha):
+          // NÃO perdemos o envio — normalizamos o que temos (resultado parcial).
+          raw = { dryRun, channels, results: [] }
+        } else {
+          // não era stream de fato (nenhuma linha NDJSON): o corpo já foi
+          // consumido — reparseia o texto acumulado como JSON único.
+          try {
+            raw = stream.rawText.trim() ? JSON.parse(stream.rawText) : null
+          } catch {
+            raw = null
+          }
+        }
       } else {
-        // caminho JSON (dry-run, modo queue, ou navegador sem streaming): resposta
-        // única — sem progresso item-a-item, mas o resultado é o mesmo formato.
-        data = (await res.json()) as SendResponse
+        // caminho JSON puro (dry-run, modo queue, navegador sem streaming):
+        // resposta única — mesmo formato.
+        raw = await res.json().catch(() => null)
       }
+
+      const data = normalizeSendResult(raw, fallbackShape)
       setResult(data)
       onDone?.(data)
     } catch (e) {
-      setError((e as Error).message)
+      setError(`${(e as Error).message} Tente novamente.`)
     } finally {
       setSending(false)
       setLoading(false)
@@ -269,9 +340,9 @@ export function SendNegotiationDialog({
           </p>
         ) : null}
 
-        {sending ? (
+        {view === "progress" ? (
           <SendingProgress count={selectedCount} done={sentDone} total={sentTotal} dryRun={dryRun} />
-        ) : !result ? (
+        ) : view === "form" ? (
           <div className="space-y-4">
             {/* Seleção de CANAL (E1) */}
             <div className="rounded-md border p-3 text-sm">
@@ -394,14 +465,14 @@ export function SendNegotiationDialog({
               </>
             ) : null}
           </div>
-        ) : (
+        ) : result ? (
           <SendResultView result={result} />
-        )}
+        ) : null}
 
         <DialogFooter>
-          {sending ? (
-            <Button disabled>Enviando…</Button>
-          ) : !result ? (
+          {view === "progress" ? (
+            <Button disabled>{dryRun ? "Simulando…" : "Enviando…"}</Button>
+          ) : view === "form" ? (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
                 Cancelar
@@ -410,7 +481,9 @@ export function SendNegotiationDialog({
                 onClick={confirmSend}
                 disabled={loading || noChannel || !preview || preview.total === 0}
               >
-                {dryRun ? "Simular envio" : "Confirmar e enviar"}
+                {/* Após um erro (result nulo, sending falso) o botão vira "Tentar
+                    novamente" — o operador repete o envio sem reabrir o diálogo. */}
+                {error ? "Tentar novamente" : dryRun ? "Simular envio" : "Confirmar e enviar"}
               </Button>
             </>
           ) : (
@@ -567,20 +640,30 @@ function channelPhrase(c: ChannelResultSummary, dryRun: boolean): string {
   return parts.length > 0 ? parts.join(", ") : "nenhum item"
 }
 
+/** Classes do cabeçalho do painel por tom (sucesso/atenção/simulação). */
+const PANEL_TONE_CLASS: Record<SendPanelTone, { box: string; title: string; body: string }> = {
+  success: { box: "border-green-200 bg-green-50", title: "text-green-800", body: "text-green-900" },
+  warning: { box: "border-amber-200 bg-amber-50", title: "text-amber-800", body: "text-amber-900" },
+  dryRun: { box: "border-blue-200 bg-blue-50", title: "text-blue-800", body: "text-blue-900" },
+}
+
 function SendResultView({ result }: { result: SendResponse }) {
   const summary = summarizeForDisplay(result)
   const failures = failureRows(result)
   const byChannel = summarizeByChannel(result)
+  const headline = sendPanelHeadline(result)
+  const tone = PANEL_TONE_CLASS[headline.tone]
   return (
     <div className="space-y-3">
-      {/* Cabeçalho de SUCESSO: confirma que o envio terminou + resumo por canal. */}
-      <div className="rounded-md border border-green-200 bg-green-50 p-3">
-        <div className="flex items-center gap-2 text-sm font-semibold text-green-800">
-          <span aria-hidden>✓</span>
-          <span>{result.dryRun ? "Simulação concluída" : "Envio concluído"}</span>
+      {/* Cabeçalho do resultado: confirma que o envio terminou (com o tom certo —
+          concluído / com falhas / simulação) + resumo por canal. SEMPRE presente,
+          mesmo com resultado vazio ("Nenhum item foi processado"). */}
+      <div className={`rounded-md border p-3 ${tone.box}`}>
+        <div className={`flex items-center gap-2 text-sm font-semibold ${tone.title}`}>
+          <span>{headline.title}</span>
         </div>
         {byChannel.length > 0 ? (
-          <ul className="mt-1.5 space-y-0.5 text-xs text-green-900">
+          <ul className={`mt-1.5 space-y-0.5 text-xs ${tone.body}`}>
             {byChannel.map((c) => (
               <li key={c.channel}>
                 <span className="font-medium">{CHANNEL_LABEL[c.channel]}:</span>{" "}
@@ -589,7 +672,7 @@ function SendResultView({ result }: { result: SendResponse }) {
             ))}
           </ul>
         ) : (
-          <p className="mt-1.5 text-xs text-green-900">Nenhum item foi processado.</p>
+          <p className={`mt-1.5 text-xs ${tone.body}`}>Nenhum item foi processado.</p>
         )}
       </div>
 

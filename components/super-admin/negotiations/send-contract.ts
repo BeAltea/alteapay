@@ -224,3 +224,101 @@ export function summarizeByChannel(result: SendResponse): ChannelResultSummary[]
   }
   return ALL_CHANNELS.filter((c) => byChannel.has(c)).map((c) => byChannel.get(c)!)
 }
+
+// ---------------------------------------------------------------------------
+// Normalização defensiva + estado do painel (compartilhado UI ⇄ testes).
+//
+// O painel de sucesso NUNCA pode sumir: qualquer coisa que o servidor devolva
+// (stream OU json, real OU dry-run, e ATÉ um payload parcial/vazio quando o
+// evento `done` do stream se perde num proxy) é coagida aqui para um
+// SendResponse válido, e o cabeçalho é decidido de forma pura e testável.
+// ---------------------------------------------------------------------------
+
+/** True se `x` é um SendResultRow minimamente plausível (defensivo a JSON solto). */
+function isSendResultRow(x: unknown): x is SendResultRow {
+  if (typeof x !== "object" || x === null) return false
+  const r = x as Record<string, unknown>
+  return (
+    typeof r.customerId === "string" &&
+    (r.outcome === "sent" || r.outcome === "failed" || r.outcome === "suppressed" || r.outcome === "skipped")
+  )
+}
+
+/**
+ * Coage QUALQUER payload (parcial, sem counts, sem results, ou até `null` quando
+ * o stream terminou sem o evento `done`) num SendResponse íntegro. Nunca lança —
+ * garante que o diálogo SEMPRE tem o que renderizar no painel. Quando os `counts`
+ * não vierem (ou vierem incompletos), são recomputados das linhas. `fallback`
+ * completa o que o servidor omitiu (ex.: o dryRun/channels que o cliente pediu).
+ */
+export function normalizeSendResult(
+  raw: unknown,
+  fallback?: { dryRun?: boolean; channels?: SendChannel[] },
+): SendResponse {
+  const obj = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>
+  const results = Array.isArray(obj.results) ? obj.results.filter(isSendResultRow) : []
+  const dryRun = typeof obj.dryRun === "boolean" ? obj.dryRun : fallback?.dryRun ?? false
+  const channels =
+    Array.isArray(obj.channels)
+      ? (obj.channels.filter((c): c is SendChannel => c === "whatsapp" || c === "email"))
+      : fallback?.channels
+  // counts: usa os do servidor quando completos; senão recomputa das linhas
+  // (fonte da verdade menos frágil que um contador que pode ter se perdido).
+  const rawCounts = (typeof obj.counts === "object" && obj.counts !== null ? obj.counts : {}) as Record<string, unknown>
+  const hasAllCounts = (["sent", "failed", "suppressed", "skipped"] as const).every(
+    (k) => typeof rawCounts[k] === "number",
+  )
+  const counts = hasAllCounts
+    ? {
+        sent: rawCounts.sent as number,
+        failed: rawCounts.failed as number,
+        suppressed: rawCounts.suppressed as number,
+        skipped: rawCounts.skipped as number,
+      }
+    : tallyOutcomes(results)
+  return {
+    dryRun,
+    ...(channels ? { channels } : {}),
+    ...(typeof obj.dedupe === "boolean" ? { dedupe: obj.dedupe } : {}),
+    counts,
+    results,
+  }
+}
+
+/** Tom do cabeçalho do painel: sucesso (verde), atenção a falhas (âmbar) ou
+ * simulação (azul). Base para o texto E a cor — puro e testável. */
+export type SendPanelTone = "success" | "warning" | "dryRun"
+
+export interface SendPanelHeadline {
+  tone: SendPanelTone
+  /** texto do cabeçalho (ex.: "✓ Envio concluído"). */
+  title: string
+  /** houve ao menos uma linha? (false → "Nenhum item foi processado"). */
+  hasItems: boolean
+}
+
+/**
+ * Decide o cabeçalho do painel a partir do resultado (já normalizado). Regras:
+ *  - dryRun            → "Simulação concluída" (azul).
+ *  - failed > 0        → "Envio com falhas"    (âmbar) — não esconde falha atrás
+ *                        de um ✓ verde.
+ *  - caso contrário    → "Envio concluído"     (verde).
+ * Puro e testável (sem JSX). O ✓/⚠ fica no texto para o teste travar o símbolo.
+ */
+export function sendPanelHeadline(result: SendResponse): SendPanelHeadline {
+  const hasItems = result.results.length > 0
+  if (result.dryRun) return { tone: "dryRun", title: "Simulação concluída", hasItems }
+  if ((result.counts.failed ?? 0) > 0) return { tone: "warning", title: "⚠ Envio com falhas", hasItems }
+  return { tone: "success", title: "✓ Envio concluído", hasItems }
+}
+
+/** Estado de renderização do corpo do diálogo. Extraído para ser testável sem
+ * jsdom: dado (sending, result), diz O QUE mostrar. A precedência é a mesma da
+ * UI — enquanto envia, a barra; terminou, o painel; senão, o preview. */
+export type SendDialogView = "progress" | "result" | "form"
+
+export function resolveDialogView(state: { sending: boolean; result: SendResponse | null }): SendDialogView {
+  if (state.sending) return "progress"
+  if (state.result) return "result"
+  return "form"
+}
