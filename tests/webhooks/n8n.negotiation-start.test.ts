@@ -32,12 +32,13 @@ function reset() {
 describe("startN8nNegotiation (H7)", () => {
   beforeEach(reset)
 
-  it("disparo entregue → engine_owner='n8n' + evento de auditoria negotiation.start", async () => {
+  it("retorno é SEMPRE síncrono owner='platform' (clique nunca trava); entrega promove n8n no background", async () => {
     const { startN8nNegotiation } = await import("@/lib/journey/acknowledgement")
-    const r = await startN8nNegotiation(input)
-    expect(r.owner).toBe("n8n")
-    expect(r.delivered).toBe(true)
-    // sessão passa a ser dona do n8n
+    // O clique responde já: owner síncrono = platform (o reply é sempre persistido).
+    // waitForDispatch=true aguarda o background de forma determinística no teste.
+    const r = await startN8nNegotiation({ ...input, waitForDispatch: true })
+    expect(r.owner).toBe("platform")
+    // ENTREGUE (emitResult.delivered=true): o background promove a sessão a n8n.
     const sess = db.negotiation_sessions!.find((s) => s.id === "s1")
     expect(sess!.engine_owner).toBe("n8n")
     // auditoria registra o evento
@@ -49,9 +50,8 @@ describe("startN8nNegotiation (H7)", () => {
   it("H8: disparo NÃO entregue (engine_unavailable) → mantém assistido (engine_owner='platform')", async () => {
     emitResult = { ok: true, delivered: false, reason: "engine_unavailable" }
     const { startN8nNegotiation } = await import("@/lib/journey/acknowledgement")
-    const r = await startN8nNegotiation(input)
+    const r = await startN8nNegotiation({ ...input, waitForDispatch: true })
     expect(r.owner).toBe("platform")
-    expect(r.delivered).toBe(false)
     const sess = db.negotiation_sessions!.find((s) => s.id === "s1")
     expect(sess!.engine_owner).toBe("platform")
     // auditoria registra o fallback
