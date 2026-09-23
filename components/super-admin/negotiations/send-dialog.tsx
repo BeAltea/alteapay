@@ -102,7 +102,7 @@ export function SendNegotiationDialog({
     }
   }, [])
 
-  async function loadPreview(next?: { channels?: SendChannel[]; dedupe?: boolean }) {
+  async function loadPreview(next?: { channels?: SendChannel[]; dedupe?: boolean; allowResend?: boolean }) {
     const ch = next?.channels ?? channels
     if (ch.length === 0) {
       // sem canal: nada a pré-visualizar; o servidor default-a para ambos, então
@@ -116,7 +116,7 @@ export function SendNegotiationDialog({
       const res = await fetch("/api/super-admin/negotiations/send-preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toBody(selection, companyId, ch, next?.dedupe ?? dedupe, true, allowResend)),
+        body: JSON.stringify(toBody(selection, companyId, ch, next?.dedupe ?? dedupe, true, next?.allowResend ?? allowResend)),
       })
       if (!res.ok) {
         setError(`Falha ao pré-visualizar (${res.status}).`)
@@ -327,7 +327,14 @@ export function SendNegotiationDialog({
                   Simular (dry run) — não envia nada, só reporta o resultado por canal
                 </label>
                 <label className="flex items-center gap-2 text-sm">
-                  <Checkbox checked={allowResend} onCheckedChange={(v) => setAllowResend(!!v)} />
+                  <Checkbox
+                    checked={allowResend}
+                    onCheckedChange={(v) => {
+                      setAllowResend(!!v)
+                      // re-avalia o preview com o novo valor (senão os contadores ficam velhos)
+                      void loadPreview({ allowResend: !!v })
+                    }}
+                  />
                   Permitir reenvio (ignorar janela de cooldown)
                 </label>
               </>

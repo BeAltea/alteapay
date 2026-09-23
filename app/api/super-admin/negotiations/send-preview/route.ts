@@ -45,6 +45,7 @@ interface PreviewBody extends SelectionBody {
   companyId?: string
   channels?: string[]
   dedupe?: boolean
+  allowResend?: boolean
 }
 
 /**
@@ -136,6 +137,7 @@ export async function POST(request: NextRequest) {
     const hub = await loadTenantHubConfig(companyId)
     const channels = parseChannels(body.channels)
     const dedupe = body.dedupe === true
+    const allowResend = body.allowResend === true
 
     const decisions = await evaluateHubChannels({
       companyId,
@@ -144,6 +146,7 @@ export async function POST(request: NextRequest) {
       minDebtValue: hub.minDebtValue,
       channels: channels as HubChannel[],
       dedupe,
+      allowResend,
     })
     const counts = summarizeHubChannels(decisions, channels as HubChannel[])
 
