@@ -142,23 +142,37 @@ export interface PayloadButton {
 }
 
 export interface PayloadDebtor {
+  /** uuid do customer. null quando indisponível. */
+  id: string | null
+  /**
+   * PRIMEIRO nome do devedor (privacidade: o fluxo saúda por nome, nunca o
+   * completo). "" quando indisponível. Campo que a captura n8n LÊ (debtor.name).
+   */
+  name: string
   document: null // NUNCA em claro neste caminho
   document_masked: string
   document_hash: string
 }
 
 export interface PayloadDebt {
+  /** uuid do débito primário/mais antigo (o mesmo do has_live_charge). null se ausente. */
+  id: string | null
   amount: number | null
   amount_cents: number | null
   amount_formatted: string | null
   currency: "BRL"
   due_date: string | null
+  /** Descrição do débito. A tabela debts não tem coluna description → null na VMAX. */
+  description: string | null
   aging_days: number | null
   invoice_count: number
   has_live_charge: boolean
 }
 
 export interface PayloadTenant {
+  /** Modo de fulfillment do tenant. Redundante com session_state.fulfillment_mode
+   * (a captura n8n tem em tenant.fulfillment_mode); usa o mesmo valor. */
+  fulfillment_mode: string
   official_channel_label: string | null
   brand_name: string
   chat_link: string | null
@@ -191,20 +205,31 @@ export interface CanonicalEnvelope {
 // Entradas canônicas que o chamador reúne (do banco/buildAckContext) e este
 // módulo transforma em envelope. Reais no `amount` (do banco), NUNCA centavos.
 export interface DebtorInput {
+  /** uuid do customer. null quando indisponível. */
+  customerId: string | null
+  /** Nome do devedor (completo OU já em 1º nome). O envelope reduz ao PRIMEIRO
+   * token (privacidade); "" quando indisponível. */
+  name: string | null
   /** Documento em CLARO (só para derivar máscara + hash — nunca vai no payload). */
   document: string
 }
 
 export interface DebtInput {
+  /** uuid do débito primário/mais antigo. null quando indisponível. */
+  debtId: string | null
   /** Valor aberto consolidado em REAIS (do banco). null quando indisponível. */
   amount: number | null
   /** Vencimento ORIGINAL mais antigo (YYYY-MM-DD) — base do aging_days. */
   dueDate: string | null
+  /** Descrição do débito (string | null). null quando não há fonte natural. */
+  description: string | null
   invoiceCount: number
   hasLiveCharge: boolean
 }
 
 export interface TenantInput {
+  /** Modo de fulfillment do tenant (mesmo valor de session_state.fulfillmentMode). */
+  fulfillmentMode: string
   officialChannelLabel: string | null
   brandName: string
   /** public_link_code do tenant (para montar o chat_link). null → chat_link null. */
@@ -253,6 +278,12 @@ function chatLinkOf(publicLinkCode: string | null): string | null {
   return `${base}/n/${publicLinkCode}`
 }
 
+/** PRIMEIRO token do nome (ex.: "Fabio Mendes" → "Fabio"). "" se não houver.
+ * Privacidade: o envelope só carrega o 1º nome (o fluxo saúda por nome). */
+function firstNameOf(name: string | null | undefined): string {
+  return (name ?? "").trim().split(/\s+/)[0] ?? ""
+}
+
 /**
  * Monta o envelope canônico. Campo ausente = null EXPLÍCITO. O `type` sai do mapa
  * de rótulos (default fixo, override por tenant). O documento em claro nunca entra
@@ -271,6 +302,9 @@ export function buildEnvelope(input: BuildEnvelopeInput): CanonicalEnvelope {
 
   const debtor: PayloadDebtor | null = input.debtor
     ? {
+        id: input.debtor.customerId ?? null,
+        // PRIVACIDADE: só o PRIMEIRO nome viaja (o fluxo saúda por nome).
+        name: firstNameOf(input.debtor.name),
         document: null,
         document_masked: maskDocument(input.debtor.document),
         document_hash: createHash("sha256").update(normalizeDocument(input.debtor.document)).digest("hex"),
@@ -279,11 +313,13 @@ export function buildEnvelope(input: BuildEnvelopeInput): CanonicalEnvelope {
 
   const debt: PayloadDebt | null = input.debt
     ? {
+        id: input.debt.debtId ?? null,
         amount: input.debt.amount,
         amount_cents: toCents(input.debt.amount),
         amount_formatted: formatBRL(input.debt.amount),
         currency: "BRL",
         due_date: input.debt.dueDate,
+        description: input.debt.description ?? null,
         aging_days: input.debt.dueDate ? agingDays(input.debt.dueDate) : null,
         invoice_count: input.debt.invoiceCount,
         has_live_charge: input.debt.hasLiveCharge,
@@ -314,6 +350,7 @@ export function buildEnvelope(input: BuildEnvelopeInput): CanonicalEnvelope {
     debtor,
     debt,
     tenant: {
+      fulfillment_mode: input.tenant.fulfillmentMode,
       official_channel_label: input.tenant.officialChannelLabel,
       brand_name: input.tenant.brandName,
       chat_link: chatLinkOf(input.tenant.publicLinkCode),

@@ -715,21 +715,47 @@ export async function buildSessionStartEnvelope(
   const supabase = createServiceClient()
 
   // tenant: rótulo do canal oficial, brand_name, public_link_code, rótulos n8n.
-  const [{ data: cfg }, { data: company }] = await Promise.all([
+  // customer: nome (o envelope reduz ao 1º nome — o fluxo n8n saúda por nome).
+  const [{ data: cfg }, { data: company }, { data: customer }] = await Promise.all([
     supabase
       .from("tenant_chat_config")
       .select("official_channel_label, branding, public_link_code, n8n_event_names, fulfillment_mode")
       .eq("company_id", input.companyId)
       .maybeSingle(),
     supabase.from("companies").select("name").eq("id", input.companyId).maybeSingle(),
+    supabase
+      .from("customers")
+      .select("name")
+      .eq("id", input.customerId)
+      .eq("company_id", input.companyId)
+      .maybeSingle(),
   ])
   const branding = (cfg?.branding ?? {}) as Record<string, unknown>
   const brandName =
     (typeof branding.brand_name === "string" && branding.brand_name) || company?.name || "Credor"
+  const customerName = (customer?.name as string | null) ?? null
+
+  // Débito primário/mais antigo: o mesmo conjunto do has_live_charge. Usamos o
+  // 1º debtId como id representativo do débito no envelope (debt.id da captura).
+  const primaryDebtId = input.debtIds[0] ?? null
+
+  // fulfillment_mode: um único valor reusado em session_state E tenant (a captura
+  // n8n tem em tenant.fulfillment_mode, redundante com session_state).
+  const fulfillmentMode = input.fulfillmentMode || (cfg?.fulfillment_mode as string) || "A"
 
   // dívida: valor consolidado (reais), vencimento original, contagem de faturas.
-  let debt: { amount: number | null; dueDate: string | null; invoiceCount: number; hasLiveCharge: boolean } | null =
-    null
+  // description: a tabela debts não tem coluna description → null na VMAX (o campo
+  // existe no envelope para o fluxo referenciar sem quebrar).
+  let debt:
+    | {
+        debtId: string | null
+        amount: number | null
+        dueDate: string | null
+        description: string | null
+        invoiceCount: number
+        hasLiveCharge: boolean
+      }
+    | null = null
   if (!input.settled && input.debtIds.length > 0) {
     // Frente B (perf): UMA leitura indexada por (company_id, document_digits) no
     // snapshot. Quando presente e pronto, monta o payload SEM I/O extra
@@ -746,8 +772,10 @@ export async function buildSessionStartEnvelope(
 
     if (snap && snap.payload_ready) {
       debt = {
+        debtId: primaryDebtId,
         amount: Number(snap.open_amount_cents) / 100,
         dueDate: (snap.oldest_original_due_date as string | null) ?? null,
+        description: null,
         invoiceCount: Number(snap.open_invoice_count ?? 0),
         hasLiveCharge: Boolean(snap.has_live_charge),
       }
@@ -767,8 +795,10 @@ export async function buildSessionStartEnvelope(
         .in("payment_status", ["pending", "overdue"])
         .limit(1)
       debt = {
+        debtId: primaryDebtId,
         amount: ack.updatedValue,
         dueDate: ack.oldestDueDate,
+        description: null,
         invoiceCount: ack.invoiceCount,
         hasLiveCharge: (liveCharges?.length ?? 0) > 0,
       }
@@ -788,12 +818,13 @@ export async function buildSessionStartEnvelope(
     sessionState: {
       identityVerified: input.identityVerified,
       debtAcknowledged: input.debtAcknowledged,
-      fulfillmentMode: input.fulfillmentMode || (cfg?.fulfillment_mode as string) || "A",
+      fulfillmentMode,
       outcome: input.outcome,
     },
-    debtor: { document: input.document },
+    debtor: { customerId: input.customerId, name: customerName, document: input.document },
     debt,
     tenant: {
+      fulfillmentMode,
       officialChannelLabel: (cfg?.official_channel_label as string | null) ?? null,
       brandName,
       publicLinkCode: (cfg?.public_link_code as string | null) ?? null,

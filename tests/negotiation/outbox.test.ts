@@ -30,18 +30,31 @@ function envelope(over: Partial<CanonicalEnvelope> = {}): CanonicalEnvelope {
     message: null,
     button: null,
     session_state: { identity_verified: true, debt_acknowledged: false, fulfillment_mode: "A", outcome: "in_progress" },
-    debtor: { document: null, document_masked: "***.444.557-**", document_hash: "a".repeat(64) },
+    debtor: {
+      id: "cust1",
+      name: "Fabio",
+      document: null,
+      document_masked: "***.444.557-**",
+      document_hash: "a".repeat(64),
+    },
     debt: {
+      id: "debt1",
       amount: 100,
       amount_cents: 10000,
       amount_formatted: "R$ 100,00",
       currency: "BRL",
       due_date: "2025-01-01",
+      description: null,
       aging_days: 100,
       invoice_count: 1,
       has_live_charge: false,
     },
-    tenant: { official_channel_label: "Portal VMAX", brand_name: "VMAX", chat_link: "https://alteapay.com/n/abc" },
+    tenant: {
+      fulfillment_mode: "A",
+      official_channel_label: "Portal VMAX",
+      brand_name: "VMAX",
+      chat_link: "https://alteapay.com/n/abc",
+    },
     ...over,
   }
 }

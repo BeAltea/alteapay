@@ -38,9 +38,21 @@ function baseInput(over: Partial<BuildEnvelopeInput> = {}): BuildEnvelopeInput {
       fulfillmentMode: "A",
       outcome: "in_progress",
     },
-    debtor: { document: CPF },
-    debt: { amount: 1234.56, dueDate: "2025-07-08", invoiceCount: 3, hasLiveCharge: true },
-    tenant: { officialChannelLabel: "Portal VMAX", brandName: "VMAX", publicLinkCode: "k7Qm3Xb9Rt" },
+    debtor: { customerId: "cust1", name: "Fulano de Tal", document: CPF },
+    debt: {
+      debtId: "debt1",
+      amount: 1234.56,
+      dueDate: "2025-07-08",
+      description: "Contrato 00456 - Serviço",
+      invoiceCount: 3,
+      hasLiveCharge: true,
+    },
+    tenant: {
+      fulfillmentMode: "A",
+      officialChannelLabel: "Portal VMAX",
+      brandName: "VMAX",
+      publicLinkCode: "k7Qm3Xb9Rt",
+    },
     occurredAt: "2026-09-23T12:00:00.000Z",
     ...over,
   }
@@ -78,6 +90,26 @@ describe("buildEnvelope — superset compatível com o Apêndice A", () => {
     expect(typeof env.debt!.aging_days).toBe("number")
     // tenant: official_channel_label (string)
     expect(env.tenant.official_channel_label).toBe("Portal VMAX")
+    // NOVO (captura n8n): debtor.{id,name}, debt.{id,description}, tenant.fulfillment_mode
+    expect(env.debtor!.id).toBe("cust1")
+    expect(env.debtor!.name).toBe("Fulano") // 1º nome de "Fulano de Tal"
+    expect(env.debt!.id).toBe("debt1")
+    expect(env.debt!.description).toBe("Contrato 00456 - Serviço")
+    expect(env.tenant.fulfillment_mode).toBe("A")
+  })
+
+  it("debtor.name é sempre o PRIMEIRO nome (privacidade)", () => {
+    const env = buildEnvelope(baseInput({ debtor: { customerId: "c9", name: "Fabio Sobrenome Da Silva", document: CPF } }))
+    expect(env.debtor!.name).toBe("Fabio")
+  })
+
+  it("description string|null: null vira null explícito", () => {
+    const env = buildEnvelope(
+      baseInput({
+        debt: { debtId: "d1", amount: 100, dueDate: "2025-01-01", description: null, invoiceCount: 1, hasLiveCharge: false },
+      }),
+    )
+    expect(env.debt!.description).toBeNull()
   })
 
   it("campos ADITIVOS presentes e nunca substituem (amount permanece reais)", () => {
@@ -113,7 +145,7 @@ describe("buildEnvelope — superset compatível com o Apêndice A", () => {
         debtor: null,
         debt: null,
         sessionState: { identityVerified: false, debtAcknowledged: false, fulfillmentMode: "A", outcome: null },
-        tenant: { officialChannelLabel: null, brandName: "VMAX", publicLinkCode: null },
+        tenant: { fulfillmentMode: "A", officialChannelLabel: null, brandName: "VMAX", publicLinkCode: null },
       }),
     )
     expect(env.message).toBeNull()
@@ -125,14 +157,34 @@ describe("buildEnvelope — superset compatível com o Apêndice A", () => {
     expect(env.tenant.official_channel_label).toBeNull()
   })
 
+  it("debtor.id/debt.id ausentes = null explícito (customerId/debtId null)", () => {
+    const env = buildEnvelope(
+      baseInput({
+        debtor: { customerId: null, name: null, document: CPF },
+        debt: { debtId: null, amount: 100, dueDate: "2025-01-01", description: null, invoiceCount: 1, hasLiveCharge: false },
+      }),
+    )
+    expect(env.debtor!.id).toBeNull()
+    expect(env.debtor!.name).toBe("") // sem nome → string vazia (nunca null)
+    expect(env.debt!.id).toBeNull()
+  })
+
   it("aging_days bate com o due_date (America/Sao_Paulo)", () => {
     const dueDate = "2025-07-08"
-    const env = buildEnvelope(baseInput({ debt: { amount: 100, dueDate, invoiceCount: 1, hasLiveCharge: false } }))
+    const env = buildEnvelope(
+      baseInput({
+        debt: { debtId: "debt1", amount: 100, dueDate, description: null, invoiceCount: 1, hasLiveCharge: false },
+      }),
+    )
     expect(env.debt!.aging_days).toBe(agingDays(dueDate))
   })
 
   it("sem due_date → aging_days null (nunca inventado)", () => {
-    const env = buildEnvelope(baseInput({ debt: { amount: 100, dueDate: null, invoiceCount: 1, hasLiveCharge: false } }))
+    const env = buildEnvelope(
+      baseInput({
+        debt: { debtId: "debt1", amount: 100, dueDate: null, description: null, invoiceCount: 1, hasLiveCharge: false },
+      }),
+    )
     expect(env.debt!.aging_days).toBeNull()
     expect(env.debt!.due_date).toBeNull()
   })
