@@ -22,7 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { StageBadge, ContactProfileIcon, LiveChargeCell, ProviderHonesty } from "./badges"
+import { StageBadge, ContactProfileIcon, LiveChargeCell, ProviderHonesty, SentChannelsCell } from "./badges"
 import { SendNegotiationDialog } from "./send-dialog"
 import { NegotiationsFilters } from "./negotiations-filters"
 import { parseFilters, serializeFilters, type NegotiationFilters } from "./filters"
@@ -247,6 +247,7 @@ export function NegotiationsTable({ companyOptions, campaignOptions, channelOpti
                 <TableHead>Devedor</TableHead>
                 <TableHead>Cedente</TableHead>
                 <TableHead>Contato</TableHead>
+                <TableHead>Enviado</TableHead>
                 <TableHead>Canal</TableHead>
                 <TableHead>
                   <button type="button" onClick={() => toggleSort("stage")}>
@@ -266,13 +267,13 @@ export function NegotiationsTable({ companyOptions, campaignOptions, channelOpti
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="text-center text-muted-foreground">
+                  <TableCell colSpan={11} className="text-center text-muted-foreground">
                     Carregando…
                   </TableCell>
                 </TableRow>
               ) : rows.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="text-center text-muted-foreground">
+                  <TableCell colSpan={11} className="text-center text-muted-foreground">
                     Nenhum devedor para os filtros atuais.
                   </TableCell>
                 </TableRow>
@@ -293,6 +294,12 @@ export function NegotiationsTable({ companyOptions, campaignOptions, channelOpti
                     <TableCell className="text-sm">{r.cedente ?? "—"}</TableCell>
                     <TableCell>
                       <ContactProfileIcon profile={r.contactProfile} />
+                    </TableCell>
+                    <TableCell>
+                      <SentChannelsCell
+                        whatsappAt={r.lastWhatsappSentAt}
+                        emailAt={r.lastEmailSentAt}
+                      />
                     </TableCell>
                     <TableCell className="text-xs">{r.channel ?? "—"}</TableCell>
                     <TableCell>

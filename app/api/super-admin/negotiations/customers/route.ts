@@ -11,6 +11,79 @@ const noCacheHeaders = {
   "Pragma": "no-cache",
 }
 
+// Status de whatsapp_messages que contam como "já enviado" ao devedor: a mensagem
+// deixou a plataforma (aceita pelo provedor / disparada / confirmada adiante).
+// `queued`/`failed`/`suppressed` NÃO contam (nunca saiu). Fonte: coluna `status`.
+const SENT_MESSAGE_STATUSES = ["accepted", "sent", "delivered", "read"] as const
+
+/** Último envio bem-sucedido por canal (whatsapp/email) por customer.id. */
+type LastSendByChannel = { whatsapp: string | null; email: string | null }
+
+/**
+ * Último envio de negociação POR CANAL (whatsapp/email) por customer, restrito aos
+ * customers.id da PÁGINA (nunca varre a tabela inteira). Lê whatsapp_messages e
+ * agrega o max(queued_at) entre os status de sucesso (SENT_MESSAGE_STATUSES).
+ * Retorna só quem tem PELO MENOS um envio; o resto fica ausente do Map (= nunca).
+ *
+ * PAGINAÇÃO (>1000): um customer pode ter várias mensagens (várias campanhas × 2
+ * canais), então o total de linhas pode passar de 1000 — lemos com `.range()`
+ * paginado por causa do teto de 1000 do Supabase, senão truncaria em silêncio.
+ * `.in("customer_id", ...)` é fatiado em chunks (teto de itens por IN).
+ */
+async function loadLastSendByChannel(
+  supabase: ReturnType<typeof createAdminClient>,
+  customerIds: string[],
+): Promise<Map<string, LastSendByChannel>> {
+  const out = new Map<string, LastSendByChannel>()
+  const uniqueIds = Array.from(new Set(customerIds.filter(Boolean)))
+  if (uniqueIds.length === 0) return out
+
+  const pageSize = 1000
+  const inChunk = 300
+
+  for (let i = 0; i < uniqueIds.length; i += inChunk) {
+    const part = uniqueIds.slice(i, i + inChunk)
+    let page = 0
+    let hasMore = true
+    while (hasMore) {
+      const { data, error } = await (supabase as any)
+        .from("whatsapp_messages")
+        .select("customer_id, channel, status, queued_at")
+        .in("customer_id", part)
+        .in("status", SENT_MESSAGE_STATUSES as unknown as string[])
+        .order("queued_at", { ascending: false })
+        .range(page * pageSize, (page + 1) * pageSize - 1)
+
+      if (error) {
+        console.error("[v0] whatsapp_messages(last-send) fetch error:", error.message)
+        break
+      }
+
+      const rows = (data ?? []) as Array<{
+        customer_id: string | null
+        channel: string | null
+        status: string | null
+        queued_at: string | null
+      }>
+
+      for (const r of rows) {
+        if (!r.customer_id || !r.queued_at) continue
+        const ch: keyof LastSendByChannel = r.channel === "email" ? "email" : "whatsapp"
+        const cur = out.get(r.customer_id) ?? { whatsapp: null, email: null }
+        const prev = cur[ch]
+        // reduz para o max(queued_at) por (customer_id, channel)
+        if (!prev || r.queued_at > prev) cur[ch] = r.queued_at
+        out.set(r.customer_id, cur)
+      }
+
+      hasMore = rows.length === pageSize
+      page++
+    }
+  }
+
+  return out
+}
+
 export async function GET(request: NextRequest) {
   try {
     // Verify the user is a super admin
@@ -248,6 +321,13 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // "Enviado" por canal: para cada customer da lista resolvido por documento
+    // (docToCustomerId), busca o último envio bem-sucedido de negociação por
+    // WhatsApp e por e-mail em whatsapp_messages. UMA agregação restrita aos
+    // customers.id que a lista realmente referencia (não varre a tabela inteira).
+    const pageCustomerIds = Array.from(new Set(Array.from(docToCustomerId.values())))
+    const lastSendByChannel = await loadLastSendByChannel(supabase, pageCustomerIds)
+
     // Also check VMAX negotiation_status field
     const customers = vmaxCustomers.map((vmax) => {
       const cpfCnpj = (vmax["CPF/CNPJ"] || "").replace(/\D/g, "")
@@ -309,6 +389,11 @@ export async function GET(request: NextRequest) {
       // Get payment status from agreement
       const paymentInfo = docToPaymentStatus.get(cpfCnpj)
 
+      // "Enviado" por canal: último envio bem-sucedido (WhatsApp/e-mail) do
+      // customer resolvido por documento. null = nunca recebeu por aquele canal.
+      const resolvedCustomerId = cpfCnpj ? docToCustomerId.get(cpfCnpj) ?? null : null
+      const lastSend = resolvedCustomerId ? lastSendByChannel.get(resolvedCustomerId) : undefined
+
       return {
         id: vmax.id,
         // customers.id resolvido por documento (null = sem cadastro em `customers`).
@@ -340,6 +425,9 @@ export async function GET(request: NextRequest) {
         notificationViewed: paymentInfo?.notificationViewed || false,
         notificationViewedAt: paymentInfo?.notificationViewedAt || null,
         notificationViewedChannel: paymentInfo?.notificationViewedChannel || null,
+        // "Enviado" por canal (ISO do último envio bem-sucedido ou null = nunca)
+        last_whatsapp_sent_at: lastSend?.whatsapp ?? null,
+        last_email_sent_at: lastSend?.email ?? null,
       }
     })
 

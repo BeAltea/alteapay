@@ -5,6 +5,58 @@ import { Smartphone, Mail, Contact, Ban, HelpCircle } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { stageMeta, CONTACT_PROFILE_META, type ContactProfile } from "./stages"
 
+const shortDate = (iso: string) =>
+  new Date(iso).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })
+
+const fullDateTime = (iso: string) => new Date(iso).toLocaleString("pt-BR")
+
+/**
+ * "Enviado": mostra, de forma compacta, se o devedor JÁ recebeu negociação por
+ * WhatsApp e/ou e-mail (último envio bem-sucedido por canal). Verde = já enviado
+ * (com a data curta dd/mm); "—" = nunca. Sem PII (só o fato do envio + data).
+ * Fonte: whatsapp_messages (status accepted/sent/delivered/read), agregado por
+ * customer na query da lista.
+ */
+export function SentChannelsCell({
+  whatsappAt,
+  emailAt,
+}: {
+  whatsappAt: string | null
+  emailAt: string | null
+}) {
+  if (!whatsappAt && !emailAt) {
+    return <span className="text-xs text-muted-foreground">—</span>
+  }
+  return (
+    <div className="flex flex-col gap-0.5">
+      {whatsappAt ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex w-fit items-center gap-1 rounded-md border border-green-200 bg-green-50 px-1.5 py-0.5 text-[11px] font-medium text-green-700">
+              <Smartphone className="h-3 w-3" />
+              WA
+              <span className="text-green-600">{shortDate(whatsappAt)}</span>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>Negociação enviada por WhatsApp em {fullDateTime(whatsappAt)}</TooltipContent>
+        </Tooltip>
+      ) : null}
+      {emailAt ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex w-fit items-center gap-1 rounded-md border border-green-200 bg-green-50 px-1.5 py-0.5 text-[11px] font-medium text-green-700">
+              <Mail className="h-3 w-3" />
+              Email
+              <span className="text-green-600">{shortDate(emailAt)}</span>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>Negociação enviada por e-mail em {fullDateTime(emailAt)}</TooltipContent>
+        </Tooltip>
+      ) : null}
+    </div>
+  )
+}
+
 const TONE_CLASS: Record<string, string> = {
   neutral: "bg-neutral-100 text-neutral-700 border-neutral-200",
   muted: "bg-neutral-50 text-neutral-500 border-neutral-200",

@@ -35,6 +35,8 @@ import {
   XCircle,
   Eye,
   ChevronDown,
+  Smartphone,
+  Mail,
 } from "lucide-react"
 import { toast } from "sonner"
 import { ReadOnlyGuard, useCanPerformActions } from "@/components/super-admin/read-only-guard"
@@ -73,6 +75,10 @@ type VmaxCustomer = {
   notificationViewed?: boolean // Whether the notification/payment link was viewed
   notificationViewedAt?: string | null // When it was viewed
   notificationViewedChannel?: string | null // Which channel (whatsapp, email, payment_link)
+  // "Enviado" por canal: último envio bem-sucedido de negociação (ISO) ou null =
+  // nunca recebeu por aquele canal. Fonte: whatsapp_messages agregado no servidor.
+  last_whatsapp_sent_at?: string | null
+  last_email_sent_at?: string | null
 }
 
 type Company = {
@@ -505,6 +511,40 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
     }
 
     return <span className={colorClass}>{formatted}</span>
+  }
+
+  // "Enviado": mostra, compacto, se o devedor JÁ recebeu negociação por WhatsApp
+  // e/ou e-mail (último envio bem-sucedido por canal). Verde com a data curta
+  // dd/mm; "—" = nunca. Sem PII nova (só o fato do envio + data).
+  const shortSentDate = (iso: string) =>
+    new Date(iso).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })
+
+  const renderSentChannels = (whatsappAt: string | null | undefined, emailAt: string | null | undefined) => {
+    if (!whatsappAt && !emailAt) {
+      return <span className="text-gray-300 dark:text-gray-600 text-xs">—</span>
+    }
+    return (
+      <div className="flex flex-col gap-0.5">
+        {whatsappAt ? (
+          <span
+            className="inline-flex w-fit items-center gap-1 rounded-md bg-green-100 dark:bg-green-900 px-1.5 py-0.5 text-[11px] font-medium text-green-700 dark:text-green-300 whitespace-nowrap"
+            title={`Negociação enviada por WhatsApp em ${new Date(whatsappAt).toLocaleString("pt-BR")}`}
+          >
+            <Smartphone className="h-3 w-3" />
+            WA {shortSentDate(whatsappAt)}
+          </span>
+        ) : null}
+        {emailAt ? (
+          <span
+            className="inline-flex w-fit items-center gap-1 rounded-md bg-green-100 dark:bg-green-900 px-1.5 py-0.5 text-[11px] font-medium text-green-700 dark:text-green-300 whitespace-nowrap"
+            title={`Negociação enviada por e-mail em ${new Date(emailAt).toLocaleString("pt-BR")}`}
+          >
+            <Mail className="h-3 w-3" />
+            Email {shortSentDate(emailAt)}
+          </span>
+        ) : null}
+      </div>
+    )
   }
 
   const getDebtAgeColor = (days: number) => {
@@ -1543,6 +1583,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                 </button>
                 <span className="w-[110px] flex-shrink-0 whitespace-nowrap">Status Neg.</span>
                 <span className="w-[100px] flex-shrink-0 whitespace-nowrap">Status Dív.</span>
+                <span className="w-[100px] flex-shrink-0 whitespace-nowrap" title="Já recebeu negociação por WhatsApp e/ou e-mail">Enviado</span>
                 <button
                   onClick={() => toggleSort("dueDate")}
                   className="w-[95px] flex-shrink-0 flex items-center gap-1 hover:text-foreground transition-colors whitespace-nowrap"
@@ -1655,6 +1696,10 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
                             Em aberto
                           </Badge>
                         )}
+                      </div>
+                      {/* Enviado (WhatsApp/e-mail) */}
+                      <div className="w-[100px] flex-shrink-0">
+                        {renderSentChannels(customer.last_whatsapp_sent_at, customer.last_email_sent_at)}
                       </div>
                       {/* Vencimento */}
                       <div className="w-[95px] flex-shrink-0 text-sm">

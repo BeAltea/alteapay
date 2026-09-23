@@ -63,6 +63,11 @@ export interface NegotiationRow {
    * quando o cedente não tem code ou o link único está desabilitado. Usado para
    * o botão "Copiar link" (nunca um link placeholder). */
   publicLinkCode: string | null
+  /** Já recebeu negociação por WhatsApp? Último envio bem-sucedido (accepted/sent/
+   * delivered/read) em whatsapp_messages com channel='whatsapp'. null = nunca. */
+  lastWhatsappSentAt: string | null
+  /** Idem para o canal e-mail (whatsapp_messages.channel='email'). null = nunca. */
+  lastEmailSentAt: string | null
 }
 
 export interface NegotiationListResult {
@@ -85,6 +90,21 @@ function chunk<T>(arr: T[], size = IN_CHUNK): T[][] {
   const out: T[][] = []
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size))
   return out
+}
+
+/**
+ * Status de whatsapp_messages que contam como "já enviado" para o devedor. A
+ * mensagem já deixou a plataforma: aceita pelo provedor (`accepted`), disparada
+ * (`sent`) ou confirmada adiante (`delivered`/`read`). `queued`/`failed`/
+ * `suppressed` NÃO contam (nunca chegou a sair). Fonte: coluna `status` de
+ * whatsapp_messages (migrations 20260916/20260917).
+ */
+const SENT_MESSAGE_STATUSES = ["accepted", "sent", "delivered", "read"] as const
+
+/** Último envio bem-sucedido por canal (whatsapp | email), por customer. */
+interface LastSendByChannel {
+  whatsapp: string | null
+  email: string | null
 }
 
 /** Intersecta um conjunto (possivelmente ainda-null = "sem restrição") com outro. */
@@ -356,6 +376,58 @@ async function aggregateDebts(
   return debtAgg
 }
 
+/**
+ * Último envio de negociação POR CANAL (whatsapp/email) por customer, restrito ao
+ * conjunto de customers da página (chunked por ids — nunca varre a tabela inteira).
+ * Lê whatsapp_messages e agrega o max(queued_at) entre os status de sucesso
+ * (SENT_MESSAGE_STATUSES). Retorna só quem tem PELO MENOS um envio; o resto fica
+ * ausente do Map (= "nunca enviado").
+ *
+ * PAGINAÇÃO (>1000): cada chunk de ids é lido com `.range()` paginado — um customer
+ * pode ter várias mensagens (várias campanhas × 2 canais), então o número de linhas
+ * por chunk pode passar de 1000. Sem `.range()` o Supabase truncaria em silêncio.
+ * Ordena por queued_at desc no banco só como conveniência; a agregação toma o MAX
+ * de qualquer forma (robusto se a ordenação não vier garantida através dos chunks).
+ */
+async function loadLastSendByChannel(
+  customerIds: string[],
+): Promise<Map<string, LastSendByChannel>> {
+  const supabase = createServiceClient()
+  const out = new Map<string, LastSendByChannel>()
+  if (customerIds.length === 0) return out
+
+  for (const part of chunk(customerIds)) {
+    let page = 0
+    for (;;) {
+      const { data, error } = await (supabase as any)
+        .from("whatsapp_messages")
+        .select("customer_id, channel, status, queued_at")
+        .in("customer_id", part)
+        .in("status", SENT_MESSAGE_STATUSES as unknown as string[])
+        .order("queued_at", { ascending: false })
+        .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+      if (error) throw new Error(`whatsapp_messages(last-send): ${error.message}`)
+      const rows = (data ?? []) as Array<{
+        customer_id: string | null
+        channel: string | null
+        status: string | null
+        queued_at: string | null
+      }>
+      for (const r of rows) {
+        if (!r.customer_id || !r.queued_at) continue
+        const ch = r.channel === "email" ? "email" : "whatsapp"
+        const cur = out.get(r.customer_id) ?? { whatsapp: null, email: null }
+        const prev = cur[ch]
+        if (!prev || r.queued_at > prev) cur[ch] = r.queued_at
+        out.set(r.customer_id, cur)
+      }
+      if (rows.length < PAGE_SIZE) break
+      page++
+    }
+  }
+  return out
+}
+
 // ------------------------------------------------------------------
 // Satélites SÓ da página (nunca do universo inteiro)
 // ------------------------------------------------------------------
@@ -439,7 +511,18 @@ async function loadPageSatellites(
     for (const s of data ?? []) if (s.customer_id) suppressed.add(s.customer_id)
   }
 
-  return { customerById, companyById, campaignById, debtAgg, suppressed, publicLinkByCompany }
+  // último envio de negociação por canal (whatsapp/email) — SÓ a página.
+  const lastSendByChannel = await loadLastSendByChannel(customerIds)
+
+  return {
+    customerById,
+    companyById,
+    campaignById,
+    debtAgg,
+    suppressed,
+    publicLinkByCompany,
+    lastSendByChannel,
+  }
 }
 
 function buildRow(
@@ -449,6 +532,7 @@ function buildRow(
   const cust = sat.customerById.get(r.customer_id)
   const agg = sat.debtAgg.get(r.customer_id) ?? { open: 0, oldestDue: null }
   const aging = agingFrom(agg.oldestDue)
+  const lastSend = sat.lastSendByChannel.get(r.customer_id) ?? { whatsapp: null, email: null }
   return {
     customerId: r.customer_id,
     companyId: r.company_id,
@@ -469,6 +553,8 @@ function buildRow(
     campaignName: r.campaign_id ? (sat.campaignById.get(r.campaign_id) ?? null) : null,
     suppressed: sat.suppressed.has(r.customer_id),
     publicLinkCode: sat.publicLinkByCompany.get(r.company_id) ?? null,
+    lastWhatsappSentAt: lastSend.whatsapp,
+    lastEmailSentAt: lastSend.email,
   }
 }
 
