@@ -1,0 +1,148 @@
+{
+  "titulo": "Contrato n8n -> AlteaPay (papel B): solicitar/criar link de pagamento ASAAS",
+  "versao": "1.0",
+  "data": "2026-09-23",
+  "descricao": "Como o fluxo n8n chama a AlteaPay para criar (ou obter) a cobranca ASAAS e receber o link. O valor do segredo N8N_WEBHOOK_SECRET e enviado separadamente.",
+
+  "endpoint": {
+    "url": "https://alteapay.com/api/webhooks/n8n",
+    "metodo": "POST",
+    "content_type": "application/json"
+  },
+
+  "autenticacao": {
+    "tipo": "HMAC-SHA256",
+    "observacao_importante": "O inbound (n8n -> AlteaPay) valida SOMENTE HMAC. NAO use Basic Auth nesta direcao (o Basic Auth so vale no sentido oposto, AlteaPay -> n8n).",
+    "segredo": {
+      "nome_variavel": "N8N_WEBHOOK_SECRET",
+      "valor": "<ENVIADO SEPARADAMENTE - o MESMO segredo configurado no Netlify da AlteaPay>"
+    },
+    "headers_obrigatorios": {
+      "x-alteapay-signature": {
+        "formato": "sha256=<hex>",
+        "como_calcular": "sha256= + hex( HMAC_SHA256( chave = N8N_WEBHOOK_SECRET, mensagem = timestamp + '.' + corpo_cru ) )",
+        "CRITICO": "assine EXATAMENTE os bytes do corpo que serao enviados. Se re-serializar o JSON depois de assinar, a assinatura quebra (401). Gere a string do corpo UMA vez e envie essa mesma string."
+      },
+      "x-alteapay-timestamp": {
+        "formato": "unix em SEGUNDOS (string)",
+        "janela": "deve estar dentro de +/- 300 segundos do horario do servidor (anti-replay)"
+      },
+      "x-alteapay-event-id": {
+        "formato": "UUID unico por requisicao",
+        "funcao": "idempotencia. Reenviar com o MESMO event_id devolve o resultado cacheado (nao cria 2a cobranca)."
+      },
+      "Content-Type": "application/json"
+    },
+    "exemplo_code_node_n8n": [
+      "const crypto = require('crypto');",
+      "const secret = $env.N8N_WEBHOOK_SECRET;",
+      "const payload = { action: 'payment.create', session_id: $json.session_id, event_id: $json.event_id, args: { offer_id: $json.offer_id, billing_type: 'PIX' } };",
+      "const body = JSON.stringify(payload);",
+      "const ts = Math.floor(Date.now() / 1000).toString();",
+      "const sig = 'sha256=' + crypto.createHmac('sha256', secret).update(ts + '.' + body).digest('hex');",
+      "return [{ json: { body, headers: { 'Content-Type':'application/json', 'x-alteapay-signature': sig, 'x-alteapay-timestamp': ts, 'x-alteapay-event-id': crypto.randomUUID() } } }];",
+      "// No no HTTP Request seguinte: Method POST, URL do endpoint, Body = {{$json.body}} como RAW (nao re-serialize), Headers = {{$json.headers}}."
+    ]
+  },
+
+  "acoes": {
+    "payment.create": {
+      "descricao": "Cria a cobranca ASAAS (ou, se ja existir, devolve o link existente) e retorna o link.",
+      "precondicoes": [
+        "sessao VERIFICADA (identity_verified_at preenchido) - senao 403",
+        "divida RECONHECIDA (debt_acknowledged) - senao 409",
+        "oferta DENTRO da matriz de negociacao vigente - senao 422"
+      ],
+      "request_body": {
+        "action": "payment.create",
+        "session_id": "<uuid da sessao de negociacao>",
+        "event_id": "<uuid unico desta requisicao>",
+        "args": {
+          "offer_id": "avista",
+          "billing_type": "PIX"
+        }
+      },
+      "campos_args": {
+        "offer_id": "'avista' (a vista) ou 'parc_N' onde N = numero de parcelas (ex.: 'parc_3')",
+        "billing_type": "OPCIONAL: 'PIX' | 'BOLETO' | 'CREDIT_CARD'"
+      },
+      "response_sucesso_created": {
+        "ok": true,
+        "status": "created",
+        "idempotent": false,
+        "payment": {
+          "agreement_id": "<uuid do acordo>",
+          "payment_id": "pay_xxxxxxxx",
+          "billing_type": "PIX",
+          "invoice_url": "https://www.asaas.com/i/xxxxxxxx",
+          "pix_copy_paste": "00020126...",
+          "boleto_url": "https://www.asaas.com/b/pdf/xxxxxxxx",
+          "boleto_line": null,
+          "due_date": "2026-08-15",
+          "total_value": 25000,
+          "installments": 1
+        }
+      },
+      "ONDE_ESTA_O_LINK": "payment.invoice_url (link principal do ASAAS). Para PIX use tambem payment.pix_copy_paste; para boleto use payment.boleto_url.",
+      "response_ja_cobrada": {
+        "ok": true,
+        "status": "already_charged",
+        "descricao": "a divida ja possui cobranca viva; devolve o LINK EXISTENTE via payment (mesma estrutura acima). NUNCA cria 2a cobranca."
+      },
+      "response_processando": {
+        "ok": true,
+        "status": "processing",
+        "agreement_id": "<uuid>",
+        "poll_after_ms": 3000,
+        "descricao": "cobranca ainda sendo criada. Repita a MESMA chamada (mesmo event_id) apos poll_after_ms."
+      }
+    },
+
+    "payment.status": {
+      "descricao": "Apenas CONSULTA o link existente, sem criar nada.",
+      "request_body": {
+        "action": "payment.status",
+        "session_id": "<uuid da sessao>",
+        "event_id": "<uuid unico>"
+      },
+      "response": "mesma estrutura de 'payment' acima (invoice_url, pix_copy_paste, boleto_url, total_value em centavos, ...), ou payment: null se nao houver cobranca."
+    }
+  },
+
+  "erros": {
+    "401": "assinatura/timestamp ausentes, assinatura invalida, ou timestamp fora da janela +/- 300s",
+    "403": "sessao nao verificada (identity_verified)",
+    "409": "divida nao reconhecida, ou ja cobrada (code: already_charged)",
+    "422": "offer_id ausente, ou oferta fora da matriz (code: OFFER_INVALID)",
+    "429": "rate-limit por IP (120 req/s)",
+    "503": "N8N_WEBHOOK_SECRET nao configurado no servidor AlteaPay"
+  },
+
+  "notas_importantes": {
+    "valores_em_centavos": "Todos os valores monetarios na borda n8n sao em CENTAVOS inteiros (ex.: total_value: 25000 = R$ 250,00). NAO em reais.",
+    "corpo_para_assinar": "A assinatura HMAC deve cobrir exatamente a string do corpo enviada. Assine e envie a MESMA string.",
+    "idempotencia": "Sempre gere um event_id novo por intencao. Retry (rede/timeout) deve reusar o MESMO event_id para nao duplicar.",
+    "engine": "A AlteaPay precisa estar com NEGOTIATION_ENGINE=n8n para o fluxo n8n conduzir a conversa; o endpoint payment.create funciona independente disso."
+  },
+
+  "exemplo_pronto_para_assinar": {
+    "comentario": "Preencha session_id/event_id, assine este _corpo com o N8N_WEBHOOK_SECRET conforme a secao autenticacao, e envie.",
+    "url": "https://alteapay.com/api/webhooks/n8n",
+    "metodo": "POST",
+    "headers": {
+      "Content-Type": "application/json",
+      "x-alteapay-signature": "sha256=<calcular a partir do _corpo>",
+      "x-alteapay-timestamp": "<unix segundos>",
+      "x-alteapay-event-id": "<uuid>"
+    },
+    "_corpo": {
+      "action": "payment.create",
+      "session_id": "REPLACE_session_id",
+      "event_id": "REPLACE_event_id_uuid",
+      "args": {
+        "offer_id": "avista",
+        "billing_type": "PIX"
+      }
+    }
+  }
+}
