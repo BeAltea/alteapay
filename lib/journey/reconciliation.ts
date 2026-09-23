@@ -7,7 +7,14 @@ import { recordEvent } from "./events"
 import { addSuppression } from "./suppressions"
 import { revokeTokens } from "./tokens"
 
-const PAID_EVENTS = new Set(["PAYMENT_RECEIVED", "PAYMENT_CONFIRMED", "RECEIVED_IN_CASH", "DUNNING_RECEIVED"])
+// Eventos ASAAS que significam PAGO (D13). Nomes COMPLETOS do ASAAS (com prefixo
+// PAYMENT_) — o webhook repassa o `event` cru; os nomes sem prefixo nunca casavam.
+const PAID_EVENTS = new Set([
+  "PAYMENT_RECEIVED",
+  "PAYMENT_CONFIRMED",
+  "PAYMENT_RECEIVED_IN_CASH",
+  "PAYMENT_DUNNING_RECEIVED",
+])
 
 export interface JourneyPaymentEvent {
   eventType: string // PAYMENT_RECEIVED etc.

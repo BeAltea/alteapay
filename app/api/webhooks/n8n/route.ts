@@ -657,10 +657,12 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       const offerId = args.offer_id as string | undefined
       if (!offerId) return jsonError(422, "args.offer_id obrigatório")
       const billingType = (args.billing_type as string | undefined) ?? null
-      const { paymentCreate, paymentCreateResponseForN8n } = await import("@/lib/journey/payment-actions")
-      const r = await paymentCreate(ctx, offerId, input.event_id)
+      const { paymentCreateOrExistingLink, paymentCreateOrLinkResponseForN8n } = await import("@/lib/journey/payment-actions")
+      // Ponto de entrada único: já cobrada (D7/D23) devolve o LINK EXISTENTE via
+      // payment.status em vez de recriar — nunca gera 2ª cobrança.
+      const r = await paymentCreateOrExistingLink(ctx, offerId, input.event_id)
       if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
-      return NextResponse.json(paymentCreateResponseForN8n(r, billingType))
+      return NextResponse.json(paymentCreateOrLinkResponseForN8n(r, billingType))
     }
     case "payment.record": {
       // Papel B (variante B): n8n criou a cobrança e registra aqui. Guard antes;

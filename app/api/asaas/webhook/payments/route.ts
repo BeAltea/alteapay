@@ -19,13 +19,15 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 )
 
-// Status mappings based on ASAAS events
-const PAYMENT_STATUS_MAP: Record<string, string> = {
+// Status mappings based on ASAAS events. `null` = evento não muda o
+// payment_status (só atualiza detalhes) → tipo admite string | null.
+const PAYMENT_STATUS_MAP: Record<string, string | null> = {
   PAYMENT_CREATED: "pending",
   PAYMENT_AWAITING_RISK_ANALYSIS: "pending",
   PAYMENT_PENDING: "pending",
   PAYMENT_CONFIRMED: "confirmed",
   PAYMENT_RECEIVED: "received",
+  PAYMENT_RECEIVED_IN_CASH: "received",
   PAYMENT_OVERDUE: "overdue",
   PAYMENT_REFUNDED: "refunded",
   PAYMENT_REFUND_REQUESTED: "refund_requested",
@@ -46,17 +48,23 @@ const PAYMENT_STATUS_MAP: Record<string, string> = {
 // Note: "completed" is the valid status value, not "paid"
 const AGREEMENT_STATUS_MAP: Record<string, string | null> = {
   PAYMENT_RECEIVED: "completed",
+  PAYMENT_RECEIVED_IN_CASH: "completed",
   PAYMENT_DUNNING_RECEIVED: "completed",
-  PAYMENT_CONFIRMED: null, // Keep current status
+  // CONFIRMED (cartão/PIX confirmado) também é estado PAGO (D13): fecha o acordo.
+  PAYMENT_CONFIRMED: "completed",
   PAYMENT_OVERDUE: null, // Keep current status, just update payment_status
   PAYMENT_REFUNDED: "cancelled",
   PAYMENT_DELETED: "cancelled",
   PAYMENT_CREDIT_CARD_CAPTURE_REFUSED: null, // Keep current status
 }
 
-// Debt status based on payment events
+// Debt status based on payment events. Os TRÊS estados pagos (RECEIVED /
+// CONFIRMED / RECEIVED_IN_CASH, + DUNNING_RECEIVED) marcam a dívida como paid;
+// a jornada vira `quitada` e o negotiation_state avança via journey_events.
 const DEBT_STATUS_MAP: Record<string, string | null> = {
   PAYMENT_RECEIVED: "paid",
+  PAYMENT_CONFIRMED: "paid",
+  PAYMENT_RECEIVED_IN_CASH: "paid",
   PAYMENT_DUNNING_RECEIVED: "paid",
   PAYMENT_REFUNDED: "pending", // Revert to open
   PAYMENT_DELETED: "pending", // Revert to open
@@ -285,8 +293,13 @@ export async function POST(request: NextRequest) {
       agreementUpdate.due_date = payment.dueDate
     }
 
-    // Set payment_received_at for received/confirmed events
-    if (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED" || event === "PAYMENT_DUNNING_RECEIVED") {
+    // Set payment_received_at for received/confirmed events (todos os pagos)
+    if (
+      event === "PAYMENT_RECEIVED" ||
+      event === "PAYMENT_CONFIRMED" ||
+      event === "PAYMENT_RECEIVED_IN_CASH" ||
+      event === "PAYMENT_DUNNING_RECEIVED"
+    ) {
       agreementUpdate.payment_received_at = new Date().toISOString()
     }
 
@@ -333,7 +346,7 @@ export async function POST(request: NextRequest) {
         // Update VMAX record
         // Both PAYMENT_RECEIVED and PAYMENT_CONFIRMED are "paid" states
         const vmaxUpdate: Record<string, any> = {
-          negotiation_status: (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED") ? "PAGO" :
+          negotiation_status: (event === "PAYMENT_RECEIVED" || event === "PAYMENT_CONFIRMED" || event === "PAYMENT_RECEIVED_IN_CASH") ? "PAGO" :
                               event === "PAYMENT_OVERDUE" ? "EM_ATRASO" :
                               event === "PAYMENT_DELETED" || event === "PAYMENT_REFUNDED" ? "CANCELADA" :
                               "EM_ANDAMENTO",

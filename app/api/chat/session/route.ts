@@ -13,7 +13,8 @@ import {
   loadSessionCtx, debtSummary, listOffers, rejectOffer,
   registerDispute, registerPaymentClaim, transferToHuman,
 } from "@/lib/journey/actions"
-import { buildAcceptSummary, confirmAccept } from "@/lib/journey/closing"
+import { buildAcceptSummary } from "@/lib/journey/closing"
+import { acceptMatrixCondition } from "@/lib/journey/assisted"
 
 export const dynamic = "force-dynamic"
 
@@ -60,12 +61,26 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, summary: pre.summary })
     }
     case "confirm": {
-      const r = await confirmAccept({
-        ctx, offerId: String(body.offerId ?? ""), termsHash: String(body.termsHash ?? ""),
-        ip, userAgent: req.headers.get("user-agent"),
-      })
-      if (!r.ok) return NextResponse.json({ ok: false, error: r.error }, { status: 409 })
-      return NextResponse.json({ ok: true, agreementId: r.agreementId })
+      const offerId = String(body.offerId ?? "")
+      // Passo 2 (2-passos F3.7): revalida os termos que o cliente confirmou. Se a
+      // oferta mudou/expirou desde o resumo → TERMS_CHANGED/OFFER_* (409). Preserva
+      // o guard de integridade antes de delegar ao caminho de cobrança compartilhado.
+      const pre = await buildAcceptSummary(ctx, offerId)
+      if (!pre.ok) return NextResponse.json({ ok: false, error: pre.error }, { status: 409 })
+      if (pre.summary.termsHash !== String(body.termsHash ?? "")) {
+        return NextResponse.json({ ok: false, error: "TERMS_CHANGED" }, { status: 409 })
+      }
+      // Aceite assistido → MESMO payment.create interno (matriz 422 / ack 409 /
+      // guard already_charged → link existente / closeAgreement+charge-inline).
+      const r = await acceptMatrixCondition(ctx, offerId)
+      if (!r.ok) return NextResponse.json({ ok: false, error: r.code, code: r.code }, { status: r.status })
+      if (r.status === "already_charged") {
+        return NextResponse.json({ ok: true, status: "already_charged", payment: r.payment })
+      }
+      if (r.status === "processing") {
+        return NextResponse.json({ ok: true, status: "processing", agreementId: r.agreementId })
+      }
+      return NextResponse.json({ ok: true, status: "created", agreementId: r.agreementId, payment: r.payment })
     }
     case "reject":
       await rejectOffer(ctx, String(body.offerId ?? ""), "customer", body.reason as string | undefined)

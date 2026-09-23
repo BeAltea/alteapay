@@ -52,7 +52,8 @@ vi.mock("@/lib/journey/actions", () => ({
 }))
 
 vi.mock("@/lib/journey/payment-actions", () => ({
-  paymentCreate: async () => {
+  // O route usa o ponto de entrada único paymentCreateOrExistingLink.
+  paymentCreateOrExistingLink: async () => {
     calls.paymentCreate += 1
     // idempotência PRÓPRIA: sempre o mesmo agreement/link (idempotent após a 1ª).
     return {
@@ -66,7 +67,7 @@ vi.mock("@/lib/journey/payment-actions", () => ({
       },
     }
   },
-  paymentCreateResponseForN8n: (r: any) => ({
+  paymentCreateOrLinkResponseForN8n: (r: any) => ({
     ok: true, idempotent: r.idempotent, status: "created",
     agreement_id: r.payment.agreement_id, asaas_payment_id: r.payment.payment_id,
     total_value: 10000,

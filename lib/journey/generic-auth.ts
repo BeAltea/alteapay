@@ -349,9 +349,87 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
     })
   }
 
+  // D1/Frente A: session.start (plataforma → n8n) SÓ numa abertura FRESCA (não no
+  // reuso/reopen — a reentrada da MESMA abertura não re-dispara). Grava no outbox
+  // (durável, idempotente por event_id) e dispara best-effort ao n8n. A entrega
+  // ao n8n NÃO soma na resposta ao devedor: o reconhecimento (nossos dados) já
+  // rodou acima e a equalização de ~600ms é feita pela rota. Gated
+  // (NEGOTIATION_ENGINE=disabled) → outbox nasce 'skipped_engine_disabled'.
+  if (!reopened) {
+    await emitSessionStartSafe({
+      companyId: input.companyId,
+      sessionId,
+      customerId,
+      document: input.document,
+      debtIds,
+      channel: input.channel,
+      settled: resolved.kind === "settled",
+    })
+  }
+
   const ttlSeconds = input.sessionTtlMinutes * 60
   const cookieValue = signChatJwt({ sid: sessionId, cid: input.companyId }, ttlSeconds)
   return { ok: true, sessionId, cookieName: CHAT_COOKIE_NAME, cookieValue, cookieMaxAge: ttlSeconds }
+}
+
+// -----------------------------------------------------------------------------
+// D1/Frente A: disparo do session.start no login. Envelope canônico via
+// emitSessionStart (engine.ts): grava no outbox + POST best-effort ao n8n. Este
+// wrapper NUNCA lança (uma falha no engine não pode derrubar a autenticação) e
+// usa Promise.allSettled para que o POST ao n8n NÃO some na resposta ao devedor.
+// Só roda com CHAT_JOURNEY_ENABLED=true (comportamento de prod idêntico com a
+// flag OFF), como bootstrapAckSafe.
+interface EmitSessionStartInput {
+  companyId: string
+  sessionId: string
+  customerId: string
+  document: string
+  debtIds: string[]
+  channel: string
+  settled: boolean
+}
+
+async function emitSessionStartSafe(input: EmitSessionStartInput): Promise<void> {
+  if (process.env.CHAT_JOURNEY_ENABLED !== "true") return
+  try {
+    const supabase = createServiceClient()
+    // Estado real da sessão recém-criada (identity/ack/outcome/fulfillment/thread/
+    // reopen_count) — uma leitura enxuta.
+    const { data: session } = await supabase
+      .from("negotiation_sessions")
+      .select(
+        "thread_id, reopen_count, identity_verified_at, debt_acknowledged_at, fulfillment_mode, outcome",
+      )
+      .eq("id", input.sessionId)
+      .maybeSingle()
+
+    const { emitSessionStart } = await import("@/lib/negotiation/engine")
+    // Promise.allSettled: a resposta ao devedor não espera o POST ao n8n.
+    const results = await Promise.allSettled([
+      emitSessionStart({
+        sessionId: input.sessionId,
+        companyId: input.companyId,
+        customerId: input.customerId,
+        document: input.document,
+        debtIds: input.debtIds,
+        reopenCount: Number(session?.reopen_count ?? 0),
+        channel: input.channel,
+        threadId: (session?.thread_id as string | null) ?? null,
+        identityVerified: Boolean(session?.identity_verified_at),
+        debtAcknowledged: Boolean(session?.debt_acknowledged_at),
+        fulfillmentMode: (session?.fulfillment_mode as string | null) ?? "A",
+        outcome: (session?.outcome as string | null) ?? "in_progress",
+        settled: input.settled,
+      }),
+    ])
+    const rejected = results.find((r) => r.status === "rejected")
+    if (rejected && rejected.status === "rejected") {
+      // rótulo técnico curto — NUNCA payload/segredo.
+      console.warn("[journey] session.start falhou (não-fatal)")
+    }
+  } catch (err) {
+    console.warn("[journey] emitSessionStartSafe falhou (não-fatal):", (err as Error).message)
+  }
 }
 
 // =============================================================================

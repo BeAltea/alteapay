@@ -19,8 +19,10 @@
 import { createServiceClient } from "@/lib/supabase/service"
 import { findBlockingAgreement, findBlockingPayment } from "@/lib/asaas-idempotency"
 import { getAsaasPaymentsForCustomer } from "@/lib/asaas"
+import { resolveMatrixRow } from "@/lib/negotiation/matrix"
+import { validateProposedTerms, type OfferTerms } from "@/lib/negotiation/offers"
 import { buildAcceptSummary, confirmAccept } from "./closing"
-import { registerPaymentClaim, rejectOffer, type SessionCtx } from "./actions"
+import { debtSummary, registerPaymentClaim, rejectOffer, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
 import { assertAcknowledgedForPayment } from "./acknowledgement"
 
@@ -104,6 +106,45 @@ async function findExistingPaymentForOffer(
   return data?.agreement_id ?? null
 }
 
+export type MatrixCheck =
+  | { ok: true }
+  | { ok: false; code: "no_matrix_row" | "offer_outside_matrix"; error?: string }
+
+/**
+ * Revalida a oferta contra a matriz VIGENTE (D8/§3): o servidor é a autoridade.
+ * A oferta foi gerada da matriz, mas a matriz pode ter mudado desde então; antes
+ * de cobrar, os termos persistidos TÊM que caber na faixa atual (desconto/entrada/
+ * parcelas/billing). Fora da matriz → 422 (offer_outside_matrix). Sem linha de
+ * matriz para o (aging, valor) do débito → 422 (no_matrix_row). Isola por sessão.
+ */
+async function assertOfferWithinMatrix(
+  ctx: SessionCtx,
+  offerId: string,
+): Promise<MatrixCheck> {
+  const supabase = createServiceClient()
+  const { data: offer } = await supabase
+    .from("negotiation_offers")
+    .select("terms, status")
+    .eq("id", offerId)
+    .eq("session_id", ctx.sessionId)
+    .maybeSingle()
+  // Sem oferta ou já não apresentável: deixa o passo do buildAcceptSummary (409)
+  // reportar; aqui só validamos a matriz para as ofertas ainda vivas.
+  if (!offer?.terms) return { ok: true }
+
+  const summary = await debtSummary(ctx)
+  const row = await resolveMatrixRow({
+    companyId: ctx.companyId,
+    agingDays: summary.agingDays,
+    debtValue: summary.originalValue,
+  })
+  if (!row) return { ok: false, code: "no_matrix_row" }
+
+  const verdict = validateProposedTerms(offer.terms as OfferTerms, row)
+  if (!verdict.ok) return { ok: false, code: "offer_outside_matrix", error: verdict.error }
+  return { ok: true }
+}
+
 /**
  * payment.create (papel A): converte uma oferta apresentada em cobrança pela
  * plataforma. O guard vive dentro de confirmAccept (nível local + ASAAS). Se a
@@ -154,6 +195,22 @@ export async function paymentCreate(
     }
   }
 
+  // Revalida a oferta contra a matriz VIGENTE (§3): fora da matriz → 422.
+  // O servidor decide — se a matriz mudou e a oferta não cabe mais, não cobra.
+  const matrix = await assertOfferWithinMatrix(ctx, offerId)
+  if (!matrix.ok) {
+    await rejectOffer(ctx, offerId, "system", matrix.code, eventId)
+    return {
+      ok: false,
+      status: 422,
+      code: matrix.code,
+      message:
+        matrix.code === "no_matrix_row"
+          ? "não há condição de matriz vigente para este débito"
+          : `oferta fora da matriz vigente (${matrix.error ?? "invalid"})`,
+    }
+  }
+
   // valida a oferta e termos (passo 1) para obter o termsHash (revalida matriz
   // vigente dentro de confirmAccept → closeAgreement).
   const pre = await buildAcceptSummary(ctx, offerId)
@@ -180,12 +237,66 @@ export async function paymentCreate(
   return { ok: true, status: "created", idempotent: false, payment: details }
 }
 
+export type PaymentCreateOrLink =
+  | { ok: true; status: "created"; idempotent: boolean; payment: PaymentDetails }
+  | { ok: true; status: "processing"; idempotent: boolean; agreement_id: string; poll_after_ms: number }
+  // já existe cobrança viva (D7/D23): NÃO recria — devolve o LINK EXISTENTE
+  // consultado por paymentStatus (acordo vivo do cliente). O front/n8n reenvia.
+  | { ok: true; status: "already_charged"; payment: PaymentDetails | null; payment_status: string | null }
+  | { ok: false; status: number; code: string; message: string }
+
+/**
+ * Ponto de entrada ÚNICO da cobrança para o n8n E para o caminho assistido: cria
+ * a cobrança (paymentCreate, guard + matriz + reconhecimento) e, se a dívida já
+ * tem cobrança viva (already_charged, D7/D23), consulta paymentStatus e devolve o
+ * LINK EXISTENTE em vez de recriar. Garante que os dois caminhos FECHAM idêntico.
+ */
+export async function paymentCreateOrExistingLink(
+  ctx: SessionCtx,
+  offerId: string,
+  eventId?: string,
+): Promise<PaymentCreateOrLink> {
+  const r = await paymentCreate(ctx, offerId, eventId)
+  if (r.ok) return r
+  if (r.code === "already_charged") {
+    // Nunca cria 2ª cobrança: reenvia o link do acordo vivo (paymentStatus §4).
+    const status = await paymentStatus(ctx)
+    return {
+      ok: true,
+      status: "already_charged",
+      payment: status.payment,
+      payment_status: status.payment_status,
+    }
+  }
+  return r
+}
+
 // ============================================================
 // Borda n8n (contrato v2): valores monetários em INTEIROS de CENTAVOS.
 // As colunas do banco permanecem em reais; a conversão é SÓ aqui.
 // ============================================================
 export const reaisToCents = (reais: number | null | undefined): number | null =>
   reais == null ? null : Math.round(reais * 100)
+
+/** Mapeia PaymentDetails → campos da resposta n8n (total em CENTAVOS na borda). */
+function paymentDetailsForN8n(
+  p: PaymentDetails,
+  billingType?: string | null,
+): Record<string, unknown> {
+  return {
+    agreement_id: p.agreement_id,
+    asaas_payment_id: p.payment_id,
+    billing_type: p.billing_type ?? billingType ?? null,
+    total_value: reaisToCents(p.total_value), // CENTAVOS
+    installments: p.installments,
+    due_date: p.due_date,
+    invoice_url: p.invoice_url,
+    pix_copy_paste: p.pix_copy_paste,
+    pix_qr_code_url: p.pix_copy_paste,
+    boleto_url: p.boleto_url,
+    boleto_line: p.boleto_line,
+  }
+}
 
 /**
  * Serializa o resultado do payment.create para o formato da resposta ao n8n
@@ -207,22 +318,48 @@ export function paymentCreateResponseForN8n(
       poll_after_ms: result.poll_after_ms,
     }
   }
-  const p = result.payment
   return {
     ok: true,
     idempotent: result.idempotent,
     status: "created",
-    agreement_id: p.agreement_id,
-    asaas_payment_id: p.payment_id,
-    billing_type: p.billing_type ?? billingType ?? null,
-    total_value: reaisToCents(p.total_value), // CENTAVOS
-    installments: p.installments,
-    due_date: p.due_date,
-    invoice_url: p.invoice_url,
-    pix_copy_paste: p.pix_copy_paste,
-    pix_qr_code_url: p.pix_copy_paste,
-    boleto_url: p.boleto_url,
-    boleto_line: p.boleto_line,
+    ...paymentDetailsForN8n(result.payment, billingType),
+  }
+}
+
+/**
+ * Resposta n8n do ponto de entrada único (paymentCreateOrExistingLink): inclui o
+ * caso `already_charged`, que devolve o LINK EXISTENTE (sem recriar cobrança).
+ */
+export function paymentCreateOrLinkResponseForN8n(
+  result: PaymentCreateOrLink,
+  billingType?: string | null,
+): Record<string, unknown> {
+  if (!result.ok) {
+    return { ok: false, code: result.code, message: result.message }
+  }
+  if (result.status === "processing") {
+    return {
+      ok: true,
+      idempotent: result.idempotent,
+      status: "processing",
+      agreement_id: result.agreement_id,
+      poll_after_ms: result.poll_after_ms,
+    }
+  }
+  if (result.status === "already_charged") {
+    return {
+      ok: true,
+      idempotent: true,
+      status: "already_charged",
+      payment_status: result.payment_status,
+      ...(result.payment ? paymentDetailsForN8n(result.payment, billingType) : {}),
+    }
+  }
+  return {
+    ok: true,
+    idempotent: result.idempotent,
+    status: "created",
+    ...paymentDetailsForN8n(result.payment, billingType),
   }
 }
 

@@ -24,6 +24,7 @@ import { maskDocument } from "@/lib/journey/document"
 import { agentChat, agentHealth, agentSessionInit, type AgentSessionInit } from "./agent-client"
 import { closeAgreement } from "./close-agreement"
 import { buildN8nOutboundHeaders, newEventId, n8nWebhookSecret } from "./n8n"
+import type { CanonicalEnvelope } from "./payload"
 import type { SessionDebtContext } from "./sessions"
 import type { NegotiationSession, TenantChatConfig } from "./types"
 
@@ -416,8 +417,10 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
   try {
     const { buildSessionContext } = await import("@/lib/journey/context")
     const ctx = await buildSessionContext(input.session.id)
+    // D1: o envelope canônico usa `type` (não `event`) — alinhado ao Apêndice A e
+    // ao buildTurnPayload (que já usa `type`). Antes este caminho mandava `event`.
     payload = ctx
-      ? { event: "chat.turn", ...ctx, message: input.message, available_actions: N8N_AVAILABLE_ACTIONS }
+      ? { type: "chat.turn", ...ctx, message: input.message, available_actions: N8N_AVAILABLE_ACTIONS }
       : buildTurnPayload(input)
   } catch (err) {
     // Resiliência: se o contexto rico não montar, manda o payload mínimo
@@ -566,7 +569,11 @@ function eventFlowUrl(): string {
 }
 
 export interface NegotiationStartPayload {
+  // D1: `type` é o campo canônico do envelope (Apêndice A). `event` é MANTIDO
+  // (superset compatível) para o fluxo n8n legado que ainda lê `event`.
+  type: string
   event: "negotiation.start"
+  contract_version: string
   event_id: string
   session_id: string
   company_id: string
@@ -600,10 +607,23 @@ export async function buildNegotiationStartPayload(
   eventId: string,
 ): Promise<NegotiationStartPayload | null> {
   const { buildSessionContext } = await import("@/lib/journey/context")
+  const { resolveEventName, CONTRACT_VERSION } = await import("./payload")
   const ctx = await buildSessionContext(sessionId)
   if (!ctx) return null
+
+  // rótulo do evento por tenant (default 'negotiation.start').
+  const { createServiceClient } = await import("@/lib/supabase/service")
+  const { data: cfg } = await createServiceClient()
+    .from("tenant_chat_config")
+    .select("n8n_event_names")
+    .eq("company_id", ctx.tenant.id)
+    .maybeSingle()
+  const type = resolveEventName("negotiation_start", (cfg?.n8n_event_names ?? null) as never)
+
   return {
+    type,
     event: "negotiation.start",
+    contract_version: CONTRACT_VERSION,
     event_id: eventId,
     session_id: sessionId,
     company_id: ctx.tenant.id,
@@ -651,6 +671,168 @@ export async function emitNegotiationStart(
       err instanceof Error ? err.message : err,
     )
     return { ok: true, delivered: false, reason: "engine_unavailable" }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// D1/Frente A: session.start (plataforma → n8n) no LOGIN. Envelope canônico
+// (payload.ts). Enxuto: sem offers/matrix — só quem/quanto/quando + estado da
+// sessão. GRAVA no outbox (idempotente por event_id determinístico); a entrega ao
+// n8n é best-effort e NÃO espera a resposta ao devedor (equalização de ~600ms
+// preservada pela rota). Gated: engine 'disabled' → outbox nasce
+// 'skipped_engine_disabled' e nunca envia.
+
+export interface SessionStartInput {
+  sessionId: string
+  companyId: string
+  customerId: string
+  /** documento em CLARO (só p/ máscara+hash; nunca vai no payload). */
+  document: string
+  debtIds: string[]
+  reopenCount: number
+  channel: string | null
+  threadId: string | null
+  identityVerified: boolean
+  debtAcknowledged: boolean
+  fulfillmentMode: string
+  outcome: string | null
+  /** true quando NÃO há dívida aberta (quitado): debt=null no envelope. */
+  settled?: boolean
+}
+
+/**
+ * Monta o envelope session.start reusando buildAckContext (valor consolidado
+ * REAIS + vencimento ORIGINAL mais antigo + contagem de faturas) e lendo tenant
+ * (official_channel_label, brand_name, public_link_code, n8n_event_names) + a
+ * presença de cobrança viva (has_live_charge) numa leitura enxuta. Sem I/O extra
+ * além do necessário; retorna null se o contexto não montar.
+ */
+export async function buildSessionStartEnvelope(
+  input: SessionStartInput,
+): Promise<CanonicalEnvelope | null> {
+  const { buildEnvelope } = await import("./payload")
+  const { createServiceClient } = await import("@/lib/supabase/service")
+  const supabase = createServiceClient()
+
+  // tenant: rótulo do canal oficial, brand_name, public_link_code, rótulos n8n.
+  const [{ data: cfg }, { data: company }] = await Promise.all([
+    supabase
+      .from("tenant_chat_config")
+      .select("official_channel_label, branding, public_link_code, n8n_event_names, fulfillment_mode")
+      .eq("company_id", input.companyId)
+      .maybeSingle(),
+    supabase.from("companies").select("name").eq("id", input.companyId).maybeSingle(),
+  ])
+  const branding = (cfg?.branding ?? {}) as Record<string, unknown>
+  const brandName =
+    (typeof branding.brand_name === "string" && branding.brand_name) || company?.name || "Credor"
+
+  // dívida: valor consolidado (reais), vencimento original, contagem de faturas.
+  let debt: { amount: number | null; dueDate: string | null; invoiceCount: number; hasLiveCharge: boolean } | null =
+    null
+  if (!input.settled && input.debtIds.length > 0) {
+    // Frente B (perf): UMA leitura indexada por (company_id, document_digits) no
+    // snapshot. Quando presente e pronto, monta o payload SEM I/O extra
+    // (open_amount_cents já é centavos → reais). Cai no buildAckContext só quando
+    // o snapshot não existe (pré-backfill/G4).
+    const { normalizeDocument } = await import("@/lib/journey/document")
+    const digits = normalizeDocument(input.document)
+    const { data: snap } = await supabase
+      .from("debtor_engine_snapshot")
+      .select("open_amount_cents, oldest_original_due_date, open_invoice_count, has_live_charge, payload_ready")
+      .eq("company_id", input.companyId)
+      .eq("document_digits", digits)
+      .maybeSingle()
+
+    if (snap && snap.payload_ready) {
+      debt = {
+        amount: Number(snap.open_amount_cents) / 100,
+        dueDate: (snap.oldest_original_due_date as string | null) ?? null,
+        invoiceCount: Number(snap.open_invoice_count ?? 0),
+        hasLiveCharge: Boolean(snap.has_live_charge),
+      }
+    } else {
+      const { buildAckContext } = await import("@/lib/journey/acknowledgement")
+      const ack = await buildAckContext({
+        companyId: input.companyId,
+        customerId: input.customerId,
+        debtIds: input.debtIds,
+      })
+      // cobrança viva: algum agreement com status ativo/pendente para as dívidas.
+      const { data: liveCharges } = await supabase
+        .from("agreements")
+        .select("id")
+        .eq("company_id", input.companyId)
+        .in("debt_id", input.debtIds)
+        .in("payment_status", ["pending", "overdue"])
+        .limit(1)
+      debt = {
+        amount: ack.updatedValue,
+        dueDate: ack.oldestDueDate,
+        invoiceCount: ack.invoiceCount,
+        hasLiveCharge: (liveCharges?.length ?? 0) > 0,
+      }
+    }
+  }
+
+  return buildEnvelope({
+    kind: "session_start",
+    eventNames: (cfg?.n8n_event_names ?? null) as never,
+    sessionId: input.sessionId,
+    companyId: input.companyId,
+    reopenCount: input.reopenCount,
+    threadId: input.threadId,
+    channel: input.channel,
+    message: null,
+    button: null,
+    sessionState: {
+      identityVerified: input.identityVerified,
+      debtAcknowledged: input.debtAcknowledged,
+      fulfillmentMode: input.fulfillmentMode || (cfg?.fulfillment_mode as string) || "A",
+      outcome: input.outcome,
+    },
+    debtor: { document: input.document },
+    debt,
+    tenant: {
+      officialChannelLabel: (cfg?.official_channel_label as string | null) ?? null,
+      brandName,
+      publicLinkCode: (cfg?.public_link_code as string | null) ?? null,
+    },
+  })
+}
+
+export type EmitSessionStartResult =
+  | { ok: true; enqueued: true; status: "pending" | "skipped_engine_disabled"; eventId: string }
+  | { ok: true; enqueued: false; reason: "context_unresolved" }
+
+/**
+ * Grava o session.start no outbox (idempotente) e, se não gated, dispara ao n8n
+ * best-effort (o chamador usa Promise.allSettled p/ não somar na resposta).
+ * RESILIENTE: nunca lança; falha de contexto → enqueued:false.
+ */
+export async function emitSessionStart(input: SessionStartInput): Promise<EmitSessionStartResult> {
+  const envelope = await buildSessionStartEnvelope(input).catch(() => null)
+  if (!envelope) return { ok: true, enqueued: false, reason: "context_unresolved" }
+
+  const { enqueueEvent, dispatchOutboxRow } = await import("./outbox")
+  const enq = await enqueueEvent({
+    sessionId: input.sessionId,
+    companyId: input.companyId,
+    envelope,
+  })
+  if (!enq.ok) return { ok: true, enqueued: false, reason: "context_unresolved" }
+
+  // Gated → não envia. Recém-criado e não gated → dispara agora (best-effort).
+  if (enq.status === "pending" && enq.created) {
+    // não await no caminho crítico do chamador — mas aqui devolvemos a Promise
+    // já resolvida; o chamador (login) embrulha em Promise.allSettled.
+    await dispatchOutboxRow({ id: enq.id, payload: envelope, attempts: 0, status: "pending" }).catch(() => "pending")
+  }
+  return {
+    ok: true,
+    enqueued: true,
+    status: enq.status === "skipped_engine_disabled" ? "skipped_engine_disabled" : "pending",
+    eventId: envelope.event_id,
   }
 }
 

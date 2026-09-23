@@ -184,6 +184,13 @@ export function coerceFlowId(raw: unknown): number | null {
  * loader por-tenant monta o VoxuyApiConfig e injeta via construtor do
  * VoxuyApiProvider); este loader por-env cobre o default e serve de base. Lança
  * VoxuyConfigError (só NOMES) quando falta credencial.
+ *
+ * ESTADO Fase 0 (2026-09-23): `VOXUY_WEBHOOK_URL` está AUSENTE no Netlify e
+ * `voxuy_flow_id` é NULL na VMAX → o gate NÃO liga; o disparo permanece `mock`
+ * (nada sai do processo). O contrato enterprise_v1 abaixo está PRONTO e testado;
+ * ligar exige só (1) VOXUY_WEBHOOK_URL, (2) voxuy_flow_id do tenant e (3) trocar
+ * whatsapp_dispatch_mode=voxuy_api. Sem isso, este loader recusa (VoxuyConfigError)
+ * e a fábrica cai no MockWhatsAppProvider — comportamento seguro por padrão.
  */
 export function loadVoxuyApiConfig(env: NodeJS.ProcessEnv = process.env): VoxuyApiConfig {
   const dialect: VoxuyDialect =

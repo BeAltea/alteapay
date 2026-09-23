@@ -69,7 +69,17 @@ function seed() {
     debts: [{ id: DEBT, company_id: CO, customer_id: CUST, status: "pending", amount: 100, due_date: "2020-01-01" }],
     vmax_invoices: [{ id_company: CO, doc: "11144477735", fatura: "F1", vencimento: "2020-01-01", saldo: 100 }],
     negotiation_sessions: [{ id: SID, company_id: CO, customer_id: CUST, debt_id: DEBT, debt_acknowledged_at: null, agreement_id: null, identity_verified_at: new Date().toISOString() }],
-    negotiation_offers: [{ id: "off-1", company_id: CO, session_id: SID, customer_id: CUST, debt_id: DEBT, status: "presented", valid_until: null, terms: { total_value: 80, installments: 1, installment_value: 80, billing_type: "PIX", first_due_date: "2026-10-01" } }],
+    // matriz vigente: acomoda a oferta à vista (20% desc., PIX) para a revalidação
+    // de matriz do payment.create (fora da matriz → 422) passar no caminho feliz.
+    negotiation_condition_matrix: [{
+      id: "mx-1", company_id: CO, name: "default", priority: 1, active: true,
+      valid_from: null, valid_to: null, aging_min_days: 0, aging_max_days: null,
+      aging_basis: "oldest_due", max_discount_pct: 30, installment_discount_pct: 10,
+      min_entry_pct: 20, max_installments: 3, min_installment_value: 10,
+      allowed_billing_types: ["PIX", "BOLETO"], proposal_validity_days: 7,
+      retry_after_days: 3, max_retries: 2, min_debt_value: 0,
+    }],
+    negotiation_offers: [{ id: "off-1", company_id: CO, session_id: SID, customer_id: CUST, debt_id: DEBT, status: "presented", valid_until: null, terms: { original_value: 100, discount_pct: 20, discount_value: 20, entry_value: 0, total_value: 80, installments: 1, installment_value: 80, billing_type: "PIX", first_due_date: "2026-10-01" } }],
     negotiation_acceptances: [],
     chat_prompts: [],
     chat_messages: [],

@@ -67,6 +67,11 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
 
   const engine = engineName()
 
+  // D1/Frente A: flush do outbox ANTES do turno — entrega o session.start
+  // pendente (ordem preservada) que o POST no login não conseguiu enviar. Gated
+  // ('skipped_engine_disabled') não é elegível. Best-effort e não-fatal.
+  await flushOutboxSafe(ctx.sessionId)
+
   // 1) grava a mensagem do cliente + evento
   await recordChatMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, role: "customer", text, engine })
   await recordEvent({
@@ -179,6 +184,21 @@ async function degradeToAssisted(sessionId: string): Promise<void> {
     await supabase.from("negotiation_sessions").update({ engine: "disabled" }).eq("id", sessionId)
   } catch (err) {
     console.warn("[chat-turn] degradeToAssisted falhou (não-fatal):", (err as Error).message)
+  }
+}
+
+/**
+ * D1/Frente A: flush do outbox da sessão no próximo turno. Entrega os eventos
+ * 'pending' na ORDEM de criação (session.start antes do 1º chat.turn). Best-effort
+ * e não-fatal: nunca derruba o turno. Gated ('skipped_engine_disabled') não é
+ * elegível (o flush só pega 'pending').
+ */
+async function flushOutboxSafe(sessionId: string): Promise<void> {
+  try {
+    const { flushOutbox } = await import("@/lib/negotiation/outbox")
+    await flushOutbox({ sessionId })
+  } catch (err) {
+    console.warn("[chat-turn] flush do outbox falhou (não-fatal):", (err as Error).message)
   }
 }
 
