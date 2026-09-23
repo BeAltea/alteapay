@@ -103,7 +103,10 @@ Log estruturado sem PII: `id`, `httpStatus`, `traceId`, `errorFields` (nomes, n�
 
 ## 3. Opt-out, bloqueio e "parar de contatar" (V3/V5 — não dependem da Voxuy)
 
-A Voxuy **não tem webhook de saída** nem **API de blacklist** (lacunas L1/L2). Logo:
+A Voxuy **não tem webhook de saída** (lacuna L1). A **blacklist existe como AÇÃO de
+fluxo** ("Adicionar à blacklist", que *impede que automações sejam enviadas*), mas
+**não há API para consultá-la nem alimentá-la** (lacuna L2) — e ela é **invisível para a
+AlteaPay** (continuamos contando/mandando e-mail para o contato já bloqueado). Logo:
 - **Tela de escolha** em `/c/{token}` (antes de qualquer autenticação, **sem dado da
   dívida**): Consultar / Cancelar inscrição / Bloquear número. Três tokens de ação
   distintos (`issueActionTokens`), sem PII, uso único para as ações destrutivas.
@@ -154,6 +157,61 @@ O mapeador (`lib/whatsapp/voxuy/inbound.ts`) reconhece só o contrato normalizad
 Qualquer outro formato → `processed=false` para análise. **Quando a Voxuy confirmar o
 formato real, só este arquivo muda.**
 
+### 6.1 OPT-OUT do fluxo Voxuy (achado 7.2) — o que o Fabio configura no nó Webhook
+
+**Problema:** ao clicar "Sair da lista"/"Cancelar Recebimento" no funil Voxuy, o
+devedor é bloqueado **só do lado da Voxuy** (a Voxuy não tem blacklist consultável,
+L2). Sem aviso, a AlteaPay continua contando esse número nas campanhas e mandando
+mensagem/e-mail. **Correção:** o nó **Webhook** do fluxo (colocado logo após os
+botões de saída) chama esta rota **em modo personalizado**, e nós registramos a
+supressão do NOSSO lado (fonte autoritativa).
+
+**Configuração no nó Webhook (modo personalizado):**
+- **Method:** `POST`
+- **URL:** `https://alteapay.com/api/webhooks/whatsapp/voxuy?s=<VOXUY_INBOUND_SECRET>`
+  (ou o header `x-alteapay-webhook-secret: <VOXUY_INBOUND_SECRET>`).
+- **Body (JSON):** inclua um campo custom **`evento`** com um dos valores que
+  reconhecemos (case-insensitive, acento tolerado) **e** o telefone do contato:
+  ```json
+  { "evento": "optout", "contact": { "phoneNumber": "{{telefone}}", "hash": "{{hash}}" } }
+  ```
+
+**Valores de `evento`/`event` reconhecidos como opt-out:**
+`optout` · `opt_out` · `opt-out` · `unsubscribe` · `sair` · `blacklist` · `descadastro`.
+
+**Tolerância de formato (o mapeador aceita qualquer uma):**
+- O campo pode se chamar `evento` **ou** `event` (também `tipo`/`action`).
+- O sinal pode vir na **raiz**, dentro de **`contact`** ou de **`transaction`**.
+- Alternativa a `evento`: um **flag booleano** de saída verdadeiro
+  (`optout`/`opt_out`/`unsubscribe`/`descadastro`/`sair`/`blacklist` = `true`,
+  `"true"`, `"1"`, `"sim"` ou `"yes"`).
+- Telefone: `contact.phoneNumber` (preferido), senão `phone`/`phoneNumber`/`telefone`
+  na raiz. Correlação adicional por `contact.hash`/`contact.id`.
+
+> **Precedência:** um `{ "event": "optout", "phone": "…" }` no formato legado A.5
+> (schema com `event` enum estrito) continua tratado pelo caminho legado — a
+> detecção tolerante acima só cobre a forma CUSTOM do nó Webhook.
+
+**O que fazemos ao receber:** registramos `contact_suppressions` com
+`scope=phone`, `channel=whatsapp`, `reason=optout`, `source=voxuy` (idempotente —
+reprocessar não duplica). A partir daí `isSuppressed`/o preview do hub excluem o
+número (motivo `suprimido`). Correlacionamos por telefone e/ou `hash` para
+recuperar `company_id`/`customer_id`; sem correlação, suprimimos globalmente pelo
+telefone. **Nunca 500** — payload malformado só fica `processed=false`.
+
+**Decisão sobre E-MAIL (produto):** o botão é do canal WhatsApp. "Cancelar
+Recebimento" (de mensagens WhatsApp) **não** é sinal claro de que o devedor quer
+parar de receber e-mail de cobrança também. Por isso **NÃO suprimimos e-mail
+automaticamente** — só WhatsApp. Se o produto decidir que o opt-out deve barrar
+e-mail, o `TODO(produto)` em `lib/whatsapp/inbound-apply.ts` explica onde ligar
+(trocar `channel` para `"all"` ou adicionar uma 2ª supressão `channel="email"`),
+idealmente exigindo um sinal explícito no payload (ex.: `evento=descadastro_total`).
+
+Código: contrato no topo de `lib/whatsapp/voxuy/inbound.ts` (`mapVoxuyInbound` →
+evento `contactOptout`); registro em `lib/whatsapp/inbound-apply.ts`
+(`applyNormalizedEvent`, branch `contactOptout`). Testes:
+`tests/whatsapp/voxuy-optout-suppression.test.ts`.
+
 ---
 
 ## 7. Envs
@@ -177,7 +235,7 @@ Por tenant (`tenant_chat_config`): `voxuy_plan_id`, `voxuy_events`
 | Lacuna | Hoje | Quando a Voxuy confirmar |
 |---|---|---|
 | L1 webhook de saída | métricas param em "aceita"; usamos cliques nossos | ligar o mapeador inbound + `provider_status_source='voxuy_webhook'` |
-| L2 blacklist própria | opt-out é 100% nosso | consultar/sincronizar se existir |
+| L2 blacklist Voxuy | existe como AÇÃO de fluxo (bloqueia automações), **sem API** de consulta/escrita → invisível p/ nós; opt-out nosso é 100% autoritativo | sincronizar se a Voxuy expuser API |
 | L3 botões | um link + tela de escolha | usar botões de URL com os 3 tokens (V2) |
 | L4 cancelar funil | nova transação p/ o mesmo número (evento `stop`) | usar endpoint próprio se surgir |
 | L5 rate limit/canal | limiter conservador (5/s) | ajustar limiter; validar WABA/templates |

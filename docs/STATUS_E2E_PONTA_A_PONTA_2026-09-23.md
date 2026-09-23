@@ -63,20 +63,44 @@
   "payloadShape":{"flowId":7064,"contactKeys":["name","phoneNumber","variables"],
   "variableKeys":["link_negociacao","primeiro_nome","credor"]} }
 ```
-→ **Nosso lado está 100% correto.** A Voxuy **aceita** (`success:true`) mas **não entrega**, e não devolve detalhe de erro. `success:true` = "recebi", não "entreguei".
+→ **Nosso lado está 100% correto** (`success:true`). Segundo a doc oficial
+(`manual.voxuyenterprise.com.br`), `success:true` significa **"recebi o webhook"**,
+**nunca** "entreguei" — não existe status de entrega **por mensagem** via API. A causa
+está no painel Voxuy/Meta.
 
-**A causa está no painel Voxuy/Meta — verificar:**
-1. **Fluxo 7064 → contador "Executados":** subiu após o disparo? Se **continua 0**, `7064` **não é o flowId do gatilho de API** (na Voxuy o ID do gatilho pode ≠ do ID da URL) → **pedir à Voxuy o flowId correto**. ← suspeita nº 1.
-2. **Template `atualizacao_registro`:** APROVADA pela Meta? (estava "Qualidade pendente"). Meta bloqueia template não-aprovada.
-3. **Histórico de mensagens Voxuy** pro número: status de entrega/rejeição.
-4. **Número** +5511974602123 é WhatsApp ativo?
-5. Perguntar ao suporte Voxuy: "POST no gatilho retorna success:true mas não entrega — qual o flowId correto e por quê?".
+**Causas prováveis, em ORDEM de probabilidade:**
+1. **BLACKLIST (mais provável).** O contato clicou **"Sair da lista"/"Cancelar
+   Recebimento"** e entrou na blacklist da Voxuy (ação de fluxo **"Adicionar à
+   blacklist"**, que *"impede que automações sejam enviadas"*). A API segue retornando
+   `success:true`. Explicaria "clicaram e pararam de receber". **Verificar:** CRM →
+   Contatos → filtro **blacklist**.
+2. **Contato PRESO no fluxo.** Um nó **"Aguarda resposta indefinidamente"** (sem tempo
+   limite) mantém o contato dentro do funil, e ele **não reentra** num novo disparo
+   (comportamento **não documentado** — disparar a um contato já dentro do fluxo). A API
+   ainda responde `success:true`. **Verificar:** CRM → Contatos → filtro **fluxos**.
+3. **Forma de pagamento da Meta** esgotada/ausente (conta WhatsApp conectada em 21/09).
+   **Verificar:** Business Manager → Contas WhatsApp.
+4. **Limite de mensagens por nível** da conta — não explica a falha de **1** mensagem,
+   mas dimensiona o tamanho do piloto.
+
+**Enfraquece a suspeita anterior ("flowId errado"):** a doc oficial só menciona *"ID do
+fluxo específico a executar"* — **não há um ID de gatilho de API separado** do ID do
+fluxo. O `flowId 7064` deve estar correto; o problema quase certamente é blacklist/fluxo,
+não ID.
+
+**ORDEM de verificação (do mais barato ao mais caro):**
+1. **CRM → o contato** (+5511974602123): está em **blacklist**? preso num **fluxo**?
+   marcado como **WhatsApp inválido**?
+2. **Disparar de novo** e olhar o contador **"Executados"** do nó **Template**.
+3. **Atendimento** (histórico da conversa) para o número.
+4. **Business Manager** (forma de pagamento / limite de mensagens).
+5. **Suporte Voxuy**, se nada acima explicar.
 
 ---
 
 ## 6. Pendências / próximos passos
 
-**Bloqueia o WhatsApp (Voxuy-side, do Fabio):** confirmar flowId do gatilho + aprovação da template + entrega no painel.
+**Bloqueia o WhatsApp (Voxuy-side, do Fabio) — na ordem do §5:** checar **blacklist** e **contato preso no fluxo** (CRM → Contatos) → redisparar e olhar "Executados" do nó Template → checar **forma de pagamento/limite** no Business Manager. (flowId 7064 provavelmente está OK — ver §5.)
 **Para o teste E2E completo:** logar no chat (agora sem timeout) → aceitar condição → gerar boleto/PIX R$250 → (pagar) → webhook fechar. Pode ser feito **pelo link do e-mail** (que funciona), sem depender do WhatsApp.
 **Para 25 reais:** só após o W6 (1 número) validado ponta-a-ponta. Seleção no hub, `dryRun` antes, cap inline 25, coluna "Enviado" ajuda a não duplicar.
 **n8n:** alinhar o fluxo (`type`) + ligar `NEGOTIATION_ENGINE=n8n`.

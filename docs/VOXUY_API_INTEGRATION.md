@@ -264,9 +264,14 @@ Placeholders (resolvidos em corpo **e** headers): `{{link_negociacao}}`,
    limiter conservador de 5/s na fila — `WHATSAPP_RATE_LIMIT_PER_SEC`.)
 2. **Sandbox:** existe ambiente de sandbox/teste para validar `flowId` e
    variáveis sem disparar mensagens reais?
-3. **Blacklist / descadastro:** há API para consultar/registrar
-   opt-out/descadastro do lado da Voxuy? (Hoje a supressão autoritativa é NOSSA —
-   `contact_suppressions`.)
+3. **Blacklist / descadastro:** a blacklist da Voxuy existe como **AÇÃO de fluxo**
+   ("Adicionar à blacklist", que *impede que automações sejam enviadas*) — **não há
+   API** para consultá-la nem alimentá-la (a doc oficial `manual.voxuyenterprise.com.br`
+   só descreve a ação de fluxo). Consequência: ela é **invisível para a AlteaPay** (um
+   contato blacklistado segue sendo contado/enviado do nosso lado e a API responde
+   `success:true` sem entregar). Hoje a supressão autoritativa é NOSSA
+   (`contact_suppressions`). **Pergunta em aberto:** existe API para consultar/sincronizar
+   a blacklist deles?
 4. **`flowId` no painel:** onde exatamente se lê o `flowId` (inteiro) de um fluxo
    no painel Enterprise?
 5. **Confirmação de entrega/leitura:** confirmar que **não existe** callback de

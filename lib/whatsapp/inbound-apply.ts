@@ -103,6 +103,65 @@ export async function applyNormalizedEvent(
       source: provider === "voxuy" ? "voxuy" : "webhook",
     })
   }
+
+  // Achado 7.2 — OPT-OUT do fluxo Voxuy ("Sair da lista"/"Cancelar Recebimento").
+  // A Voxuy bloqueia do lado dela mas não tem blacklist consultável (L2): a
+  // supressão autoritativa é a NOSSA. Registramos supressão do NÚMERO no canal
+  // WhatsApp (o devedor pediu para parar de receber mensagens). Idempotente
+  // (addSuppression não duplica). Correlacionamos por contactRef (provider
+  // message id que a Voxuy nos devolve) e/ou por telefone (E.164) para recuperar
+  // company_id/customer_id; sem correlação, suprimimos globalmente pelo telefone.
+  //
+  // E-MAIL: NÃO suprimimos automaticamente. O botão do funil Voxuy é do canal
+  // WhatsApp — "Cancelar Recebimento" (de mensagens) não é sinal claro de que o
+  // devedor também quer parar de receber e-mail (cobrança pode continuar por
+  // e-mail). Suprimir e-mail é decisão de PRODUTO; deixamos como TODO explícito.
+  // TODO(produto): se o opt-out deve também barrar e-mail, trocar channel para
+  // "all" OU adicionar uma 2ª supressão channel="email" aqui (exige sinal claro
+  // no payload, ex.: evento=descadastro_total).
+  if (ev.type === "contactOptout") {
+    // Tenta correlacionar por contactRef (provider_message_id) e/ou telefone para
+    // recuperar company/customer. Sem correlação => supressão global pelo número.
+    const ors: string[] = []
+    if (ev.contactRef) ors.push(`provider_message_id.eq.${ev.contactRef}`)
+    if (ev.phoneE164) ors.push(`phone_e164.eq.${ev.phoneE164}`)
+    let companyId: string | null = null
+    let customerId: string | null = null
+    let phoneE164: string | null = ev.phoneE164
+    if (ors.length > 0) {
+      const { data: msg } = await supabase
+        .from("whatsapp_messages")
+        .select("company_id, customer_id, phone_e164")
+        .or(ors.join(","))
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (msg) {
+        companyId = msg.company_id ?? null
+        customerId = msg.customer_id ?? null
+        phoneE164 = phoneE164 ?? msg.phone_e164 ?? null
+      }
+    }
+    // Sem telefone (nem do payload nem da mensagem) não há alvo de supressão de
+    // telefone — nada a fazer (o bruto já foi gravado para análise). Nunca 500.
+    if (!phoneE164) return
+    await addSuppression({
+      companyId,
+      scope: "phone",
+      phoneE164,
+      customerId,
+      channel: "whatsapp",
+      reason: "optout", // o devedor pediu para parar de receber mensagens
+      source: provider === "voxuy" ? "voxuy" : "webhook",
+      metadata: { cause: "voxuy_flow_optout" },
+    })
+    if (companyId) {
+      await recordEvent({
+        companyId, customerId, type: "optout.received", actor: "customer",
+        payload: { via: "voxuy_flow" },
+      })
+    }
+  }
 }
 
 export interface CaptureResult {

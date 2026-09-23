@@ -76,6 +76,14 @@ n8n (payment.create)  →  AlteaPay cria cobrança no ASAAS (POST /payments, cli
 - ⚠️ **GAP-V2 (ativação):** falta credencial real (`VOXUY_WEBHOOK_URL`) + `voxuy_flow_id` + telefones em E.164 para ligar `voxuy_api`. **Pendente do Fabio.**
 - ⚠️ **GAP-V3 (envio do link):** como o ASAAS não envia, a AlteaPay tem que mandar o **link de pagamento** por WhatsApp (Voxuy) e/ou e-mail (SendGrid). O envio pelo chat insere a URL/botão; validar que o fluxo (n8n `chat.send` ou o assistido) inclui o link de pagamento quando a cobrança é criada.
 - ℹ️ **E-mail (SendGrid) já funciona** direto (`sendEmailViaSendGrid`), com click-tracking **desligado** (o domínio de rastreio `url6522.alteapay.com` não resolve — ver `[[vmax-template-cobranca]]`). O WhatsApp real depende do Voxuy (V1/V2).
+- ⚠️ **GAP-V4 (`success:true` não é entrega):** a Voxuy retorna `{"success":true}` = "recebi o webhook", **nunca** "entreguei". **Não existe status de entrega por mensagem via API.** Quando o WhatsApp "some" (aceita mas não chega), diagnosticar **nesta ordem** (doc oficial `manual.voxuyenterprise.com.br`):
+  1. **BLACKLIST (mais provável):** o contato clicou "Sair da lista"/"Cancelar Recebimento" → ação de fluxo **"Adicionar à blacklist"** ("impede que automações sejam enviadas"); a API segue `success:true`. **Verificar:** CRM → Contatos → filtro **blacklist**.
+  2. **Contato PRESO no fluxo:** nó "Aguarda resposta indefinidamente" sem tempo limite → não reentra num novo disparo (comportamento não documentado). **Verificar:** CRM → Contatos → filtro **fluxos**.
+  3. **Forma de pagamento da Meta** esgotada/ausente. **Verificar:** Business Manager → Contas WhatsApp.
+  4. **Limite de mensagens por nível** (dimensiona o piloto; não explica falha de 1).
+  - **Enfraquece "flowId errado":** a doc só fala "ID do fluxo específico a executar" — não há ID de gatilho de API separado.
+- 🧨 **GAP-V5 (produto — botão ambíguo):** **"Cancelar Recebimento"** é ambíguo/perigoso em cobrança — pode ser lido como **"cancelar a cobrança"**, o que explicaria "100% clicaram nele". **Recomendação:** renomear para **"Parar de receber mensagens"** e manter **"Consultar Dívida"** como 1º botão, destacado.
+- 🕳️ **GAP-V6 (produto — blacklist invisível):** a blacklist da Voxuy **existe** (como AÇÃO de fluxo, sem API de consulta) e é **INVISÍVEL para a AlteaPay** — continuamos contando o contato como enviado e mandando e-mail. **Correção (em implementação):** nó **Webhook** no fluxo Voxuy → registra a **supressão do nosso lado** (`contact_suppressions`) quando o contato entra na blacklist/opt-out.
 
 ---
 

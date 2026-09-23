@@ -6,6 +6,13 @@ export type NormalizedWhatsAppEvent =
   | { type: "clicked"; providerMessageId: string; button: "consult" | "optout" | "block"; at: string }
   | { type: "optout" | "block"; phone: string; at: string }
   | { type: "reply"; phone: string; text: string; at: string }
+  // Opt-out do FLUXO Voxuy (achado 7.2): o devedor clicou "Sair da lista"/
+  // "Cancelar Recebimento" no funil da Voxuy. O nó Webhook do fluxo (modo
+  // personalizado) avisa a AlteaPay para registrarmos a supressão do NOSSO lado
+  // — a Voxuy bloqueia só do lado dela (não tem blacklist consultável, L2).
+  // Correlação por telefone (E.164, quando derivável) e/ou por contactRef
+  // (contact.hash/id que a Voxuy nos devolve).
+  | { type: "contactOptout"; phoneE164: string | null; contactRef: string; at: string }
 
 export interface SendCampaignMessageInput {
   companyId: string

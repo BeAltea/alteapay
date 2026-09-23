@@ -25,7 +25,7 @@
 
 ## 1. Voxuy (AlteaPay → Voxuy) — já implementado
 
-A AlteaPay dispara; a Voxuy agenda o funil. **A API da Voxuy é só de entrada** (não há webhook de saída nem blacklist — o opt-out é controlado pela AlteaPay).
+A AlteaPay dispara; a Voxuy agenda o funil. **A API da Voxuy é só de entrada** (não há webhook de saída; o opt-out é controlado pela AlteaPay). A **blacklist existe** — mas como **AÇÃO de fluxo** ("Adicionar à blacklist", que *impede que automações sejam enviadas*), **não como API**: não há endpoint para consultá-la nem alimentá-la, então ela é **invisível para a AlteaPay** (um contato blacklistado continua contando como enviado do nosso lado, e a API segue retornando `success:true` sem entregar).
 
 - **Endpoint:** `POST` na URL de webhook da conta (contém o `<codigo>`; tratada como segredo `VOXUY_WEBHOOK_URL`). `Content-Type: application/json`. Autenticação: campo **`apiToken`** no corpo.
 - **Payload (minimização de PII — sem CPF, sem valor):**
