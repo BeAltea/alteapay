@@ -593,4 +593,24 @@ describe("buildProviderSelector (T3-2)", () => {
     delete process.env.VOXUY_FLOW_ID
     delete process.env.VOXUY_DIALECT
   })
+
+  it("voxuy_api com tenant flowId e SEM env VOXUY_FLOW_ID: usa o flowId do tenant (regressão prod)", async () => {
+    // Reproduz o estado de produção: URL setada, mas VOXUY_FLOW_ID env AUSENTE
+    // (o flowId vem do tenant_chat_config.voxuy_flow_id). Antes do fix, o loader
+    // lançava VoxuyConfigError e o selector caía SEM apiConfig → a mensagem ficava
+    // 'queued' (VoxuyApiProvider re-lançava na construção). Agora o tenant flowId
+    // é injetado no loader e o apiConfig sai completo.
+    process.env.VOXUY_WEBHOOK_URL = "https://webhooks.voxuy.com/voxuyapi/deadbeef-cafe-babe-f00d-9f3a1b2c3d4e"
+    delete process.env.VOXUY_FLOW_ID
+    process.env.VOXUY_DIALECT = "enterprise_v1"
+    const { buildProviderSelector } = await import("@/lib/journey/campaign-send")
+    const sel = buildProviderSelector("voxuy_api", 7064)
+    expect(typeof sel).toBe("object")
+    if (typeof sel === "object") {
+      expect(sel.apiConfig).toBeDefined()
+      expect(sel.apiConfig?.flowId).toBe(7064)
+    }
+    delete process.env.VOXUY_WEBHOOK_URL
+    delete process.env.VOXUY_DIALECT
+  })
 })

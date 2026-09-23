@@ -53,11 +53,17 @@ export function buildProviderSelector(
 ): string | { dispatchMode: string; apiConfig?: ReturnType<typeof loadVoxuyApiConfig> } {
   const mode = resolveDispatchMode(providerRaw)
   if (mode !== "voxuy_api") return providerRaw ?? "mock"
+  const tFlow = coerceFlowId(tenantFlowId)
   try {
-    const base = loadVoxuyApiConfig()
+    // O flowId vem do TENANT (tenant_chat_config.voxuy_flow_id), não do env. Sem
+    // injetá-lo aqui, loadVoxuyApiConfig lança VoxuyConfigError por falta de
+    // VOXUY_FLOW_ID mesmo com o tenant configurado — e a mensagem ficaria `queued`.
+    const base = loadVoxuyApiConfig(
+      tFlow != null ? { ...process.env, VOXUY_FLOW_ID: String(tFlow) } : process.env,
+    )
     return {
       dispatchMode: "voxuy_api",
-      apiConfig: { ...base, flowId: coerceFlowId(tenantFlowId) ?? base.flowId },
+      apiConfig: { ...base, flowId: tFlow ?? base.flowId },
     }
   } catch {
     // env base incompleta: deixa o VoxuyApiProvider validar e reportar como config.
