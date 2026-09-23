@@ -63,6 +63,11 @@ export async function POST(req: NextRequest) {
   //  - Não reconheço [0] → contestação (registra dispute);
   //  - Atendente [99] → handoff.
   if (prompt.kind === "debt_consult") {
+   // Envolvemos a branch INTEIRA em try/catch: o clique NUNCA pode morrer por
+   // exceção (ou por qualquer I/O lento) sem devolver JSON — senão o front fica
+   // preso em "..." esperando um corpo que não vem. Qualquer erro inesperado vira
+   // 500 {code:'consult_flow_error'} e o front re-habilita os botões.
+   try {
     // 1) responde o prompt (marca answered + grava a mensagem do cliente = label).
     //    A integridade do clique (ativo/botão existe) é validada aqui.
     const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
@@ -129,6 +134,16 @@ export async function POST(req: NextRequest) {
 
     // Botão fora do catálogo esperado do debt_consult: já respondido, sem efeito.
     return NextResponse.json({ ok: true, button_id: buttonId })
+   } catch (err) {
+     // Nunca deixa a request morrer por exceção/timeout: sempre devolve JSON. O
+     // prompt pode já ter sido respondido (answerPrompt) — o front recarrega o
+     // estado via pollMessages; o importante é o botão sair do "...".
+     console.error("[chat:button] debt_consult falhou:", (err as Error).message)
+     return NextResponse.json(
+       { ok: false, code: "consult_flow_error", error: "consult_flow_error" },
+       { status: 500 },
+     )
+   }
   }
 
   // Reconhecimento da dívida: caminho dedicado (4 efeitos + comportamento em "Não").
@@ -181,9 +196,10 @@ export async function POST(req: NextRequest) {
         reply: notRecognizedReply,
       })
     }
-    // "Sim, reconheço" (button 1): handoff ao n8n (engine_owner='n8n' + emite
-    // negotiation.start). RESILIENTE (H8): se o n8n não estiver plugado, mantém
-    // o assistido e o cliente NÃO vê erro. Nunca derruba a resposta do clique.
+    // "Sim, reconheço" (button 1): handoff ao n8n em BACKGROUND (best-effort —
+    // negotiation.start disparado sem bloquear o clique). RESILIENTE (H8): se o
+    // n8n não estiver plugado/o disparo falhar, mantém o assistido e o cliente
+    // NÃO vê erro. Nunca derruba nem pendura a resposta do clique.
     let engineOwner: "platform" | "n8n" = "platform"
     try {
       const start = await startN8nNegotiation({
@@ -197,16 +213,17 @@ export async function POST(req: NextRequest) {
       console.warn("[chat:button] negotiation.start falhou (fallback assistido):", (err as Error).message)
     }
     const recognizedReply = "Perfeito! Então vamos trabalhar juntos para sanar o seu débito."
-    // Só persiste o reply assistido quando o engine é o assistido (platform). Com
-    // o n8n dono, o próprio fluxo empurra as mensagens seguintes via chat.send —
-    // gravar aqui duplicaria a conversa. O clique do cliente já foi gravado.
-    if (engineOwner === "platform") {
-      await persistAssistantMessage({
-        companyId: ctx.companyId,
-        sessionId: ctx.sessionId,
-        text: recognizedReply,
-      })
-    }
+    // SEMPRE persiste o reply (bug histórico: condicionar a engineOwner==='platform'
+    // deixava o lado do assistente VAZIO no banco quando o n8n era dado como dono
+    // mas não empurrava nada — a sessão reaberta só trazia a pergunta + o clique
+    // "Sim". Como o handoff é best-effort/background e a entrega não é confirmada
+    // aqui, o histórico não pode depender do n8n). O clique do cliente já foi
+    // gravado por answerPrompt dentro de recordAcknowledgement.
+    await persistAssistantMessage({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      text: recognizedReply,
+    })
     return NextResponse.json({
       ok: true,
       acknowledged: true,

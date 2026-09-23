@@ -24,7 +24,9 @@ let db: FakeDb
 let chargeAdds = 0
 let asaasPayments: any[] = []
 
-vi.mock("@/lib/supabase/service", () => ({ createServiceClient: () => makeFakeSupabase(db) }))
+// vi.fn() (não arrow) para permitir mockImplementationOnce num teste de erro de
+// insert; o default segue devolvendo o fake em memória.
+vi.mock("@/lib/supabase/service", () => ({ createServiceClient: vi.fn(() => makeFakeSupabase(db)) }))
 vi.mock("@/lib/queue/queues", () => ({
   chargeQueue: { add: async () => { chargeAdds++; return { id: `job_${chargeAdds}` } } },
   n8nQueue: { add: async () => ({ id: "j" }) },
@@ -221,5 +223,82 @@ describe("E2E reconhecimento — clique antigo e chat.send", () => {
     expect(msg).toBeTruthy()
     expect(msg?.role).toBe("assistant")
     expect(msg?.n8n_execution_id).toBe("exec_9")
+  })
+})
+
+// --- C1 backend: correção da trava do botão + persistência do histórico -------
+describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
+  beforeEach(seed)
+
+  it("handleDebtNegotiate persiste dados da dívida + reply (histórico completo), independente do n8n", async () => {
+    const promptId = await ackPrompt()
+    const { handleDebtNegotiate } = await import("@/lib/journey/acknowledgement")
+    const { answerPrompt } = await import("@/lib/journey/prompts")
+    const answered = await answerPrompt({ sessionId: SID, companyId: CO, promptId, buttonId: 3 })
+    expect(answered.ok).toBe(true)
+
+    const out = await handleDebtNegotiate({
+      companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, debtIds: [DEBT], promptId, buttonId: 3,
+    })
+    // owner síncrono é sempre 'platform' (o handoff n8n é best-effort/background).
+    expect(out.engineOwner).toBe("platform")
+
+    const assistantTexts = (db.chat_messages ?? []).filter((m) => m.role === "assistant").map((m) => m.text)
+    // dados da dívida (debtInfoMessage) E o reply — os DOIS no histórico local,
+    // sem depender do n8n empurrar nada (bug histórico: reply só era gravado se
+    // engineOwner==='platform', deixando o lado do assistente vazio).
+    expect(assistantTexts.some((t) => t.includes("dados da sua dívida"))).toBe(true)
+    expect(assistantTexts.some((t) => t.includes("trabalhar juntos para sanar"))).toBe(true)
+  })
+
+  it("Negociar [3] grava o reconhecimento (button_id=3) — não é mais descartado pelo CHECK", async () => {
+    const promptId = await ackPrompt()
+    const neg = await recognizeViaNegotiate(promptId)
+    expect(neg.ok).toBe(true)
+    // a linha de reconhecimento existe com button_id=3 e acknowledged=true.
+    const ack = (db.debt_acknowledgements ?? []).find((r) => r.button_id === 3)
+    expect(ack).toBeTruthy()
+    expect(ack?.acknowledged).toBe(true)
+    refreshView()
+    expect(db.debt_acknowledgement_latest.some((v) => v.acknowledged === true)).toBe(true)
+  })
+
+  it("kickoff n8n é best-effort: sem n8n plugado, mantém engine_owner assistido e não lança", async () => {
+    const { startN8nNegotiation } = await import("@/lib/journey/acknowledgement")
+    // waitForDispatch:true torna o background determinístico no teste; em produção
+    // o caminho crítico NUNCA o aguarda (fire-and-forget).
+    const r = await startN8nNegotiation({
+      companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, waitForDispatch: true,
+    })
+    expect(r).toEqual({ ok: true, owner: "platform", delivered: false })
+    // sem entrega (n8n não plugado no lab), a sessão NÃO é promovida a dono n8n.
+    expect(db.negotiation_sessions[0].engine_owner ?? "platform").not.toBe("n8n")
+  })
+
+  it("persistDebtRecognition LANÇA (não descarta em silêncio) se o insert retornar erro", async () => {
+    // simula a violação de constraint: só o insert do append-log devolve {error}.
+    // O código deve LANÇAR (defesa em profundidade) em vez de seguir com um
+    // reconhecimento fantasma. Substituímos createServiceClient (já mockado no
+    // topo) só nesta chamada via mockImplementationOnce.
+    const { makeFakeSupabase } = await import("./_fake-supabase")
+    const { createServiceClient } = await import("@/lib/supabase/service")
+    ;(createServiceClient as unknown as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+      const fake = makeFakeSupabase(db)
+      return {
+        from(table: string) {
+          if (table === "debt_acknowledgements") {
+            return { insert: async () => ({ error: { message: "check_violation" } }) }
+          }
+          return fake.from(table)
+        },
+      }
+    })
+    const { persistDebtRecognition } = await import("@/lib/journey/acknowledgement")
+    await expect(
+      persistDebtRecognition({
+        companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT,
+        promptId: "p", buttonId: 3, acknowledged: true, source: "chat_button_negotiate",
+      }),
+    ).rejects.toThrow(/debt_acknowledgements insert falhou/)
   })
 })

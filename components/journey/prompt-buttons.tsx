@@ -4,6 +4,11 @@
 // Sim/Não; 98/99 ao final). Desabilita após o clique. Trata 409 prompt_not_active
 // devolvendo o controle ao pai (que recarrega o estado). Sem termos técnicos ao
 // cliente e sem badge de id (o badge do button_id é só no painel admin).
+//
+// VIVACIDADE: o clique NUNCA fica preso em "..." — quando onClick resolve com
+// erro (rede/timeout/4xx/5xx), o `finally` para o loading, reabilita os botões
+// (answered continua false) e mostramos um aviso curto ao cliente em vez de
+// silêncio. O pai (chat.tsx) garante o resolve via AbortController no fetch.
 import { useMemo, useState } from "react"
 
 export interface PromptButton {
@@ -34,19 +39,35 @@ export function PromptButtons({
 }) {
   const [pending, setPending] = useState<number | null>(null)
   const [answered, setAnswered] = useState(false)
+  // Aviso curto ao cliente quando o clique falha (rede/timeout/servidor). Sem
+  // termos técnicos e sem código de erro — só orienta a tentar de novo.
+  const [notice, setNotice] = useState<string | null>(null)
 
   const buttons = useMemo(() => [...prompt.buttons].sort((a, b) => a.id - b.id), [prompt.buttons])
 
   async function handle(buttonId: number) {
     if (pending !== null || answered) return
+    setNotice(null)
     setPending(buttonId)
     try {
       const res = await onClick(prompt.id, buttonId)
       if (res.ok) {
         setAnswered(true)
+      } else if (res.code === "prompt_not_active") {
+        // O pai já recarrega o prompt ativo (este componente será remontado via
+        // key={prompt.id}); não mostramos aviso pois o estado será substituído.
+      } else {
+        // 4xx/5xx/timeout/rede: reabilita os botões (answered continua false) e
+        // avisa o cliente em vez de deixar em silêncio.
+        setNotice(
+          res.code === "timeout"
+            ? "A conexão está lenta. Toque no botão novamente."
+            : "Não foi possível processar agora. Toque no botão novamente.",
+        )
       }
-      // 409 prompt_not_active: o pai recarrega o prompt ativo; aqui só liberamos.
     } finally {
+      // SEMPRE para o loading — o botão nunca fica preso em "...". Como o pai
+      // garante o resolve (AbortController), este finally sempre roda.
       setPending(null)
     }
   }
@@ -68,6 +89,7 @@ export function PromptButtons({
           </button>
         ))}
       </div>
+      {notice ? <p className="text-xs text-red-600">{notice}</p> : null}
     </div>
   )
 }

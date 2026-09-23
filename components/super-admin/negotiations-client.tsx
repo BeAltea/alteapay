@@ -100,6 +100,13 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
   // showModal agora controla o diálogo de envio F1 (seleção de canal WhatsApp/
   // e-mail + "não duplicar"), que reusa as rotas send-preview/send.
   const [showModal, setShowModal] = useState(false)
+  // SNAPSHOT dos customers.id capturado NA ABERTURA do diálogo. A montagem do
+  // SendNegotiationDialog é guardada por ESTE snapshot, NUNCA pela seleção viva
+  // (sendableCustomerIds): assim, quando o envio conclui e o background limpa a
+  // seleção, o diálogo NÃO é desmontado e o painel de resultado ("✓ Envio
+  // concluído") permanece até o operador clicar em "Fechar". Zerado só no
+  // fechamento (onOpenChange(false)).
+  const [sendSelectionIds, setSendSelectionIds] = useState<string[]>([])
   const [sortField, setSortField] = useState<"name" | "debt" | "debtAge" | "dueDate" | null>(null)
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc")
   const [syncing, setSyncing] = useState(false)
@@ -689,6 +696,10 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
     }
 
     // 4. No issues, open the F1 channel-selection dialog.
+    // Captura o snapshot da seleção AGORA: a montagem do diálogo passa a depender
+    // deste snapshot, não da seleção viva — limpar a seleção no onDone (pós-envio)
+    // não desmonta mais o diálogo nem apaga o painel de resultado.
+    setSendSelectionIds(sendableCustomerIds)
     setShowModal(true)
   }
 
@@ -699,6 +710,7 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
       toast.error("Nenhum cliente selecionado possui cadastro para envio de negociacao (documento sem correspondencia na base de clientes).")
       return
     }
+    setSendSelectionIds(sendableCustomerIds)
     setShowModal(true)
   }
 
@@ -743,11 +755,29 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
   }
 
   // O envio agora é feito pelo diálogo F1 (SendNegotiationDialog), que chama
-  // send-preview/send com channels[]/dedupe. Ao concluir, limpamos a seleção e
-  // recarregamos a lista para refletir o novo status.
+  // send-preview/send com channels[]/dedupe.
+  //
+  // CONTRATO: onDone significa "envio CONCLUÍDO, atualize os dados em background"
+  // — e SÓ isso. NÃO limpamos a seleção aqui: fazê-lo zeraria sendableCustomerIds
+  // e, como a montagem do diálogo depende do SNAPSHOT (não da seleção viva), a
+  // limpeza precoce mataria o painel de resultado. O diálogo continua montado
+  // mostrando "✓ Envio concluído"; loadCustomers só recarrega a lista por baixo
+  // (o painel fica por cima). A limpeza de seleção acontece no FECHAMENTO, em
+  // handleSendDialogClose.
   const handleSendDone = () => {
-    setSelectedCustomers(new Set())
     if (selectedCompanyId) loadCustomers(selectedCompanyId)
+  }
+
+  // Chamado quando o operador fecha o diálogo de envio (botão "Fechar", Cancelar,
+  // ESC ou clique fora). É AQUI que a seleção e o snapshot são limpos — depois de
+  // o operador já ter visto o painel de resultado. Não recarrega a lista
+  // (o onDone já cuidou disso); apenas preserva o filtro/estado atual.
+  const handleSendDialogClose = (open: boolean) => {
+    setShowModal(open)
+    if (!open) {
+      setSelectedCustomers(new Set())
+      setSendSelectionIds([])
+    }
   }
 
   const formatCurrency = (value: number) =>
@@ -1872,14 +1902,18 @@ export function NegotiationsClient({ companies }: { companies: Company[] }) {
 
       {/* Send Negotiation Dialog (F1): seleção de canal WhatsApp/e-mail +
           "não duplicar" → send-preview/send. Envia os customers.id resolvidos
-          (não os VMAX ids). */}
-      {showModal && selectedCompanyId && sendableCustomerIds.length > 0 ? (
+          (não os VMAX ids).
+          A guarda usa o SNAPSHOT (sendSelectionIds), capturado na abertura — não
+          a seleção viva. Assim, ao concluir o envio, o onDone pode recarregar a
+          lista em background sem desmontar o diálogo: o painel "✓ Envio concluído"
+          permanece até o operador clicar em "Fechar" (handleSendDialogClose). */}
+      {showModal && selectedCompanyId && sendSelectionIds.length > 0 ? (
         <SendNegotiationDialog
           open={showModal}
-          onOpenChange={setShowModal}
+          onOpenChange={handleSendDialogClose}
           companyId={selectedCompanyId}
-          selectedCount={sendableCustomerIds.length}
-          selection={{ kind: "ids", customerIds: sendableCustomerIds }}
+          selectedCount={sendSelectionIds.length}
+          selection={{ kind: "ids", customerIds: sendSelectionIds }}
           onDone={handleSendDone}
         />
       ) : null}

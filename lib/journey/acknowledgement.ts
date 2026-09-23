@@ -609,8 +609,15 @@ export async function persistDebtRecognition(input: {
     ? createHash("sha256").update(input.ip).digest("hex").slice(0, 32)
     : null
 
-  // 1) append-only debt_acknowledgements
-  await supabase.from("debt_acknowledgements").insert({
+  // 1) append-only debt_acknowledgements. O supabase-js NÃO lança em violação de
+  //    constraint (retorna {error}) — checamos explicitamente para NUNCA descartar
+  //    o reconhecimento em silêncio. Bug histórico: o CHECK(button_id in (0,1))
+  //    rejeitava o button_id=3 (Negociar) e a linha sumia sem trace, quebrando o
+  //    debt_acknowledgement_latest/o guard de pagamento. A migration
+  //    20260932_debt_ack_button_id_relax.sql relaxa o CHECK para (0,1,2,3); aqui
+  //    lançamos o erro para o chamador (rota) resolver como 500 auditável em vez
+  //    de seguir com um reconhecimento fantasma.
+  const { error: ackInsertError } = await supabase.from("debt_acknowledgements").insert({
     company_id: input.companyId,
     session_id: input.sessionId,
     customer_id: input.customerId,
@@ -622,6 +629,9 @@ export async function persistDebtRecognition(input: {
     ip_hash: ipHash,
     user_agent: input.userAgent ?? null,
   })
+  if (ackInsertError) {
+    throw new Error(`debt_acknowledgements insert falhou: ${ackInsertError.message}`)
+  }
 
   // 2) journey_events (debt.acknowledged | debt.not_recognized)
   await recordEvent({
@@ -711,58 +721,102 @@ export type StartN8nResult =
   | { ok: true; owner: "platform"; delivered: false } // fallback assistido (H8)
 
 /**
- * H7: handoff ao n8n no reconhecimento "Sim" (button_id=1). Efeitos:
- *   1) marca negotiation_sessions.engine_owner='n8n' (a partir daí, os turnos
- *      vão ao fluxo);
- *   2) emite negotiation.start ao n8n (Apêndice B, assinado; centavos, doc
- *      mascarado);
- *   3) journey_events: negotiation.start (entregue) OU engine_unavailable
- *      (fallback assistido, H8) — auditoria.
+ * Dispara o negotiation.start ao n8n em BACKGROUND (best-effort, fora do caminho
+ * crítico do clique) e grava a auditoria do desfecho quando ele resolver. NUNCA
+ * é aguardado pelo caminho da resposta ao cliente: o fetch ao webhook n8n pode
+ * levar até N8N_FLOW_TIMEOUT_MS (~60s) e a rota tem maxDuration=60 — aguardar aqui
+ * estourava o budget e deixava o botão "..." pendurado (Netlify matava a função
+ * antes de responder). Ao rodar solto, o clique responde em <2s e o handoff n8n
+ * segue por trás; se ele entregar, o engine_owner vira 'n8n' e os PRÓXIMOS turnos
+ * vão ao fluxo (a resposta DESTE clique já foi persistida localmente pelo
+ * chamador — o histórico nunca depende do n8n). NUNCA lança.
+ */
+async function dispatchNegotiationStartInBackground(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+  eventId: string
+}): Promise<void> {
+  try {
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const emit = await emitNegotiationStart(input.sessionId, input.eventId)
+    const delivered = emit.ok === true && "delivered" in emit && emit.delivered === true
+
+    const supabase = createServiceClient()
+    // Só promove o dono a n8n quando o disparo foi de fato ENTREGUE. Sem entrega
+    // (n8n não plugado/timeout/5xx) a sessão permanece no assistido (platform).
+    if (delivered) {
+      await supabase
+        .from("negotiation_sessions")
+        .update({ engine_owner: "n8n", updated_at: new Date().toISOString() })
+        .eq("id", input.sessionId)
+    }
+
+    await recordEvent({
+      companyId: input.companyId,
+      customerId: input.customerId,
+      debtId: input.debtId,
+      sessionId: input.sessionId,
+      // O funil não tem estágio próprio para negotiation.start; usamos um evento de
+      // timeline (chat.turn.assistant marca a transição de dono do engine na
+      // auditoria, com um payload explícito). engine_unavailable idem, no fallback.
+      type: "chat.turn.assistant",
+      actor: delivered ? "n8n" : "system",
+      eventId: delivered ? `neg_start:${input.eventId}` : `neg_start_unavailable:${input.eventId}`,
+      payload: delivered
+        ? { event: "negotiation.start", engine_owner: "n8n" }
+        : { event: "engine_unavailable", engine_owner: "platform", reason: "reason" in emit ? emit.reason : "unknown" },
+    })
+  } catch (err) {
+    // Best-effort: uma falha no handoff em background jamais afeta o clique já
+    // respondido. Só loga um rótulo curto (sem URL/segredo/PII).
+    console.warn("[journey] negotiation.start (background) falhou:", (err as Error).message)
+  }
+}
+
+/**
+ * H7: handoff ao n8n no reconhecimento "Sim"/Negociar. Efeitos:
+ *   1) DISPARA negotiation.start ao n8n em BACKGROUND (best-effort — ver
+ *      dispatchNegotiationStartInBackground). O fetch ao webhook n8n NÃO é
+ *      aguardado: manter o clique instantâneo é a garantia de vivacidade do botão.
+ *   2) a auditoria (engine_owner + journey_event) é gravada pelo background
+ *      quando o disparo resolve.
  *
- * RESILIENTE (H8): se o n8n não estiver plugado/o disparo falhar, mantém
- * engine_owner='platform' (assistido) e NUNCA lança — o cliente segue sem ver
- * erro. O contrato negotiation.start é o MESMO nos dois casos.
+ * RESILIENTE (H8): SEMPRE retorna owner='platform' SÍNCRONO — a resposta DESTE
+ * clique é persistida localmente pelo chamador (o histórico nunca depende do
+ * n8n). Se o n8n entregar por trás, os PRÓXIMOS turnos vão ao fluxo. NUNCA lança.
+ *
+ * `waitForDispatch` (default false) permite ao teste aguardar o background de
+ * forma determinística; em produção o caminho crítico nunca o aguarda.
  */
 export async function startN8nNegotiation(input: {
   companyId: string
   sessionId: string
   customerId: string
   debtId: string
+  waitForDispatch?: boolean
 }): Promise<StartN8nResult> {
-  const supabase = createServiceClient()
   const eventId = randomUUID()
 
-  const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
-  const emit = await emitNegotiationStart(input.sessionId, eventId)
-
-  const delivered = emit.ok === true && "delivered" in emit && emit.delivered === true
-  const owner: "n8n" | "platform" = delivered ? "n8n" : "platform"
-
-  // Só assume o dono n8n quando o disparo foi entregue. Sem entrega → assistido.
-  await supabase
-    .from("negotiation_sessions")
-    .update({ engine_owner: owner, updated_at: new Date().toISOString() })
-    .eq("id", input.sessionId)
-
-  await recordEvent({
+  const dispatch = dispatchNegotiationStartInBackground({
     companyId: input.companyId,
+    sessionId: input.sessionId,
     customerId: input.customerId,
     debtId: input.debtId,
-    sessionId: input.sessionId,
-    // O funil não tem estágio próprio para negotiation.start; usamos um evento de
-    // timeline (chat.turn.assistant marca a transição de dono do engine na
-    // auditoria, com um payload explícito). engine_unavailable idem, no fallback.
-    type: "chat.turn.assistant",
-    actor: delivered ? "n8n" : "system",
-    eventId: delivered ? `neg_start:${eventId}` : `neg_start_unavailable:${eventId}`,
-    payload: delivered
-      ? { event: "negotiation.start", engine_owner: "n8n" }
-      : { event: "engine_unavailable", engine_owner: "platform", reason: "reason" in emit ? emit.reason : "unknown" },
+    eventId,
   })
+  // fire-and-forget: NÃO await no caminho crítico. `void` marca o descarte
+  // proposital da Promise; o rejection já é engolido dentro do dispatch.
+  if (input.waitForDispatch) {
+    await dispatch
+  } else {
+    void dispatch
+  }
 
-  return delivered
-    ? { ok: true, owner: "n8n", delivered: true }
-    : { ok: true, owner: "platform", delivered: false }
+  // Owner SÍNCRONO = platform: o clique responde já e o reply é sempre
+  // persistido. A promoção a 'n8n' (se entregar) acontece no background.
+  return { ok: true, owner: "platform", delivered: false }
 }
 
 // --- orquestração do fluxo Consultar/Negociar (rota /api/chat/button) --------
@@ -883,7 +937,10 @@ export async function handleDebtNegotiate(input: {
     userAgent: input.userAgent,
   })
 
-  // Kickoff n8n (best-effort): emite negotiation.start e assume engine_owner.
+  // Kickoff n8n (best-effort, fire-and-forget): dispara negotiation.start em
+  // BACKGROUND — NÃO bloqueia a resposta ao clique (ver startN8nNegotiation). O
+  // owner síncrono é sempre 'platform'; a promoção a 'n8n' (se entregar) acontece
+  // por trás e vale para os PRÓXIMOS turnos.
   let engineOwner: "platform" | "n8n" = "platform"
   try {
     const start = await startN8nNegotiation({
@@ -898,15 +955,17 @@ export async function handleDebtNegotiate(input: {
   }
 
   const reply = "Perfeito! Então vamos trabalhar juntos para sanar o seu débito."
-  // Com o n8n dono, o próprio fluxo empurra as próximas mensagens via chat.send —
-  // gravar aqui duplicaria. Só persistimos o reply no assistido (platform).
-  if (engineOwner === "platform") {
-    await persistAssistantMessage({
-      companyId: input.companyId,
-      sessionId: input.sessionId,
-      text: reply,
-    })
-  }
+  // SEMPRE persiste o reply localmente (bug histórico: condicionar a
+  // engineOwner==='platform' deixava o lado do assistente VAZIO no banco quando o
+  // n8n era assumido dono mas NÃO devolvia/empurrava nada — a sessão reaberta só
+  // trazia a pergunta + o clique). Como o handoff n8n agora é best-effort/em
+  // background e a entrega não é garantida (papel B não confirmado no clique), o
+  // histórico não pode depender dele: gravamos o reply aqui, incondicionalmente.
+  await persistAssistantMessage({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    text: reply,
+  })
   return { ok: true, engineOwner, reply }
 }
 

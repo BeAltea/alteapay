@@ -161,6 +161,10 @@ export function JourneyChat() {
   }
 
   useEffect(() => {
+    // MONTAGEM = HISTÓRICO COMPLETO: sinceRef começa null, então este 1º poll faz
+    // GET /api/chat/messages SEM `since` → o servidor devolve TODAS as mensagens da
+    // sessão (ascending, limit 200), não só a última. O dedup por id (seenIds) e o
+    // avanço de sinceRef garantem que os polls seguintes só tragam o que é novo.
     pollMessages()
     // Sem teto de tempo: a página NÃO pode expirar. Só pausa quando a aba não
     // está visível ou quando o modal (inatividade/expiração) está aberto.
@@ -229,11 +233,20 @@ export function JourneyChat() {
   // — nunca num passo intermediário do fluxo.
   async function clickButton(promptId: string, buttonId: number): Promise<PromptClickResult> {
     resetIdle()
+    // GARANTIA DE VIVACIDADE: o backend agora responde rápido (o kickoff n8n saiu
+    // do caminho crítico do clique — C1), mas ainda blindamos o cliente contra um
+    // servidor lento/rede presa com um AbortController. Sem isto, um fetch pendurado
+    // deixaria a Promise do onClick sem resolver e o botão travado em "..." para
+    // sempre. Com o timeout, o "..." SEMPRE resolve e o PromptButtons reabilita os
+    // botões e mostra um aviso ("conexão lenta, toque de novo").
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 15_000)
     try {
       const res = await fetch("/api/chat/button", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt_id: promptId, button_id: buttonId }),
+        signal: controller.signal,
       })
       // Sessão do chat expirada/ausente → MODAL de reautenticação (não redireciona
       // sozinho). Com TTL de 30 dias isto praticamente não ocorre.
@@ -260,18 +273,41 @@ export function JourneyChat() {
         }
         return { ok: true }
       }
-      // 409 prompt_not_active: recarrega o prompt ativo atual.
+      // 409 prompt_not_active: recarrega o prompt ativo atual (o PromptButtons será
+      // remontado via key={activePrompt.id} e não mostra aviso neste caso).
       if (res.status === 409 && data?.code === "prompt_not_active") {
         await pollMessages()
+        return { ok: false, code: "prompt_not_active" }
       }
-      return { ok: false, code: data?.code }
-    } catch {
-      return { ok: false }
+      // Demais erros (404/409/422/5xx): devolve o code p/ o PromptButtons avisar
+      // o cliente e reabilitar os botões (o loading para no finally do filho).
+      return { ok: false, code: typeof data?.code === "string" ? data.code : "error" }
+    } catch (err) {
+      // AbortError = estouramos o nosso timeout (servidor lento) → code "timeout"
+      // para o PromptButtons mostrar "conexão lenta, toque de novo". Demais erros
+      // de rede caem em code genérico. Em ambos, o botão SAI do "...".
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return { ok: false, code: "timeout" }
+      }
+      return { ok: false, code: "network" }
+    } finally {
+      clearTimeout(timeoutId)
     }
   }
 
   return (
     <div className="flex flex-1 flex-col gap-3">
+      {/* Sair do CHAT: volta para a tela de CPF/CNPJ (/n/{code}), NUNCA o login
+          da plataforma (/auth/login). Reusa goToChatLogin. */}
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={goToChatLogin}
+          className="rounded-md px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-800 hover:bg-neutral-100"
+        >
+          Sair
+        </button>
+      </div>
       <div
         ref={scrollRef}
         className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm"
