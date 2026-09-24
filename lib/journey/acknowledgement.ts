@@ -248,12 +248,14 @@ export function backToOptionsButtons(): Button[] {
  * Variação sem nome cai em "Olá!" (nunca "Olá, !"/"null").
  */
 export function threeOptionsSummary(ctx: AckContext): string {
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá!"
-  // Objetivo (pedido do Fabio 2026-09-24): exibe já o VALOR; o vencimento original
-  // e a natureza (serviço do cedente) ficam sob demanda no "Consultar dívida".
+  const greeting = ctx.firstName ? `Oi, ${ctx.firstName}! Tudo bem?` : "Oi! Tudo bem?"
+  // Tom AMIGÁVEL + objetivo (pedido do Fabio 2026-09-24): acolhe, já exibe o VALOR
+  // e se coloca à disposição. O vencimento original e a natureza (serviço do
+  // cedente) ficam sob demanda no "Consultar dívida". Linguagem D36 (sem ameaça).
   return (
-    `${greeting} Você tem uma pendência de ${BRL(ctx.updatedValue)} com a ${ctx.creditorName}. ` +
-    `Como prefere seguir? Se já pagou, é só desconsiderar esta mensagem.`
+    `${greeting} Estou aqui para te ajudar a resolver um valor em aberto de ` +
+    `${BRL(ctx.updatedValue)} com a ${ctx.creditorName}, da forma mais simples possível. ` +
+    `Como você prefere seguir? Se já tiver pago, pode desconsiderar esta mensagem. 🙂`
   )
 }
 

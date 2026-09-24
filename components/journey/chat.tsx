@@ -673,6 +673,17 @@ export function JourneyChat() {
           }
           // senão: mantém aguardando_motor; o poll trará wait_started_at do servidor.
         }
+        // CONSULTAR — informativo: renderiza a resposta (vencimento + cedente) NA
+        // HORA, sem depender do timing do poll; o menu reabre em seguida via
+        // pollMessages. O dedup por conteúdo colapsa a bolha local com a persistida
+        // que o poll trouxer (mesmo texto) — nunca duplica.
+        if (data?.action === "consult" && typeof data?.reply === "string" && data.reply) {
+          const consultText = data.reply as string
+          setMessages((prev) => [
+            ...prev,
+            { id: `consult-${Date.now()}`, from: "assistant", text: consultText, action: null, promptId: null },
+          ])
+        }
         // O prompt clicado já foi respondido (answered) no servidor. Limpamos o
         // prompt local para não travar a UI num prompt morto e puxamos o estado:
         // mensagens novas (dados da dívida + resposta) + o novo active_prompt (o

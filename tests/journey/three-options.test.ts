@@ -156,11 +156,11 @@ describe("bootstrap do menu de 3 opções (§6.1)", () => {
     expect(db.chat_prompts.length).toBe(0)
   })
 
-  it("firstName vazio → saudação genérica 'Olá!' (nunca 'Olá, !'/'null')", async () => {
+  it("firstName vazio → saudação genérica (nunca 'Oi, !'/'null')", async () => {
     const { threeOptionsSummary } = await import("@/lib/journey/acknowledgement")
     const msg = threeOptionsSummary({ firstName: "", creditorName: "VMAX", updatedValue: 100, invoiceCount: 1, oldestDueDate: "2020-01-10" })
-    expect(msg.startsWith("Olá!")).toBe(true)
-    expect(msg).not.toContain("Olá, !")
+    expect(msg.startsWith("Oi! Tudo bem?")).toBe(true)
+    expect(msg).not.toContain("Oi, !")
     expect(msg).not.toContain("null")
   })
 })
@@ -324,7 +324,7 @@ describe("resumo objetivo + Consultar + reset 24h", () => {
     const s = threeOptionsSummary(await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
     expect(s).toContain("250")
     expect(s).not.toContain("Vencimento original")
-    expect(s).toContain("Como prefere seguir")
+    expect(s).toMatch(/prefere seguir/i)
   })
 
   it("debtConsultReply mostra vencimento original + serviço do cedente", async () => {
@@ -333,6 +333,30 @@ describe("resumo objetivo + Consultar + reset 24h", () => {
     expect(r).toContain("Vencimento original")
     expect(r).toMatch(/serviço oferecido pela/i)
     expect(r).toContain("VMAX")
+  })
+
+  it("Consultar [2]: sequência do clique gera a resposta + reabre o menu (não fica mudo)", async () => {
+    const ack = await import("@/lib/journey/acknowledgement")
+    const { answerPrompt } = await import("@/lib/journey/prompts")
+    // 1) bootstrap do menu
+    await ack.bootstrapThreeOptionsPrompt({ companyId: CO, sessionId: SID, customerId: CUST, debtIds: [DEBT], primaryDebtId: DEBT })
+    const p1 = db.chat_prompts.find((p) => p.status === "active")!
+    expect(p1.buttons.map((b: any) => b.id)).toContain(2)
+    const msgsBefore = db.chat_messages.length
+    // 2) simula o branch BTN_CONSULT do button/route.ts
+    const answered = await answerPrompt({ sessionId: SID, companyId: CO, promptId: p1.id, buttonId: 2 })
+    expect(answered.ok).toBe(true)
+    const reply = ack.debtConsultReply(await ack.buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
+    await ack.persistAssistantMessage({ companyId: CO, sessionId: SID, text: reply })
+    const reopened = await ack.reopenThreeOptions({ companyId: CO, sessionId: SID, customerId: CUST, debtIds: [DEBT], primaryDebtId: DEBT })
+    expect(reopened.ok).toBe(true)
+    // 3) a resposta do consult foi persistida E há um novo menu ativo
+    expect(db.chat_messages.some((m) => m.text === reply)).toBe(true)
+    expect(db.chat_messages.length).toBeGreaterThan(msgsBefore)
+    const active = db.chat_prompts.find((p) => p.status === "active")
+    expect(active).toBeTruthy()
+    expect(active!.id).not.toBe(p1.id)
+    expect(active!.buttons.map((b: any) => b.id)).toEqual([4, 1, 2, 0])
   })
 
   it("reset 24h: histórico com >24h é apagado; recente é mantido", async () => {
