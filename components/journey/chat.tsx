@@ -448,7 +448,8 @@ export function JourneyChat() {
               <>
                 <p className="text-base font-semibold text-neutral-800">Você ainda está aí?</p>
                 <p className="mt-2 text-sm text-neutral-600">
-                  Sua conversa continua salva. Toque em <strong>Continuar</strong> para retomar de onde parou.
+                  Sua conversa continua salva. Toque em <strong>Continuar</strong> para retomar de onde parou,
+                  ou em <strong>Sair</strong> para encerrar.
                 </p>
                 <button
                   type="button"
@@ -457,6 +458,13 @@ export function JourneyChat() {
                   className="mt-5 w-full rounded-md px-4 py-2.5 text-sm font-semibold text-white"
                 >
                   Continuar
+                </button>
+                <button
+                  type="button"
+                  onClick={goToChatLogin}
+                  className="mt-2 w-full rounded-md border border-neutral-300 px-4 py-2.5 text-sm font-semibold text-neutral-600 hover:bg-neutral-50"
+                >
+                  Sair
                 </button>
               </>
             ) : (
