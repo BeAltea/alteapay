@@ -98,6 +98,13 @@ export async function chatSend(
     if (dup?.id) return { ok: true, message_id: dup.id, duplicate: true }
   }
 
+  // §C3: composição com o placeholder "trabalhando" (chat-turn.recordWorkingPlaceholder,
+  // gravado no Negociar). Como chat_messages NÃO tem coluna superseded_at, adotamos a
+  // variante SEM migração por ORDENAÇÃO: o placeholder foi gravado no clique (mais
+  // antigo) e este chat.send do n8n é mais novo → renderiza ABAIXO dele
+  // ("Estou preparando…" → resposta real), leitura natural. A dedup por conteúdo
+  // abaixo usa o TEXTO exato, e o placeholder tem texto diferente das respostas do
+  // n8n, então nunca há falso-positivo de duplicata entre eles.
   let prompt: PromptRow | null = null
   if (args.prompt) {
     const created = await createPrompt({

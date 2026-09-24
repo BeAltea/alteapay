@@ -163,6 +163,77 @@ describe("emitNegotiationStart (H7/H8)", () => {
     expect(r.ok).toBe(true)
     if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
   })
+
+  // ── §C3: entrega DURÁVEL via outbox + fix da assimetria de URL ─────────────
+
+  it("§C3: POST ok → grava a linha no outbox e a marca 'sent' (sem re-POST no flush)", async () => {
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-durable-ok")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-durable-ok")
+    expect(rows.length).toBe(1) // 1 linha por event_id
+    expect(rows[0].status).toBe("sent") // marcada como entregue
+    expect(rows[0].sent_at).toBeTruthy()
+  })
+
+  it("§C3: POST 5xx → a linha do outbox FICA 'pending' (o flush reentregará — entrega CONFIÁVEL)", async () => {
+    respondStatus = 500
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-durable-500")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(false)
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-durable-500")
+    expect(rows.length).toBe(1)
+    expect(rows[0].status).toBe("pending") // NÃO perdida: reentrega no próximo flush
+  })
+
+  it("§C3: idempotente por event_id — 2 disparos do mesmo event_id → 1 só linha", async () => {
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    await emitNegotiationStart(SID, "evt-idem")
+    await emitNegotiationStart(SID, "evt-idem")
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-idem")
+    expect(rows.length).toBe(1)
+  })
+
+  it("§C3: URL só POR-TENANT (env vazia) → o start VAI ao n8n (fim da assimetria 'não envia nada')", async () => {
+    // Antes: kickoff era env-only → tenant-only virava "" → engine_unavailable.
+    delete process.env.N8N_CHAT_FLOW_URL
+    delete process.env.N8N_EVENT_FLOW_URL
+    db.tenant_chat_config[0].n8n_chat_flow_url = `http://127.0.0.1:${port}/webhook/tenant`
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-tenant-url")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    expect(lastRaw).not.toBe("") // POSTou de fato
+    expect(JSON.parse(lastRaw).event).toBe("negotiation.start")
+  })
+
+  it("§C3: SEM N8N_WEBHOOK_SECRET mas COM URL → ainda dispara (secret deixou de ser hard-gate)", async () => {
+    delete process.env.N8N_WEBHOOK_SECRET
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-nosecret")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    expect(lastRaw).not.toBe("") // POST aconteceu mesmo sem secret
+    // reset p/ não vazar para os próximos testes (beforeEach re-seta, mas explícito)
+    process.env.N8N_WEBHOOK_SECRET = SECRET
+  })
+
+  it("§C3: sem NENHUMA URL → enfileira mesmo assim (durável p/ o dia do plug) e reporta unavailable", async () => {
+    delete process.env.N8N_CHAT_FLOW_URL
+    delete process.env.N8N_EVENT_FLOW_URL
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-nourl-enqueue")
+    expect(r.ok).toBe(true)
+    if (r.ok && !("delivered" in r && r.delivered)) {
+      expect((r as any).reason).toBe("engine_unavailable")
+    }
+    expect(lastRaw).toBe("") // nada POSTado
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-nourl-enqueue")
+    expect(rows.length).toBe(1) // porém enfileirado (durável)
+    expect(rows[0].status).toBe("pending")
+  })
 })
 
 describe("resolveEngineForSession (H7/H8 roteamento)", () => {

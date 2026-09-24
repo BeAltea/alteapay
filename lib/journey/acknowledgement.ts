@@ -511,6 +511,29 @@ export async function persistAssistantMessage(input: {
         .maybeSingle()
       if (existing) return (existing as { id: string }).id
     }
+
+    // DEDUP POR CONTEÚDO — "manter só a última" (mesmo padrão provado em
+    // chat-send.ts:87-99). Fluxos plataforma (debtInfoMessage, replies de
+    // Negociar/Não-reconheço) e o re-bootstrap da saudação re-persistiam texto
+    // IDÊNTICO a cada clique/re-entrada — sem promptId, ou com um prompt NOVO
+    // (a idempotência por prompt_id acima não pega prompt novo). Se uma mensagem
+    // 'assistant' com o MESMO texto já existe nesta sessão nos últimos 15min, NÃO
+    // re-insere: devolve o id existente. O texto já é neutro/mascarado (valor/venc
+    // ok, sem documento) — nenhuma PII nova é envolvida. Cobre também o caminho COM
+    // promptId (saudação re-bootstrapada com prompt novo → mesmo texto suprimido; o
+    // prompt/menu é recriado por createPrompt, mas a bolha não duplica).
+    const since = new Date(Date.now() - 15 * 60_000).toISOString()
+    const { data: dup } = await supabase
+      .from("chat_messages")
+      .select("id")
+      .eq("session_id", input.sessionId)
+      .eq("role", "assistant")
+      .eq("text", text)
+      .gte("created_at", since)
+      .limit(1)
+      .maybeSingle()
+    if (dup) return (dup as { id: string }).id
+
     const { data } = await supabase
       .from("chat_messages")
       .insert({
@@ -787,8 +810,11 @@ async function dispatchNegotiationStartInBackground(input: {
  * clique é persistida localmente pelo chamador (o histórico nunca depende do
  * n8n). Se o n8n entregar por trás, os PRÓXIMOS turnos vão ao fluxo. NUNCA lança.
  *
- * `waitForDispatch` (default false) permite ao teste aguardar o background de
- * forma determinística; em produção o caminho crítico nunca o aguarda.
+ * `waitForDispatch` (default false) permite ao chamador/teste aguardar o
+ * background de forma DETERMINÍSTICA. handleDebtNegotiate passa `true` DE
+ * PROPÓSITO (protegido por um Promise.race contra deadline curto), garantindo
+ * que o disparo é iniciado sem travar o clique; o default fire-and-forget vale
+ * para os demais caminhos (ex.: reconhecimento legado na rota).
  */
 export async function startN8nNegotiation(input: {
   companyId: string
@@ -806,16 +832,19 @@ export async function startN8nNegotiation(input: {
     debtId: input.debtId,
     eventId,
   })
-  // ENDURECIDO (2026-09-23): por PADRÃO AGUARDA o disparo — a arquitetura pós-
-  // Negociar depende do negotiation.start CHEGAR no n8n (senão o fluxo nunca
-  // conduz). Como o kickoff usa timeout CURTO (~5s, N8N_KICKOFF_TIMEOUT_MS), o
-  // await é bounded e seguro (< maxDuration=60s), sem o problema do fire-and-forget
-  // em serverless (que podia não executar). `waitForDispatch:false` explícito ainda
-  // permite o modo antigo. O rejection é engolido dentro do dispatch.
-  if (input.waitForDispatch === false) {
-    void dispatch
-  } else {
+  // CORRIGIDO (2026-09-23): o caminho crítico do clique NUNCA aguarda o dispatch
+  // por PADRÃO. O kickoff (emitNegotiationStart) já roda com timeout curto (~5s,
+  // N8N_KICKOFF_TIMEOUT_MS) DENTRO do dispatch; aguardá-lo aqui por default era o
+  // que travava o botão em "..." (build + até 5s de POST síncrono). Agora o default
+  // é fire-and-forget: o clique responde imediatamente após persistir, e o disparo
+  // segue resolvendo em background. `waitForDispatch:true` EXPLÍCITO ainda permite
+  // o modo determinístico — usado pelos testes e por handleDebtNegotiate, que se
+  // protege da trava com um Promise.race contra deadline curto próprio. O rejection
+  // é engolido dentro do dispatch (nunca lança).
+  if (input.waitForDispatch === true) {
     await dispatch
+  } else {
+    void dispatch
   }
 
   // Owner SÍNCRONO = platform: o clique responde já e o reply é sempre
@@ -914,6 +943,7 @@ export async function handleDebtNegotiate(input: {
   buttonId: number
   ip?: string | null
   userAgent?: string | null
+  dispatchDeadlineMs?: number // deadline do kickoff no caminho do clique (default 2500)
 }): Promise<{ ok: true; engineOwner: "platform" | "n8n"; reply: string }> {
   const ackCtx = await buildAckContext({
     companyId: input.companyId,
@@ -941,24 +971,51 @@ export async function handleDebtNegotiate(input: {
     userAgent: input.userAgent,
   })
 
-  // Kickoff n8n (best-effort, fire-and-forget): dispara negotiation.start em
-  // BACKGROUND — NÃO bloqueia a resposta ao clique (ver startN8nNegotiation). O
-  // owner síncrono é sempre 'platform'; a promoção a 'n8n' (se entregar) acontece
-  // por trás e vale para os PRÓXIMOS turnos.
+  // Kickoff n8n CONFIÁVEL sem travar o clique: dispara negotiation.start e AGUARDA
+  // até um deadline CURTO (default 2500ms) via Promise.race. `waitForDispatch:true`
+  // é passado DE PROPÓSITO (garante que o disparo é de fato iniciado e não é
+  // perdido pelo serverless num fire-and-forget puro); o race contra o deadline
+  // nos protege da trava do POST síncrono. Se entregar dentro do deadline, promove
+  // engine_owner a 'n8n' já nesta resposta; se estourar, o clique retorna em ≤2.5s
+  // e o disparo segue resolvendo em background (emitNegotiationStart tem timeout
+  // próprio ~5s < maxDuration=60s e grava engine_owner/auditoria ao concluir).
+  // NUNCA lança.
   let engineOwner: "platform" | "n8n" = "platform"
+  const deadlineMs = input.dispatchDeadlineMs ?? 2500
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
   try {
-    const start = await startN8nNegotiation({
-      companyId: input.companyId,
-      sessionId: input.sessionId,
-      customerId: input.customerId,
-      debtId: input.debtId,
-    })
+    const start = await Promise.race<StartN8nResult>([
+      startN8nNegotiation({
+        companyId: input.companyId,
+        sessionId: input.sessionId,
+        customerId: input.customerId,
+        debtId: input.debtId,
+        waitForDispatch: true,
+      }),
+      new Promise<StartN8nResult>((resolve) => {
+        deadlineTimer = setTimeout(
+          () => resolve({ ok: true, owner: "platform", delivered: false }),
+          deadlineMs,
+        )
+        // não segura o event loop: o dispatch, se estourar o deadline, segue solto
+        // e o timer não deve impedir o encerramento da função serverless nem do teste.
+        deadlineTimer.unref?.()
+      }),
+    ])
     engineOwner = start.owner
   } catch (err) {
     console.warn("[journey] negotiation.start falhou (fallback assistido):", (err as Error).message)
+  } finally {
+    if (deadlineTimer) clearTimeout(deadlineTimer)
   }
 
-  const reply = "Perfeito! Então vamos trabalhar juntos para sanar o seu débito."
+  // Indicador "trabalhando": até o n8n empurrar o próximo turno (via chat.send), a
+  // única sinalização de que a negociação está em curso é este reply. Deixa
+  // explícito que estamos PREPARANDO a negociação (o front o mostra no pollMessages
+  // pós-clique; a resposta do n8n aparece depois por polling normal). Sem PII.
+  const reply =
+    "Perfeito! Então vamos trabalhar juntos para sanar o seu débito. " +
+    "Estou preparando sua negociação, só um instante…"
   // SEMPRE persiste o reply localmente (bug histórico: condicionar a
   // engineOwner==='platform' deixava o lado do assistente VAZIO no banco quando o
   // n8n era assumido dono mas NÃO devolvia/empurrava nada — a sessão reaberta só

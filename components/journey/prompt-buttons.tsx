@@ -34,8 +34,10 @@ export function PromptButtons({
   onClick,
 }: {
   prompt: ActivePrompt
-  /** Envia o clique; retorna ok/erro. 409 prompt_not_active volta pro pai recarregar. */
-  onClick: (promptId: string, buttonId: number) => Promise<PromptClickResult>
+  /** Envia o clique; retorna ok/erro. 409 prompt_not_active volta pro pai recarregar.
+   *  O `buttonLabel` deixa o pai reconhecer o botão Negociar (pela label, já que a
+   *  UI não tem o `kind`) para injetar o indicador optimistic "preparando negociação". */
+  onClick: (promptId: string, buttonId: number, buttonLabel: string) => Promise<PromptClickResult>
 }) {
   const [pending, setPending] = useState<number | null>(null)
   const [answered, setAnswered] = useState(false)
@@ -49,8 +51,9 @@ export function PromptButtons({
     if (pending !== null || answered) return
     setNotice(null)
     setPending(buttonId)
+    const label = buttons.find((b) => b.id === buttonId)?.label ?? ""
     try {
-      const res = await onClick(prompt.id, buttonId)
+      const res = await onClick(prompt.id, buttonId, label)
       if (res.ok) {
         setAnswered(true)
       } else if (res.code === "prompt_not_active") {

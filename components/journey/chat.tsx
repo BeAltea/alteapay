@@ -14,24 +14,22 @@
 //   (/n/{code}), NÃO o login da AlteaPay.
 import { useCallback, useEffect, useRef, useState } from "react"
 import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
+import {
+  dedupAssistantByContent,
+  isNegotiateLabel,
+  NEGOTIATION_PENDING_TEXT,
+  type ChatMsg,
+  type MsgAction,
+} from "./chat-display"
 
-interface MsgAction {
-  type: string
-  label: string
-  href: string
-}
-
-interface ChatMsg {
-  id: string
-  from: "customer" | "assistant"
-  text: string
-  action?: MsgAction | null
-  // prompt_id da pergunta que originou esta bolha (quando é a mensagem do prompt).
-  // Enquanto o prompt está 'active', a pergunta é mostrada no bloco de botões — a
-  // bolha correspondente é omitida para não duplicar. Respondido o prompt (sem
-  // active_prompt), a bolha aparece e mantém o resumo no histórico.
-  promptId?: string | null
-}
+// ChatMsg / MsgAction e os helpers puros de exibição (dedup por conteúdo, rótulo
+// Negociar, texto do indicador) vivem em ./chat-display para serem testados no
+// ambiente node do vitest. Ver comentário lá.
+//
+// prompt_id da bolha (quando é a mensagem do prompt): enquanto o prompt está
+// 'active' a pergunta aparece no bloco de botões — a bolha persistida é omitida
+// no render p/ não duplicar; respondido o prompt (sem active_prompt) a bolha
+// reaparece e mantém o resumo no histórico.
 
 /** Só aceitamos links externos http(s) — nunca javascript:/relativos suspeitos. */
 function safeExternalAction(raw: unknown): MsgAction | null {
@@ -75,6 +73,10 @@ export function JourneyChat() {
   // perdendo o histórico. O usuário decide (Continuar / Entrar novamente).
   const [idleModal, setIdleModalState] = useState<null | "idle" | "expired">(null)
   const modalRef = useRef<null | "idle" | "expired">(null)
+  // Bolha local "trabalhando" injetada ao clicar Negociar, antes de a resposta
+  // do n8n chegar via poll. Guardamos o id sintético para removê-la quando a
+  // primeira mensagem assistant real da negociação chegar (ou em erro).
+  const pendingNegotiationRef = useRef<string | null>(null)
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
@@ -154,16 +156,26 @@ export function JourneyChat() {
         if (seenIds.current.has(m.id)) continue
         seenIds.current.add(m.id)
         sinceRef.current = m.created_at
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: m.id,
-            from: m.role === "customer" ? "customer" : "assistant",
-            text: m.text,
-            action: safeExternalAction(m.action),
-            promptId: m.prompt_id ?? null,
-          },
-        ])
+        const isAssistant = m.role !== "customer"
+        // Se havia uma bolha "preparando negociação" local e chegou a 1ª
+        // mensagem real do assistente (resposta do n8n), removemos a optimistic
+        // ao inserir a real — troca sem piscar duplicado.
+        const optimisticId = pendingNegotiationRef.current
+        const dropOptimistic = isAssistant && optimisticId !== null
+        if (dropOptimistic) pendingNegotiationRef.current = null
+        setMessages((prev) => {
+          const base = dropOptimistic ? prev.filter((x) => x.id !== optimisticId) : prev
+          return [
+            ...base,
+            {
+              id: m.id,
+              from: isAssistant ? "assistant" : "customer",
+              text: m.text,
+              action: safeExternalAction(m.action),
+              promptId: m.prompt_id ?? null,
+            },
+          ]
+        })
       }
       // Nunca sobrescreve o prompt depois de encerrado (preserva o histórico).
       if (!endedRef.current) setActivePrompt(data?.active_prompt ?? null)
@@ -232,27 +244,67 @@ export function JourneyChat() {
     void pollMessages()
   }
 
+  // Remove a bolha optimistic "preparando negociação" (se houver). Chamada nos
+  // caminhos de erro do clique — não faz sentido manter "preparando" se o clique
+  // falhou; o PromptButtons já mostra "toque de novo". No SUCESSO NÃO limpamos
+  // aqui: a bolha só sai quando a 1ª resposta real do n8n chega no poll.
+  function clearPendingNegotiation() {
+    const id = pendingNegotiationRef.current
+    if (!id) return
+    pendingNegotiationRef.current = null
+    setMessages((prev) => prev.filter((m) => m.id !== id))
+  }
+
   // Clique num prompt de botões (Consultar/Negociar/Não reconheço). HISTÓRICO VEM
   // DO SERVIDOR: o servidor persiste em chat_messages a pergunta, o clique do
   // cliente, os dados da dívida e a resposta — então NÃO empurramos bolhas locais
   // (evita duplicar). Um poll logo após o POST traz tudo + o PRÓXIMO prompt (se
   // houver). Assim uma sessão reaberta reconstrói o contexto completo.
   //
+  // EXCEÇÃO — indicador optimistic ao Negociar: uma bolha LOCAL "preparando
+  // negociação" é injetada no clique (antes do await) só para dar feedback de
+  // "trabalhando" enquanto o backend dispara negotiation.start ao n8n e
+  // aguardamos a 1ª resposta chegar. Não é persistida; some quando a resposta
+  // real aparece (no poll) ou em erro. Não colide com o histórico do servidor.
+  //
   // NÃO encerramos mais o chat no clique: o fluxo continua (Consultar reabre o
   // menu Negociar/Não reconheço; Negociar entra na negociação n8n). O polling
   // segue vivo e o active_prompt reflete o estado real do servidor. Só marcamos
   // 'ended' quando a rota sinaliza um desfecho terminal (transferência a humano)
   // — nunca num passo intermediário do fluxo.
-  async function clickButton(promptId: string, buttonId: number): Promise<PromptClickResult> {
+  async function clickButton(
+    promptId: string,
+    buttonId: number,
+    buttonLabel: string,
+  ): Promise<PromptClickResult> {
     resetIdle()
-    // GARANTIA DE VIVACIDADE: o backend agora responde rápido (o kickoff n8n saiu
-    // do caminho crítico do clique — C1), mas ainda blindamos o cliente contra um
-    // servidor lento/rede presa com um AbortController. Sem isto, um fetch pendurado
+    const isNegotiate = isNegotiateLabel(buttonLabel)
+    // OPTIMISTIC: ao Negociar, injeta já uma bolha "preparando sua negociação"
+    // (antes do await). Feedback imediato de que o sistema está trabalhando
+    // enquanto o backend dispara negotiation.start ao n8n e aguardamos a 1ª
+    // resposta (chat.send) chegar via poll. NÃO persiste: é local e some quando a
+    // resposta real aparece (ou em erro).
+    if (isNegotiate) {
+      const optimisticId = `optimistic-neg-${Date.now()}`
+      pendingNegotiationRef.current = optimisticId
+      setMessages((prev) => [
+        ...prev,
+        { id: optimisticId, from: "assistant", text: NEGOTIATION_PENDING_TEXT, action: null, promptId: null },
+      ])
+    }
+    // GARANTIA DE VIVACIDADE: o backend responde o clique rápido (o kickoff n8n
+    // roda em background — C1), mas ainda blindamos o cliente contra um servidor
+    // lento/rede presa com um AbortController. Sem isto, um fetch pendurado
     // deixaria a Promise do onClick sem resolver e o botão travado em "..." para
     // sempre. Com o timeout, o "..." SEMPRE resolve e o PromptButtons reabilita os
     // botões e mostra um aviso ("conexão lenta, toque de novo").
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 15_000)
+    // 8s: cobre folgadamente o caminho feliz (build+persist ~1-2s) e ainda dá
+    // margem se o kickoff ainda estiver awaitado (5s) num runtime não-corrigido —
+    // nesse caso, com Negociar, o optimistic acima já mostrou "preparando", então
+    // um abort não deixa a tela muda. Para Consultar (que não chama n8n) é folga
+    // enorme. Acima disso o cliente desiste em vez de prender o botão por 15s.
+    const timeoutId = setTimeout(() => controller.abort(), 8_000)
     try {
       const res = await fetch("/api/chat/button", {
         method: "POST",
@@ -263,6 +315,7 @@ export function JourneyChat() {
       // Sessão do chat expirada/ausente → MODAL de reautenticação (não redireciona
       // sozinho). Com TTL de 30 dias isto praticamente não ocorre.
       if (res.status === 401) {
+        clearPendingNegotiation()
         stopPoll()
         modalRef.current = "expired"
         setIdleModalState("expired")
@@ -274,6 +327,8 @@ export function JourneyChat() {
         // prompt local para não travar a UI num prompt morto e puxamos o estado:
         // mensagens novas (dados da dívida + resposta) + o novo active_prompt (o
         // menu pós-consulta, quando houver). O poll re-hidrata activePrompt.
+        // NÃO limpamos a optimistic aqui: a resposta do n8n costuma vir num poll
+        // seguinte, não neste — a bolha "preparando" fica até ela chegar.
         setActivePrompt(null)
         await pollMessages()
         // Desfecho terminal: só uma transferência a humano encerra a conversa.
@@ -288,16 +343,20 @@ export function JourneyChat() {
       // 409 prompt_not_active: recarrega o prompt ativo atual (o PromptButtons será
       // remontado via key={activePrompt.id} e não mostra aviso neste caso).
       if (res.status === 409 && data?.code === "prompt_not_active") {
+        clearPendingNegotiation()
         await pollMessages()
         return { ok: false, code: "prompt_not_active" }
       }
       // Demais erros (404/409/422/5xx): devolve o code p/ o PromptButtons avisar
       // o cliente e reabilitar os botões (o loading para no finally do filho).
+      clearPendingNegotiation()
       return { ok: false, code: typeof data?.code === "string" ? data.code : "error" }
     } catch (err) {
       // AbortError = estouramos o nosso timeout (servidor lento) → code "timeout"
       // para o PromptButtons mostrar "conexão lenta, toque de novo". Demais erros
-      // de rede caem em code genérico. Em ambos, o botão SAI do "...".
+      // de rede caem em code genérico. Em ambos, o botão SAI do "..." e a bolha
+      // optimistic é removida (o clique não avançou).
+      clearPendingNegotiation()
       if (err instanceof DOMException && err.name === "AbortError") {
         return { ok: false, code: "timeout" }
       }
@@ -325,12 +384,16 @@ export function JourneyChat() {
         className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm"
         style={{ minHeight: 320 }}
       >
-        {messages
-          // Enquanto o prompt está ATIVO, sua pergunta já é mostrada no bloco de
-          // botões abaixo — omite a bolha persistida correspondente para não
-          // duplicar. Respondido o prompt (sem active_prompt), a bolha aparece.
-          .filter((m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id))
-          .map((m) => (
+        {dedupAssistantByContent(
+          // 1º filtra a bolha do prompt ATIVO (sua pergunta já aparece no bloco de
+          // botões abaixo — omitida aqui para não duplicar; respondido o prompt,
+          // sem active_prompt, ela reaparece). 2º deduplica por conteúdo, mantendo
+          // a ÚLTIMA ocorrência de cada texto assistant idêntico ("Aqui estão os
+          // dados...", saudação re-bootstrapada) → "só a última resposta".
+          messages.filter(
+            (m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id),
+          ),
+        ).map((m) => (
           <div
             key={m.id}
             className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}

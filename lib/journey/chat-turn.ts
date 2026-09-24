@@ -56,6 +56,55 @@ function sanitize(text: string): string {
 }
 
 /**
+ * §C3: texto do indicador "trabalhando" do handoff assíncrono ao n8n. Exportado
+ * para que o chat-send possa reconhecê-lo (a resposta real do n8n renderiza
+ * DEPOIS dele — ordenação natural: "preparando…" → resposta).
+ */
+export const WORKING_PLACEHOLDER_TEXT = "Estou preparando sua negociação. Só um instante…"
+
+/**
+ * §C3: grava o placeholder "trabalhando" logo após o Negociar, para o poller
+ * (GET /api/chat/messages) exibir progresso IMEDIATAMENTE — sem mudança no
+ * cliente — enquanto o negotiation.start viaja ao n8n e a resposta real ainda
+ * não chegou (via chat.send, papel B).
+ *
+ * Idempotente por CONTEÚDO (mesmo texto, janela 15min) — mesmo padrão do
+ * chat-send.ts: re-entradas / re-cliques NUNCA empilham mais de um placeholder,
+ * compondo com a dedup do slice de acknowledgement sem conflito. Nunca lança.
+ *
+ * O slice de acknowledgement/botão chama isto logo após startN8nNegotiation(...).
+ */
+export async function recordWorkingPlaceholder(input: {
+  companyId: string
+  sessionId: string
+}): Promise<void> {
+  const text = WORKING_PLACEHOLDER_TEXT
+  try {
+    const supabase = createServiceClient()
+    const since = new Date(Date.now() - 15 * 60_000).toISOString()
+    const { data: dup } = await supabase
+      .from("chat_messages")
+      .select("id")
+      .eq("session_id", input.sessionId)
+      .eq("role", "assistant")
+      .eq("text", text)
+      .gte("created_at", since)
+      .limit(1)
+      .maybeSingle()
+    if (dup?.id) return // dedup — mantém só um
+    await supabase.from("chat_messages").insert({
+      company_id: input.companyId,
+      session_id: input.sessionId,
+      role: "assistant",
+      text,
+      engine: "platform",
+    })
+  } catch (err) {
+    console.warn("[chat-turn] recordWorkingPlaceholder falhou (não-fatal):", (err as Error).message)
+  }
+}
+
+/**
  * Executa um turno do chat autenticado. `ctx` vem do cookie de sessão.
  * A resposta neutra + chat.engine_error (1x/sessão) fica a cargo do chamador
  * quando o engine lança.

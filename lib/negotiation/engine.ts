@@ -561,11 +561,36 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
 // (claro só com as 2 flags; como payment_origin está travado em 'platform' por
 // D17, o CPF nunca sai).
 
-/** URL do fluxo de eventos do n8n. Reusa N8N_CHAT_FLOW_URL se não houver um
- * endpoint de eventos dedicado (N8N_EVENT_FLOW_URL) — o fluxo distingue pelo
- * campo `event` do corpo. */
-function eventFlowUrl(): string {
-  return process.env.N8N_EVENT_FLOW_URL || process.env.N8N_CHAT_FLOW_URL || ""
+/**
+ * §C3: URL do kickoff (negotiation.start) resolvida COMO OS TURNOS.
+ * Ordem: endpoint dedicado (N8N_EVENT_FLOW_URL) → fluxo de chat POR TENANT
+ * (tenant_chat_config.n8n_chat_flow_url) → env (N8N_CHAT_FLOW_URL) → "".
+ *
+ * Corrige a assimetria histórica em que o kickoff resolvia a URL só por env
+ * (N8N_EVENT_FLOW_URL → N8N_CHAT_FLOW_URL) enquanto os turnos usam
+ * resolveChatFlowUrl (por-tenant → env): uma URL só por tenant fazia o start ir
+ * para "" (engine_unavailable) mesmo com os turnos indo ao n8n. A URL resolvida
+ * é um segredo operacional — nunca logar.
+ */
+async function resolveEventFlowUrl(companyId: string): Promise<string> {
+  // endpoint de eventos dedicado sempre vence, se configurado.
+  const dedicated = process.env.N8N_EVENT_FLOW_URL
+  if (dedicated && dedicated.trim()) return dedicated.trim()
+  // senão, espelha o resolver do TURNO: fluxo de chat por-tenant → env.
+  try {
+    const { createServiceClient } = await import("@/lib/supabase/service")
+    const { data: cfg } = await createServiceClient()
+      .from("tenant_chat_config")
+      .select("n8n_chat_flow_url")
+      .eq("company_id", companyId)
+      .maybeSingle()
+    const perTenant = cfg?.n8n_chat_flow_url
+    if (typeof perTenant === "string" && perTenant.trim()) return perTenant.trim()
+  } catch (err) {
+    // leitura best-effort: se falhar, cai na env (nunca derruba o kickoff).
+    console.warn("[engine:n8n] resolveEventFlowUrl falhou (usando env):", (err as Error).message)
+  }
+  return process.env.N8N_CHAT_FLOW_URL || ""
 }
 
 export interface NegotiationStartPayload {
@@ -643,11 +668,74 @@ export async function buildNegotiationStartPayload(
 }
 
 /**
+ * §C3: grava o negotiation.start no engine_outbox (JSONB) para ENTREGA DURÁVEL —
+ * o mesmo mecanismo provado do session.start. Idempotente por event_id (índice
+ * UNIQUE): reentrada/re-clique não duplica a linha. NÃO envia aqui; a entrega
+ * fica a cargo do POST best-effort no clique E do flushOutbox do próximo turno
+ * (ordem preservada), garantindo reentrega mesmo se o POST curto falhar.
+ *
+ * NegotiationStartPayload não é um dos três EventKind que buildEnvelope produz,
+ * então NÃO passa por enqueueEvent (que tipa CanonicalEnvelope e gate em
+ * engine 'disabled'); gravamos o row shape aqui, e postToN8n/dispatchOutboxRow
+ * entregam a linha inalterados. Best-effort e não-fatal: nunca lança.
+ */
+async function enqueueNegotiationStart(p: NegotiationStartPayload): Promise<void> {
+  const { createServiceClient } = await import("@/lib/supabase/service")
+  const supabase = createServiceClient()
+  // idempotente por event_id (UNIQUE) — reentrada não duplica.
+  const { data: existing } = await supabase
+    .from("engine_outbox")
+    .select("id")
+    .eq("event_id", p.event_id)
+    .maybeSingle()
+  if (existing) return
+  await supabase.from("engine_outbox").insert({
+    session_id: p.session_id,
+    company_id: p.company_id,
+    event_type: p.type, // rótulo negotiation.start resolvido (por tenant)
+    event_id: p.event_id,
+    payload: p,
+    status: "pending",
+    attempts: 0,
+    next_attempt_at: new Date().toISOString(),
+  })
+}
+
+/**
+ * §C3: marca a linha do outbox como 'sent' quando o POST curto do clique já
+ * entregou — evita um re-POST duplicado no próximo flush. Idempotente por
+ * event_id. Best-effort e não-fatal: nunca lança.
+ */
+async function markOutboxSent(eventId: string): Promise<void> {
+  try {
+    const { createServiceClient } = await import("@/lib/supabase/service")
+    const now = new Date().toISOString()
+    await createServiceClient()
+      .from("engine_outbox")
+      .update({ status: "sent", sent_at: now, next_attempt_at: null, updated_at: now })
+      .eq("event_id", eventId)
+      .select("id")
+  } catch (err) {
+    console.warn("[engine:n8n] markOutboxSent falhou (não-fatal):", (err as Error).message)
+  }
+}
+
+/**
  * Emite negotiation.start ao n8n (assinado, mesmo esquema HMAC dos outros
  * contratos). RESILIENTE (H8): se o n8n não estiver configurado ou o POST
  * falhar, NÃO lança — devolve delivered:false/reason:'engine_unavailable' para
- * o chamador registrar auditoria e seguir no assistido. Idempotência por
- * event_id fica a cargo do fluxo n8n (o mesmo esquema dos demais eventos).
+ * o chamador registrar auditoria e seguir no assistido.
+ *
+ * §C3 (entrega CONFIÁVEL + sem travar o clique):
+ *  1) resolve a URL COMO OS TURNOS (dedicado → por-tenant → env), removendo a
+ *     assimetria que fazia o start ir para "" com URL só por tenant.
+ *  2) N8N_WEBHOOK_SECRET DEIXA de ser hard-gate (só warn): a assinatura vazia é
+ *     problema de config do operador, idêntico ao comportamento dos turnos —
+ *     assim o start não "some" silenciosamente quando o secret falta.
+ *  3) GRAVA a linha durável no outbox (idempotente) e faz um POST best-effort de
+ *     timeout CURTO (N8N_KICKOFF_TIMEOUT_MS, default 2500ms, alinhado ao outbox).
+ *     Se o POST falha/estoura, a linha fica 'pending' e o flush do próximo turno
+ *     (e o script ops) REENTREGA — a entrega não depende de um único disparo.
  */
 export async function emitNegotiationStart(
   sessionId: string,
@@ -656,23 +744,34 @@ export async function emitNegotiationStart(
   const payload = await buildNegotiationStartPayload(sessionId, eventId).catch(() => null)
   if (!payload) return { ok: false, reason: "context_unresolved" }
 
-  const url = eventFlowUrl()
-  if (!url || !n8nWebhookSecret()) {
-    // H8: n8n não plugado ainda → cai no assistido. O contrato é o MESMO no dia
-    // do plug (só configuração muda).
+  const url = await resolveEventFlowUrl(payload.company_id)
+  if (!url) {
+    // n8n genuinamente não plugado (sem dedicado, sem tenant, sem env). Enfileira
+    // mesmo assim para durabilidade (entrega no dia em que a URL existir, igual ao
+    // session.start 'pending'), mas reporta unavailable p/ o chamador seguir assistido.
+    await enqueueNegotiationStart(payload).catch(() => {})
     return { ok: true, delivered: false, reason: "engine_unavailable" }
   }
+
+  // Secret ausente NÃO derruba mais o start (era a causa do "não envia nada"): o
+  // buildN8nOutboundHeaders segue com assinatura vazia; só avisamos no log.
+  if (!n8nWebhookSecret()) {
+    console.warn("[engine:n8n] N8N_WEBHOOK_SECRET ausente — negotiation.start irá sem assinatura")
+  }
+
   try {
-    // Kickoff (negotiation.start) usa timeout CURTO: só precisamos ENTREGAR o
-    // disparo (o n8n conduz depois via chat.send/prompt.ask). Assim o handoff é
-    // AWAITADO com segurança (bem abaixo do maxDuration=60s da rota) — confiável em
-    // serverless, sem travar o clique como o antigo flowTimeoutMs (60s).
-    const kickoffTimeoutMs = Number(process.env.N8N_KICKOFF_TIMEOUT_MS || "5000")
-    await callN8nFlow(url, payload, kickoffTimeoutMs)
+    // Kickoff (negotiation.start): timeout CURTO (2500ms default, = ENGINE_OUTBOX_TIMEOUT_MS)
+    // para não dominar o clique. A entrega NÃO depende deste único disparo:
+    const kickoffTimeoutMs = Number(process.env.N8N_KICKOFF_TIMEOUT_MS || "2500")
+    await enqueueNegotiationStart(payload) // durável, idempotente
+    await callN8nFlow(url, payload, kickoffTimeoutMs) // best-effort curto
+    await markOutboxSent(payload.event_id) // evita re-POST no próximo flush
     return { ok: true, delivered: true, event_id: eventId }
   } catch (err) {
+    // POST falhou/estourou → a linha do outbox fica 'pending' e SERÁ reentregue
+    // pelo flush do próximo turno / script ops. A entrega não se perde.
     console.warn(
-      "[engine:n8n] negotiation.start falhou (fallback assistido):",
+      "[engine:n8n] negotiation.start POST falhou (outbox reentregará):",
       err instanceof Error ? err.message : err,
     )
     return { ok: true, delivered: false, reason: "engine_unavailable" }
