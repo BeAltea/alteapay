@@ -110,19 +110,20 @@ function seed(opts: { channelLabel?: string | null; channelUrl?: string | null; 
 describe("bootstrap do menu de 3 opções (§6.1)", () => {
   beforeEach(() => seed())
 
-  it("cria prompt debt_three_options com 3 botões na ordem Pagar→Negociar→Não reconheço", async () => {
+  it("cria prompt debt_three_options com 4 botões na ordem Pagar→Negociar→Consultar→Não reconheço", async () => {
     const { bootstrapThreeOptionsPrompt } = await import("@/lib/journey/acknowledgement")
     const r = await bootstrapThreeOptionsPrompt({ companyId: CO, sessionId: SID, customerId: CUST, debtIds: [DEBT], primaryDebtId: DEBT })
     expect(r.ok && r.created).toBe(true)
     const prompt = db.chat_prompts[0]
     expect(prompt.kind).toBe("debt_three_options")
-    // ordem contratual (Pagar › Negociar › Não reconheço) — NÃO a ordem dos ids
-    expect(prompt.buttons.map((b: any) => b.id)).toEqual([4, 1, 0])
+    // ordem contratual (Pagar › Negociar › Consultar › Não reconheço) — NÃO a ordem dos ids
+    expect(prompt.buttons.map((b: any) => b.id)).toEqual([4, 1, 2, 0])
     // rótulo do Pagar carrega o valor canônico (M3) — R$ 250,00
     expect(prompt.buttons[0].label).toContain("Quero pagar")
     expect(prompt.buttons[0].label).toContain("250")
     expect(prompt.buttons[1].label).toBe("Quero negociar")
-    expect(prompt.buttons[2].label).toBe("Não reconheço esta dívida")
+    expect(prompt.buttons[2].label).toBe("Consultar dívida")
+    expect(prompt.buttons[3].label).toBe("Não reconheço esta dívida")
   })
 
   it("a mensagem-resumo traz valor atualizado e vencimento (sem clique); D36 'se já pagou'", async () => {
@@ -287,7 +288,7 @@ describe("encaminhamento ao cedente (§6.2/M6)", () => {
     expect(back.ok).toBe(true)
     const active = db.chat_prompts.find((p) => p.status === "active")
     expect(active?.kind).toBe("debt_three_options")
-    expect(active?.buttons.map((b: any) => b.id)).toEqual([4, 1, 0])
+    expect(active?.buttons.map((b: any) => b.id)).toEqual([4, 1, 2, 0])
   })
 })
 
@@ -295,18 +296,57 @@ describe("encaminhamento ao cedente (§6.2/M6)", () => {
 // buttons.ts: ordenação e ids do menu de 3 opções.
 // ============================================================================
 describe("buttons — ordenação do menu de 3 opções", () => {
-  it("sortButtons respeita `order` (Pagar,Negociar,Não reconheço) e não o id (4,1,0)", async () => {
+  it("sortButtons respeita `order` (Pagar,Negociar,Consultar,Não reconheço) e não o id (4,1,2,0)", async () => {
     const { threeOptionsButtons, sortButtons } = await import("@/lib/journey/buttons").then(async (m) => ({
       sortButtons: m.sortButtons,
       threeOptionsButtons: (await import("@/lib/journey/acknowledgement")).threeOptionsButtons,
     }))
     const sorted = sortButtons(threeOptionsButtons(250, false))
-    expect(sorted.map((b) => b.id)).toEqual([4, 1, 0])
+    expect(sorted.map((b) => b.id)).toEqual([4, 1, 2, 0])
   })
 
   it("sortButtons legado (sem `order`) mantém sort por id crescente", async () => {
     const { sortButtons } = await import("@/lib/journey/buttons")
     const sorted = sortButtons([{ id: 99, label: "z" }, { id: 0, label: "n" }, { id: 1, label: "s" }])
     expect(sorted.map((b) => b.id)).toEqual([0, 1, 99])
+  })
+})
+
+// ============================================================================
+// Ajustes 2026-09-24 (Fabio): resumo OBJETIVO (só o valor), "Consultar dívida"
+// (vencimento + serviço do cedente sob demanda) e reset do chat após 24h.
+// ============================================================================
+describe("resumo objetivo + Consultar + reset 24h", () => {
+  beforeEach(() => seed())
+
+  it("threeOptionsSummary é OBJETIVO: exibe o VALOR e NÃO o vencimento", async () => {
+    const { threeOptionsSummary, buildAckContext } = await import("@/lib/journey/acknowledgement")
+    const s = threeOptionsSummary(await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
+    expect(s).toContain("250")
+    expect(s).not.toContain("Vencimento original")
+    expect(s).toContain("Como prefere seguir")
+  })
+
+  it("debtConsultReply mostra vencimento original + serviço do cedente", async () => {
+    const { debtConsultReply, buildAckContext } = await import("@/lib/journey/acknowledgement")
+    const r = debtConsultReply(await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
+    expect(r).toContain("Vencimento original")
+    expect(r).toMatch(/serviço oferecido pela/i)
+    expect(r).toContain("VMAX")
+  })
+
+  it("reset 24h: histórico com >24h é apagado; recente é mantido", async () => {
+    const { resetStaleChatIfInactive } = await import("@/lib/journey/acknowledgement")
+    const old = new Date(Date.now() - 25 * 3_600_000).toISOString()
+    db.chat_messages = [{ id: "m1", session_id: SID, company_id: CO, role: "assistant", text: "velho", created_at: old }]
+    db.chat_prompts = [{ id: "p1", session_id: SID, company_id: CO, kind: "debt_three_options", status: "active", buttons: [], created_at: old }]
+    expect(await resetStaleChatIfInactive(SID, CO)).toBe(true)
+    expect(db.chat_messages.length).toBe(0)
+    expect(db.chat_prompts.length).toBe(0)
+
+    const fresh = new Date(Date.now() - 60_000).toISOString()
+    db.chat_messages = [{ id: "m2", session_id: SID, company_id: CO, role: "assistant", text: "novo", created_at: fresh }]
+    expect(await resetStaleChatIfInactive(SID, CO)).toBe(false)
+    expect(db.chat_messages.length).toBe(1)
   })
 })

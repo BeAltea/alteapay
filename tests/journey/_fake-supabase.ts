@@ -49,6 +49,7 @@ class QueryBuilder {
   private limitN: number | null = null
   private pendingInsert: Row[] | null = null
   private pendingUpdate: Row | null = null
+  private pendingDelete = false
   private selecting = false
 
   constructor(
@@ -121,6 +122,10 @@ class QueryBuilder {
     this.pendingUpdate = patch
     return this
   }
+  delete() {
+    this.pendingDelete = true
+    return this
+  }
 
   private applyFilters(rows: Row[]): Row[] {
     let out = rows.filter((r) => this.filters.every((f) => matches(r, f)))
@@ -154,6 +159,14 @@ class QueryBuilder {
       for (const row of target) Object.assign(row, this.pendingUpdate)
       this.onWrite?.()
       return { data: target, error: null }
+    }
+    if (this.pendingDelete) {
+      const target = new Set(this.applyFilters(table))
+      const kept = table.filter((r) => !target.has(r))
+      table.length = 0
+      table.push(...kept)
+      this.onWrite?.()
+      return { data: [...target], error: null }
     }
     return { data: this.applyFilters(table), error: null }
   }

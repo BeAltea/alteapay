@@ -229,9 +229,10 @@ export function threeOptionsButtons(value: number, showHandoff: boolean): Button
   const buttons: Button[] = [
     { id: BTN_PAY, label: payLabel(value), order: 0 },
     { id: BTN_YES, label: "Quero negociar", order: 1 },
-    { id: BTN_NO, label: "Não reconheço esta dívida", order: 2 },
+    { id: BTN_CONSULT, label: "Consultar dívida", order: 2 },
+    { id: BTN_NO, label: "Não reconheço esta dívida", order: 3 },
   ]
-  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento", order: 3 })
+  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento", order: 4 })
   return buttons
 }
 
@@ -248,12 +249,24 @@ export function backToOptionsButtons(): Button[] {
  */
 export function threeOptionsSummary(ctx: AckContext): string {
   const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá!"
-  const faturas = ctx.invoiceCount > 1 ? ` · ${ctx.invoiceCount} faturas` : ""
+  // Objetivo (pedido do Fabio 2026-09-24): exibe já o VALOR; o vencimento original
+  // e a natureza (serviço do cedente) ficam sob demanda no "Consultar dívida".
   return (
-    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
-    `Valor atualizado: ${BRL(ctx.updatedValue)} · ` +
+    `${greeting} Você tem uma pendência de ${BRL(ctx.updatedValue)} com a ${ctx.creditorName}. ` +
+    `Como prefere seguir? Se já pagou, é só desconsiderar esta mensagem.`
+  )
+}
+
+/**
+ * Resposta do "Consultar dívida" [2] (informativo — NÃO reconhece a dívida): o
+ * detalhe que saiu do resumo objetivo — vencimento original (e nº de faturas) e
+ * que se trata de um serviço oferecido pelo cedente. Linguagem D36.
+ */
+export function debtConsultReply(ctx: AckContext): string {
+  const faturas = ctx.invoiceCount > 1 ? ` (${ctx.invoiceCount} faturas)` : ""
+  return (
     `Vencimento original: ${formatDatePt(ctx.oldestDueDate)}${faturas}. ` +
-    `Como você prefere seguir? Se já pagou, é só desconsiderar esta mensagem.`
+    `Trata-se de um serviço oferecido pela ${ctx.creditorName}.`
   )
 }
 
@@ -405,6 +418,44 @@ export async function bootstrapThreeOptionsPrompt(input: {
   return { ok: true, created: true, prompt: created.prompt }
 }
 
+// 24h sem interação → o histórico é apagado e a jornada recomeça como um chat novo.
+const CHAT_HISTORY_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Pedido do Fabio (2026-09-24): passadas 24h da ÚLTIMA interação, o histórico do
+ * chat é apagado e a jornada volta como um chat novo. Baseia-se na última
+ * `chat_messages` da sessão (a última interação REAL) — não no `last_activity_at`,
+ * que a própria auth acabou de bumpar ao reabrir a sessão. Best-effort e NÃO-fatal:
+ * uma falha aqui não derruba a auth (no pior caso o histórico antigo permanece).
+ * Retorna true se apagou. Ordem: mensagens antes dos prompts (FK prompt_id).
+ */
+export async function resetStaleChatIfInactive(sessionId: string, _companyId: string): Promise<boolean> {
+  try {
+    const supabase = createServiceClient()
+    const { data: last } = await supabase
+      .from("chat_messages")
+      .select("created_at")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (!last?.created_at) return false // sem histórico → nada a apagar
+    if (Date.now() - new Date(last.created_at).getTime() < CHAT_HISTORY_TTL_MS) return false // ainda fresco
+    await supabase.from("chat_messages").delete().eq("session_id", sessionId)
+    await supabase.from("chat_prompts").delete().eq("session_id", sessionId)
+    // limpa a espera (defensivo — coluna wait_state pode não estar aplicada).
+    await supabase
+      .from("negotiation_sessions")
+      .update({ wait_state: null, wait_started_at: null })
+      .eq("id", sessionId)
+      .then(() => {}, () => {})
+    return true
+  } catch (err) {
+    console.warn("[journey] reset 24h (não-fatal):", (err as Error).message)
+    return false
+  }
+}
+
 /**
  * Bootstrap tolerante a falhas do menu de 3 opções (análogo a bootstrapAckSafe).
  * Só roda com CHAT_JOURNEY_ENABLED=true e NUNCA lança — uma falha aqui não pode
@@ -420,6 +471,8 @@ export async function bootstrapThreeOptionsSafe(input: {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") return
   if (!input.primaryDebtId || input.debtIds.length === 0) return
   try {
+    // 24h sem interação → apaga o histórico e recomeça (antes de (re)publicar o menu).
+    await resetStaleChatIfInactive(input.sessionId, input.companyId)
     await bootstrapThreeOptionsPrompt({
       companyId: input.companyId,
       sessionId: input.sessionId,

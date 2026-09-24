@@ -16,6 +16,7 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { getPrompt, answerPrompt } from "@/lib/journey/prompts"
 import {
   buildAckContext,
+  debtConsultReply,
   handleDebtConsult,
   handleDebtNegotiate,
   handleDebtNotRecognized,
@@ -310,6 +311,22 @@ export async function POST(req: NextRequest) {
           ok: true, button_id: buttonId, action: "negotiate", acknowledged: true,
           offers_presented: true, engine_owner: engineOwner, reply,
         })
+      }
+
+      // --- CONSULTAR [2] (informativo — NÃO reconhece a dívida) --------------
+      if (buttonId === BTN_CONSULT) {
+        const ackCtx = await buildAckContext({
+          companyId: ctx.companyId, customerId: ctx.customerId, debtIds,
+        })
+        const reply = debtConsultReply(ackCtx)
+        await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
+        // Consultar é informativo: reabre o menu de 3 opções para o devedor seguir
+        // (Pagar/Negociar/Não reconheço). Sem reconhecimento implícito.
+        await reopenThreeOptions({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+          debtIds, primaryDebtId,
+        })
+        return NextResponse.json({ ok: true, button_id: buttonId, action: "consult", acknowledged: false, reply })
       }
 
       // --- NÃO RECONHEÇO [0] -------------------------------------------------
