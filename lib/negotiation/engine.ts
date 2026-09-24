@@ -20,6 +20,7 @@ import { createHash } from "node:crypto"
 
 import { z } from "zod"
 
+import type { Button } from "@/lib/journey/buttons"
 import { maskDocument } from "@/lib/journey/document"
 import { agentChat, agentHealth, agentSessionInit, type AgentSessionInit } from "./agent-client"
 import { closeAgreement } from "./close-agreement"
@@ -614,6 +615,25 @@ export interface NegotiationStartPayload {
   matrix: unknown
   offers: unknown
   available_actions: readonly string[]
+  /**
+   * URL pública do NOSSO receptor (`${NEXT_PUBLIC_APP_URL}/api/webhooks/n8n`) para
+   * onde o fluxo n8n responde no modo ASSÍNCRONO (action='chat.send' assinado,
+   * ecoando este event_id). É a nossa URL pública, documentável. Omitido quando
+   * NEXT_PUBLIC_APP_URL não está configurado (não quebra o build do payload).
+   */
+  callback_url?: string
+}
+
+/**
+ * URL pública do NOSSO receptor de callbacks n8n a partir de NEXT_PUBLIC_APP_URL.
+ * Normaliza a barra final (`https://x/` e `https://x` → `https://x/api/webhooks/n8n`,
+ * sem barra dupla). Retorna undefined se a env estiver ausente (campo omitido).
+ * Valor SEMPRE de process.env no servidor — nunca de entrada externa.
+ */
+function n8nCallbackUrl(): string | undefined {
+  const base = process.env.NEXT_PUBLIC_APP_URL
+  if (!base || !base.trim()) return undefined
+  return `${base.trim().replace(/\/+$/, "")}/api/webhooks/n8n`
 }
 
 export type NegotiationStartResult =
@@ -645,6 +665,7 @@ export async function buildNegotiationStartPayload(
     .maybeSingle()
   const type = resolveEventName("negotiation_start", (cfg?.n8n_event_names ?? null) as never)
 
+  const callbackUrl = n8nCallbackUrl()
   return {
     type,
     event: "negotiation.start",
@@ -664,6 +685,8 @@ export async function buildNegotiationStartPayload(
     matrix: ctx.matrix,
     offers: ctx.offers,
     available_actions: N8N_AVAILABLE_ACTIONS,
+    // §3: presente só quando NEXT_PUBLIC_APP_URL está configurado (senão omitido).
+    ...(callbackUrl ? { callback_url: callbackUrl } : {}),
   }
 }
 
@@ -721,6 +744,86 @@ async function markOutboxSent(eventId: string): Promise<void> {
 }
 
 /**
+ * §2: resultado normalizado do corpo SÍNCRONO do kickoff. `text` é a bolha do
+ * assistente; `prompt` (opcional) vira um prompt de botões; `n8n_execution_id`
+ * é repassado. `null` quando o corpo não traz nada renderizável.
+ */
+export interface KickoffReply {
+  text: string
+  prompt?: { kind: string; question: string; buttons: Button[] }
+  n8n_execution_id?: string
+}
+
+/**
+ * §2.1/§2.2: parser PURO e LENIENTE do corpo síncrono do kickoff. NUNCA lança.
+ * Aceita as duas convenções:
+ *  (a) forma enxuta do recipe: `{ text, buttons? }`;
+ *  (b) contrato EngineTurnResult: `{ reply, buttons?/prompt?, n8n_execution_id? }`.
+ * - texto: `text` OU `reply` (alias), string não-vazia após trim.
+ * - prompt: usa `prompt:{kind,question,buttons}` direto; senão, se vier
+ *   `buttons:[...]` no topo, monta `{ kind:'offer_choice', question:<texto>, buttons }`.
+ * - corpo vazio/{"message":"Workflow was started"}/{}/null/não-objeto/sem texto E
+ *   sem buttons → retorna `null` (não persiste; cai no placeholder/outbox atual).
+ * A validação fina dos botões fica no chatSend (best-effort); aqui só extraímos.
+ */
+export function parseKickoffReply(body: unknown): KickoffReply | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null
+  const b = body as Record<string, unknown>
+
+  const rawText = typeof b.text === "string" ? b.text : typeof b.reply === "string" ? b.reply : ""
+  const text = rawText.trim()
+
+  // prompt explícito tem precedência; senão, buttons no topo montam um offer_choice.
+  let prompt: KickoffReply["prompt"] | undefined
+  const explicit = b.prompt
+  if (explicit && typeof explicit === "object" && !Array.isArray(explicit)) {
+    const p = explicit as Record<string, unknown>
+    const buttons = Array.isArray(p.buttons) ? (p.buttons as Button[]) : []
+    prompt = {
+      kind: typeof p.kind === "string" && p.kind.trim() ? p.kind : "offer_choice",
+      question: typeof p.question === "string" && p.question.trim() ? p.question : text,
+      buttons,
+    }
+  } else if (Array.isArray(b.buttons) && b.buttons.length > 0) {
+    prompt = { kind: "offer_choice", question: text, buttons: b.buttons as Button[] }
+  }
+
+  // sem texto E sem prompt renderizável → nada a persistir.
+  if (!text && !prompt) return null
+
+  const execId = typeof b.n8n_execution_id === "string" ? b.n8n_execution_id : undefined
+  return { text, prompt, ...(execId ? { n8n_execution_id: execId } : {}) }
+}
+
+/**
+ * §4.1(d): persiste a resposta SÍNCRONA do kickoff via o MESMO write path do
+ * inbound async (`chatSend`), reusando `loadSessionCtx(session_id)` (NUNCA
+ * reconstrói SessionCtx do payload) e o MESMO `payload.event_id` do kickoff como
+ * eventId (dedupe compartilhado SYNC↔ASYNC). Best-effort e NÃO-fatal: qualquer
+ * falha (contexto ausente, botões inválidos, erro de escrita) só gera um warn de
+ * rótulo curto — NUNCA derruba o clique. Sem log do corpo cru/URL/segredo/PII.
+ */
+async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): Promise<void> {
+  try {
+    const parsed = parseKickoffReply(body)
+    if (!parsed) return
+    const { loadSessionCtx } = await import("@/lib/journey/actions")
+    const ctx = await loadSessionCtx(p.session_id)
+    if (!ctx) return
+    const { chatSend } = await import("@/lib/journey/chat-send")
+    await chatSend(
+      ctx,
+      { text: parsed.text, prompt: parsed.prompt, n8n_execution_id: parsed.n8n_execution_id },
+      p.event_id,
+    )
+  } catch (err) {
+    // rótulo curto — sem corpo cru/URL/segredo/PII.
+    const label = err instanceof Error ? err.name : "persist_error"
+    console.warn("[engine:n8n] persist kickoff (não-fatal)", label)
+  }
+}
+
+/**
  * Emite negotiation.start ao n8n (assinado, mesmo esquema HMAC dos outros
  * contratos). RESILIENTE (H8): se o n8n não estiver configurado ou o POST
  * falhar, NÃO lança — devolve delivered:false/reason:'engine_unavailable' para
@@ -763,9 +866,13 @@ export async function emitNegotiationStart(
     // Kickoff (negotiation.start): timeout CURTO (2500ms default, = ENGINE_OUTBOX_TIMEOUT_MS)
     // para não dominar o clique. A entrega NÃO depende deste único disparo:
     const kickoffTimeoutMs = Number(process.env.N8N_KICKOFF_TIMEOUT_MS || "2500")
-    await enqueueNegotiationStart(payload) // durável, idempotente
-    await callN8nFlow(url, payload, kickoffTimeoutMs) // best-effort curto
-    await markOutboxSent(payload.event_id) // evita re-POST no próximo flush
+    await enqueueNegotiationStart(payload) // 1) durável, idempotente
+    const body = await callN8nFlow(url, payload, kickoffTimeoutMs) // 2) captura o corpo SYNC
+    await markOutboxSent(payload.event_id) // 3) entrega confirmada ANTES da persistência
+    // 4) RENDER SYNC (best-effort, NUNCA lança): se o corpo trouxer texto/prompt
+    //    AUTORADO pelo n8n, persiste via chatSend com o MESMO event_id (dedupe
+    //    compartilhado SYNC↔ASYNC). Corpo vazio/async → não persiste (placeholder).
+    await persistKickoffReply(payload, body).catch(() => {})
     return { ok: true, delivered: true, event_id: eventId }
   } catch (err) {
     // POST falhou/estourou → a linha do outbox fica 'pending' e SERÁ reentregue

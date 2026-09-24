@@ -24,6 +24,9 @@ let lastRaw = ""
 let lastSig: string | null = null
 let lastTs: string | null = null
 let respondStatus = 200
+// N8N_SYNC fix: corpo SYNC variável que o stub devolve (default: async/vazio,
+// como o webhook real "Workflow was started" → parser retorna null).
+let respondBody: unknown = { message: "Workflow was started" }
 
 function seed() {
   db = {
@@ -44,6 +47,7 @@ function seed() {
     negotiation_offers: [],
     debt_acknowledgement_latest: [{ session_id: SID, debt_id: "debt1", acknowledged: true, button_id: 1, created_at: "2026-09-18T10:05:00Z", prompt_id: "p1" }],
     chat_prompts: [],
+    chat_messages: [],
   }
 }
 
@@ -59,7 +63,8 @@ beforeAll(async () => {
         res.writeHead(respondStatus).end("boom")
         return
       }
-      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true }))
+      // corpo variável (default async/vazio); testes SYNC setam respondBody.
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(respondBody))
     })
   })
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
@@ -75,9 +80,11 @@ beforeEach(() => {
   lastSig = null
   lastTs = null
   respondStatus = 200
+  respondBody = { message: "Workflow was started" } // default: async/vazio
   process.env.N8N_WEBHOOK_SECRET = SECRET
   process.env.N8N_CHAT_FLOW_URL = `http://127.0.0.1:${port}/webhook/chat`
   process.env.NEGOTIATION_ENGINE = "n8n"
+  process.env.NEXT_PUBLIC_APP_URL = "https://alteapay.com"
   delete process.env.N8N_EVENT_FLOW_URL
   delete process.env.MOCK_ALL_INTEGRATIONS
 })
@@ -233,6 +240,234 @@ describe("emitNegotiationStart (H7/H8)", () => {
     const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-nourl-enqueue")
     expect(rows.length).toBe(1) // porém enfileirado (durável)
     expect(rows[0].status).toBe("pending")
+  })
+})
+
+// ── N8N_SYNC fix: RENDER SYNC + callback_url + dedupe compartilhado ──────────
+describe("emitNegotiationStart — RENDER SYNC (persistKickoffReply)", () => {
+  it("T1/AC1: SYNC {reply} → 1 chat_messages (assistant, engine=n8n, n8n_event_id==event_id)", async () => {
+    respondBody = { reply: "Vamos negociar sua dívida." }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-sync-reply")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    const msgs = (db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-sync-reply")
+    expect(msgs.length).toBe(1)
+    expect(msgs[0].role).toBe("assistant")
+    expect(msgs[0].engine).toBe("n8n")
+    expect(msgs[0].text).toContain("Vamos negociar sua dívida.")
+  })
+
+  it("T1/AC1: aceita a forma enxuta {text}", async () => {
+    respondBody = { text: "Olá! Vamos negociar." }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-sync-text")
+    expect(r.ok).toBe(true)
+    const msgs = (db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-sync-text")
+    expect(msgs.length).toBe(1)
+    expect(msgs[0].text).toContain("Olá! Vamos negociar.")
+  })
+
+  it("T2/AC2: SYNC {text, buttons} → 1 chat_messages + 1 chat_prompts ativo", async () => {
+    respondBody = { text: "Escolha:", buttons: [{ id: 2, label: "À vista", value: "avista" }, { id: 3, label: "Parcelar", value: "parc_3" }] }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-sync-buttons")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    const msgs = (db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-sync-buttons")
+    expect(msgs.length).toBe(1)
+    expect(msgs[0].prompt_id).toBeTruthy()
+    const prompts = (db.chat_prompts ?? []).filter((p) => p.status === "active")
+    expect(prompts.length).toBe(1)
+    expect(prompts[0].buttons.length).toBe(2)
+    expect(msgs[0].prompt_id).toBe(prompts[0].id)
+  })
+
+  it("T2/AC2: botões INVÁLIDOS → NENHUMA bolha/prompt, delivered:true, sem exceção", async () => {
+    respondBody = { text: "Escolha:", buttons: [{ id: 1, label: "x" }, { id: 1, label: "y" }] }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-sync-badbtn")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true) // best-effort: clique não cai
+    const msgs = (db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-sync-badbtn")
+    expect(msgs.length).toBe(0)
+    expect((db.chat_prompts ?? []).length).toBe(0)
+  })
+
+  it("T3/AC3: dedupe SYNC↔ASYNC por event_id — chat.send ecoando o event_id → duplicate", async () => {
+    respondBody = { reply: "Vamos negociar sua dívida." }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    await emitNegotiationStart(SID, "evt-shared")
+    const before = (db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-shared").length
+    expect(before).toBe(1)
+    // papel B (async) ecoando o MESMO event_id
+    const { loadSessionCtx } = await import("@/lib/journey/actions")
+    const { chatSend } = await import("@/lib/journey/chat-send")
+    const ctx = await loadSessionCtx(SID)
+    expect(ctx).not.toBeNull()
+    const echo = await chatSend(ctx!, { text: "eco" }, "evt-shared")
+    expect(echo.ok).toBe(true)
+    if (echo.ok) expect(echo.duplicate).toBe(true)
+    const after = (db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-shared").length
+    expect(after).toBe(1) // sem 2ª bolha
+  })
+
+  it("T5/AC5: corpo async/vazio {message:'Workflow was started'} → NENHUMA bolha, outbox sent, delivered:true", async () => {
+    respondBody = { message: "Workflow was started" }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-async-empty")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    expect((db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-async-empty").length).toBe(0)
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-async-empty")
+    expect(rows[0]?.status).toBe("sent")
+  })
+
+  it("T5/AC5: corpo {} e null → NENHUMA bolha (parser null), delivered:true", async () => {
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    respondBody = {}
+    const r1 = await emitNegotiationStart(SID, "evt-empty-obj")
+    expect(r1.ok).toBe(true)
+    respondBody = null
+    const r2 = await emitNegotiationStart(SID, "evt-null-body")
+    expect(r2.ok).toBe(true)
+    expect((db.chat_messages ?? []).length).toBe(0)
+  })
+
+  it("T6/AC6: 5xx → delivered:false, outbox pending, NENHUMA bolha, sem exceção", async () => {
+    respondStatus = 500
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-sync-500")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(false)
+    expect((db.chat_messages ?? []).length).toBe(0)
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-sync-500")
+    expect(rows[0]?.status).toBe("pending")
+  })
+
+  it("T7/AC7: loadSessionCtx null durante a persistência → delivered:true, outbox já 'sent', sem exceção", async () => {
+    respondBody = { reply: "Vamos negociar." }
+    // força loadSessionCtx a devolver null SÓ na persistência (o payload já foi
+    // montado por buildSessionContext antes). markOutboxSent roda ANTES da bolha.
+    const actions = await import("@/lib/journey/actions")
+    const spy = vi.spyOn(actions, "loadSessionCtx").mockResolvedValue(null)
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-noctx")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    expect(spy).toHaveBeenCalledWith(SID) // a persistência tentou carregar o ctx
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-noctx")
+    expect(rows[0]?.status).toBe("sent")
+    expect((db.chat_messages ?? []).length).toBe(0) // sem contexto, sem bolha
+    spy.mockRestore()
+  })
+
+  it("T7/AC7: chatSend lança → clique não cai (delivered:true), outbox 'sent'", async () => {
+    respondBody = { reply: "Vamos negociar." }
+    const chatSendMod = await import("@/lib/journey/chat-send")
+    const spy = vi.spyOn(chatSendMod, "chatSend").mockRejectedValue(new Error("boom"))
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const r = await emitNegotiationStart(SID, "evt-chatsend-throw")
+    expect(r.ok).toBe(true)
+    if (r.ok && "delivered" in r) expect(r.delivered).toBe(true)
+    expect(spy).toHaveBeenCalledTimes(1) // a persistência chamou chatSend (que lançou)
+    const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-chatsend-throw")
+    expect(rows[0]?.status).toBe("sent")
+    expect((db.chat_messages ?? []).length).toBe(0) // nada gravado (lançou)
+    spy.mockRestore()
+  })
+
+  it("AC9: o POST síncrono continua assinado e é o negotiation.start com callback_url", async () => {
+    respondBody = { text: "ok" }
+    const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
+    const { verifyN8nRequest } = await import("@/lib/negotiation/n8n")
+    await emitNegotiationStart(SID, "evt-hmac-cb")
+    expect(verifyN8nRequest(lastRaw, lastSig, lastTs).ok).toBe(true)
+    const sent = JSON.parse(lastRaw)
+    expect(sent.event).toBe("negotiation.start")
+    expect(sent.event_id).toBe("evt-hmac-cb")
+    expect(sent.callback_url).toBe("https://alteapay.com/api/webhooks/n8n")
+  })
+})
+
+describe("buildNegotiationStartPayload — callback_url (§3)", () => {
+  it("T4/AC4: NEXT_PUBLIC_APP_URL sem barra final → .../api/webhooks/n8n", async () => {
+    process.env.NEXT_PUBLIC_APP_URL = "https://alteapay.com"
+    const { buildNegotiationStartPayload } = await import("@/lib/negotiation/engine")
+    const p = await buildNegotiationStartPayload(SID, "evt-cb-1")
+    expect(p!.callback_url).toBe("https://alteapay.com/api/webhooks/n8n")
+  })
+
+  it("T4/AC4: NEXT_PUBLIC_APP_URL COM barra final → sem barra dupla", async () => {
+    process.env.NEXT_PUBLIC_APP_URL = "https://alteapay.com/"
+    const { buildNegotiationStartPayload } = await import("@/lib/negotiation/engine")
+    const p = await buildNegotiationStartPayload(SID, "evt-cb-2")
+    expect(p!.callback_url).toBe("https://alteapay.com/api/webhooks/n8n")
+  })
+
+  it("T4/AC4: sem NEXT_PUBLIC_APP_URL → callback_url OMITIDO, sem throw", async () => {
+    delete process.env.NEXT_PUBLIC_APP_URL
+    const { buildNegotiationStartPayload } = await import("@/lib/negotiation/engine")
+    const p = await buildNegotiationStartPayload(SID, "evt-cb-3")
+    expect(p).not.toBeNull()
+    expect(p!.callback_url).toBeUndefined()
+    expect("callback_url" in (p as object)).toBe(false)
+  })
+
+  it("T8/AC10/AC11: callback_url NÃO introduz PII (doc mascarado; CPF/tel/email nunca em claro)", async () => {
+    process.env.NEXT_PUBLIC_APP_URL = "https://alteapay.com"
+    const { buildNegotiationStartPayload } = await import("@/lib/negotiation/engine")
+    const p = await buildNegotiationStartPayload(SID, "evt-cb-pii")
+    const json = JSON.stringify(p)
+    expect(json).toContain("https://alteapay.com/api/webhooks/n8n")
+    expect((p!.customer as any).document_masked).toBe("***.444.777-**")
+    expect(json).not.toContain("11144477735")
+    expect(json).not.toContain("11999998888")
+    expect(json).not.toContain("fabio@x.com")
+  })
+})
+
+// ── parser puro parseKickoffReply (§2.1/§2.2) ────────────────────────────────
+describe("parseKickoffReply (parser puro, nunca lança)", () => {
+  it("{text} → {text}", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    expect(parseKickoffReply({ text: "oi" })).toEqual({ text: "oi" })
+  })
+  it("{reply} alias de text", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    expect(parseKickoffReply({ reply: "olá" })).toEqual({ text: "olá" })
+  })
+  it("text prevalece sobre reply quando ambos vêm", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    expect(parseKickoffReply({ text: "T", reply: "R" })!.text).toBe("T")
+  })
+  it("{text, buttons} → prompt offer_choice com a mesma pergunta", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    const r = parseKickoffReply({ text: "Escolha", buttons: [{ id: 2, label: "A" }] })
+    expect(r!.prompt).toEqual({ kind: "offer_choice", question: "Escolha", buttons: [{ id: 2, label: "A" }] })
+  })
+  it("{prompt} explícito tem precedência sobre buttons no topo", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    const r = parseKickoffReply({ text: "t", prompt: { kind: "payment_method_choice", question: "Q", buttons: [{ id: 2, label: "PIX" }] } })
+    expect(r!.prompt!.kind).toBe("payment_method_choice")
+    expect(r!.prompt!.question).toBe("Q")
+  })
+  it("n8n_execution_id é repassado", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    expect(parseKickoffReply({ text: "x", n8n_execution_id: "exec_9" })!.n8n_execution_id).toBe("exec_9")
+  })
+  it("{message:'Workflow was started'} → null", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    expect(parseKickoffReply({ message: "Workflow was started" })).toBeNull()
+  })
+  it("{}, null, string vazia, não-objeto, array → null (nunca lança)", async () => {
+    const { parseKickoffReply } = await import("@/lib/negotiation/engine")
+    expect(parseKickoffReply({})).toBeNull()
+    expect(parseKickoffReply(null)).toBeNull()
+    expect(parseKickoffReply("")).toBeNull()
+    expect(parseKickoffReply("texto solto")).toBeNull()
+    expect(parseKickoffReply([{ text: "x" }])).toBeNull()
+    expect(parseKickoffReply({ text: "   " })).toBeNull() // só espaços
   })
 })
 

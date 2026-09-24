@@ -21,6 +21,20 @@ function devAllowed(): boolean {
 interface TurnPayload {
   message?: string
   session_id?: string
+  event?: string
+  /**
+   * N8N_SYNC fix (E2E determinístico): quando presente, o stub ECOA esta forma
+   * como resposta síncrona — permite exercitar o parser SYNC do kickoff com a
+   * forma enxuta `{text, buttons?}` OU o contrato `{reply,...}`. Sem ele, o stub
+   * mantém o roteiro determinístico por `message` (comportamento atual).
+   */
+  stub_reply?: {
+    text?: string
+    reply?: string
+    buttons?: Array<{ id: number; label: string; value?: string }>
+    message?: string
+    prompt?: { kind?: string; question?: string; buttons?: Array<{ id: number; label: string; value?: string }> }
+  }
 }
 
 /** Roteiro determinístico: espelha o stubChat, mas no formato de resposta do fluxo. */
@@ -79,6 +93,13 @@ export async function POST(request: Request) {
     payload = JSON.parse(rawBody) as TurnPayload
   } catch {
     return NextResponse.json({ error: "JSON inválido" }, { status: 400 })
+  }
+
+  // N8N_SYNC fix: forma enxuta parametrizada para o E2E do kickoff (SYNC).
+  // Ecoa exatamente `stub_reply` — permite testar {text,buttons?} | {reply} |
+  // {message:"Workflow was started"} (async/vazio) de forma determinística.
+  if (payload.stub_reply) {
+    return NextResponse.json(payload.stub_reply)
   }
 
   return NextResponse.json(reply(payload.message ?? ""))
