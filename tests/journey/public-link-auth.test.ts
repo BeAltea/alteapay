@@ -33,7 +33,8 @@ vi.mock("@/lib/negotiation/crypto", () => ({
 }))
 const settledCalls: Array<Record<string, unknown>> = []
 vi.mock("@/lib/journey/acknowledgement", () => ({
-  bootstrapAckSafe: async () => ({ ok: true }),
+  // onda "3 opções": o login publica o menu de 3 opções (não mais o Sim/Não).
+  bootstrapThreeOptionsSafe: async () => ({ ok: true }),
   bootstrapSettledSafe: async (input: Record<string, unknown>) => {
     settledCalls.push(input)
   },

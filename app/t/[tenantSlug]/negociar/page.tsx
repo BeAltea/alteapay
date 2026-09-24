@@ -22,6 +22,8 @@ export default async function GenericNegociarPage({
       tenantSlug={result.tenant.slug}
       successHref="./chat"
       captchaEnabled={process.env.CHAT_CAPTCHA_ENABLED === "true"}
+      // R4 — selo da porta: nome do credor (companies.name via branding).
+      creditorName={result.tenant.branding.brandName}
     />
   )
 }

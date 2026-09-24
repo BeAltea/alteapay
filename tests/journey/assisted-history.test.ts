@@ -98,7 +98,7 @@ describe("histórico do fluxo assistido (sessão reaberta)", () => {
     expect(out.ok).toBe(true)
 
     // dados da dívida publicados como mensagem
-    expect(db.chat_messages.some((m) => m.role === "assistant" && /dados da sua dívida/.test(m.text))).toBe(true)
+    expect(db.chat_messages.some((m) => m.role === "assistant" && /dados da sua pendência/.test(m.text))).toBe(true)
     // NÃO reconheceu ainda (Consultar não registra reconhecimento)
     expect(db.debt_acknowledgements.length).toBe(0)
     // menu pós-consulta ativo: Negociar [3] + Não reconheço [0]
@@ -178,7 +178,7 @@ describe("histórico do fluxo assistido (sessão reaberta)", () => {
     expect(ordered[1].button_id).toBe(3)
     // dados da dívida (assistant)
     expect(ordered[2].role).toBe("assistant")
-    expect(ordered[2].text).toContain("dados da sua dívida")
+    expect(ordered[2].text).toContain("dados da sua pendência")
     // resposta do assistente
     expect(ordered[3].role).toBe("assistant")
     expect(ordered[3].text).toContain("vamos trabalhar juntos")

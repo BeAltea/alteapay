@@ -21,6 +21,55 @@ import {
   type ChatMsg,
   type MsgAction,
 } from "./chat-display"
+import {
+  DEGRADED_MENU_COPY,
+  deriveWaitStep,
+  elapsedSince,
+  hydrateWaitState,
+  resolveWaitView,
+  shouldRenderEngineMsg,
+  shouldShowSlowExits,
+  shouldShowTypingIndicator,
+  waitStepCopy,
+  type WaitState,
+  type WaitStep,
+} from "@/lib/journey/wait-machine"
+import { interpretPaymentPoll, shouldOfferProcessingExit } from "@/lib/journey/pay-poll"
+
+// D2 — ESPERA CONFIÁVEL: a máquina de espera (§6.3) é client-side sobre o polling
+// atual. A lógica PURA (degraus, copy, absorventes, reidratação) vive em
+// lib/journey/wait-machine.ts (testável em node); aqui só o wire-up React (timers,
+// estado, render acessível). O clique NEGOCIAR arma a espera; a resposta do n8n
+// (mensagem engine='n8n' no poll) resolve para 'negociando'; 15s sem resposta
+// degrada para um menu acionável SEM cancelar o polling/outbox. NUNCA mostra erro
+// técnico/HTTP/"n8n" ao devedor.
+
+// Estado do PAGAR renderizado na UI (link com copiar / processando / erro). O
+// button/route.ts (D1) devolve o shape do payService (D3) no POST do clique — o
+// chat o guarda aqui para renderizar a §5.2/§5.3/§5.4 da copy. Sem PII.
+interface PayResult {
+  status: "link" | "processing" | "error"
+  link: string | null
+  valor: number | null
+  vencimento_link: string | null
+  already_charged: boolean
+}
+
+const TICK_MS = 250 // granularidade da troca de copy (menor que o poll de 2500ms)
+
+/** Formata reais no MESMO padrão do buildAckContext (R$ 250,00). null → "". */
+function formatBRL(valor: number | null): string {
+  if (valor == null || !Number.isFinite(valor)) return ""
+  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(valor)
+}
+
+/** Vencimento do link ASAAS (YYYY-MM-DD) → dd/mm/aaaa. Ausente → "". */
+function formatDueDate(iso: string | null): string {
+  if (!iso) return ""
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso)
+  if (!m) return ""
+  return `${m[3]}/${m[2]}/${m[1]}`
+}
 
 // ChatMsg / MsgAction e os helpers puros de exibição (dedup por conteúdo, rótulo
 // Negociar, texto do indicador) vivem em ./chat-display para serem testados no
@@ -42,14 +91,43 @@ function safeExternalAction(raw: unknown): MsgAction | null {
   return { type: "external_link", label, href }
 }
 
-/** Render simples de **negrito** (o n8n envia markdown). Preserva quebras de linha
- *  via whitespace-pre-line na bolha. Não injeta HTML. */
+/** Só http(s) — nunca javascript:/data:. Usado para auto-linkar URLs no histórico. */
+function isSafeHttpUrl(raw: string): boolean {
+  return /^https?:\/\/\S+$/i.test(raw)
+}
+
+/** Auto-linka URLs http(s) "cruas" numa fatia de texto (R7): a mensagem do link
+ *  de pagamento é PERSISTIDA como texto (com a URL numa linha) para sobreviver ao
+ *  reload/reuso — ao restaurar do histórico ela precisa voltar clicável. Só
+ *  http(s); nunca injeta HTML. Retorna nós React. */
+function linkifyUrls(text: string, keyBase: string) {
+  return text.split(/(https?:\/\/\S+)/g).map((chunk, i) =>
+    isSafeHttpUrl(chunk) ? (
+      <a
+        key={`${keyBase}-a-${i}`}
+        href={chunk}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="break-all font-medium underline underline-offset-2"
+        style={{ color: "var(--brand-secondary)" }}
+      >
+        {chunk}
+      </a>
+    ) : (
+      <span key={`${keyBase}-t-${i}`}>{chunk}</span>
+    ),
+  )
+}
+
+/** Render simples de **negrito** (o n8n envia markdown) + auto-link de URLs
+ *  http(s) (R7 — link persistido no histórico volta clicável). Preserva quebras
+ *  de linha via whitespace-pre-line na bolha. Não injeta HTML. */
 function renderRichText(text: string) {
   return text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
     part.length > 4 && part.startsWith("**") && part.endsWith("**") ? (
       <strong key={i}>{part.slice(2, -2)}</strong>
     ) : (
-      <span key={i}>{part}</span>
+      <span key={i}>{linkifyUrls(part, `p${i}`)}</span>
     ),
   )
 }
@@ -63,7 +141,7 @@ export function JourneyChat() {
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [ended, setEnded] = useState(false)
   const [activePrompt, setActivePrompt] = useState<ActivePrompt | null>(null)
-  const scrollRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement | null>(null)
   const sinceRef = useRef<string | null>(null)
   const seenIds = useRef<Set<string>>(new Set())
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -77,6 +155,110 @@ export function JourneyChat() {
   // do n8n chegar via poll. Guardamos o id sintético para removê-la quando a
   // primeira mensagem assistant real da negociação chegar (ou em erro).
   const pendingNegotiationRef = useRef<string | null>(null)
+
+  // --- Máquina de espera (D2, §6.3) ----------------------------------------
+  // waitState: estado DECIDIDO (idle/aguardando_motor/menu_degradado/…). O degrau
+  // visual (d0..d4) é derivado do tempo (waitStep) e não é estado. waitStartedAt é
+  // a âncora única (do servidor no reload; do relógio no clique). Refs espelham o
+  // estado para os callbacks de timer/poll (que não veem o valor do closure).
+  const [waitState, setWaitStateRaw] = useState<WaitState>("idle")
+  const [waitStep, setWaitStep] = useState<WaitStep>("d0_suppressed")
+  const waitStateRef = useRef<WaitState>("idle")
+  const waitStartedAtRef = useRef<string | null>(null)
+  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Resultado do PAGAR (link/processando/erro) renderizado abaixo do histórico.
+  const [payResult, setPayResult] = useState<PayResult | null>(null)
+  const [copied, setCopied] = useState(false)
+  // R3 — poll do link quando a cobrança volta 'processing' (worker gerando).
+  // payPollRef: timer do poll; payPollAttempts: nº de tentativas (para oferecer a
+  // saída acionável após o teto, nunca espera muda infinita).
+  const payPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [payPollAttempts, setPayPollAttempts] = useState(0)
+  // R8 — foco/anúncio do resumo pós-login: quando a 1ª mensagem do assistente
+  // (resumo) e/ou o menu de 3 opções aparecem, movemos o foco para a região do
+  // resumo uma única vez, para o leitor de tela anunciá-la (M18).
+  const summaryFocusRef = useRef<HTMLDivElement | null>(null)
+  const summaryFocusedRef = useRef(false)
+
+  const setWaitState = useCallback((s: WaitState) => {
+    waitStateRef.current = s
+    setWaitStateRaw(s)
+  }, [])
+
+  // Recalcula o degrau a partir de waitStartedAt; aos 15s, degrada (menu_degradado)
+  // SEM parar o polling/outbox. Só age enquanto 'aguardando_motor'.
+  const recomputeWaitStep = useCallback(() => {
+    if (waitStateRef.current !== "aguardando_motor") return
+    const elapsed = elapsedSince(waitStartedAtRef.current, Date.now())
+    const step = deriveWaitStep(elapsed)
+    setWaitStep(step)
+    if (step === "d4_degraded") {
+      // Transição por TEMPO → menu_degradado. Persistência no servidor é
+      // responsabilidade do backend no reload; aqui é só o visual do client.
+      setWaitState("menu_degradado")
+      stopTick()
+    }
+  }, [setWaitState])
+
+  function stopTick() {
+    if (tickRef.current) {
+      clearInterval(tickRef.current)
+      tickRef.current = null
+    }
+  }
+
+  const startTick = useCallback(() => {
+    stopTick()
+    recomputeWaitStep()
+    tickRef.current = setInterval(recomputeWaitStep, TICK_MS)
+  }, [recomputeWaitStep])
+
+  // Resposta do motor chegou → sai da espera para 'negociando' (fluxo normal de
+  // turnos). Remove a bolha de espera (o indicador some porque waitState deixa de
+  // ser aguardando_motor/menu_degradado) e encerra o tick.
+  const resolveWaitToNegotiating = useCallback(() => {
+    stopTick()
+    waitStartedAtRef.current = null
+    setWaitStep("d0_suppressed")
+    setWaitState("negociando")
+  }, [setWaitState])
+
+  // Reidrata a espera a partir do estado do servidor (M11). Só age quando o
+  // servidor tem uma espera persistida (wait_state != null) OU quando ela já foi
+  // resolvida no servidor (wait_state null enquanto o client ainda mostrava
+  // aguardando_motor/menu_degradado — reconcilia). NÃO sobrepõe estados locais de
+  // PAGAR (gerando_cobranca/link_entregue/erro_cobranca) nem o clique em curso.
+  const rehydrateWait = useCallback(
+    (serverWaitState: string | null, serverWaitStartedAt: string | null) => {
+      const local = waitStateRef.current
+      // Estados do PAGAR e desfechos são governados localmente pelo clique/poll de
+      // pagamento — o poll de mensagens não os altera.
+      if (local === "gerando_cobranca" || local === "link_entregue" || local === "erro_cobranca") return
+      if (serverWaitState) {
+        const view = resolveWaitView(
+          hydrateWaitState({ wait_state: serverWaitState, wait_started_at: serverWaitStartedAt }),
+          serverWaitStartedAt,
+          Date.now(),
+        )
+        // Só (re)arma a espera se o client não está já num estado mais avançado
+        // (negociando vence uma espera obsoleta do servidor). Evita "voltar" ao
+        // spinner depois que a resposta já chegou.
+        if (local === "negociando") return
+        waitStartedAtRef.current = serverWaitStartedAt
+        setWaitStep(view.step)
+        setWaitState(view.state)
+        if (view.state === "aguardando_motor") startTick()
+        else stopTick()
+        return
+      }
+      // Servidor sem espera (wait_state null): se o client ainda mostrava a espera,
+      // significa que o servidor já a resolveu (motor respondeu / limpeza) → some.
+      if (local === "aguardando_motor" || local === "menu_degradado") {
+        resolveWaitToNegotiating()
+      }
+    },
+    [resolveWaitToNegotiating, setWaitState, startTick],
+  )
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
@@ -143,6 +325,9 @@ export function JourneyChat() {
       }
       if (!res.ok) return
       const data = await res.json()
+      // M11: reidrata a máquina de espera a partir do estado do servidor (vem no
+      // 1º poll e nos seguintes). Um reload durante a espera restaura o degrau.
+      rehydrateWait(data?.wait_state ?? null, data?.wait_started_at ?? null)
       const pushed: Array<{
         id: string
         role: string
@@ -151,18 +336,39 @@ export function JourneyChat() {
         button_id: number | null
         prompt_id?: string | null
         action?: unknown
+        engine?: string | null
       }> = Array.isArray(data?.messages) ? data.messages : []
       for (const m of pushed) {
         if (seenIds.current.has(m.id)) continue
+        const isAssistant = m.role !== "customer"
+        // "Resposta do motor" = mensagem do assistente gravada com engine='n8n'
+        // (chat-send do papel B). Distingue a resposta do CÉREBRO das nossas
+        // próprias bolhas (eco A.2, narração — engine != 'n8n').
+        const isEngineMsg = isAssistant && m.engine === "n8n"
+        // M12 — resposta TARDIA em estado ABSORVENTE (link_entregue/quitada/
+        // nao_reconhecida): DESCARTA a bolha do motor (nunca reabre negociação,
+        // nunca aparece após pagamento). Anteparo CLIENT (defensivo); o servidor é
+        // o autoritativo. Marca como vista para não reavaliar no próximo poll.
+        if (isEngineMsg && !shouldRenderEngineMsg(waitStateRef.current)) {
+          seenIds.current.add(m.id)
+          sinceRef.current = m.created_at
+          continue
+        }
         seenIds.current.add(m.id)
         sinceRef.current = m.created_at
-        const isAssistant = m.role !== "customer"
         // Se havia uma bolha "preparando negociação" local e chegou a 1ª
         // mensagem real do assistente (resposta do n8n), removemos a optimistic
         // ao inserir a real — troca sem piscar duplicado.
         const optimisticId = pendingNegotiationRef.current
         const dropOptimistic = isAssistant && optimisticId !== null
         if (dropOptimistic) pendingNegotiationRef.current = null
+        // A resposta do motor RESOLVE a espera (aguardando_motor OU menu_degradado
+        // → negociando): remove a bolha de espera, encerra o tick, some o
+        // indicador. Se estava degradado, a tardia ainda renderiza (menu_degradado
+        // NÃO é absorvente) — só some o menu de degradação.
+        if (isEngineMsg && (waitStateRef.current === "aguardando_motor" || waitStateRef.current === "menu_degradado")) {
+          resolveWaitToNegotiating()
+        }
         setMessages((prev) => {
           const base = dropOptimistic ? prev.filter((x) => x.id !== optimisticId) : prev
           return [
@@ -197,7 +403,11 @@ export function JourneyChat() {
       if (modalRef.current) return
       pollMessages()
     }, 2500)
-    return () => stopPoll()
+    return () => {
+      stopPoll()
+      stopTick() // encerra o tick da espera ao desmontar (sem timer órfão)
+      stopPayPoll() // R3 — encerra o poll do link de pagamento
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -244,6 +454,83 @@ export function JourneyChat() {
     void pollMessages()
   }
 
+  function stopPayPoll() {
+    if (payPollRef.current) {
+      clearInterval(payPollRef.current)
+      payPollRef.current = null
+    }
+  }
+
+  // R3 — POLL DO LINK EM `processing`: quando a cobrança volta 'processing' (o
+  // worker ainda está gerando o link, CHARGE_MODE=queue), a UI NÃO fica muda:
+  // consulta GET /api/chat/payment a cada 2,5s até o link aparecer e então troca
+  // a bolha "gerando…" pelo link (§5.2). Passado o teto (~60s), a UI oferece a
+  // saída "Falar com atendimento" (renderizada abaixo) — nunca espera infinita.
+  // NUNCA declara pago (M15): 'ready' só significa que o link existe.
+  useEffect(() => {
+    if (ended || payResult?.status !== "processing") {
+      stopPayPoll()
+      return
+    }
+    let cancelled = false
+    async function pollPayment() {
+      if (modalRef.current) return
+      try {
+        const res = await fetch("/api/chat/payment")
+        if (!res.ok) return
+        const data = await res.json().catch(() => null)
+        const out = interpretPaymentPoll(data)
+        if (cancelled) return
+        if (out.status === "ready") {
+          stopPayPoll()
+          setPayResult({
+            status: "link",
+            link: out.link,
+            valor: out.valor,
+            vencimento_link: out.vencimentoLink,
+            already_charged: false,
+          })
+          setWaitState("link_entregue")
+        } else {
+          setPayPollAttempts((n) => n + 1)
+        }
+      } catch {
+        /* silencioso: uma falha de rede não derruba a espera; tenta de novo */
+      }
+    }
+    // Dispara já uma vez e depois a cada 2,5s (mesmo ritmo do poll de mensagens).
+    void pollPayment()
+    payPollRef.current = setInterval(() => {
+      if (document.visibilityState !== "visible") return
+      void pollPayment()
+    }, 2500)
+    return () => {
+      cancelled = true
+      stopPayPoll()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [payResult?.status, ended])
+
+  // R8 — ao aparecer o resumo pós-login + menu de 3 opções, move o foco para a
+  // região do resumo UMA vez, para o leitor de tela anunciá-la (M18). Só quando
+  // já há conteúdo e um prompt ativo (o menu). Não re-anuncia em loop.
+  useEffect(() => {
+    if (summaryFocusedRef.current) return
+    if (ended) return
+    if (messages.length === 0 && !activePrompt) return
+    const el = summaryFocusRef.current
+    if (!el) return
+    summaryFocusedRef.current = true
+    // rAF para garantir que o nó já está no DOM antes de focar.
+    requestAnimationFrame(() => {
+      try {
+        el.focus({ preventScroll: false })
+      } catch {
+        /* noop */
+      }
+    })
+  }, [messages.length, activePrompt, ended])
+
   // Remove a bolha optimistic "preparando negociação" (se houver). Chamada nos
   // caminhos de erro do clique — não faz sentido manter "preparando" se o clique
   // falhou; o PromptButtons já mostra "toque de novo". No SUCESSO NÃO limpamos
@@ -279,12 +566,45 @@ export function JourneyChat() {
   ): Promise<PromptClickResult> {
     resetIdle()
     const isNegotiate = isNegotiateLabel(buttonLabel)
+    // R1 — ESCOLHA DE PARCELA: no prompt 'offer_choice' um item de lista (2..97,
+    // não a volta[98]/atendimento[99]) seleciona uma oferta da matriz → o servidor
+    // gera o link ASAAS (action:'pay'). Trata-se como um PAGAR (gera cobrança):
+    // mostra "gerando link" e renderiza o resultado no painel de pagamento.
+    const isOfferSelect =
+      activePrompt?.kind === "offer_choice" && buttonId >= 2 && buttonId <= 97
+    // PAGAR: button_id=4 (BTN_PAY do menu de 3 opções) OU rótulo "Pagar …" (os
+    // atalhos "Pagar {valor} agora" [d3] e "Pagar {valor} à vista" [degradação]
+    // também disparam o pagamento) OU seleção de uma parcela da matriz. Detecção
+    // por label/kind cobre todos os pontos.
+    const isPay =
+      buttonId === 4 || isOfferSelect || /^\s*(quero pagar|pagar)\b/i.test(buttonLabel)
+    // CLICK_PAGAR → gerando_cobranca (Apêndice B). Some qualquer espera de
+    // negociação anterior (o devedor escolheu pagar) e mostra "gerando link".
+    if (isPay) {
+      stopTick()
+      waitStartedAtRef.current = null
+      setWaitStep("d0_suppressed")
+      setWaitState("gerando_cobranca")
+      setPayResult(null)
+      setCopied(false)
+      setPayPollAttempts(0) // R3 — zera o contador do poll de 'processing'
+    }
     // OPTIMISTIC: ao Negociar, injeta já uma bolha "preparando sua negociação"
     // (antes do await). Feedback imediato de que o sistema está trabalhando
     // enquanto o backend dispara negotiation.start ao n8n e aguardamos a 1ª
     // resposta (chat.send) chegar via poll. NÃO persiste: é local e some quando a
     // resposta real aparece (ou em erro).
+    // CLICK_NEGOCIAR → aguardando_motor: arma a máquina de espera (âncora local
+    // enquanto o poll não traz o wait_started_at do servidor). O tick deriva os
+    // degraus 1,2/4/10/15s. Só arma se ainda estava idle (2º clique é no-op — o
+    // dedup por event_id no negotiation.start evita 2º start).
     if (isNegotiate) {
+      if (waitStateRef.current === "idle" || waitStateRef.current === "menu_degradado") {
+        waitStartedAtRef.current = new Date().toISOString()
+        setWaitState("aguardando_motor")
+        setWaitStep("d0_suppressed")
+        startTick()
+      }
       const optimisticId = `optimistic-neg-${Date.now()}`
       pendingNegotiationRef.current = optimisticId
       setMessages((prev) => [
@@ -316,13 +636,43 @@ export function JourneyChat() {
       // sozinho). Com TTL de 30 dias isto praticamente não ocorre.
       if (res.status === 401) {
         clearPendingNegotiation()
+        if (isPay) clearWaitForPayFailure()
+        else if (isNegotiate) resetWaitToIdle()
         stopPoll()
         modalRef.current = "expired"
         setIdleModalState("expired")
         return { ok: false, code: "unauthorized" }
       }
       const data = await res.json().catch(() => ({}))
+      // PAGAR — o button/route.ts (D1) devolve o shape do payService (D3) NO
+      // corpo do clique (com HTTP 200 mesmo em erro de negócio). Renderizamos o
+      // resultado (link/processando/erro) aqui, sem depender do poll. O guard de
+      // cobrança e a idempotência são do servidor; o client só exibe a copy §5.
+      if (isPay && data && data.action === "pay") {
+        applyPayResult(data)
+        // O menu de 3 opções já foi respondido; o poll traz o histórico. O botão
+        // sai do "..." (ok) — o resultado do pagamento aparece no painel próprio.
+        setActivePrompt(null)
+        await pollMessages()
+        return { ok: true }
+      }
       if (res.ok) {
+        // NEGOCIAR — dois desfechos (R1):
+        //  (a) offers_presented=true → o servidor JÁ apresentou as PARCELAS DA
+        //      MATRIZ como um prompt 'offer_choice' (fallback assistido). NÃO há
+        //      espera: saímos do aguardando_motor otimista e limpamos a bolha
+        //      "preparando" — as parcelas aparecem no poll seguinte como botões,
+        //      ação imediatamente disponível (sem spinner de 15s).
+        //  (b) sem offers (wait_state='aguardando_motor') → mantém a espera D2
+        //      armada; o poll traz wait_started_at do servidor e, aos 15s, o menu
+        //      de degradação (M10).
+        if (data?.action === "negotiate") {
+          if (data?.offers_presented === true) {
+            clearPendingNegotiation()
+            resetWaitToIdle()
+          }
+          // senão: mantém aguardando_motor; o poll trará wait_started_at do servidor.
+        }
         // O prompt clicado já foi respondido (answered) no servidor. Limpamos o
         // prompt local para não travar a UI num prompt morto e puxamos o estado:
         // mensagens novas (dados da dívida + resposta) + o novo active_prompt (o
@@ -344,25 +694,199 @@ export function JourneyChat() {
       // remontado via key={activePrompt.id} e não mostra aviso neste caso).
       if (res.status === 409 && data?.code === "prompt_not_active") {
         clearPendingNegotiation()
+        if (isPay) resetWaitToIdle() // prompt já consumido: não trava em gerando_cobranca
+        else if (isNegotiate) resetWaitToIdle()
         await pollMessages()
         return { ok: false, code: "prompt_not_active" }
       }
       // Demais erros (404/409/422/5xx): devolve o code p/ o PromptButtons avisar
       // o cliente e reabilitar os botões (o loading para no finally do filho).
       clearPendingNegotiation()
+      if (isPay) clearWaitForPayFailure()
+      else if (isNegotiate) resetWaitToIdle()
       return { ok: false, code: typeof data?.code === "string" ? data.code : "error" }
     } catch (err) {
       // AbortError = estouramos o nosso timeout (servidor lento) → code "timeout"
       // para o PromptButtons mostrar "conexão lenta, toque de novo". Demais erros
       // de rede caem em code genérico. Em ambos, o botão SAI do "..." e a bolha
-      // optimistic é removida (o clique não avançou).
+      // optimistic é removida (o clique não avançou). O PAGAR cai num menu de erro
+      // acionável (nunca beco sem saída); o NEGOCIAR volta a idle (pode retentar).
       clearPendingNegotiation()
+      if (isPay) clearWaitForPayFailure()
+      else if (isNegotiate) resetWaitToIdle()
       if (err instanceof DOMException && err.name === "AbortError") {
         return { ok: false, code: "timeout" }
       }
       return { ok: false, code: "network" }
     } finally {
       clearTimeout(timeoutId)
+    }
+  }
+
+  // Traduz o shape do payService (D3) em PayResult para render (§5.2/§5.3/§5.4).
+  // NUNCA declara pago (M15): 'processing' (worker off) e 'link' apenas entregam o
+  // link; a quitação é do webhook. Erro de negócio (ok:false) → menu acionável.
+  function applyPayResult(data: Record<string, unknown>) {
+    stopTick()
+    waitStartedAtRef.current = null
+    if (data.ok === true) {
+      const processing = data.processing === true && !data.link
+      setPayResult({
+        status: processing ? "processing" : "link",
+        link: typeof data.link === "string" ? data.link : null,
+        valor: typeof data.valor === "number" ? data.valor : null,
+        vencimento_link: typeof data.vencimento_link === "string" ? data.vencimento_link : null,
+        already_charged: data.already_charged === true,
+      })
+      // link_entregue é ABSORVENTE (M12): a resposta tardia do motor é descartada.
+      setWaitState(processing ? "gerando_cobranca" : "link_entregue")
+    } else {
+      // Erro de negócio (rótulo curto do servidor) → copy humana §5.4 (nunca o
+      // rótulo cru). Menu [Tentar novamente] [Falar com atendimento].
+      setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false })
+      setWaitState("erro_cobranca")
+    }
+  }
+
+  // Falha de transporte no PAGAR (timeout/rede/401): cai no menu de erro §5.4
+  // (nunca beco sem saída, nunca erro técnico). "Nenhuma cobrança foi criada"
+  // tranquiliza sobre duplicidade — o servidor não chegou a cobrar.
+  function clearWaitForPayFailure() {
+    stopTick()
+    waitStartedAtRef.current = null
+    setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false })
+    setWaitState("erro_cobranca")
+  }
+
+  // Volta a espera ao idle (NEGOCIAR falhou/consumido): o devedor pode reabrir o
+  // menu e tentar de novo. Não mexe em payResult.
+  function resetWaitToIdle() {
+    stopTick()
+    waitStartedAtRef.current = null
+    setWaitStep("d0_suppressed")
+    setWaitState("idle")
+  }
+
+  // --- Ações dos atalhos da espera/degradação (§6.3 d3 / §4 A.5) -----------
+  // CAMINHO REAL SEMPRE (M10): quando o menu de 3 opções já foi consumido (ex.: o
+  // devedor clicou "Quero negociar" e o prompt ficou answered/sumiu), NÃO há
+  // prompt ativo para reusar. Antes, os atalhos caíam em resetWaitToIdle()+
+  // pollMessages() — mas o poll NÃO repõe um prompt já respondido, deixando a tela
+  // MORTA (D2 BLOQUEANTE). Agora reabrimos o menu payável no servidor via
+  // /api/chat/reopen (trilha D1, sem prompt_id) e o poll seguinte traz o menu de
+  // volta — "Pagar à vista"/"Tentar as opções de novo" sempre têm botão real.
+
+  // Re-publica o menu de 3 opções no servidor (payável) e re-hidrata a UI. Sai da
+  // espera para idle e puxa o novo active_prompt. Best-effort: mesmo em erro de
+  // rede o poll reconcilia o estado.
+  async function reopenOptions() {
+    resetWaitToIdle()
+    try {
+      await fetch("/api/chat/reopen", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "reopen_options" }),
+      })
+    } catch {
+      /* silencioso: o poll abaixo reconcilia mesmo sem a re-emissão */
+    }
+    await pollMessages()
+  }
+
+  // R5 — "Já paguei / enviar comprovante": registra o payment_claim no servidor
+  // (POST /api/chat/reopen {action:'payment_claim'}) — a equipe confere. NÃO declara
+  // pago (D6/M15). O servidor persiste a orientação ao devedor e REABRE o menu de 3
+  // opções (nunca beco sem saída, M7); o poll seguinte traz a bolha de orientação +
+  // o menu de volta. Best-effort: em erro de rede, o poll reconcilia. Não encerra a
+  // conversa (diferente do handoff). Guarda contra clique duplo com um flag local.
+  const [claimSent, setClaimSent] = useState(false)
+  async function requestPaymentClaim() {
+    if (claimSent) return
+    setClaimSent(true)
+    resetIdle()
+    try {
+      await fetch("/api/chat/reopen", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "payment_claim" }),
+      })
+    } catch {
+      /* silencioso: o poll abaixo reconcilia a orientação + o menu reaberto */
+    }
+    await pollMessages()
+  }
+
+  // Handoff SEM prompt ativo: transfere ao atendimento direto no servidor e
+  // encerra a conversa (desfecho terminal). Reusa o mesmo endpoint de reopen.
+  async function requestHandoffNoPrompt() {
+    try {
+      const res = await fetch("/api/chat/reopen", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "handoff" }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data?.transferred === true) {
+        endedRef.current = true
+        setEnded(true)
+        stopTick()
+        stopPoll()
+        return
+      }
+    } catch {
+      /* silencioso: cai no reopen do menu abaixo (o handoff também está lá) */
+    }
+    // Não confirmou a transferência: repõe o menu para o devedor não ficar preso.
+    await reopenOptions()
+  }
+
+  // "Pagar {valor}" (agora / à vista): reusa o botão PAGAR do prompt ativo se ele
+  // ainda existir (id 4); senão RE-ABRE o menu (o PAGAR volta e o devedor conclui).
+  // NUNCA cobra 2x: o caminho de cobrança e a idempotência são do servidor.
+  function payActiveButtonId(): number | null {
+    const b = activePrompt?.buttons?.find((x) => x.id === 4)
+    return b ? b.id : null
+  }
+  async function onWaitPayNow() {
+    const pid = payActiveButtonId()
+    if (activePrompt && pid != null) {
+      await clickButton(activePrompt.id, pid, "Pagar")
+      return
+    }
+    // Sem botão PAGAR ativo (menu consumido): re-emite o menu payável (M10) — não
+    // apenas poll (que não repõe prompt respondido). O devedor reabre e paga.
+    await reopenOptions()
+  }
+  // "Tentar as opções de novo" (A.5): re-emite o menu de 3 opções no servidor.
+  async function onWaitRetryOptions() {
+    await reopenOptions()
+  }
+  // "Falar com atendimento": reusa o botão de handoff (99) do prompt ativo se
+  // houver; senão transfere direto ao atendimento no servidor (nunca beco sem
+  // saída). Sem termos técnicos ao devedor.
+  async function onWaitHandoff() {
+    const h = activePrompt?.buttons?.find((x) => x.id === 99)
+    if (activePrompt && h) {
+      await clickButton(activePrompt.id, 99, h.label)
+      return
+    }
+    await requestHandoffNoPrompt()
+  }
+  // "Tentar novamente" (§5.4, erro de cobrança): reusa o PAGAR ativo, senão repõe
+  // o menu. Limpa o painel de erro antes.
+  async function onPayRetry() {
+    setPayResult(null)
+    await onWaitPayNow()
+  }
+  // Copiar o link de pagamento (§5.2). Best-effort; sem quebrar se o clipboard
+  // não estiver disponível.
+  async function onCopyLink(link: string) {
+    try {
+      await navigator.clipboard?.writeText(link)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      /* silencioso: o link continua visível/clicável na tela */
     }
   }
 
@@ -379,9 +903,23 @@ export function JourneyChat() {
           Sair
         </button>
       </div>
+      {/* R8 — a região de mensagens é um log acessível: o resumo pós-login e as
+          respostas do assistente são anunciados ao leitor de tela (aria-live
+          polite, só adições), e a região recebe FOCO uma vez após o login (M18).
+          Os BOTÕES ficam num bloco com aria-live=off (abaixo) para não serem
+          re-anunciados em loop — a live region envolve só a copy. */}
       <div
-        ref={scrollRef}
-        className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm"
+        ref={(node) => {
+          scrollRef.current = node
+          summaryFocusRef.current = node
+        }}
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions text"
+        aria-atomic="false"
+        aria-label="Conversa de negociação"
+        tabIndex={-1}
+        className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-secondary)]/40"
         style={{ minHeight: 320 }}
       >
         {dedupAssistantByContent(
@@ -427,12 +965,207 @@ export function JourneyChat() {
           </div>
         ))}
 
+        {/* --- Máquina de espera (§6.3): indicador acessível + copy narrada + saídas --- */}
+        {!ended && waitState === "aguardando_motor" ? (
+          <div className="flex flex-col items-start gap-2">
+            {/* Copy narrada por degrau (d2/d3 reescrevem a bolha de espera; d0/d1
+                não têm texto próprio — o eco A.2 do servidor permanece acima). */}
+            {waitStepCopy(waitStep) ? (
+              <div className="max-w-[85%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+                {waitStepCopy(waitStep)}
+              </div>
+            ) : null}
+            {/* Indicador "digitando" — só de d1 em diante (supressão inicial <1,2s).
+                aria-live="polite" + role="status" para o leitor de tela (M18). */}
+            {shouldShowTypingIndicator(waitStep) ? (
+              <div
+                role="status"
+                aria-live="polite"
+                aria-label="Buscando as condições de pagamento"
+                className="inline-flex items-center gap-1.5 rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2.5"
+              >
+                <span className="sr-only">Buscando as condições de pagamento…</span>
+                <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400 [animation-delay:-0.3s]" />
+                <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400 [animation-delay:-0.15s]" />
+                <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400" />
+              </div>
+            ) : null}
+            {/* Saídas aos 10s (d3) — SEM cancelar a espera (o tick e o poll seguem). */}
+            {shouldShowSlowExits(waitStep) ? (
+              <div className="flex flex-wrap gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={onWaitPayNow}
+                  style={{ backgroundColor: "var(--brand-secondary)" }}
+                  className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+                >
+                  Pagar agora
+                </button>
+                <button
+                  type="button"
+                  onClick={onWaitHandoff}
+                  className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                >
+                  Falar com atendimento
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* --- Degradação aos 15s (§4 / A.5): menu acionável, nunca "erro". --- */}
+        {!ended && waitState === "menu_degradado" ? (
+          <div className="flex flex-col items-start gap-2" role="status" aria-live="polite">
+            <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+              {DEGRADED_MENU_COPY}
+            </div>
+            <div className="flex flex-wrap gap-2 pt-1">
+              <button
+                type="button"
+                onClick={onWaitPayNow}
+                style={{ backgroundColor: "var(--brand-secondary)" }}
+                className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+              >
+                Pagar à vista
+              </button>
+              <button
+                type="button"
+                onClick={onWaitRetryOptions}
+                className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+              >
+                Tentar as opções de novo
+              </button>
+              <button
+                type="button"
+                onClick={onWaitHandoff}
+                className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+              >
+                Falar com atendimento
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* --- Gerando cobrança (§5.1 / A.4) --- */}
+        {!ended && waitState === "gerando_cobranca" && !payResult ? (
+          <div role="status" aria-live="polite" className="flex flex-col items-start">
+            <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+              Certo. Estou gerando o seu link de pagamento. Um instante.
+            </div>
+          </div>
+        ) : null}
+
+        {/* --- Resultado do PAGAR: link (com copiar) / processando / erro --- */}
+        {!ended && payResult ? (
+          <div className="flex flex-col items-start gap-2" role="status" aria-live="polite">
+            {payResult.status === "link" ? (
+              <>
+                <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+                  {payResult.already_charged
+                    ? `Você já tem uma cobrança ativa${payResult.valor ? ` no valor de ${formatBRL(payResult.valor)}` : ""}. Use o mesmo link abaixo — não precisa gerar outro. Se você já pagou, é só desconsiderar.`
+                    : `Pronto! Aqui está o seu link para pagar${payResult.valor ? ` ${formatBRL(payResult.valor)}` : ""}${payResult.vencimento_link ? `, com vencimento em ${formatDueDate(payResult.vencimento_link)}` : ""}. É só abrir e escolher como prefere pagar (Pix, boleto ou cartão). Se você já pagou, pode desconsiderar.`}
+                </div>
+                {payResult.link ? (
+                  <div className="flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
+                    <a
+                      href={payResult.link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ backgroundColor: "var(--brand-secondary)" }}
+                      className="inline-block rounded-md px-4 py-2 text-center text-sm font-semibold text-white"
+                    >
+                      Abrir link de pagamento
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => onCopyLink(payResult.link as string)}
+                      className="rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    >
+                      {copied ? "Link copiado!" : "Copiar link"}
+                    </button>
+                  </div>
+                ) : null}
+              </>
+            ) : payResult.status === "processing" ? (
+              <>
+                <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+                  Estou gerando o seu link de pagamento. Assim que estiver pronto, ele aparece aqui — pode aguardar um instante.
+                </div>
+                {/* R3 — inline "digitando" para o processing não parecer travado. */}
+                <div
+                  className="inline-flex items-center gap-1.5 rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2.5"
+                  aria-hidden="true"
+                >
+                  <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400 [animation-delay:-0.3s]" />
+                  <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400 [animation-delay:-0.15s]" />
+                  <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400" />
+                </div>
+                {/* R3 — passado o teto (~60s) sem link, oferece saída acionável
+                    (nunca espera muda infinita). O poll segue vivo em paralelo. */}
+                {shouldOfferProcessingExit(payPollAttempts) ? (
+                  <div className="flex flex-col items-start gap-2 pt-1">
+                    <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+                      Está demorando um pouco mais que o normal para gerar o link. Você pode continuar aguardando ou falar com o nosso atendimento.
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onWaitHandoff}
+                      className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    >
+                      Falar com atendimento
+                    </button>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+                  Não consegui gerar o seu link de pagamento agora. Isso costuma se resolver em uma nova tentativa. Você pode tentar de novo ou falar com o nosso atendimento — não se preocupe, nenhuma cobrança foi criada.
+                </div>
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={onPayRetry}
+                    style={{ backgroundColor: "var(--brand-secondary)" }}
+                    className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+                  >
+                    Tentar novamente
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onWaitHandoff}
+                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                  >
+                    Falar com atendimento
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        ) : null}
+
         {activePrompt && !ended ? (
-          <div className="pt-1">
+          // R8 — aria-live=off: os BOTÕES não entram no anúncio do log (evita
+          // re-anúncio das labels em loop; A-07). group + aria-label dão contexto
+          // ao leitor de tela; a navegação por teclado alcança os botões na ordem.
+          <div className="pt-1" aria-live="off" role="group" aria-label="Opções de negociação">
             {/* key por id do prompt: ao trocar de prompt (ex.: Consultar reabre o
                 menu pós-consulta) o componente REMONTA, zerando o estado local
                 'answered'/'pending' — sem isso o novo menu nasceria desabilitado. */}
             <PromptButtons key={activePrompt.id} prompt={activePrompt} onClick={clickButton} />
+            {/* R5 — afordância "Já paguei": secundária/discreta, disponível no menu de
+                3 opções (payável). Registra o payment_claim (conferência da equipe),
+                sem declarar pago; o servidor reabre o menu em seguida. Some após o
+                clique (claimSent) para não empilhar. Só no menu de 3 opções. */}
+            {activePrompt.kind === "debt_three_options" && !claimSent ? (
+              <button
+                type="button"
+                onClick={requestPaymentClaim}
+                className="mt-2 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
+              >
+                Já paguei este valor
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>

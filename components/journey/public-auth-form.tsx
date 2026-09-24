@@ -9,6 +9,7 @@
 // - Nunca guarda PII em title/localStorage/query. Erro/no_debt/blocked têm a
 //   MESMA aparência de mensagem uniforme (o servidor devolve o texto).
 import { useCallback, useEffect, useRef, useState } from "react"
+import { entrySealText, entrySealWhoText, ENTRY_SEAL_WHO_LABEL } from "@/lib/journey/entry-seal"
 
 const NO_DEBT_FALLBACK =
   "Não encontramos dívidas cadastradas para negociação com este documento. Se você recebeu uma mensagem nossa, confira se digitou o documento corretamente. Se preferir, fale com nosso atendimento."
@@ -79,6 +80,7 @@ export function PublicAuthForm({
   successHref,
   captchaEnabled = false,
   captchaSiteKey = "",
+  creditorName = "",
 }: {
   code: string
   /** ABSOLUTO (ex.: /n/{code}/chat). Navegação HARD após o login para o layout
@@ -86,12 +88,17 @@ export function PublicAuthForm({
   successHref: string
   captchaEnabled?: boolean
   captchaSiteKey?: string
+  /** R4 — nome do credor (companies.name via branding do tenant) para o SELO da
+   *  porta. NÃO revela o débito; ausente → texto genérico seguro (entry-seal.ts). */
+  creditorName?: string
 }) {
   const [doc, setDoc] = useState("")
   const [consent, setConsent] = useState(false)
   const [captchaToken, setCaptchaToken] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  // R4 — "quem somos" é um disclosure inline (sem página nova); começa fechado.
+  const [showWho, setShowWho] = useState(false)
 
   const widgetRef = useRef<HTMLDivElement | null>(null)
   const widgetIdRef = useRef<string | null>(null)
@@ -172,6 +179,25 @@ export function PublicAuthForm({
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-1 flex-col gap-5" autoComplete="off">
+      {/* R4 — SELO DE LEGITIMIDADE na porta (antes do CPF): diz de QUEM veio o
+          link e que a AlteaPay só OPERA o canal. NÃO revela o débito (D6/D17). */}
+      <div className="rounded-md border border-neutral-200 bg-white/70 px-3 py-2.5 text-sm text-neutral-600">
+        <p>{entrySealText(creditorName)}</p>
+        <button
+          type="button"
+          onClick={() => setShowWho((v) => !v)}
+          aria-expanded={showWho}
+          className="mt-1 inline-flex items-center text-xs font-medium text-[var(--brand-secondary)] underline underline-offset-2"
+        >
+          {ENTRY_SEAL_WHO_LABEL}
+        </button>
+        {showWho ? (
+          <p className="mt-2 text-xs leading-relaxed text-neutral-500">
+            {entrySealWhoText(creditorName)}
+          </p>
+        ) : null}
+      </div>
+
       <div>
         <h1 className="text-xl font-semibold">Consulte sua negociação com segurança</h1>
         <p className="mt-1 text-sm text-neutral-500">

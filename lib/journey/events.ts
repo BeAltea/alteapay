@@ -28,6 +28,13 @@ export type JourneyEventType =
   | "contact.stopped" | "contact.stop_failed"
   | "message.accepted"
   | "session.closed" | "retry.available"
+  // Onda "3 opções" — trilha PAGAR AGORA (§6.4/M17). Telemetria da cobrança à
+  // vista iniciada pelo botão PAGAR do chat. Sem PII no payload (só ids/estado).
+  //   pay.requested   — clique PAGAR chegou ao payService (gerando_cobranca).
+  //   pay.link_ready  — link ASAAS entregue (created OU already_charged).
+  //   pay.processing  — cobrança aceita mas o link ainda não voltou (worker off).
+  //   pay.failed      — erro ASAAS/guard: rótulo curto, NUNCA mensagem crua.
+  | "pay.requested" | "pay.link_ready" | "pay.processing" | "pay.failed"
   // Auditoria de privacidade: super_admin revelou o documento em claro de uma
   // linha (listas super-admin). Aditivo — o payload NUNCA carrega o doc em claro
   // (maskPayload já mascara; registramos ator/motivo/doc mascarado/ids).

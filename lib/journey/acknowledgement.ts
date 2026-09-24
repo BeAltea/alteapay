@@ -19,14 +19,18 @@ import { createHash, randomUUID } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { recordEvent } from "./events"
 import {
+  BTN_BACK,
   BTN_CONSULT,
   BTN_HANDOFF,
   BTN_NEGOTIATE,
   BTN_NO,
+  BTN_PAY,
   BTN_YES,
   type Button,
 } from "./buttons"
 import { createPrompt, answerPrompt, type PromptRow } from "./prompts"
+import { listOffers, type ListedOffer, type SessionCtx } from "./actions"
+import type { OfferTerms } from "@/lib/negotiation/offers"
 
 const BRL = (v: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v || 0)
@@ -113,7 +117,7 @@ export function acknowledgementButtons(showHandoff: boolean): Button[] {
     { id: BTN_YES, label: "Sim, reconheço" },
     { id: BTN_NO, label: "Não reconheço" },
   ]
-  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendente" })
+  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
 }
 
@@ -122,12 +126,13 @@ export function acknowledgementButtons(showHandoff: boolean): Button[] {
  * pergunta). Sem contagem de faturas. Se firstName vazio, cai no genérico.
  */
 export function acknowledgementQuestion(ctx: AckContext): string {
+  // R14/D36: "pendência" (não "dívida"); tom neutro, sem ameaça.
   const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
   return (
-    `${greeting} Temos uma dívida em seu nome da empresa ${ctx.creditorName}. ` +
+    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
     `Valor atualizado ${BRL(ctx.updatedValue)}, ` +
     `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}. ` +
-    `Você reconhece esta cobrança em seu nome?`
+    `Você reconhece esta cobrança em seu nome? Se já pagou, é só desconsiderar esta mensagem.`
   )
 }
 
@@ -148,7 +153,7 @@ export function consultNegotiateButtons(showHandoff: boolean): Button[] {
     { id: BTN_CONSULT, label: "Consultar Dívida" },
     { id: BTN_NEGOTIATE, label: "Negociar Dívida" },
   ]
-  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendente" })
+  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
 }
 
@@ -162,7 +167,7 @@ export function postConsultButtons(showHandoff: boolean): Button[] {
     { id: BTN_NEGOTIATE, label: "Negociar Dívida" },
     { id: BTN_NO, label: "Não reconheço a dívida" },
   ]
-  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendente" })
+  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
 }
 
@@ -172,9 +177,10 @@ export function postConsultButtons(showHandoff: boolean): Button[] {
  * (na mensagem `debtInfoMessage`), evitando repetir os números duas vezes.
  */
 export function consultNegotiateQuestion(ctx: AckContext): string {
+  // R14/D36: "pendência" (não "dívida"); sem ameaça.
   const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
   return (
-    `${greeting} Temos uma dívida em seu nome da empresa ${ctx.creditorName}. ` +
+    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
     `O que você deseja fazer?`
   )
 }
@@ -194,11 +200,414 @@ export function debtInfoMessage(ctx: AckContext): string {
     ctx.invoiceCount > 0
       ? ` em ${ctx.invoiceCount} fatura(s)`
       : ""
+  // R14/D36: "pendência" (não "dívida").
   return (
-    `Aqui estão os dados da sua dívida com a ${ctx.creditorName}: ` +
+    `Aqui estão os dados da sua pendência com a ${ctx.creditorName}: ` +
     `valor atualizado ${BRL(ctx.updatedValue)}${invoiceLine}, ` +
     `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}.`
   )
+}
+
+// ============================================================================
+// Onda "3 opções" (§6.1, §6.2, M2–M7) — menu pós-login: Pagar › Negociar › Não
+// reconheço. Trilha D1. Reconhecimento IMPLÍCITO ao clicar Pagar/Negociar (M4).
+// ============================================================================
+
+/** Rótulo/valor exibidos em REAIS, com o mesmo Intl do resumo (R$ 250,00). */
+function payLabel(value: number): string {
+  return `Quero pagar — ${BRL(value)}`
+}
+
+/**
+ * Botões do menu de 3 opções (§6.1, ordem contratual G1 D.2):
+ *   [4] Pagar (rótulo com valor canônico) › [1] Negociar › [0] Não reconheço.
+ * A ordem de EXIBIÇÃO é fixada por `order` (0,1,2) — NÃO pela ordem dos ids (que é
+ * 4,1,0). show_handoff_button acrescenta [99] ao final. O rótulo de pagar carrega
+ * o {valor} da fonte canônica (M3): clique informado, sem tela extra de confirmação.
+ */
+export function threeOptionsButtons(value: number, showHandoff: boolean): Button[] {
+  const buttons: Button[] = [
+    { id: BTN_PAY, label: payLabel(value), order: 0 },
+    { id: BTN_YES, label: "Quero negociar", order: 1 },
+    { id: BTN_NO, label: "Não reconheço esta dívida", order: 2 },
+  ]
+  if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento", order: 3 })
+  return buttons
+}
+
+/** Botão único de VOLTA do "Não reconheço" (M7): reabre o menu de 3 opções. */
+export function backToOptionsButtons(): Button[] {
+  return [{ id: BTN_BACK, label: "Na verdade, quero ver as opções", order: 0 }]
+}
+
+/**
+ * Mensagem-resumo do menu de 3 opções (§6.1, copy 03-copy.md §1). Uma bolha:
+ * saudação + credor + valor atualizado + vencimento original (+ N faturas se >1) +
+ * convite. "Se já pagou, é só desconsiderar" cobre D36. Sem PII (nada de documento).
+ * Variação sem nome cai em "Olá!" (nunca "Olá, !"/"null").
+ */
+export function threeOptionsSummary(ctx: AckContext): string {
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá!"
+  const faturas = ctx.invoiceCount > 1 ? ` · ${ctx.invoiceCount} faturas` : ""
+  return (
+    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
+    `Valor atualizado: ${BRL(ctx.updatedValue)} · ` +
+    `Vencimento original: ${formatDatePt(ctx.oldestDueDate)}${faturas}. ` +
+    `Como você prefere seguir? Se já pagou, é só desconsiderar esta mensagem.`
+  )
+}
+
+/**
+ * Canal oficial do cedente (§6.2/M6) com FALLBACK SEGURO (decisão G1 D.1):
+ *  - se `official_channel_label` do tenant existir → usa-o (+ url se houver);
+ *  - se estiver NULL/vazio (VMAX hoje) → NUNCA renderiza vazio/"null"/outro cedente
+ *    (incidente "GNLink"): devolve `hasConfig:false` e o texto genérico é montado
+ *    por `notRecognizedReply` ("pelo canal informado na sua fatura ou no site
+ *    oficial da {credor}"). Quem chama emite o alerta de config (telemetria/log).
+ */
+export interface CreditorChannel {
+  creditorName: string
+  hasConfig: boolean
+  channelLabel: string | null
+  channelUrl: string | null
+}
+
+export async function resolveCreditorChannel(input: {
+  companyId: string
+  customerId: string
+  debtId: string
+}): Promise<CreditorChannel> {
+  const supabase = createServiceClient()
+  const { data: cfg } = await supabase
+    .from("tenant_chat_config")
+    .select("official_channel_label, official_channel_url")
+    .eq("company_id", input.companyId)
+    .maybeSingle()
+  // {credor} SEMPRE da fonte canônica (buildAckContext), nunca do label do canal.
+  let creditorName = "empresa credora"
+  try {
+    const ackCtx = await buildAckContext({
+      companyId: input.companyId,
+      customerId: input.customerId,
+      debtIds: [input.debtId],
+    })
+    creditorName = ackCtx.creditorName
+  } catch {
+    /* fallback silencioso: mantém o genérico */
+  }
+  const rawLabel = typeof cfg?.official_channel_label === "string" ? cfg.official_channel_label.trim() : ""
+  const rawUrl = typeof cfg?.official_channel_url === "string" ? cfg.official_channel_url.trim() : ""
+  const hasConfig = rawLabel.length > 0
+  return {
+    creditorName,
+    hasConfig,
+    channelLabel: hasConfig ? rawLabel : null,
+    channelUrl: rawUrl.length > 0 ? rawUrl : null,
+  }
+}
+
+/**
+ * Copy do "Não reconheço" (§6.2, 03-copy.md §3), encaminhando ao CEDENTE. Nunca
+ * promete pagamento; nunca cita AlteaPay como responsável pela dívida. D36:
+ * "se já pagou, informe o credor". Duas variações — só a frase do canal muda:
+ *   COM config    → "pelo canal oficial: {label}[ ({url})]"
+ *   SEM config    → "pelo canal informado na sua fatura ou no site oficial da {credor}"
+ * NUNCA renderiza "null"/vazio/terceiro (garantido por resolveCreditorChannel).
+ */
+export function notRecognizedReply(channel: CreditorChannel): string {
+  const { creditorName } = channel
+  const channelSentence = channel.hasConfig
+    ? `Para entender a origem do débito e contestar, fale diretamente com a ${creditorName} pelo canal oficial: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}.`
+    : `Para entender a origem do débito e contestar, fale diretamente com a ${creditorName} pelo canal informado na sua fatura ou no site oficial da ${creditorName}.`
+  return (
+    `Obrigado por avisar. Registramos que você não reconhece esta cobrança e não vamos ` +
+    `gerar nenhum pagamento agora. ${channelSentence} ` +
+    `A AlteaPay é a plataforma que opera o canal de negociação; quem tem os detalhes do ` +
+    `contrato é a ${creditorName}. Se você já pagou este valor, informe isso ao credor ` +
+    `para que ele atualize o cadastro.`
+  )
+}
+
+export type BootstrapThreeOptionsResult =
+  | { ok: true; created: false; reason: "disabled" | "already_active"; prompt?: PromptRow }
+  | { ok: true; created: true; prompt: PromptRow }
+  | { ok: false; error: string }
+
+/**
+ * Cria o prompt INICIAL da sessão no formato de 3 opções (§6.1). Idempotente na
+ * RE-ENTRADA: só recria quando NÃO há prompt ativo da jornada
+ * (debt_three_options/debt_consult/debt_acknowledgement) — assim uma sessão
+ * reaberta não perde o menu, e um reload durante a negociação não duplica o
+ * prompt. A pergunta-resumo (com valor/vencimento) é persistida em chat_messages
+ * ligada ao prompt (histórico da re-entrada). Respeita acknowledgement_enabled.
+ * NÃO grava reconhecimento — só apresenta (o reconhecimento implícito é no clique).
+ */
+export async function bootstrapThreeOptionsPrompt(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtIds: string[]
+  primaryDebtId: string
+}): Promise<BootstrapThreeOptionsResult> {
+  const supabase = createServiceClient()
+  const { data: cfg } = await supabase
+    .from("tenant_chat_config")
+    .select("acknowledgement_enabled, show_handoff_button")
+    .eq("company_id", input.companyId)
+    .maybeSingle()
+  if (cfg?.acknowledgement_enabled === false) {
+    return { ok: true, created: false, reason: "disabled" }
+  }
+
+  const { data: existing } = await supabase
+    .from("chat_prompts")
+    .select("*")
+    .eq("session_id", input.sessionId)
+    .in("kind", ["debt_three_options", "debt_consult", "debt_acknowledgement"])
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (existing) {
+    return { ok: true, created: false, reason: "already_active", prompt: existing as PromptRow }
+  }
+
+  const ackCtx = await buildAckContext({
+    companyId: input.companyId,
+    customerId: input.customerId,
+    debtIds: input.debtIds,
+  })
+  const question = threeOptionsSummary(ackCtx)
+  const created = await createPrompt({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    kind: "debt_three_options",
+    question,
+    buttons: threeOptionsButtons(ackCtx.updatedValue, cfg?.show_handoff_button === true),
+    context: {
+      creditor_name: ackCtx.creditorName,
+      updated_value: ackCtx.updatedValue,
+      invoice_count: ackCtx.invoiceCount,
+      oldest_due_date: ackCtx.oldestDueDate,
+      primary_debt_id: input.primaryDebtId,
+      debt_ids: input.debtIds,
+    },
+    createdBy: "platform",
+  })
+  if (!created.ok) return { ok: false, error: created.error }
+
+  await persistAssistantMessage({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    text: question,
+    promptId: created.prompt.id,
+  })
+  return { ok: true, created: true, prompt: created.prompt }
+}
+
+/**
+ * Bootstrap tolerante a falhas do menu de 3 opções (análogo a bootstrapAckSafe).
+ * Só roda com CHAT_JOURNEY_ENABLED=true e NUNCA lança — uma falha aqui não pode
+ * derrubar a autenticação (o devedor entra no chat de qualquer forma).
+ */
+export async function bootstrapThreeOptionsSafe(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtIds: string[]
+  primaryDebtId: string | null
+}): Promise<void> {
+  if (process.env.CHAT_JOURNEY_ENABLED !== "true") return
+  if (!input.primaryDebtId || input.debtIds.length === 0) return
+  try {
+    await bootstrapThreeOptionsPrompt({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      customerId: input.customerId,
+      debtIds: input.debtIds,
+      primaryDebtId: input.primaryDebtId,
+    })
+  } catch (err) {
+    console.warn("[journey] bootstrap 3 opções falhou:", (err as Error).message)
+  }
+}
+
+/**
+ * Reabre o menu de 3 opções após "Não reconheço" → volta ([98]). Recria o prompt
+ * de 3 opções com a mesma mensagem-resumo. Reusa bootstrapThreeOptionsPrompt (que
+ * é idempotente); se ainda houver um prompt ativo (não deveria — o clique de volta
+ * já respondeu o prompt do "não reconheço"), devolve o ativo.
+ */
+export async function reopenThreeOptions(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtIds: string[]
+  primaryDebtId: string
+}): Promise<{ ok: true; reply: string } | { ok: false; error: string }> {
+  const res = await bootstrapThreeOptionsPrompt(input)
+  if (!res.ok) return res
+  const ackCtx = await buildAckContext({
+    companyId: input.companyId,
+    customerId: input.customerId,
+    debtIds: input.debtIds,
+  })
+  return { ok: true, reply: threeOptionsSummary(ackCtx) }
+}
+
+// ============================================================================
+// R1 (onda "3 opções", modo ASSISTIDO sem n8n) — apresentação das PARCELAS DA
+// MATRIZ como botões quando o devedor clica "Quero negociar" e o motor n8n NÃO
+// conduz (fallback determinístico). O SERVIDOR é dono da matriz (D8/D11): as
+// ofertas saem de `listOffers` (lib/negotiation/offers.ts → matriz do servidor),
+// nunca do client. Selecionar uma → acceptMatrixCondition/caminho canônico
+// (closeAgreement → charge-inline) gera o link ASAAS no chat, com guard de
+// idempotência (D7) e already_charged (D23): NUNCA 2ª cobrança, NUNCA declara pago.
+// ============================================================================
+
+/** IDs de item de lista (2..97) para as ofertas, na ORDEM em que `listOffers`
+ *  devolve (à vista primeiro, depois parcelado). id 2 = 1ª oferta, 3 = 2ª, … O
+ *  `value` carrega o offer_id (uuid persistido em negotiation_offers) — o servidor
+ *  revalida contra a matriz no aceite (não confia no client). */
+const OFFER_FIRST_BUTTON_ID = 2
+
+/**
+ * Rótulo curto e claro de uma oferta de parcelamento (§ copy, sem PII):
+ *   - à vista (1 parcela): "À vista R$ 175,00" (+ "(30% de desconto)" se houver);
+ *   - parcelado (N>1): "3x de R$ 78,33 (total R$ 235,00)".
+ * Valores da OFERTA (total/parcela) — a mesma matriz que gerou a oferta. Nunca
+ * insinua desconto quando não há (discount_value 0).
+ */
+export function offerButtonLabel(terms: OfferTerms): string {
+  if (terms.installments <= 1) {
+    const base = `À vista ${BRL(terms.total_value)}`
+    return terms.discount_value > 0
+      ? `${base} (${Math.round(terms.discount_pct)}% de desconto)`
+      : base
+  }
+  return `${terms.installments}x de ${BRL(terms.installment_value)} (total ${BRL(terms.total_value)})`
+}
+
+/** Monta os botões de escolha de oferta a partir da lista da matriz (na ordem
+ *  de `listOffers`). id = 2..N (item de lista), value = offer_id, order = índice
+ *  para a exibição preservar a ordem "à vista → parcelado". `order` também deixa o
+ *  BTN_BACK (98) no fim, dando ao devedor a saída "voltar às opções" (M7). */
+export function offerChoiceButtons(offers: ListedOffer[]): Button[] {
+  const buttons: Button[] = offers.map((o, i) => ({
+    id: OFFER_FIRST_BUTTON_ID + i,
+    label: offerButtonLabel(o.terms),
+    value: o.id,
+    order: i,
+  }))
+  // volta às opções (M7): nunca é beco sem saída.
+  buttons.push({ id: BTN_BACK, label: "Voltar às opções", order: offers.length })
+  return buttons
+}
+
+/** Pergunta que acompanha os botões de parcelamento (D36: "se já pagou,
+ *  desconsidere"). Sem PII; sem ameaça/negativação. */
+export function offerChoiceQuestion(): string {
+  return (
+    "Aqui estão as opções de pagamento disponíveis para você. " +
+    "Escolha a que preferir para gerar o seu pagamento. Se já pagou, é só desconsiderar."
+  )
+}
+
+export type PresentMatrixOffersResult =
+  | { ok: true; presented: true; offers: ListedOffer[]; promptId: string }
+  | { ok: true; presented: false; reason: "no_offers" }
+  | { ok: false; error: string }
+
+/**
+ * R1 — apresenta as OPÇÕES DE PARCELAMENTO DETERMINÍSTICAS da matriz do servidor
+ * (`listOffers`) como um prompt de botões (kind 'offer_choice'). É o fallback
+ * assistido do "Quero negociar" quando o n8n não conduz. Idempotente na
+ * re-entrada: se já há um prompt 'offer_choice' ATIVO nesta sessão, não recria
+ * (reload/clique duplo não empilha). Sem ofertas na matriz (sem faixa vigente) →
+ * `presented:false` (o chamador cai no caminho de degradação, nunca beco sem
+ * saída). NÃO cobra nada aqui — só apresenta; a cobrança é no aceite. NÃO decide
+ * desconto/parcela (D8): só exibe o que a matriz gerou.
+ */
+export async function presentMatrixOffers(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+}): Promise<PresentMatrixOffersResult> {
+  const ctx: SessionCtx = {
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    customerId: input.customerId,
+    debtId: input.debtId,
+  }
+  const supabase = createServiceClient()
+
+  // idempotência: se já existe um 'offer_choice' ATIVO, reusa (não re-apresenta).
+  const { data: existing } = await supabase
+    .from("chat_prompts")
+    .select("id, buttons")
+    .eq("session_id", input.sessionId)
+    .eq("kind", "offer_choice")
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (existing) {
+    // devolve as ofertas ainda vivas (para o chamador reidratar, se precisar)
+    const offers = await listOffers(ctx)
+    return { ok: true, presented: true, offers, promptId: (existing as { id: string }).id }
+  }
+
+  const offers = await listOffers(ctx)
+  if (offers.length === 0) return { ok: true, presented: false, reason: "no_offers" }
+
+  const question = offerChoiceQuestion()
+  const created = await createPrompt({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    kind: "offer_choice",
+    question,
+    buttons: offerChoiceButtons(offers),
+    context: {
+      debt_ids: [input.debtId],
+      primary_debt_id: input.debtId,
+      offer_ids: offers.map((o) => o.id),
+      source: "assisted_matrix",
+    },
+    createdBy: "platform",
+  })
+  if (!created.ok) return { ok: false, error: created.error }
+  await persistAssistantMessage({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    text: question,
+    promptId: created.prompt.id,
+  })
+  return { ok: true, presented: true, offers, promptId: created.prompt.id }
+}
+
+/**
+ * Resolve o offer_id a partir do clique num botão de 'offer_choice': o `value` do
+ * botão carrega o uuid da oferta. Valida que o botão pertence ao prompt e que a
+ * oferta ainda está listada no context (defesa em profundidade — o servidor não
+ * confia no client; a revalidação de matriz definitiva é do paymentCreate). Sem
+ * PII. Retorna null quando o botão não mapeia uma oferta (ex.: BTN_BACK).
+ */
+export function resolveOfferIdFromButton(
+  prompt: PromptRow,
+  buttonId: number,
+): string | null {
+  const btn = (prompt.buttons ?? []).find((b) => b.id === buttonId)
+  const value = btn?.value
+  if (typeof value !== "string" || value.length === 0) return null
+  const offerIds = Array.isArray((prompt.context as { offer_ids?: unknown } | null)?.offer_ids)
+    ? ((prompt.context as { offer_ids: string[] }).offer_ids)
+    : null
+  // Se o context lista offer_ids, o value TEM que estar entre eles (não aceita um
+  // id arbitrário do client). Sem lista (context antigo), aceita o value do botão
+  // — a matriz ainda é revalidada no aceite (paymentCreate → assertOfferWithinMatrix).
+  if (offerIds && !offerIds.includes(value)) return null
+  return value
 }
 
 // --- dívida quitada (cliente já pagou) --------------------------------------
@@ -624,6 +1033,9 @@ export async function persistDebtRecognition(input: {
   buttonId: number
   acknowledged: boolean
   source: string
+  /** M4: 'implicit' quando o reconhecimento vem do clique em Pagar/Negociar no
+   *  menu de 3 opções; 'explicit' (default) no "Sim, reconheço". */
+  mode?: "explicit" | "implicit"
   ip?: string | null
   userAgent?: string | null
 }): Promise<void> {
@@ -637,7 +1049,8 @@ export async function persistDebtRecognition(input: {
   //    o reconhecimento em silêncio. Bug histórico: o CHECK(button_id in (0,1))
   //    rejeitava o button_id=3 (Negociar) e a linha sumia sem trace, quebrando o
   //    debt_acknowledgement_latest/o guard de pagamento. A migration
-  //    20260932_debt_ack_button_id_relax.sql relaxa o CHECK para (0,1,2,3); aqui
+  //    20260932_debt_ack_button_id_relax.sql relaxa o CHECK para (0,1,2,3) e a
+  //    20260933_debt_ack_mode.sql estende para (0,1,2,3,4) incluindo PAGAR; aqui
   //    lançamos o erro para o chamador (rota) resolver como 500 auditável em vez
   //    de seguir com um reconhecimento fantasma.
   const { error: ackInsertError } = await supabase.from("debt_acknowledgements").insert({
@@ -649,6 +1062,7 @@ export async function persistDebtRecognition(input: {
     acknowledged: input.acknowledged,
     button_id: input.buttonId,
     source: input.source,
+    mode: input.mode ?? "explicit",
     ip_hash: ipHash,
     user_agent: input.userAgent ?? null,
   })
@@ -1059,6 +1473,41 @@ export async function handleDebtNotRecognized(input: {
   })
   const onNotRecognized = await onNotRecognizedBehavior(input.companyId)
   return { ok: true, onNotRecognized }
+}
+
+/**
+ * Reconhecimento IMPLÍCITO (M4) do menu de 3 opções: o clique em Pagar (4) ou
+ * Negociar (1) conta como reconhecimento da dívida — grava
+ * debt_acknowledgements(acknowledged=true, mode='implicit', button_id) e destrava
+ * o payment.create (guard D18). É gravado ANTES de payService/negotiation.start
+ * pela rota /api/chat/button (contrato G1). NÃO responde o prompt (a rota já
+ * chamou answerPrompt). `source` distingue a origem no append-log:
+ *   chat_three_options_pay | chat_three_options_negotiate.
+ */
+export async function recognizeImplicit(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+  promptId: string
+  buttonId: number // BTN_PAY (4) ou BTN_YES (1)
+  source: string
+  ip?: string | null
+  userAgent?: string | null
+}): Promise<void> {
+  await persistDebtRecognition({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    customerId: input.customerId,
+    debtId: input.debtId,
+    promptId: input.promptId,
+    buttonId: input.buttonId,
+    acknowledged: true,
+    mode: "implicit",
+    source: input.source,
+    ip: input.ip,
+    userAgent: input.userAgent,
+  })
 }
 
 export type AckGuard =

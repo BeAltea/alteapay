@@ -21,7 +21,7 @@ import { recordEvent } from "./events"
 import { GENERIC_AUTH_MESSAGE } from "./auth"
 import { isAcceptableDocument, normalizeDocument } from "./document"
 import { resolveByDocument, type ResolvedDebtor, type SettledDebtor } from "./resolver"
-import { bootstrapAckSafe, bootstrapSettledSafe } from "./acknowledgement"
+import { bootstrapSettledSafe, bootstrapThreeOptionsSafe } from "./acknowledgement"
 import { verifyCaptcha as verifyCaptchaFunctional } from "./captcha"
 import {
   docHashOf,
@@ -328,8 +328,11 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
   }
 
   if (resolved.kind === "open") {
-    // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
-    await bootstrapAckSafe({
+    // onda "3 opções" (§6.1, M1/M2): menu pós-login (Pagar › Negociar › Não
+    // reconheço) publicado sem clique como 1ª interação. Substitui o prompt legado
+    // Sim/Não (bootstrapAckSafe) — a troca é o que torna a branch debt_three_options
+    // de /api/chat/button alcançável ponta-a-ponta (D1 ALTO). Gated/idempotente.
+    await bootstrapThreeOptionsSafe({
       companyId: input.companyId,
       sessionId,
       customerId,

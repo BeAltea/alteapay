@@ -15,12 +15,21 @@
 // "Não reconheço a dívida" reusa o BTN_NO (0). Assim o catálogo booleano
 // (1/0/99) segue intacto para os demais prompts.
 //
+// Onda "3 opções" (§6.1, decisão G1 D.2/ordem): o prompt inicial pós-login passa
+// a oferecer TRÊS botões, sempre nesta ordem — Pagar(4) › Negociar(1) › Não
+// reconheço(0) — no kind 'debt_three_options'. Ids:
+//   4 = PAGAR (id livre; NÃO colide com Consultar=2/Negociar=3/booleano 0,1)
+//   1 = NEGOCIAR (reusa BTN_YES: "quero negociar" implica reconhecimento)
+//   0 = NAO_RECONHECO (reusa BTN_NO)
+// O clique em Pagar(4) ou Negociar(1) grava reconhecimento IMPLÍCITO (M4).
+//
 // prompt_kind conhecidos; kinds novos vindos do n8n são aceitos e registrados
 // (o servidor não impõe um enum fechado, só valida a estrutura dos botões).
 
 export type PromptKind =
   | "debt_acknowledgement"
   | "debt_consult"
+  | "debt_three_options"
   | "offer_choice"
   | "payment_method_choice"
   | "payment_confirmation"
@@ -29,6 +38,7 @@ export type PromptKind =
 export const KNOWN_PROMPT_KINDS: readonly PromptKind[] = [
   "debt_acknowledgement",
   "debt_consult",
+  "debt_three_options",
   "offer_choice",
   "payment_method_choice",
   "payment_confirmation",
@@ -39,6 +49,8 @@ export const BTN_YES = 1
 export const BTN_NO = 0
 export const BTN_CONSULT = 2
 export const BTN_NEGOTIATE = 3
+/** Onda "3 opções": botão PAGAR do menu pós-login (id livre; decisão G1). */
+export const BTN_PAY = 4
 export const BTN_BACK = 98
 export const BTN_HANDOFF = 99
 
@@ -49,6 +61,13 @@ export interface Button {
   id: number
   label: string
   value?: string
+  /**
+   * Ordem de exibição EXPLÍCITA (menor primeiro). Quando presente, tem precedência
+   * sobre o id no sortButtons. Necessário para o menu de 3 opções, cuja ordem
+   * contratual (Pagar › Negociar › Não reconheço) NÃO coincide com a ordem dos ids
+   * (4,1,0). Botões sem `order` mantêm o comportamento legado (sort por id).
+   */
+  order?: number
 }
 
 export type ButtonValidation =
@@ -101,9 +120,20 @@ export function assertBooleanButtons(buttons: Button[]): ButtonValidation {
   return { ok: true }
 }
 
-/** Ordena por id crescente (a UI apresenta 1/0 como Sim/Não; 98/99 ao final). */
+/**
+ * Ordena os botões para exibição. Regra:
+ *  - se QUALQUER botão traz `order`, ordena por `order` (menor primeiro), com o id
+ *    como desempate (botões sem `order` vão ao final, preservando o id-sort entre
+ *    eles). Isto atende o menu de 3 opções (Pagar › Negociar › Não reconheço), cuja
+ *    ordem contratual não coincide com a ordem dos ids (4,1,0);
+ *  - caso contrário, comportamento legado: id crescente (Sim/Não como 1/0; 98/99 ao
+ *    final).
+ */
 export function sortButtons(buttons: Button[]): Button[] {
-  return [...buttons].sort((a, b) => a.id - b.id)
+  const hasOrder = buttons.some((b) => typeof b.order === "number")
+  if (!hasOrder) return [...buttons].sort((a, b) => a.id - b.id)
+  const rank = (b: Button) => (typeof b.order === "number" ? b.order : Number.MAX_SAFE_INTEGER)
+  return [...buttons].sort((a, b) => rank(a) - rank(b) || a.id - b.id)
 }
 
 /** Localiza um botão pelo id no catálogo (após validado). */

@@ -7,7 +7,7 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { signChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createHandoffSession, loadTenantConfig } from "@/lib/negotiation/sessions"
 import { recordEvent } from "./events"
-import { bootstrapAckSafe } from "./acknowledgement"
+import { bootstrapThreeOptionsSafe } from "./acknowledgement"
 import type { AccessTokenRow } from "./tokens"
 
 export const GENERIC_AUTH_MESSAGE =
@@ -217,9 +217,13 @@ export async function authenticateDebtor(input: AuthenticateInput): Promise<Auth
     sessionId, type: "session.started", actor: "system",
   })
 
-  // onda R: reconhecimento da dívida é a 1ª interação (determinístico, local).
+  // onda "3 opções" (§6.1, M1/M2): o menu pós-login (Pagar › Negociar › Não
+  // reconheço) é a 1ª interação, publicado sem clique. Substitui o prompt legado
+  // de reconhecimento Sim/Não (bootstrapAckSafe) — sem esta troca, a branch
+  // debt_three_options de /api/chat/button ficava inalcançável (D1 ALTO). Gated por
+  // CHAT_JOURNEY_ENABLED (idempotente, NUNCA lança).
   const debtIds = (tokenRow.debt_ids?.length ? tokenRow.debt_ids : debtId ? [debtId] : []) as string[]
-  await bootstrapAckSafe({
+  await bootstrapThreeOptionsSafe({
     companyId: tokenRow.company_id,
     sessionId,
     customerId: tokenRow.customer_id,

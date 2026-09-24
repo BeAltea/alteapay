@@ -247,7 +247,7 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     // dados da dívida (debtInfoMessage) E o reply — os DOIS no histórico local,
     // sem depender do n8n empurrar nada (bug histórico: reply só era gravado se
     // engineOwner==='platform', deixando o lado do assistente vazio).
-    expect(assistantTexts.some((t) => t.includes("dados da sua dívida"))).toBe(true)
+    expect(assistantTexts.some((t) => t.includes("dados da sua pendência"))).toBe(true)
     expect(assistantTexts.some((t) => t.includes("trabalhar juntos para sanar"))).toBe(true)
   })
 

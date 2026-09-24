@@ -33,6 +33,50 @@ export async function loadSessionCtx(sessionId: string): Promise<SessionCtx | nu
   }
 }
 
+/**
+ * R15 — nome do cedente para a copy do devedor (mensagens de handoff / já paguei).
+ * Precedência CANÔNICA (idêntica a buildAckContext, §0 da copy): branding.brand_name
+ * › companies.name (VMAX) › "Credor". Nunca AlteaPay como responsável pela dívida,
+ * nunca "empresa credora"/"null"/terceiro (anti-GNLink). NUNCA lança: em qualquer
+ * falha de I/O cai no genérico "Credor" (rede de segurança, não estado de operação).
+ * `hasRealName=false` sinaliza ao chamador que caiu no genérico (para alerta de dado).
+ */
+export interface CreditorName {
+  name: string
+  hasRealName: boolean
+}
+
+export async function resolveCreditorName(input: {
+  companyId: string
+}): Promise<CreditorName> {
+  try {
+    const supabase = createServiceClient()
+    const { data: company } = await supabase
+      .from("companies")
+      .select("name")
+      .eq("id", input.companyId)
+      .maybeSingle()
+    const { data: cfg } = await supabase
+      .from("tenant_chat_config")
+      .select("branding")
+      .eq("company_id", input.companyId)
+      .maybeSingle()
+    const branding = (cfg?.branding ?? {}) as Record<string, unknown>
+    const brandName =
+      typeof branding.brand_name === "string" && branding.brand_name.trim().length > 0
+        ? branding.brand_name.trim()
+        : ""
+    const companyName =
+      typeof company?.name === "string" && company.name.trim().length > 0
+        ? company.name.trim()
+        : ""
+    const real = brandName || companyName
+    return real ? { name: real, hasRealName: true } : { name: "Credor", hasRealName: false }
+  } catch {
+    return { name: "Credor", hasRealName: false }
+  }
+}
+
 // ---------- debt.summary ----------
 export interface DebtSummary {
   debtId: string
@@ -50,8 +94,9 @@ export async function debtSummary(ctx: SessionCtx): Promise<DebtSummary> {
     .select("id, amount, due_date, description, company_id")
     .eq("id", ctx.debtId)
     .single()
-  const { data: company } = await supabase
-    .from("companies").select("name").eq("id", ctx.companyId).single()
+  // R15: nome do cedente pela precedência canônica (branding › companies.name ›
+  // "Credor"). Nunca "" — cair em vazio deixava o resumo sem cedente identificado.
+  const creditor = await resolveCreditorName({ companyId: ctx.companyId })
   const { data: customer } = await supabase
     .from("customers").select("document").eq("id", ctx.customerId).single()
   const doc = (customer?.document ?? "").replace(/\D/g, "")
@@ -68,7 +113,7 @@ export async function debtSummary(ctx: SessionCtx): Promise<DebtSummary> {
   })
   return {
     debtId: ctx.debtId,
-    creditorName: company?.name ?? "",
+    creditorName: creditor.name,
     originalValue: Number(debt?.amount ?? 0),
     agingDays: oldest ? agingDays(oldest) : 0,
     oldestDueDate: oldest,
@@ -229,11 +274,50 @@ export async function registerPaymentClaim(
   return caseId
 }
 
+/**
+ * R2 — copy de confirmação da transferência ao atendimento (nunca silêncio/"Sessão
+ * encerrada" seca). NOMEIA o canal (WhatsApp AlteaPay) e a expectativa de contato,
+ * SEM prometer prazo que não podemos cumprir e SEM expor número em claro (o número
+ * real do WhatsApp AlteaPay não foi fornecido — mensagem de fallback segura).
+ * D36: sem ameaça; dúvidas sobre a origem do débito ficam com o cedente ({credor}).
+ * `creditorName` já vem resolvido pela precedência canônica (R15). Sem PII.
+ */
+export function humanHandoffReply(creditorName: string): string {
+  return (
+    "Certo. Vou encaminhar você ao nosso atendimento. " +
+    "Em breve a nossa equipe entra em contato com você pelo WhatsApp da AlteaPay. " +
+    `Dúvidas sobre a origem do débito são com a ${creditorName}. ` +
+    "Se você já pagou, é só desconsiderar esta mensagem."
+  )
+}
+
 export async function transferToHuman(
   ctx: SessionCtx, reason: string, actor: JourneyActor, eventId?: string,
 ): Promise<string> {
   const supabase = createServiceClient()
   const caseId = await openCase(ctx, "human_handoff", { reason })
+
+  // R2 (N-01 ALTO): ANTES de suprimir/encerrar, persistir uma MENSAGEM ao devedor
+  // com o próximo passo — nunca cair em "Sessão encerrada" mudo (silêncio = erro
+  // para o devedor, justo quando ele PEDIU ajuda humana). O poll seguinte do client
+  // (que roda antes de marcar o desfecho terminal) traz esta bolha. Best-effort: uma
+  // falha aqui não pode derrubar o handoff (o caso/suppressão/evento seguem).
+  try {
+    const creditor = await resolveCreditorName({ companyId: ctx.companyId })
+    if (!creditor.hasRealName) {
+      // Alerta de dado (sem PII): cedente sem companies.name/branding — usando genérico.
+      console.warn(`[journey] handoff: cedente sem nome real (company=${ctx.companyId}) — usando fallback "Credor"`)
+    }
+    const { persistAssistantMessage } = await import("./acknowledgement")
+    await persistAssistantMessage({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      text: humanHandoffReply(creditor.name),
+    })
+  } catch (err) {
+    console.warn("[journey] mensagem de handoff ao devedor falhou (não-fatal):", (err as Error).message)
+  }
+
   await addSuppression({
     companyId: ctx.companyId, scope: "customer", customerId: ctx.customerId,
     channel: "all", reason: "human", source: "chat",
@@ -263,6 +347,53 @@ export async function transferToHuman(
     console.warn("[journey] aviso de handoff falhou:", (err as Error).message)
   }
   return caseId
+}
+
+/**
+ * R5 — "Já paguei / enviar comprovante". REGISTRA a alegação de pagamento como um
+ * caso `payment_claim` (a equipe concilia) e persiste uma MENSAGEM ao devedor
+ * orientando a guardar/enviar o comprovante — SEM declarar pago (D6/M15: quem
+ * confirma é a conciliação/webhook). Reusa a peça que já existe no modo assistido
+ * (registerPaymentClaim / openCase 'payment_claim'). NÃO cobra, NÃO fecha acordo,
+ * NÃO suprime o contato (diferente do handoff): o devedor pode seguir no menu. NUNCA
+ * é beco sem saída — o chamador reabre o menu de 3 opções (M7). Sem PII no log.
+ */
+export async function handlePaymentClaim(
+  ctx: SessionCtx, actor: JourneyActor, eventId?: string,
+): Promise<{ ok: true; caseId: string; reply: string }> {
+  const caseId = await registerPaymentClaim(
+    ctx,
+    { channel: "chat", note: "devedor informou que já pagou (Já paguei) — aguardando conferência" },
+    actor,
+    eventId,
+  )
+  const creditor = await resolveCreditorName({ companyId: ctx.companyId })
+  const reply = paymentClaimReply(creditor.name)
+  try {
+    const { persistAssistantMessage } = await import("./acknowledgement")
+    await persistAssistantMessage({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      text: reply,
+    })
+  } catch (err) {
+    console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)
+  }
+  return { ok: true, caseId, reply }
+}
+
+/**
+ * R5 — copy do "Já paguei". Registramos a informação para conferência (NÃO declara
+ * pago — D6/M15) e orientamos o devedor a guardar o comprovante. Sem ameaça (D36),
+ * sem prometer baixa imediata. `creditorName` já resolvido (R15). Sem PII.
+ */
+export function paymentClaimReply(creditorName: string): string {
+  return (
+    "Obrigado por avisar. Registramos que você informou já ter pago este valor e a nossa " +
+    "equipe vai conferir. Enquanto isso, guarde o seu comprovante de pagamento — ele pode ser " +
+    `pedido para a baixa. Se o pagamento foi feito com a ${creditorName}, informe também o credor ` +
+    "para que ele atualize o cadastro. Você não precisa fazer mais nada por aqui agora."
+  )
 }
 
 // ---------- session.close ----------

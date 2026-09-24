@@ -15,6 +15,10 @@ export interface PromptButton {
   id: number
   label: string
   value?: string
+  /** Ordem de exibição contratual (menor primeiro), independente do id — o menu de
+   *  3 opções (Pagar › Negociar › Não reconheço) usa order 0/1/2 sobre ids 4/1/0.
+   *  Ausente = comportamento legado (ordena por id). Espelha buttons.ts/sortButtons. */
+  order?: number
 }
 
 export interface ActivePrompt {
@@ -45,7 +49,14 @@ export function PromptButtons({
   // termos técnicos e sem código de erro — só orienta a tentar de novo.
   const [notice, setNotice] = useState<string | null>(null)
 
-  const buttons = useMemo(() => [...prompt.buttons].sort((a, b) => a.id - b.id), [prompt.buttons])
+  // Ordem contratual order-aware (M2/D.2): se algum botão traz `order`, ordena por
+  // order (menor primeiro) com o id como desempate; sem `order`, mantém o legado
+  // (sort por id). Espelha lib/journey/buttons.ts:sortButtons — o render NÃO pode
+  // re-inverter a ordem que o servidor persistiu (era o ALTO A-01).
+  const buttons = useMemo(() => {
+    const rank = (b: PromptButton) => (typeof b.order === "number" ? b.order : Number.MAX_SAFE_INTEGER)
+    return [...prompt.buttons].sort((a, b) => rank(a) - rank(b) || a.id - b.id)
+  }, [prompt.buttons])
 
   async function handle(buttonId: number) {
     if (pending !== null || answered) return

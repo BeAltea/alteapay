@@ -30,6 +30,9 @@ export default async function PublicLinkPage({
       successHref={`/n/${code}/chat`}
       captchaEnabled={captchaEnabled()}
       captchaSiteKey={captchaSiteKey()}
+      // R4 — nome do credor (companies.name via branding do tenant) para o SELO
+      // da porta. É só quem ENVIOU o link, não revela o débito (D6/D17).
+      creditorName={result.tenant.branding.brandName}
     />
   )
 }

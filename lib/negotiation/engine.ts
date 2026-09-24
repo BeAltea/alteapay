@@ -811,15 +811,47 @@ async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): P
     const ctx = await loadSessionCtx(p.session_id)
     if (!ctx) return
     const { chatSend } = await import("@/lib/journey/chat-send")
-    await chatSend(
+    const sent = await chatSend(
       ctx,
       { text: parsed.text, prompt: parsed.prompt, n8n_execution_id: parsed.n8n_execution_id },
       p.event_id,
     )
+    // D2/M11: a 1ª resposta SÍNCRONA do motor já entrou no histórico → a sessão
+    // saiu de 'aguardando_motor' para 'negociando'. Limpa a espera no servidor
+    // para que um reload NÃO restaure o spinner (o degrau seria derivado de um
+    // wait_started_at obsoleto). Só limpa se a mensagem foi de fato persistida
+    // (inclui a variante duplicate, que também significa "o motor já respondeu").
+    if (sent.ok) await clearWaitStateOnEngineReply(p.session_id)
   } catch (err) {
     // rótulo curto — sem corpo cru/URL/segredo/PII.
     const label = err instanceof Error ? err.name : "persist_error"
     console.warn("[engine:n8n] persist kickoff (não-fatal)", label)
+  }
+}
+
+/**
+ * D2 — persistência do wait_state no caminho do negotiation.start (§4 do design):
+ * quando o motor RESPONDE (kickoff síncrono persistido), a espera acabou → limpa
+ * negotiation_sessions.wait_state para NULL ('idle') e zera wait_started_at, de
+ * modo que um reload não recomece a animação de espera (M11). NUNCA lança e é
+ * DEFENSIVO: se a coluna M-4 ainda não existir em produção (aplicada só no G6), o
+ * update erra e apenas logamos um rótulo curto — a resposta do motor já está no
+ * histórico e o client transiciona para 'negociando' pelo próprio poll de qualquer
+ * forma (a limpeza do servidor é só para o caso de reload). Sem PII/segredo no log.
+ */
+async function clearWaitStateOnEngineReply(sessionId: string): Promise<void> {
+  try {
+    const { createServiceClient } = await import("@/lib/supabase/service")
+    const { error } = await createServiceClient()
+      .from("negotiation_sessions")
+      .update({ wait_state: null, wait_started_at: null })
+      .eq("id", sessionId)
+      .not("wait_state", "is", null) // só toca sessões que estavam esperando
+    if (error) {
+      console.warn("[engine:n8n] clear wait_state não aplicado (coluna M-4 pendente?)", error.code ?? "")
+    }
+  } catch (err) {
+    console.warn("[engine:n8n] clear wait_state falhou (defensivo)", err instanceof Error ? err.name : "")
   }
 }
 

@@ -26,7 +26,8 @@ vi.mock("@/lib/negotiation/sessions", () => ({
 }))
 vi.mock("@/lib/journey/events", () => ({ recordEvent: async () => ({ ok: true, duplicate: false }) }))
 vi.mock("@/lib/journey/acknowledgement", () => ({
-  bootstrapAckSafe: async () => ({ ok: true }),
+  // onda "3 opções": o login publica o menu de 3 opções (não mais o Sim/Não).
+  bootstrapThreeOptionsSafe: async () => ({ ok: true }),
   bootstrapSettledSafe: async () => {},
 }))
 

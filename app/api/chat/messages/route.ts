@@ -49,10 +49,31 @@ export async function GET(req: NextRequest) {
     .limit(1)
     .maybeSingle()
 
+  // Estado de espera (M11 — onda "3 opções", trilha D2): o client reconstrói a
+  // máquina de espera (degraus 1,2/4/10/15s) a partir destes dois campos + o
+  // relógio local, então um reload durante a espera restaura o degrau. Zero
+  // request extra — vem junto do 1º poll. DEFENSIVO: se as colunas M-4 ainda não
+  // existirem em produção (aplicadas só no G6), o SELECT erra → devolvemos null e
+  // a UI só não restaura o degrau (nunca quebra o poll). Nunca é PII.
+  let waitState: string | null = null
+  let waitStartedAt: string | null = null
+  const { data: waitRow, error: waitErr } = await supabase
+    .from("negotiation_sessions")
+    .select("wait_state, wait_started_at")
+    .eq("id", claims.sid)
+    .eq("company_id", claims.cid)
+    .maybeSingle()
+  if (!waitErr && waitRow) {
+    waitState = (waitRow as { wait_state?: string | null }).wait_state ?? null
+    waitStartedAt = (waitRow as { wait_started_at?: string | null }).wait_started_at ?? null
+  }
+
   return NextResponse.json({
     ok: true,
     messages: messages ?? [],
     active_prompt: activePrompt ?? null,
+    wait_state: waitState,
+    wait_started_at: waitStartedAt,
     server_time: new Date().toISOString(),
   })
 }

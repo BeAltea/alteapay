@@ -134,7 +134,8 @@ describe("acknowledgementQuestion", () => {
       oldestDueDate: "2020-01-15",
     })
     expect(msg).toContain("Olá, Fabio!")
-    expect(msg).toContain("da empresa VMAX")
+    // R14/D36: cedente identificado, tom "pendência ... com a {credor}".
+    expect(msg).toContain("com a VMAX")
     expect(msg).toContain("R$")
     expect(msg).toContain("Você reconhece esta cobrança em seu nome?")
     // não menciona contagem de faturas
@@ -151,7 +152,8 @@ describe("acknowledgementQuestion", () => {
       invoiceCount: 1,
       oldestDueDate: "2020-01-15",
     })
-    expect(msg.startsWith("Olá! Temos uma dívida")).toBe(true)
+    // R14/D36: copy alinhada — "pendência" (não "dívida em seu nome").
+    expect(msg.startsWith("Olá! Encontramos uma pendência")).toBe(true)
     expect(msg).not.toContain("Olá, !")
   })
 })
@@ -185,7 +187,7 @@ describe("buildAckContext", () => {
     const ctx = await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] })
     expect(ctx.firstName).toBe("")
     expect(ctx.creditorName).toBe("VMAX LTDA") // cai no company.name
-    expect(acknowledgementQuestion(ctx).startsWith("Olá! Temos")).toBe(true)
+    expect(acknowledgementQuestion(ctx).startsWith("Olá! Encontramos uma pendência")).toBe(true)
   })
 })
 

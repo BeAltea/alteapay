@@ -6,6 +6,7 @@
 // Nunca guarda PII em title/localStorage/query.
 import { useState } from "react"
 import { useRouter } from "next/navigation"
+import { entrySealText, entrySealWhoText, ENTRY_SEAL_WHO_LABEL } from "@/lib/journey/entry-seal"
 
 function maskDoc(raw: string): string {
   const d = raw.replace(/\D/g, "").slice(0, 14)
@@ -25,10 +26,13 @@ export function JourneyGenericAuthForm({
   tenantSlug,
   successHref = "./chat",
   captchaEnabled = false,
+  creditorName = "",
 }: {
   tenantSlug: string
   successHref?: string
   captchaEnabled?: boolean
+  /** R4 — nome do credor (companies.name via branding) para o SELO da porta. */
+  creditorName?: string
 }) {
   const router = useRouter()
   const [doc, setDoc] = useState("")
@@ -36,6 +40,7 @@ export function JourneyGenericAuthForm({
   const [captchaToken, setCaptchaToken] = useState("")
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [showWho, setShowWho] = useState(false)
 
   const digits = doc.replace(/\D/g, "")
   const canSubmit =
@@ -79,6 +84,24 @@ export function JourneyGenericAuthForm({
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-1 flex-col gap-5" autoComplete="off">
+      {/* R4 — SELO DE LEGITIMIDADE na porta (antes do CPF); não revela o débito. */}
+      <div className="rounded-md border border-neutral-200 bg-white/70 px-3 py-2.5 text-sm text-neutral-600">
+        <p>{entrySealText(creditorName)}</p>
+        <button
+          type="button"
+          onClick={() => setShowWho((v) => !v)}
+          aria-expanded={showWho}
+          className="mt-1 inline-flex items-center text-xs font-medium text-[var(--brand-secondary)] underline underline-offset-2"
+        >
+          {ENTRY_SEAL_WHO_LABEL}
+        </button>
+        {showWho ? (
+          <p className="mt-2 text-xs leading-relaxed text-neutral-500">
+            {entrySealWhoText(creditorName)}
+          </p>
+        ) : null}
+      </div>
+
       <div>
         <h1 className="text-xl font-semibold">Acesse sua negociação</h1>
         <p className="mt-1 text-sm text-neutral-500">
