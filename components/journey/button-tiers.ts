@@ -61,10 +61,15 @@ export function isContestation(kind: string, id: number): boolean {
 
 // Estilo por tier. Todos os alvos têm min-h-[44px] (R-19) e px generoso. O primary
 // preenche com a marca (fundo var(--brand-secondary), texto adaptativo AA); o
-// secondary usa contorno de marca (peso menor que o primary, maior que o tertiary);
-// o tertiary é discreto (contorno neutro/ghost). foco visível (focus-visible ring).
+// secondary usa contorno de marca com TEXTO NEUTRO ESCURO (A4/N-D5-2: texto na cor
+// da marca sobre branco cai a 1,92:1 num secundário claro como o da VMAX); o
+// tertiary é discreto (contorno neutro/ghost). foco visível (focus-visible ring).
+//
+// A4/N-D5-4: o tamanho da fonte NÃO fica no BASE (text-sm × text-base no mesmo
+// elemento deixava o primary em 14px); cada tier declara o seu — o primary é
+// maior de verdade (text-base + py-3 ≈ 48px) que os demais (text-sm + py-2.5 → 44px).
 export const BASE_BTN =
-  "inline-flex min-h-[44px] items-center justify-center rounded-md text-sm font-semibold " +
+  "inline-flex min-h-[44px] items-center justify-center rounded-md font-semibold " +
   "transition-colors disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 " +
   "focus-visible:ring-offset-1 focus-visible:ring-[var(--brand-secondary)]"
 
@@ -72,19 +77,19 @@ export const BASE_BTN =
 export function tierClass(tier: ButtonTier): string {
   switch (tier) {
     case "primary":
-      // maior (px-5, text-base), preenchido — o destaque da tela.
-      return `${BASE_BTN} w-full px-5 text-base shadow-sm sm:w-auto`
+      // maior (px-5, py-3, text-base), preenchido — o destaque da tela.
+      return `${BASE_BTN} w-full px-5 py-3 text-base shadow-sm sm:w-auto`
     case "secondary":
-      // contorno de marca, peso intermediário.
+      // contorno de marca, texto neutro escuro (AA em qualquer marca), peso intermediário.
       return (
-        `${BASE_BTN} border-2 px-4 ` +
-        "border-[var(--brand-secondary)] text-[var(--brand-secondary)] hover:bg-[var(--brand-secondary)]/10"
+        `${BASE_BTN} border-2 px-4 py-2.5 text-sm ` +
+        "border-[var(--brand-secondary)] text-neutral-900 hover:bg-[var(--brand-secondary)]/10"
       )
     case "tertiary":
     default:
       // discreto: contorno neutro, texto neutro.
       return (
-        `${BASE_BTN} border border-neutral-300 px-4 font-medium text-neutral-600 hover:bg-neutral-50`
+        `${BASE_BTN} border border-neutral-300 px-4 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50`
       )
   }
 }

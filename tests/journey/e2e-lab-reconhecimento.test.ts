@@ -247,13 +247,16 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     // dados da dívida (debtInfoMessage) E o reply — os DOIS no histórico local,
     // sem depender do n8n empurrar nada (bug histórico: reply só era gravado se
     // engineOwner==='platform', deixando o lado do assistente vazio).
-    expect(assistantTexts.some((t) => t.includes("dados da sua pendência"))).toBe(true)
+    // A4/S24: detalhes compactos (sem valor) no lugar de "dados da sua pendência".
+    expect(assistantTexts.some((t) => t.startsWith("Vencimento original"))).toBe(true)
     // A2 (G2-c): com faixa de matriz vigente (esta seed tem a oferta 'off-1'), o
     // caminho legado apresenta as PARCELAS — o reply é a confirmação T2 e a
     // pergunta das parcelas fica ativa (nunca mais "preparando… só um instante").
+    // A4/S22+S7: T2 = NEGOTIATE_ACK_TEXT = NEGOTIATION_PENDING_TEXT (Apêndice B).
     const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
     expect(out.offersPresented).toBe(true)
     expect(out.reply).toBe(NEGOTIATE_ACK_TEXT)
+    expect(NEGOTIATE_ACK_TEXT).toBe("Certo. Estas são as condições disponíveis para você:")
     expect(assistantTexts).toContain(NEGOTIATE_ACK_TEXT)
     expect((db.chat_prompts ?? []).some((p) => p.kind === "offer_choice" && p.status === "active")).toBe(true)
   })

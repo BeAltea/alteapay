@@ -59,14 +59,15 @@ export const HISTORY_VISIBLE_CAP = 20
  *  e aguardamos a 1ª resposta chegar via poll). É texto plano, sem PII.
  *  T3 / R-26: IDÊNTICO à confirmação persistida pelo servidor (T2 em
  *  button/route.ts) — uma única frase para o MESMO instante, para não duplicar a
- *  bolha no histórico (M4). "Certo." (não "Perfeito.") e "para você" (não "seu caso"). */
-export const NEGOTIATION_PENDING_TEXT =
-  "Certo. Vou buscar as condições de pagamento disponíveis para você."
+ *  bolha no histórico (M4). A4 (N-D5-8): a constante vive em UM lugar
+ *  (lib/journey/wait-machine.ts) e é re-exportada aqui para o client. */
+export { NEGOTIATION_PENDING_TEXT } from "@/lib/journey/wait-machine"
 
-/** Reconhece o botão que dispara a negociação n8n pelo rótulo (a UI não tem o
- *  kind do botão). Casa "Negociar" / "Negociar Dívida" sem depender do id. */
+/** Reconhece o botão que dispara a negociação pelo rótulo (a UI não tem o kind
+ *  do botão). Casa o rótulo canônico "Negociar" (A4/S2) e o legado "Negociar
+ *  Dívida"; NUNCA "Detalhes da dívida"/"Não reconheço"/"Pagar …". */
 export function isNegotiateLabel(label: string): boolean {
-  return /negociar/i.test(label)
+  return /\bnegociar\b/i.test(label)
 }
 
 // Colapsa bolhas do ASSISTENTE com texto idêntico, mantendo apenas a ÚLTIMA

@@ -48,16 +48,20 @@ function hasPaymentLink(text: string | null | undefined): boolean {
 }
 
 /**
- * Reconhece a bolha PRESERVADA de "Já paguei" (paymentClaimReply em actions.ts
- * — "Registramos que você já pagou este valor. A nossa equipe vai conferir…").
- * O payment_claim NÃO seta wait_state (handlePaymentClaim só registra o caso e
- * persiste esta bolha), então o recap detecta o desfecho pelo TEXTO preservado (a
- * mesma fonte canônica de C7/R-42: chat_messages), sem depender de uma coluna de
- * estado nem tocar journey_events. Casa a âncora estável da frase, não a copy
- * inteira (a A4 pode refinar o final da frase sem quebrar a detecção).
+ * Reconhece a bolha PRESERVADA de "Já paguei" (paymentClaimReply em actions.ts —
+ * A4/S18: "Obrigado por avisar. Vamos conferir o pagamento…"; histórico anterior:
+ * "Registramos que você já pagou este valor…"). O payment_claim NÃO seta
+ * wait_state (handlePaymentClaim só registra o caso e persiste esta bolha), então
+ * o recap detecta o desfecho pelo TEXTO preservado (a mesma fonte canônica de
+ * C7/R-42: chat_messages), sem depender de uma coluna de estado nem tocar
+ * journey_events. Casa a âncora estável de CADA geração da frase, não a copy
+ * inteira (bolhas já gravadas continuam reconhecidas).
  */
 function hasPaymentClaim(text: string | null | undefined): boolean {
-  return typeof text === "string" && /registramos que você já pagou/i.test(text)
+  return (
+    typeof text === "string" &&
+    /vamos conferir o pagamento|registramos que você já pagou/i.test(text)
+  )
 }
 
 /**
@@ -203,18 +207,20 @@ export function resolveRecapState(
 }
 
 /**
- * Frase única da retomada (carta de voz: adulta, curta, uma ideia, sem valor —
- * o valor mora no card e nos outcomes). A3/§2.2: é a SAUDAÇÃO DE RETORNO do
- * Apêndice B para todo estado — o "recapitulativo da última escolha" é o último
- * outcome que o client preserva acima do menu, não uma frase. `state` e o label
- * real do clique ficam disponíveis para a A4 variar a copy por estado.
+ * A4/S6 (Apêndice B "Saudação de retorno") — a frase do bloco de retomada é a
+ * saudação de retorno, ÚNICA para todos os estados: "Olá de novo, {primeiro_nome}.
+ * Você já viu os detalhes do valor em aberto. Como prefere seguir?". O que a
+ * última escolha produziu (link/acordo/"já paguei") NÃO é narrado aqui: o outcome
+ * preservado é exibido acima do menu (§2.2 — mecanismo da A3), e o valor mora no
+ * card fixo. `state`/`decisionLabel` seguem na assinatura (o Recap os expõe para
+ * a UI/A3). `firstName` ausente/vazio → "Olá de novo." (nunca "Olá de novo, .").
+ * Sem PII. Mecanismo (nome lido em buildRecap) é da A3; copy é da A4.
  */
 export function recapText(
-  state: RecapState,
-  decisionLabel: string | null,
-  firstName: string | null = null,
+  _state: RecapState,
+  _decisionLabel: string | null,
+  firstName?: string | null,
 ): string {
-  void state
-  void decisionLabel
+  // A3: a frase mora em returnGreeting (fonte única, também usada por buildRecap).
   return returnGreeting(firstName)
 }

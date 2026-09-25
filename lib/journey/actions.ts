@@ -359,7 +359,7 @@ export async function transferToHuman(
     const creditor = await resolveCreditorName({ companyId: ctx.companyId })
     if (!creditor.hasRealName) {
       // Alerta de dado (sem PII): cedente sem companies.name/branding — usando genérico.
-      console.warn(`[journey] handoff: cedente sem nome real (company=${ctx.companyId}) — usando fallback "Credor"`)
+      console.warn(`[journey] handoff: cedente sem nome real (company=${ctx.companyId}); usando fallback "Credor"`)
     }
     const { persistAssistantMessage } = await import("./acknowledgement")
     await persistAssistantMessage({
@@ -416,7 +416,7 @@ export async function handlePaymentClaim(
 ): Promise<{ ok: true; caseId: string; reply: string }> {
   const caseId = await registerPaymentClaim(
     ctx,
-    { channel: "chat", note: "devedor informou que já pagou (Já paguei) — aguardando conferência" },
+    { channel: "chat", note: "devedor informou que já pagou (Já paguei); aguardando conferência" },
     actor,
     eventId,
   )
@@ -445,16 +445,14 @@ export async function handlePaymentClaim(
  * sem prometer baixa imediata. `creditorName` já resolvido (R15). Sem PII.
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-export function paymentClaimReply(_creditorName?: string): string {
-  // T13 / R-34: enxuto, sem "Obrigado por avisar" (muleta). NÃO declara pago (D6/M15):
-  // "a nossa equipe vai conferir" + orienta guardar o comprovante. Sem PII. O
-  // `_creditorName` é mantido na assinatura por compatibilidade com os chamadores
-  // (a nova copy não cita o credor — a conferência é da equipe AlteaPay).
-  return (
-    "Registramos que você já pagou este valor. A nossa equipe vai conferir. " +
-    "Guarde o seu comprovante — ele pode ser pedido para dar baixa. " +
-    "Você não precisa fazer mais nada por aqui agora."
-  )
+export function paymentClaimReply(_creditorName?: string, contact?: string | null): string {
+  // A4/S18 (Apêndice B "Já paguei"): "Obrigado por avisar. Vamos conferir o
+  // pagamento. Se quiser adiantar, fale com o atendimento: {contato}." NÃO declara
+  // pago (D6/M15). `{contato}` só entra quando há um contato configurado; sem ele,
+  // a frase termina em "fale com o atendimento." (o botão de atendimento existe).
+  // `_creditorName` é mantido por compatibilidade com os chamadores. Sem PII.
+  const who = contact && contact.trim() ? `fale com o atendimento: ${contact.trim()}.` : "fale com o atendimento."
+  return `Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, ${who}`
 }
 
 // ---------- session.close ----------

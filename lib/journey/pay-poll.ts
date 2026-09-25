@@ -61,3 +61,53 @@ export const PAY_POLL_MAX_ATTEMPTS = 24
 export function shouldOfferProcessingExit(attempts: number): boolean {
   return attempts >= PAY_POLL_MAX_ATTEMPTS
 }
+
+// ---------------------------------------------------------------------------
+// A4 (S14/S15, N-D5-8) — copy do LINK DE PAGAMENTO, fonte ÚNICA para a bolha
+// persistida (lib/journey/pay.ts) e para o painel-fallback do client
+// (components/journey/chat.tsx). Este módulo é puro e client-safe (sem supabase),
+// por isso a copy mora aqui e não em pay.ts (server). Apêndice B:
+//   "Aqui está seu link para pagar {valor}, válido até {vencimento_link}."
+//   "Você já tem uma cobrança ativa de {valor}. Use o link abaixo; não é preciso gerar outro."
+// NUNCA declara pago (M15). Sem PII (só valor/vencimento/URL).
+// ---------------------------------------------------------------------------
+
+/** Reais no padrão pt-BR (R$ 250,00) — mesma formatação da UI/buildAckContext. */
+function formatBRL(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return ""
+  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v)
+}
+
+/** Vencimento do link ASAAS (YYYY-MM-DD) → dd/mm/aaaa para a copy. Ausente → "". */
+export function formatDueDatePt(iso: string | null | undefined): string {
+  if (!iso) return ""
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso)
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : ""
+}
+
+/**
+ * Copy do link de pagamento (pura). `link` presente → a URL entra numa linha
+ * própria (histórico/painel); `link:null` → só o texto (o botão "Abrir link de
+ * pagamento" já carrega a URL — N-D1-8).
+ */
+export function payLinkMessageText(input: {
+  link: string | null
+  valor: number | null
+  vencimentoLink: string | null
+  alreadyCharged: boolean
+}): string {
+  const valorTxt = input.valor != null ? formatBRL(input.valor) : ""
+  const venc = formatDueDatePt(input.vencimentoLink)
+  const linkLine = input.link ? `\n${input.link}` : ""
+  if (input.alreadyCharged) {
+    // S15: sem travessão; sem "se já pagou desconsidere" (é o botão "Já paguei").
+    const head = valorTxt
+      ? `Você já tem uma cobrança ativa de ${valorTxt}.`
+      : "Você já tem uma cobrança ativa."
+    return `${head} Use o link abaixo; não é preciso gerar outro.${linkLine}`
+  }
+  // S14: uma frase; valor + validade do link. Sem "Pronto!".
+  const head = valorTxt ? `Aqui está seu link para pagar ${valorTxt}` : "Aqui está seu link de pagamento"
+  const vencPart = venc ? `, válido até ${venc}` : ""
+  return `${head}${vencPart}.${linkLine}`
+}

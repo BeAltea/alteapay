@@ -52,6 +52,7 @@ import {
   type PaymentDetails,
 } from "./payment-actions"
 import { createPrompt, getActivePrompt, type PromptRow } from "./prompts"
+import { payLinkMessageText } from "./pay-poll"
 import { createServiceClient } from "@/lib/supabase/service"
 import { isBlockingAgreement } from "@/lib/asaas-idempotency"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
@@ -75,51 +76,10 @@ function dueDatePlus(days: number): string {
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 
-/** Reais no padrão pt-BR (R$ 250,00) — mesma formatação da UI/buildAckContext. */
-function formatBRL(v: number | null): string {
-  if (v == null || !Number.isFinite(v)) return ""
-  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v)
-}
-
-/** Vencimento do link ASAAS (YYYY-MM-DD) → dd/mm/aaaa para a copy. */
-function formatDueDatePt(iso: string | null): string {
-  if (!iso) return ""
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso)
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : ""
-}
-
-/**
- * R7 — copy do link de pagamento PARA O HISTÓRICO (chat_messages). Espelha a copy
- * §5.2 (novo link) / §5.3 (already_charged) da UI, mas em uma mensagem PERSISTIDA,
- * para que o reload/reuso de sessão restaure o link (M11). Inclui o {link} em
- * texto (a UI renderiza a bolha; o link fica clicável/copiável no histórico).
- * NUNCA declara pago (M15). Sem PII (só valor/vencimento/URL).
- */
-export function payLinkMessageText(input: {
-  link: string | null
-  valor: number | null
-  vencimentoLink: string | null
-  alreadyCharged: boolean
-}): string {
-  const valorTxt = input.valor != null ? formatBRL(input.valor) : ""
-  const venc = formatDueDatePt(input.vencimentoLink)
-  if (input.alreadyCharged) {
-    // T8 / R-30: sem "se já pagou desconsidere" (é o botão "Já paguei" — C10).
-    const head = valorTxt
-      ? `Você já tem uma cobrança ativa de ${valorTxt}.`
-      : "Você já tem uma cobrança ativa."
-    const linkLine = input.link ? `\n${input.link}` : ""
-    return `${head} Use o mesmo link abaixo — não é preciso gerar outro.${linkLine}`
-  }
-  // T7 / R-29: sem "Pronto!" e sem "se já pagou desconsidere"; reforço de segurança
-  // leve ("o link é pessoal e seguro") no ponto de maior conversão (link na tela).
-  const head = valorTxt
-    ? `Aqui está o seu link para pagar ${valorTxt}`
-    : "Aqui está o seu link de pagamento"
-  const vencPart = venc ? `, com vencimento em ${venc}` : ""
-  const linkLine = input.link ? `\n${input.link}` : ""
-  return `${head}${vencPart}. É só abrir e escolher entre Pix, boleto ou cartão. O link é pessoal e seguro.${linkLine}`
-}
+// A4 (S14/S15, N-D5-8): a copy do link vive em UM lugar, client-safe
+// (./pay-poll.ts) — a bolha persistida (aqui) e o painel-fallback do client
+// (chat.tsx) usam a MESMA função. Re-exportada para quem a importa de "./pay".
+export { payLinkMessageText }
 
 /** Marcador de estágio da bolha do link (offers_snapshot.stage). */
 export const PAYMENT_LINK_STAGE = "payment_link"
@@ -241,7 +201,7 @@ export interface PayServiceOk {
   ok: true
   /** link ASAAS (invoice/pix/boleto) para o devedor pagar. */
   link: string | null
-  /** valor integral cobrado (reais) — DEVE bater com o rótulo do botão (D39/D41). */
+  /** valor integral cobrado (reais): DEVE bater com o rótulo do botão (D39/D41). */
   valor: number
   /** vencimento do link (D+3) no formato ASAAS (YYYY-MM-DD). */
   vencimento_link: string | null

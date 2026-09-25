@@ -105,7 +105,8 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
     expect(ack).toMatchObject({ acknowledged: true, source: "chat_button_negotiate" })
     // histórico: dados da dívida (legado) e T2 antes da pergunta das parcelas
     const assistant = db.chat_messages.filter((m) => m.role === "assistant").map((m) => m.text)
-    expect(assistant.some((t) => t.includes("dados da sua pendência"))).toBe(true)
+    // A4/S24: dados da dívida na linha compacta (sem valor).
+    expect(assistant.some((t) => t.startsWith("Vencimento original"))).toBe(true)
     const iAck = assistant.indexOf(NEGOTIATE_ACK_TEXT)
     const iQ = assistant.findIndex((t) => /condições disponíveis/i.test(t))
     expect(iAck).toBeGreaterThanOrEqual(0)
@@ -122,7 +123,9 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
     expect(b.ok).toBe(true)
     expect(b.wait_state).toBe("aguardando_motor")
     expect(b.offers_presented).toBeUndefined()
-    expect(b.reply).toContain("preparando sua negociação")
+    // A4/S22: sem "Perfeito!… preparando…"; o reply sem parcelas é a mesma frase S7 (T2).
+    const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
+    expect(b.reply).toBe(NEGOTIATE_ACK_TEXT)
     expect(db.chat_prompts.some((p) => p.kind === "offer_choice")).toBe(false)
   })
 

@@ -319,7 +319,8 @@ describe("GET /api/chat/messages — anotação de geração no servidor + recap
     const { debtInfoMessage } = await import("@/lib/journey/acknowledgement")
     const text = debtInfoMessage({ firstName: "Ana", creditorName: "VMAX", updatedValue: 250, invoiceCount: 1, oldestDueDate: "2026-08-15" })
     expect(text).not.toMatch(/R\$/)
-    expect(text).toMatch(/1 fatura\(s\)/)
+    // A4/S24 (plural condicional): "1 fatura" / "2 faturas".
+    expect(text).toMatch(/1 fatura\b/)
     // formatDatePt (pré-existente, fora desta trilha) formata a data no fuso local:
     // em UTC-3 "2026-08-15" sai como 14/08 — o teste aceita os dois (a data em si é da A4).
     expect(text).toMatch(/1[45]\/08\/2026/)
