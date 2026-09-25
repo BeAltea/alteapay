@@ -36,7 +36,7 @@ import {
   type WaitState,
   type WaitStep,
 } from "@/lib/journey/wait-machine"
-import { interpretPaymentPoll, shouldOfferProcessingExit } from "@/lib/journey/pay-poll"
+import { interpretPaymentPoll, payLinkMessageText, shouldOfferProcessingExit } from "@/lib/journey/pay-poll"
 
 // D2 — ESPERA CONFIÁVEL: a máquina de espera (§6.3) é client-side sobre o polling
 // atual. A lógica PURA (degraus, copy, absorventes, reidratação) vive em
@@ -69,19 +69,13 @@ const PAY_ABORT_MS = 45_000
 const PAY_LONG_WAIT_MS = 8_000
 const CLICK_ABORT_MS = 8_000
 
-/** Formata reais no MESMO padrão do buildAckContext (R$ 250,00). null → "". */
-function formatBRL(valor: number | null): string {
-  if (valor == null || !Number.isFinite(valor)) return ""
-  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(valor)
-}
-
-/** Vencimento do link ASAAS (YYYY-MM-DD) → dd/mm/aaaa. Ausente → "". */
-function formatDueDate(iso: string | null): string {
-  if (!iso) return ""
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso)
-  if (!m) return ""
-  return `${m[3]}/${m[2]}/${m[1]}`
-}
+/** A4/N-D5-2 (R-23): TODO elemento preenchido com a marca usa a cor de texto
+ *  ADAPTATIVA (--brand-secondary-fg, preto/branco por luminância — contrast.ts),
+ *  nunca branco fixo: sobre o secundário claro da VMAX (#EAB308) branco dá 1,92:1. */
+const BRAND_FILL_STYLE = {
+  backgroundColor: "var(--brand-secondary)",
+  color: "var(--brand-secondary-fg, #ffffff)",
+} as const
 
 // ChatMsg / MsgAction e os helpers puros de exibição (dedup por conteúdo, rótulo
 // Negociar, texto do indicador) vivem em ./chat-display para serem testados no
@@ -133,8 +127,7 @@ function linkifyUrls(text: string, keyBase: string) {
         href={chunk}
         target="_blank"
         rel="noopener noreferrer"
-        className="break-all font-medium underline underline-offset-2"
-        style={{ color: "var(--brand-secondary)" }}
+        className="break-all font-medium text-neutral-800 underline underline-offset-2"
       >
         {chunk}
       </a>
@@ -1104,7 +1097,7 @@ export function JourneyChat() {
         <button
           type="button"
           onClick={goToChatLogin}
-          className="rounded-md px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-800 hover:bg-neutral-100"
+          className="inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 hover:bg-neutral-100 hover:text-neutral-800"
         >
           Sair
         </button>
@@ -1151,7 +1144,7 @@ export function JourneyChat() {
             <button
               type="button"
               onClick={() => setHistoryExpanded(true)}
-              className="rounded-md px-3 py-1 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
+              className="inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800"
             >
               Ver conversa completa
             </button>
@@ -1163,14 +1156,10 @@ export function JourneyChat() {
             className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}
           >
             <div
-              style={
-                m.from === "customer"
-                  ? { backgroundColor: "var(--brand-secondary)" }
-                  : undefined
-              }
+              style={m.from === "customer" ? BRAND_FILL_STYLE : undefined}
               className={
                 m.from === "customer"
-                  ? "max-w-[85%] whitespace-pre-line rounded-2xl rounded-br-sm px-3.5 py-2 text-sm text-white"
+                  ? "max-w-[85%] whitespace-pre-line rounded-2xl rounded-br-sm px-3.5 py-2 text-sm"
                   : "max-w-[85%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800"
               }
             >
@@ -1191,15 +1180,15 @@ export function JourneyChat() {
                   href={m.action.href}
                   target="_blank"
                   rel="noopener noreferrer"
-                  style={{ backgroundColor: "var(--brand-secondary)" }}
-                  className="inline-block rounded-md px-4 py-2 text-center text-sm font-semibold text-white"
+                  style={BRAND_FILL_STYLE}
+                  className="inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold"
                 >
                   {m.action.label}
                 </a>
                 <button
                   type="button"
                   onClick={() => onCopyLink((m.action as MsgAction).href)}
-                  className="rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                  className="min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                 >
                   {copied ? "Link copiado!" : "Copiar link"}
                 </button>
@@ -1211,8 +1200,8 @@ export function JourneyChat() {
                 href={m.action.href}
                 target="_blank"
                 rel="noopener noreferrer"
-                style={{ backgroundColor: "var(--brand-secondary)" }}
-                className="mt-2 inline-block rounded-md px-4 py-2 text-sm font-semibold text-white"
+                style={BRAND_FILL_STYLE}
+                className="mt-2 inline-flex min-h-[44px] items-center rounded-md px-4 py-2 text-sm font-semibold"
               >
                 {m.action.label}
               </a>
@@ -1258,15 +1247,15 @@ export function JourneyChat() {
               <button
                 type="button"
                 onClick={onWaitPayNow}
-                style={{ backgroundColor: "var(--brand-secondary)" }}
-                className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+                style={BRAND_FILL_STYLE}
+                className="min-h-[44px] rounded-md px-4 text-sm font-semibold"
               >
                 Pagar agora
               </button>
               <button
                 type="button"
                 onClick={onWaitHandoff}
-                className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
               >
                 Falar com atendimento
               </button>
@@ -1284,22 +1273,22 @@ export function JourneyChat() {
               <button
                 type="button"
                 onClick={onWaitPayNow}
-                style={{ backgroundColor: "var(--brand-secondary)" }}
-                className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+                style={BRAND_FILL_STYLE}
+                className="min-h-[44px] rounded-md px-4 text-sm font-semibold"
               >
                 Pagar à vista
               </button>
               <button
                 type="button"
                 onClick={onWaitRetryOptions}
-                className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
               >
                 Tentar as opções de novo
               </button>
               <button
                 type="button"
                 onClick={onWaitHandoff}
-                className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
               >
                 Falar com atendimento
               </button>
@@ -1314,7 +1303,7 @@ export function JourneyChat() {
               {/* A1: copy progressiva — após PAY_LONG_WAIT_MS sem resposta. */}
               {payLongWait
                 ? "Ainda estou gerando o seu link de pagamento."
-                : "Certo. Estou gerando o seu link de pagamento. Só um instante."}
+                : "Certo. Estou gerando seu link de pagamento."}
             </div>
           </div>
         ) : null}
@@ -1328,13 +1317,15 @@ export function JourneyChat() {
             {payResult.status === "link" ? (
               <>
                 <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-                  {/* T7/T8 (R-29/R-30): sem "Pronto!" e sem "se já pagou
-                      desconsidere" (isso é o botão "Já paguei" — C10). Reforço de
-                      segurança leve ("o link é pessoal e seguro"); espelha
-                      pay.ts:payLinkMessageText (a bolha persistida no histórico). */}
-                  {payResult.already_charged
-                    ? `Você já tem uma cobrança ativa${payResult.valor ? ` de ${formatBRL(payResult.valor)}` : ""}. Use o mesmo link abaixo — não é preciso gerar outro.`
-                    : `Aqui está o seu link para pagar${payResult.valor ? ` ${formatBRL(payResult.valor)}` : ""}${payResult.vencimento_link ? `, com vencimento em ${formatDueDate(payResult.vencimento_link)}` : ""}. É só abrir e escolher entre Pix, boleto ou cartão. O link é pessoal e seguro.`}
+                  {/* A4 (S14/S15, N-D5-8): a MESMA função da bolha persistida
+                      (lib/journey/pay-poll.ts) — nenhuma copy duplicada. link:null
+                      porque o botão "Abrir link de pagamento" abaixo já o carrega. */}
+                  {payLinkMessageText({
+                    link: null,
+                    valor: payResult.valor,
+                    vencimentoLink: payResult.vencimento_link,
+                    alreadyCharged: payResult.already_charged,
+                  })}
                 </div>
                 {payResult.link ? (
                   <div className="flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
@@ -1342,15 +1333,15 @@ export function JourneyChat() {
                       href={payResult.link}
                       target="_blank"
                       rel="noopener noreferrer"
-                      style={{ backgroundColor: "var(--brand-secondary)" }}
-                      className="inline-block rounded-md px-4 py-2 text-center text-sm font-semibold text-white"
+                      style={BRAND_FILL_STYLE}
+                      className="inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold"
                     >
                       Abrir link de pagamento
                     </a>
                     <button
                       type="button"
                       onClick={() => onCopyLink(payResult.link as string)}
-                      className="rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                      className="min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                     >
                       {copied ? "Link copiado!" : "Copiar link"}
                     </button>
@@ -1368,7 +1359,7 @@ export function JourneyChat() {
                   <button
                     type="button"
                     onClick={onWaitRetryOptions}
-                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                   >
                     Voltar às opções
                   </button>
@@ -1376,7 +1367,7 @@ export function JourneyChat() {
                     <button
                       type="button"
                       onClick={requestPaymentClaim}
-                      className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                      className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                     >
                       Já paguei este valor
                     </button>
@@ -1384,7 +1375,7 @@ export function JourneyChat() {
                   <button
                     type="button"
                     onClick={onWaitHandoff}
-                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                   >
                     Falar com atendimento
                   </button>
@@ -1393,7 +1384,7 @@ export function JourneyChat() {
             ) : payResult.status === "processing" ? (
               <>
                 <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-                  Estou gerando o seu link de pagamento. Assim que estiver pronto, ele aparece aqui — pode aguardar um instante.
+                  Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui.
                 </div>
                 {/* R3 — inline "digitando" para o processing não parecer travado. */}
                 <div
@@ -1414,7 +1405,7 @@ export function JourneyChat() {
                     <button
                       type="button"
                       onClick={onWaitHandoff}
-                      className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                      className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                     >
                       Falar com atendimento
                     </button>
@@ -1428,8 +1419,8 @@ export function JourneyChat() {
                       foi criada.") ANTES das ações; frases curtas, sem código/erro
                       técnico exposto. */}
                   {payResult.confirmedNotCreated
-                    ? "Não consegui gerar o seu link de pagamento agora. Nenhuma cobrança foi criada. Você pode tentar de novo ou falar com o nosso atendimento."
-                    : "Não consegui gerar o seu link de pagamento agora. Você pode tentar de novo ou falar com o nosso atendimento."}
+                    ? "Não consegui gerar o link agora. Nenhuma cobrança foi criada."
+                    : "Não consegui gerar o link agora."}
                 </div>
                 {/* R-06 (C13) — erro_cobranca NÃO prende o devedor entre "tentar de
                     novo" (que pode falhar de novo) e um atendimento: além de Tentar
@@ -1441,22 +1432,22 @@ export function JourneyChat() {
                   <button
                     type="button"
                     onClick={onPayRetry}
-                    style={{ backgroundColor: "var(--brand-secondary)" }}
-                    className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+                    style={BRAND_FILL_STYLE}
+                    className="min-h-[44px] rounded-md px-4 text-sm font-semibold"
                   >
-                    Tentar novamente
+                    Tentar de novo
                   </button>
                   <button
                     type="button"
                     onClick={onPayBackToOptions}
-                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                   >
                     Voltar às opções
                   </button>
                   <button
                     type="button"
                     onClick={onWaitHandoff}
-                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
                   >
                     Falar com atendimento
                   </button>
@@ -1498,7 +1489,7 @@ export function JourneyChat() {
               <button
                 type="button"
                 onClick={requestPaymentClaim}
-                className="mt-2 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
+                className="mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800"
               >
                 Já paguei este valor
               </button>
@@ -1524,15 +1515,15 @@ export function JourneyChat() {
                 <button
                   type="button"
                   onClick={resumeFromIdle}
-                  style={{ backgroundColor: "var(--brand-secondary)" }}
-                  className="mt-5 w-full rounded-md px-4 py-2.5 text-sm font-semibold text-white"
+                  style={BRAND_FILL_STYLE}
+                  className="mt-5 min-h-[44px] w-full rounded-md px-4 py-2.5 text-sm font-semibold"
                 >
                   Continuar
                 </button>
                 <button
                   type="button"
                   onClick={goToChatLogin}
-                  className="mt-2 w-full rounded-md border border-neutral-300 px-4 py-2.5 text-sm font-semibold text-neutral-600 hover:bg-neutral-50"
+                  className="mt-2 min-h-[44px] w-full rounded-md border border-neutral-300 px-4 py-2.5 text-sm font-semibold text-neutral-600 hover:bg-neutral-50"
                 >
                   Sair
                 </button>
@@ -1546,8 +1537,8 @@ export function JourneyChat() {
                 <button
                   type="button"
                   onClick={goToChatLogin}
-                  style={{ backgroundColor: "var(--brand-secondary)" }}
-                  className="mt-5 w-full rounded-md px-4 py-2.5 text-sm font-semibold text-white"
+                  style={BRAND_FILL_STYLE}
+                  className="mt-5 min-h-[44px] w-full rounded-md px-4 py-2.5 text-sm font-semibold"
                 >
                   Entrar novamente
                 </button>

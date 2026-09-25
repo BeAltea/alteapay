@@ -142,7 +142,8 @@ describe("R1 — apresentação das parcelas da matriz (fallback assistido)", ()
     expect(cashLabel).toMatch(/À vista R\$/)
     expect(cashLabel).toContain("(recomendado)")
     if (cash.terms.discount_value > 0) {
-      expect(cashLabel).toMatch(/você economiza R\$/)
+      expect(cashLabel).toMatch(/economia de R\$/) // A4/S9: sem travessão
+      expect(cashLabel).not.toContain("—")
     }
     // parcelado: "Nx de R$ … (total R$ …)"
     const inst = r.offers.find((o) => o.terms.installments > 1)
@@ -160,7 +161,8 @@ describe("R1 — apresentação das parcelas da matriz (fallback assistido)", ()
     const msg = db.chat_messages.find((m) => m.role === "assistant" && /condições disponíveis para você/i.test(m.text))
     expect(msg).toBeTruthy()
     expect(msg!.text).not.toContain("desconsiderar")
-    expect(msg!.text).toMatch(/gero o seu pagamento/i)
+    // A4/S8: a MESMA frase do eco do clique Negociar (S7) — uma bolha só na tela.
+    expect(msg!.text).toBe("Certo. Estas são as condições disponíveis para você:")
   })
 
   it("idempotente: com 'offer_choice' ativo NÃO recria (reload/clique duplo não empilha)", async () => {
@@ -265,7 +267,7 @@ describe("R1 — aceite de uma parcela gera o link canônico", () => {
     // respondido como already_charged ("Você já tem uma cobrança ativa…") com o
     // MESMO link — 2 bolhas distintas, e o 3º aceite NÃO empilha (dedup 15min).
     expect(withLink.length).toBe(2)
-    expect(withLink[0].text).toMatch(/Aqui está o seu link/i)
+    expect(withLink[0].text).toMatch(/Aqui está seu link/i)
     expect(withLink[1].text).toMatch(/já tem uma cobrança ativa/i)
     // ambas carregam a ação open_payment_link (fonte única do painel do client)
     expect(withLink.every((m: any) => m.offers_snapshot?.message_action?.type === "open_payment_link")).toBe(true)

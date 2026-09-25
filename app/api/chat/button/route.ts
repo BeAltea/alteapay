@@ -46,6 +46,7 @@ import {
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { engineName } from "@/lib/negotiation/engine"
+import { NEGOTIATION_PENDING_TEXT } from "@/lib/journey/wait-machine"
 import {
   BTN_BACK,
   BTN_CONSULT,
@@ -359,10 +360,10 @@ export async function POST(req: NextRequest) {
         })
         // Confirmação NOSSA imediata (A.2) — persistida para o histórico. Nada do
         // n8n é aguardado: a espera é client-side em D2.
-        // T2 / R-26: mesma frase EXATA da bolha optimistic do client
-        // (NEGOTIATION_PENDING_TEXT em chat-display.ts) — 1 só bolha para o mesmo
-        // instante (M4). "Certo." (não "Perfeito."), "para você" (não "seu caso").
-        const reply = "Certo. Vou buscar as condições de pagamento disponíveis para você."
+        // T2 / R-26: a MESMA constante da bolha optimistic do client e da pergunta
+        // do prompt de parcelas (A4/S7, lib/journey/wait-machine.ts) — 1 só bolha
+        // para o mesmo instante (M4).
+        const reply = NEGOTIATION_PENDING_TEXT
         await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
         // Dispara negotiation.start em BACKGROUND (best-effort/resiliente H8): se o
         // n8n um dia conduzir, ele assume os próximos turnos. NÃO aguardamos.
@@ -465,7 +466,7 @@ export async function POST(req: NextRequest) {
         })
         if (!channel.hasConfig) {
           // Alerta operacional (sem PII): tenant sem official_channel_label semeado.
-          console.warn(`[chat:button] GNLink: official_channel_label ausente (company=${ctx.companyId}) — usando fallback seguro`)
+          console.warn(`[chat:button] GNLink: official_channel_label ausente (company=${ctx.companyId}); usando fallback seguro`)
         }
         const reply = notRecognizedReply(channel)
         // A1: resultado da ação como OUTCOME (ligado ao clique) ANTES do menu-volta.
@@ -479,7 +480,8 @@ export async function POST(req: NextRequest) {
         const { backToOptionsButtons } = await import("@/lib/journey/acknowledgement")
         await createPrompt({
           companyId: ctx.companyId, sessionId: ctx.sessionId, kind: "debt_three_options",
-          question: "Se preferir, você pode voltar às opções.",
+          // A4/S12: sem pergunta — o rótulo "Voltar às opções" basta.
+          question: "",
           buttons: backToOptionsButtons(),
           context: { primary_debt_id: primaryDebtId, debt_ids: debtIds, stage: "not_recognized_back" },
           createdBy: "platform",
@@ -586,14 +588,13 @@ export async function POST(req: NextRequest) {
       } catch {
         /* fallback silencioso: mantém o texto genérico */
       }
-      // R-46: mesma carta de voz do notRecognizedReply — adulto, sem "Obrigado
-      // pelo seu retorno" (muleta), sem "se já pagou desconsidere". Identifica a
-      // {credor} (dona da dívida) e a AlteaPay (operadora do canal). Sem ameaça.
-      const notRecognizedReply = `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName}. A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
-      await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: notRecognizedReply })
+      // A4 (N-D5-8): função ÚNICA da copy (sem duplicata inline). O caminho legado
+      // nunca leu a config de canal → fallback seguro (hasConfig:false).
+      const legacyReply = notRecognizedReply({ creditorName, hasConfig: false, channelLabel: null, channelUrl: null })
+      await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: legacyReply })
       return NextResponse.json({
         ok: true, button_id: buttonId, action: "not_recognized",
-        acknowledged: false, on_not_recognized: out.onNotRecognized, reply: notRecognizedReply,
+        acknowledged: false, on_not_recognized: out.onNotRecognized, reply: legacyReply,
       })
     }
 
@@ -652,24 +653,23 @@ export async function POST(req: NextRequest) {
       } catch {
         /* fallback silencioso: mantém o texto genérico */
       }
-      // R-46: mesma carta de voz do notRecognizedReply — adulto, sem "Obrigado
-      // pelo seu retorno" (muleta), sem "se já pagou desconsidere". Identifica a
-      // {credor} (dona da dívida) e a AlteaPay (operadora do canal). Sem ameaça.
-      const notRecognizedReply = `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName}. A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
+      // A4 (N-D5-8): função ÚNICA da copy (sem duplicata inline). O caminho legado
+      // nunca leu a config de canal → fallback seguro (hasConfig:false).
+      const legacyReply = notRecognizedReply({ creditorName, hasConfig: false, channelLabel: null, channelUrl: null })
       // Persiste a resposta do assistente no histórico (o clique do cliente já foi
       // gravado por answerPrompt dentro de recordAcknowledgement). Assim a sessão
       // reaberta reconstrói [pergunta+resumo] → [clique] → [resposta].
       await persistAssistantMessage({
         companyId: ctx.companyId,
         sessionId: ctx.sessionId,
-        text: notRecognizedReply,
+        text: legacyReply,
       })
       return NextResponse.json({
         ok: true,
         acknowledged: false,
         button_id: buttonId,
         on_not_recognized: res.onNotRecognized ?? "continue",
-        reply: notRecognizedReply,
+        reply: legacyReply,
       })
     }
     // "Sim, reconheço" (button 1): handoff ao n8n em BACKGROUND (best-effort —
@@ -688,7 +688,8 @@ export async function POST(req: NextRequest) {
     } catch (err) {
       console.warn("[chat:button] negotiation.start falhou (fallback assistido):", (err as Error).message)
     }
-    const recognizedReply = "Perfeito! Então vamos trabalhar juntos para sanar o seu débito."
+    // A4/S22: sem "Perfeito!"/"sanar o seu débito" — a frase do Apêndice B (S7).
+    const recognizedReply = NEGOTIATION_PENDING_TEXT
     // SEMPRE persiste o reply (bug histórico: condicionar a engineOwner==='platform'
     // deixava o lado do assistente VAZIO no banco quando o n8n era dado como dono
     // mas não empurrava nada — a sessão reaberta só trazia a pergunta + o clique

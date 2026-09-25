@@ -187,7 +187,7 @@ export function PublicAuthForm({
           type="button"
           onClick={() => setShowWho((v) => !v)}
           aria-expanded={showWho}
-          className="mt-1 inline-flex items-center text-xs font-medium text-[var(--brand-secondary)] underline underline-offset-2"
+          className="mt-1 inline-flex min-h-[44px] items-center text-sm font-medium text-[var(--brand-secondary)] underline underline-offset-2"
         >
           {ENTRY_SEAL_WHO_LABEL}
         </button>
@@ -247,10 +247,10 @@ export function PublicAuthForm({
       <button
         type="submit"
         disabled={!canSubmit}
-        style={{ backgroundColor: "var(--brand-secondary)" }}
-        className="mt-auto h-11 rounded-md text-base font-semibold text-white transition-opacity disabled:opacity-40"
+        style={{ backgroundColor: "var(--brand-secondary)", color: "var(--brand-secondary-fg, #ffffff)" }}
+        className="mt-auto h-11 rounded-md text-base font-semibold transition-opacity disabled:opacity-40"
       >
-        {submitting ? "Confirmando..." : "Consultar"}
+        {submitting ? "Confirmando..." : "Continuar"}
       </button>
     </form>
   )

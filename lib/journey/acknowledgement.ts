@@ -31,15 +31,45 @@ import {
 import { createPrompt, answerPrompt, type PromptRow } from "./prompts"
 import { listOffers, type ListedOffer, type SessionCtx } from "./actions"
 import type { OfferTerms } from "@/lib/negotiation/offers"
+import { NEGOTIATION_PENDING_TEXT } from "./wait-machine"
 
 const BRL = (v: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v || 0)
 
+/** dd/mm/aaaa; ausente/inválida → "" (o chamador omite o segmento — nunca um
+ *  placeholder na fala do devedor). */
 function formatDatePt(iso: string | null): string {
-  if (!iso) return "—"
+  if (!iso) return ""
   const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return "—"
+  if (Number.isNaN(d.getTime())) return ""
   return d.toLocaleDateString("pt-BR")
+}
+
+/**
+ * A4 (Apêndice B) — abertura comum a TODAS as saudações da jornada: identifica o
+ * canal (oficial, de negociação, da {credor}) e a AlteaPay como operadora. Sem
+ * valor, sem "Tudo bem?", sem emoji, sem "se já pagou desconsidere". Sem nome →
+ * "Olá." (nunca "Olá, ."/"null").
+ */
+function channelGreeting(ctx: Pick<AckContext, "firstName" | "creditorName">): string {
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
+  return `${greeting} Este é o canal oficial de negociação da ${ctx.creditorName}, operado pela AlteaPay.`
+}
+
+/**
+ * A4 (S10/S24, Apêndice B "Detalhes") — linha compacta de detalhes da dívida:
+ * "Vencimento original {venc} · {n} fatura(s) · serviço da {credor}". Segmentos
+ * ausentes são omitidos (nunca "—"/vazio). SEM valor (mora no card — R-12) e sem
+ * PII. A pergunta "Como prefere seguir?" NÃO entra aqui: quem pergunta é o menu
+ * reemitido logo abaixo (REOPEN_MENU_QUESTION) — uma pergunta só na tela.
+ */
+function debtDetailLine(ctx: AckContext): string {
+  const parts: string[] = []
+  const venc = formatDatePt(ctx.oldestDueDate)
+  if (venc) parts.push(`Vencimento original ${venc}`)
+  if (ctx.invoiceCount > 0) parts.push(`${ctx.invoiceCount} ${ctx.invoiceCount === 1 ? "fatura" : "faturas"}`)
+  parts.push(`serviço da ${ctx.creditorName}`)
+  return parts.join(" · ")
 }
 
 export interface AckContext {
@@ -128,14 +158,9 @@ export function acknowledgementButtons(showHandoff: boolean): Button[] {
  * pergunta). Sem contagem de faturas. Se firstName vazio, cai no genérico.
  */
 export function acknowledgementQuestion(ctx: AckContext): string {
-  // R14/D36: "pendência" (não "dívida"); tom neutro, sem ameaça.
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
-  return (
-    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
-    `Valor atualizado ${BRL(ctx.updatedValue)}, ` +
-    `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}. ` +
-    `Você reconhece esta cobrança em seu nome? Se já pagou, é só desconsiderar esta mensagem.`
-  )
+  // A4/S23 (Apêndice B): abertura comum + pergunta. Sem valor na fala (R-12), sem
+  // "desconsiderar" (é o botão "Já paguei"), sem exclamação. D36: sem ameaça.
+  return `${channelGreeting(ctx)} Você reconhece esta cobrança em seu nome?`
 }
 
 // --- fluxo Consultar/Negociar (prompt inicial pedido pelo dono) -------------
@@ -152,8 +177,8 @@ export function acknowledgementQuestion(ctx: AckContext): string {
 /** Botões do prompt inicial: [2] Consultar, [3] Negociar (+[99] se handoff). */
 export function consultNegotiateButtons(showHandoff: boolean): Button[] {
   const buttons: Button[] = [
-    { id: BTN_CONSULT, label: "Consultar Dívida" },
-    { id: BTN_NEGOTIATE, label: "Negociar Dívida" },
+    { id: BTN_CONSULT, label: "Detalhes da dívida" },
+    { id: BTN_NEGOTIATE, label: "Negociar" },
   ]
   if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
@@ -166,8 +191,8 @@ export function consultNegotiateButtons(showHandoff: boolean): Button[] {
  */
 export function postConsultButtons(showHandoff: boolean): Button[] {
   const buttons: Button[] = [
-    { id: BTN_NEGOTIATE, label: "Negociar Dívida" },
-    { id: BTN_NO, label: "Não reconheço a dívida" },
+    { id: BTN_NEGOTIATE, label: "Negociar" },
+    { id: BTN_NO, label: "Não reconheço" },
   ]
   if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
@@ -179,12 +204,8 @@ export function postConsultButtons(showHandoff: boolean): Button[] {
  * (na mensagem `debtInfoMessage`), evitando repetir os números duas vezes.
  */
 export function consultNegotiateQuestion(ctx: AckContext): string {
-  // R14/D36: "pendência" (não "dívida"); sem ameaça.
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
-  return (
-    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
-    `O que você deseja fazer?`
-  )
+  // A4/S24 (Apêndice B): abertura comum + convite. Sem valor, sem exclamação.
+  return `${channelGreeting(ctx)} O que você deseja fazer?`
 }
 
 /** Pergunta do menu pós-consulta (após mostrar os dados da dívida). */
@@ -198,16 +219,8 @@ export function postConsultQuestion(): string {
  * (nada de documento) — só os dados financeiros que o devedor pode ver.
  */
 export function debtInfoMessage(ctx: AckContext): string {
-  const invoiceLine =
-    ctx.invoiceCount > 0
-      ? ` em ${ctx.invoiceCount} fatura(s)`
-      : ""
-  // R14/D36: "pendência" (não "dívida").
-  return (
-    `Aqui estão os dados da sua pendência com a ${ctx.creditorName}: ` +
-    `valor atualizado ${BRL(ctx.updatedValue)}${invoiceLine}, ` +
-    `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}.`
-  )
+  // A4/S24: mesma linha compacta do "Detalhes da dívida" — SEM valor na fala (R-12).
+  return `${debtDetailLine(ctx)}.`
 }
 
 // ============================================================================
@@ -217,7 +230,7 @@ export function debtInfoMessage(ctx: AckContext): string {
 
 /** Rótulo/valor exibidos em REAIS, com o mesmo Intl do resumo (R$ 250,00). */
 function payLabel(value: number): string {
-  return `Quero pagar — ${BRL(value)}`
+  return `Pagar ${BRL(value)}`
 }
 
 /**
@@ -230,9 +243,9 @@ function payLabel(value: number): string {
 export function threeOptionsButtons(value: number, showHandoff: boolean): Button[] {
   const buttons: Button[] = [
     { id: BTN_PAY, label: payLabel(value), order: 0 },
-    { id: BTN_YES, label: "Quero negociar", order: 1 },
-    { id: BTN_CONSULT, label: "Consultar dívida", order: 2 },
-    { id: BTN_NO, label: "Não reconheço esta dívida", order: 3 },
+    { id: BTN_YES, label: "Negociar", order: 1 },
+    { id: BTN_CONSULT, label: "Detalhes da dívida", order: 2 },
+    { id: BTN_NO, label: "Não reconheço", order: 3 },
   ]
   if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento", order: 4 })
   return buttons
@@ -240,7 +253,7 @@ export function threeOptionsButtons(value: number, showHandoff: boolean): Button
 
 /** Botão único de VOLTA do "Não reconheço" (M7): reabre o menu de 3 opções. */
 export function backToOptionsButtons(): Button[] {
-  return [{ id: BTN_BACK, label: "Na verdade, quero ver as opções", order: 0 }]
+  return [{ id: BTN_BACK, label: "Voltar às opções", order: 0 }]
 }
 
 /**
@@ -252,13 +265,8 @@ export function backToOptionsButtons(): Button[] {
  * LGPD — R-24). Variação sem nome cai em "Olá." (nunca "Olá, ."/"null"). Sem PII.
  */
 export function threeOptionsSummary(ctx: AckContext): string {
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
-  return (
-    `${greeting} Encontramos um valor em aberto em seu nome com a ${ctx.creditorName}. ` +
-    `Dá para resolver agora mesmo por aqui. ` +
-    `A AlteaPay opera este canal de negociação; a dívida é da ${ctx.creditorName}. ` +
-    `Como você prefere seguir?`
-  )
+  // A4/S5 — texto do Apêndice B, ipsis litteris.
+  return `${channelGreeting(ctx)} Como você prefere seguir?`
 }
 
 /**
@@ -269,12 +277,8 @@ export function threeOptionsSummary(ctx: AckContext): string {
  * na fala (mora no card/rótulo — R-12). Sem PII (nada de documento).
  */
 export function debtConsultReply(ctx: AckContext): string {
-  const faturas = ctx.invoiceCount > 1 ? ` e reúne ${ctx.invoiceCount} faturas` : ""
-  return (
-    `Este valor tem vencimento original em ${formatDatePt(ctx.oldestDueDate)}${faturas} ` +
-    `e refere-se a um serviço da ${ctx.creditorName}. ` +
-    `Se quiser, é só escolher abaixo como prefere seguir.`
-  )
+  // A4/S10 (Apêndice B "Detalhes"): bloco compacto; a pergunta vem do menu abaixo.
+  return `${debtDetailLine(ctx)}.`
 }
 
 /**
@@ -336,16 +340,15 @@ export async function resolveCreditorChannel(input: {
  */
 export function notRecognizedReply(channel: CreditorChannel): string {
   const { creditorName } = channel
-  const channelSentence = channel.hasConfig
-    ? `Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName} pelo canal oficial: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}.`
-    : `Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName} pelo canal informado na sua fatura ou no site oficial da ${creditorName}.`
-  // R-46 (carta de voz): adulto, sem "Obrigado por avisar" (muleta), sem "se já
-  // pagou desconsidere". Preserva o conteúdo jurídico (não gera pagamento;
-  // contestação segue disponível) e identifica VMAX (dona) e AlteaPay (operadora).
+  // A4/S11 (Apêndice B): "…fale com a {credor}: {canal_oficial}." COM config; SEM
+  // config (VMAX hoje) o fallback seguro "pelo canal informado na sua fatura ou no
+  // site oficial da {credor}" ocupa o lugar de {canal_oficial}. Nunca "null"/vazio.
+  const contact = channel.hasConfig
+    ? `: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}`
+    : ` pelo canal informado na sua fatura ou no site oficial da ${creditorName}`
   return (
-    `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. ` +
-    `${channelSentence} ` +
-    `A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
+    `Registramos que você não reconhece esta cobrança. ` +
+    `Para entender a origem e contestar, fale com a ${creditorName}${contact}.`
   )
 }
 
@@ -672,7 +675,7 @@ export async function resetStaleChatIfInactive(sessionId: string, _companyId: st
       .then(() => {}, () => {})
     return true
   } catch (err) {
-    console.warn("[journey] reset 24h — rotação de thread (não-fatal):", (err as Error).message)
+    console.warn("[journey] reset 24h: rotação de thread (não-fatal):", (err as Error).message)
     return false
   }
 }
@@ -756,7 +759,7 @@ export function offerButtonLabel(terms: OfferTerms): string {
   if (terms.installments <= 1) {
     const base = `À vista ${BRL(terms.total_value)}`
     return terms.discount_value > 0
-      ? `${base} — você economiza ${BRL(terms.discount_value)} (recomendado)`
+      ? `${base}, economia de ${BRL(terms.discount_value)} (recomendado)`
       : `${base} (recomendado)`
   }
   return `${terms.installments}x de ${BRL(terms.installment_value)} (total ${BRL(terms.total_value)})`
@@ -782,10 +785,8 @@ export function offerChoiceButtons(offers: ListedOffer[]): Button[] {
  *  Uma ideia, sem "se já pagou desconsidere" (isso é o botão "Já paguei" — C10).
  *  Sem PII; sem ameaça/negativação; sem valor na fala (mora no card/rótulo — R-12). */
 export function offerChoiceQuestion(): string {
-  return (
-    "Estas são as condições disponíveis para você. " +
-    "Escolha a que preferir e eu gero o seu pagamento."
-  )
+  // A4/S8: a MESMA frase do eco do clique Negociar (S7) — uma bolha só na tela.
+  return NEGOTIATION_PENDING_TEXT
 }
 
 export type PresentMatrixOffersResult =
@@ -923,7 +924,7 @@ export function debtSettledContactHref(): string {
 export function debtSettledContactAction(): MessageLinkAction {
   return {
     type: "external_link",
-    label: "Recebi uma cobrança — falar com atendimento",
+    label: "Falar com atendimento",
     href: debtSettledContactHref(),
   }
 }
@@ -933,13 +934,15 @@ export function debtSettledContactAction(): MessageLinkAction {
  * de pagamento for desconhecida, omite o "em {data}" e mantém o "consta como paga".
  */
 export function settledMessage(ctx: SettledContext): string {
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
-  const paidWhen = ctx.paidAt ? ` em ${formatDatePt(ctx.paidAt)}` : ""
-  const dueWhen = ctx.oldestDueDate ? ` (vencimento ${formatDatePt(ctx.oldestDueDate)})` : ""
+  // A4/S21: sem exclamação, sem CAPS, sem "Obrigado!". O valor é o do OUTCOME
+  // (pagamento recebido), permitido pela R-12.
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
+  const paidDate = ctx.paidAt ? formatDatePt(ctx.paidAt) : ""
+  const paidWhen = paidDate ? ` em ${paidDate}` : ""
   return (
-    `${greeting} Verificamos aqui: sua dívida com a ${ctx.creditorName} ` +
-    `no valor de ${BRL(ctx.totalPaid)}${dueWhen} consta como PAGA${paidWhen} e está quitada. ` +
-    `Obrigado! Se precisar de algo, fale com o nosso atendimento.`
+    `${greeting} Não há valor em aberto em seu nome com a ${ctx.creditorName}: ` +
+    `o pagamento de ${BRL(ctx.totalPaid)} consta como recebido${paidWhen}. ` +
+    `Se precisar de algo, fale com o atendimento.`
   )
 }
 
@@ -1749,9 +1752,9 @@ export async function handleDebtNegotiate(input: {
   // única sinalização de que a negociação está em curso é este reply. Deixa
   // explícito que estamos PREPARANDO a negociação (o front o mostra no pollMessages
   // pós-clique; a resposta do n8n aparece depois por polling normal). Sem PII.
-  const reply =
-    "Perfeito! Então vamos trabalhar juntos para sanar o seu débito. " +
-    "Estou preparando sua negociação, só um instante…"
+  // A4/S22: sem "Perfeito!"/"sanar o seu débito" — a mesma frase do clique
+  // Negociar do menu de 3 opções (Apêndice B).
+  const reply = NEGOTIATION_PENDING_TEXT
   // SEMPRE persiste o reply localmente (bug histórico: condicionar a
   // engineOwner==='platform' deixava o lado do assistente VAZIO no banco quando o
   // n8n era assumido dono mas NÃO devolvia/empurrava nada — a sessão reaberta só

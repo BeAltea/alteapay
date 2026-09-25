@@ -119,11 +119,11 @@ describe("bootstrap do menu de 3 opções (§6.1)", () => {
     // ordem contratual (Pagar › Negociar › Consultar › Não reconheço) — NÃO a ordem dos ids
     expect(prompt.buttons.map((b: any) => b.id)).toEqual([4, 1, 2, 0])
     // rótulo do Pagar carrega o valor canônico (M3) — R$ 250,00
-    expect(prompt.buttons[0].label).toContain("Quero pagar")
-    expect(prompt.buttons[0].label).toContain("250")
-    expect(prompt.buttons[1].label).toBe("Quero negociar")
-    expect(prompt.buttons[2].label).toBe("Consultar dívida")
-    expect(prompt.buttons[3].label).toBe("Não reconheço esta dívida")
+    // A4/S1–S4 (Apêndice B): "Pagar R$ 250,00" (sem travessão) · Negociar · Detalhes da dívida · Não reconheço
+    expect(prompt.buttons[0].label).toMatch(/^Pagar R\$\s?250,00$/)
+    expect(prompt.buttons[1].label).toBe("Negociar")
+    expect(prompt.buttons[2].label).toBe("Detalhes da dívida")
+    expect(prompt.buttons[3].label).toBe("Não reconheço")
   })
 
   it("a mensagem-resumo (T1/R-24) identifica cedente+AlteaPay, SEM valor e SEM 'desconsiderar'", async () => {
@@ -265,10 +265,9 @@ describe("encaminhamento ao cedente (§6.2/M6)", () => {
     expect(reply).toContain("VMAX")
     // fallback: canal informado na fatura / site oficial do credor
     expect(reply).toContain("informado na sua fatura")
-    // nunca promete pagamento; AlteaPay não é responsável pela dívida
-    expect(reply).toContain("não vamos gerar nenhum pagamento")
-    // R-46 (carta de voz): AlteaPay opera o canal; o dono do contrato é o credor.
-    expect(reply).toContain("A AlteaPay opera o canal de negociação")
+    // A4/S11 (Apêndice B): registra a contestação e encaminha ao cedente — duas frases.
+    expect(reply.startsWith("Registramos que você não reconhece esta cobrança. ")).toBe(true)
+    expect(reply).toContain("Para entender a origem e contestar, fale com a VMAX")
     // R-46/C10: sem "Obrigado por avisar" (muleta) nem "se já pagou desconsidere".
     expect(reply).not.toContain("Obrigado por avisar")
     expect(reply).not.toContain("desconsidere")
@@ -280,7 +279,7 @@ describe("encaminhamento ao cedente (§6.2/M6)", () => {
     const channel = await resolveCreditorChannel({ companyId: CO, customerId: CUST, debtId: DEBT })
     expect(channel.hasConfig).toBe(true)
     const reply = notRecognizedReply(channel)
-    expect(reply).toContain("canal oficial: SAC VMAX 0800-123")
+    expect(reply).toContain("fale com a VMAX: SAC VMAX 0800-123")
     expect(reply).toContain("https://vmax.example/sac")
     expect(reply).not.toContain("informado na sua fatura") // variação com config
   })
@@ -346,14 +345,12 @@ describe("resumo objetivo + Consultar + reset 24h", () => {
   it("debtConsultReply (T4/R-27): vencimento + serviço do cedente + caminho de volta", async () => {
     const { debtConsultReply, buildAckContext } = await import("@/lib/journey/acknowledgement")
     const r = debtConsultReply(await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
-    // T4: "vencimento original em {venc}" e "refere-se a um serviço da {credor}".
-    expect(r).toMatch(/vencimento original em/i)
-    expect(r).toMatch(/serviço da/i)
-    expect(r).toContain("VMAX")
+    // A4/S10 (Apêndice B "Detalhes"): "Vencimento original {venc} · {n} fatura(s) · {descrição}."
+    expect(r).toMatch(/^Vencimento original \d{2}\/\d{2}\/\d{4} · 1 fatura · serviço da VMAX\.$/)
     // R-12: sem valor na fala (mora no card/rótulo).
     expect(r).not.toContain("R$")
-    // a carta pede sempre oferecer caminho: a frase termina convidando a escolher.
-    expect(r).toMatch(/escolher abaixo/i)
+    // a pergunta "Como prefere seguir?" é do MENU reemitido logo abaixo (uma só na tela).
+    expect(r).not.toMatch(/prefere seguir/i)
   })
 
   it("Consultar [2]: sequência do clique gera a resposta + reabre o menu (não fica mudo)", async () => {

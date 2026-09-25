@@ -160,8 +160,9 @@ describe("payLinkMessageText — copy do link (R7, pura)", () => {
     expect(t).not.toMatch(/^Pronto!/)
     expect(t.toLowerCase()).not.toContain("já pagou")
     expect(t.toLowerCase()).not.toContain("desconsider")
-    // reforço de segurança leve (link pessoal e seguro).
-    expect(t).toContain("O link é pessoal e seguro")
+    // A4/S14 (Apêndice B): "…válido até {vencimento_link}." — sem travessão.
+    expect(t).toContain("válido até 27/09/2026")
+    expect(t).not.toContain("—")
   })
 
   it("already_charged (T8/R-30): reforça 'não é preciso gerar outro', sem 'já pagou'", () => {

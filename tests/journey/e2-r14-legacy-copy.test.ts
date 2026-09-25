@@ -54,16 +54,23 @@ describe("R14 — copy legada alinhada a D36 (compatibilidade, fora do bootstrap
     oldestDueDate: "2020-01-10",
   }
 
-  it("acknowledgementQuestion/consultNegotiateQuestion/debtInfoMessage: 'pendência', nunca 'dívida em seu nome'", async () => {
+  it("acknowledgementQuestion/consultNegotiateQuestion/debtInfoMessage: Apêndice B (A4/S23–S24), nunca 'dívida em seu nome', sem valor", async () => {
     const { acknowledgementQuestion, consultNegotiateQuestion, debtInfoMessage } = await import("@/lib/journey/acknowledgement")
     for (const text of [acknowledgementQuestion(ackCtx), consultNegotiateQuestion(ackCtx), debtInfoMessage(ackCtx)]) {
-      expect(text).toMatch(/pend[êe]ncia/i)
       expect(text).not.toMatch(/d[ií]vida em seu nome/i)
       // D36: sem ameaça
       expect(text).not.toMatch(/negativa|protesto|judicial|SPC|Serasa/i)
       // cedente identificado (R15)
       expect(text).toContain("VMAX")
+      // A4: sem valor na fala (R-12), sem "desconsiderar", sem exclamação/travessão
+      expect(text).not.toContain("R$")
+      expect(text).not.toMatch(/desconsider/i)
+      expect(text).not.toMatch(/[!—]/)
     }
+    // as saudações legadas usam a abertura do Apêndice B
+    expect(acknowledgementQuestion(ackCtx).startsWith("Olá, Fabio. Este é o canal oficial de negociação da VMAX, operado pela AlteaPay.")).toBe(true)
+    expect(consultNegotiateQuestion(ackCtx).endsWith("O que você deseja fazer?")).toBe(true)
+    expect(debtInfoMessage(ackCtx)).toMatch(/^Vencimento original \d{2}\/\d{2}\/\d{4} · 2 faturas · serviço da VMAX\.$/)
   })
 
   it("botões de handoff legados usam 'Falar com atendimento' (não 'atendente')", async () => {

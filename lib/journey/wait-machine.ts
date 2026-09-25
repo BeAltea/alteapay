@@ -102,17 +102,27 @@ export function shouldShowSlowExits(step: WaitStep): boolean {
 // no histórico — aqui só as trocas narradas que a máquina reescreve na bolha de
 // espera (não empilha bolha nova).
 // ---------------------------------------------------------------------------
+/**
+ * A4/S7 (Apêndice B "Negociar - antes") — a ÚNICA frase de confirmação do clique
+ * Negociar. É persistida pelo servidor (T2, button/route.ts), injetada como bolha
+ * optimistic pelo client (T3, chat.tsx) e é a pergunta do prompt de parcelas
+ * (offerChoiceQuestion): uma só frase para o mesmo instante, nunca duplicada.
+ * Vive aqui (módulo puro, client-safe) para servidor e client importarem a MESMA
+ * constante (N-D5-8). Sem PII.
+ */
+export const NEGOTIATION_PENDING_TEXT = "Certo. Estas são as condições disponíveis para você:"
+
 /** Copy narrada exibida em cada degrau da espera (bolha de espera reescrita).
  *  Vazio ("") = sem texto próprio (D0 usa o eco do servidor; D1 é só indicador). */
 export function waitStepCopy(step: WaitStep): string {
   switch (step) {
-    case "d2_narrated":
-      return "Estou consultando as condições de pagamento disponíveis para você. Só um instante."
     case "d3_slow":
-      return "Está demorando um pouco mais que o normal, mas já estou quase lá. Se preferir, você já pode resolver agora:"
+      // A4/S19: sem "já estou quase lá" (promessa vazia). Frases curtas.
+      return "Está demorando mais que o normal. Se preferir, você pode resolver agora:"
     default:
-      // d0_suppressed / d1_typing: sem texto próprio (o eco A.2 do servidor
-      // permanece na bolha anterior). d4_degraded usa a copy de degradação (§4).
+      // d0_suppressed / d1_typing / d2_narrated: sem texto próprio — o eco S7
+      // ("Certo. Estas são as condições…") já está na tela e é a ÚNICA frase de
+      // espera (A4/S19). d4_degraded usa a copy de degradação (§4).
       return ""
   }
 }

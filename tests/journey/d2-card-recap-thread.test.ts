@@ -114,20 +114,20 @@ describe("RECAP de retomada (C7/R-17/R-42)", () => {
   it("após decisão + link → state after_link, com label REAL do clique (R-42)", async () => {
     db.chat_messages = [
       { id: "g1", session_id: SID, company_id: CO, role: "assistant", text: "Olá.", created_at: "2026-09-24T10:00:00Z" },
-      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Quero pagar — R$ 250,00", button_id: 4, created_at: "2026-09-24T10:01:00Z" },
+      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Pagar R$ 250,00", button_id: 4, created_at: "2026-09-24T10:01:00Z" },
       { id: "o1", session_id: SID, company_id: CO, role: "assistant", text: "Seu link: https://asaas/checkout/pay_1", created_at: "2026-09-24T10:02:00Z" },
     ]
     const { buildRecap } = await import("@/lib/journey/recap")
     const recap = await buildRecap(SID, CO)
     expect(recap).toBeTruthy()
     expect(recap!.state).toBe("after_link")
-    expect(recap!.lastDecisionLabel).toBe("Quero pagar — R$ 250,00") // label real, não genérico
+    expect(recap!.lastDecisionLabel).toBe("Pagar R$ 250,00") // label real, não genérico
   })
 
   it("wait_state='aguardando_motor' + decisão → state after_negotiate", async () => {
     db.negotiation_sessions[0].wait_state = "aguardando_motor"
     db.chat_messages = [
-      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Quero negociar", button_id: 1, created_at: "2026-09-24T10:01:00Z" },
+      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Negociar", button_id: 1, created_at: "2026-09-24T10:01:00Z" },
     ]
     const { buildRecap } = await import("@/lib/journey/recap")
     const recap = await buildRecap(SID, CO)
@@ -137,7 +137,7 @@ describe("RECAP de retomada (C7/R-17/R-42)", () => {
   it("wait_state='nao_reconhecida' → state after_not_recognized", async () => {
     db.negotiation_sessions[0].wait_state = "nao_reconhecida"
     db.chat_messages = [
-      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Não reconheço esta dívida", button_id: 0, created_at: "2026-09-24T10:01:00Z" },
+      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Não reconheço", button_id: 0, created_at: "2026-09-24T10:01:00Z" },
     ]
     const { buildRecap } = await import("@/lib/journey/recap")
     const recap = await buildRecap(SID, CO)
@@ -150,22 +150,25 @@ describe("RECAP de retomada (C7/R-17/R-42)", () => {
   it("após 'Já paguei' (bolha preservada) → state after_payment_claim, mesmo sem wait_state", async () => {
     db.chat_messages = [
       { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Já paguei", button_id: 5, created_at: "2026-09-24T10:01:00Z" },
-      { id: "a1", session_id: SID, company_id: CO, role: "assistant", text: "Registramos que você já pagou este valor. A nossa equipe vai conferir. Guarde o seu comprovante — ele pode ser pedido para dar baixa. Você não precisa fazer mais nada por aqui agora.", created_at: "2026-09-24T10:01:05Z" },
+      // A4/S18: copy atual do paymentClaimReply (a âncora do recap reconhece esta E a geração anterior).
+      { id: "a1", session_id: SID, company_id: CO, role: "assistant", text: "Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento.", created_at: "2026-09-24T10:01:05Z" },
     ]
     const { buildRecap } = await import("@/lib/journey/recap")
     const recap = await buildRecap(SID, CO)
     expect(recap!.state).toBe("after_payment_claim")
     expect(recap!.lastDecisionLabel).toBe("Já paguei")
-    expect(recap!.text).toMatch(/conferindo|conferir/i)
+    // A4/S6: o bloco de retomada é a saudação de retorno do Apêndice B (única para todos os estados).
+    expect(recap!.text).toBe("Olá de novo. Você já viu os detalhes do valor em aberto. Como prefere seguir?")
   })
 
   // Precedência: "Já paguei" tem prioridade sobre um link entregue na mesma thread —
   // quem avisou que pagou deve retomar na conferência, não em "seu link está aqui".
   it("'Já paguei' após link → state after_payment_claim (precedência sobre after_link)", async () => {
     db.chat_messages = [
-      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Quero pagar — R$ 250,00", button_id: 4, created_at: "2026-09-24T10:00:00Z" },
+      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Pagar R$ 250,00", button_id: 4, created_at: "2026-09-24T10:00:00Z" },
       { id: "o1", session_id: SID, company_id: CO, role: "assistant", text: "Seu link: https://asaas/checkout/pay_1", created_at: "2026-09-24T10:00:30Z" },
       { id: "c2", session_id: SID, company_id: CO, role: "customer", text: "Já paguei", button_id: 5, created_at: "2026-09-24T10:02:00Z" },
+      // geração ANTERIOR da copy (bolha já gravada em produção) — continua reconhecida.
       { id: "a2", session_id: SID, company_id: CO, role: "assistant", text: "Registramos que você já pagou este valor. A nossa equipe vai conferir.", created_at: "2026-09-24T10:02:05Z" },
     ]
     const { buildRecap } = await import("@/lib/journey/recap")
@@ -184,7 +187,7 @@ describe("RECAP de retomada (C7/R-17/R-42)", () => {
 
   it("GET com `since` (poll incremental) NÃO devolve recap; sem `since` (retomada) devolve", async () => {
     db.chat_messages = [
-      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Quero pagar — R$ 250,00", button_id: 4, created_at: "2026-09-24T10:01:00Z" },
+      { id: "c1", session_id: SID, company_id: CO, role: "customer", text: "Pagar R$ 250,00", button_id: 4, created_at: "2026-09-24T10:01:00Z" },
     ]
     const { GET } = await import("@/app/api/chat/messages/route")
     const { signChatJwt } = await import("@/lib/negotiation/crypto")

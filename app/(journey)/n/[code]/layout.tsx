@@ -83,7 +83,7 @@ export default async function PublicLinkLayout({
   const view = authed
     ? {
         brandName: branding.brandName,
-        subtitle: `AlteaPay · parceira oficial de cobrança de ${branding.brandName}`,
+        subtitle: `AlteaPay · canal oficial de negociação da ${branding.brandName}`,
         logoUrl: branding.logoUrl,
         primary: branding.brandPrimaryColor,
         secondary: branding.brandSecondaryColor,

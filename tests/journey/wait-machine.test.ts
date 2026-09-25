@@ -93,11 +93,13 @@ describe("copy narrada (03-copy.md §2/§4) — sem termos técnicos", () => {
     expect(waitStepCopy("d0_suppressed")).toBe("")
     expect(waitStepCopy("d1_typing")).toBe("")
   })
-  it("d2 = progresso narrado (consulta das condições)", () => {
-    expect(waitStepCopy("d2_narrated")).toContain("consultando as condições")
+  it("d2 = sem texto próprio (A4/S19: o eco S7 já na tela é a ÚNICA frase de espera)", () => {
+    expect(waitStepCopy("d2_narrated")).toBe("")
   })
-  it("d3 = 'demorando um pouco mais' + convite a resolver agora", () => {
-    expect(waitStepCopy("d3_slow")).toContain("demorando um pouco mais")
+  it("d3 = 'demorando mais que o normal' + convite a resolver agora; sem 'já estou quase lá' (A4/S19)", () => {
+    expect(waitStepCopy("d3_slow")).toContain("demorando mais que o normal")
+    expect(waitStepCopy("d3_slow")).not.toMatch(/quase lá/i)
+    expect(waitStepCopy("d3_slow")).not.toContain("—")
   })
   it("nenhuma copy de espera cita n8n/HTTP/erro técnico/sistema externo", () => {
     const all = [

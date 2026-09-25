@@ -124,7 +124,7 @@ describe("recordAcknowledgement", () => {
 })
 
 describe("acknowledgementQuestion", () => {
-  it("mensagem única: nome do cliente + nome do credor, valor e vencimento; SEM faturas", async () => {
+  it("mensagem única (A4/S23, Apêndice B): nome do cliente + credor + AlteaPay; SEM valor, SEM faturas", async () => {
     const { acknowledgementQuestion } = await import("@/lib/journey/acknowledgement")
     const msg = acknowledgementQuestion({
       firstName: "Fabio",
@@ -133,17 +133,17 @@ describe("acknowledgementQuestion", () => {
       invoiceCount: 7, // dígito ausente no valor/data → prova que não é exibido
       oldestDueDate: "2020-01-15",
     })
-    expect(msg).toContain("Olá, Fabio!")
-    // R14/D36: cedente identificado, tom "pendência ... com a {credor}".
-    expect(msg).toContain("com a VMAX")
-    expect(msg).toContain("R$")
+    expect(msg).toContain("Olá, Fabio.")
+    // R14/D36 + A4: cedente identificado, AlteaPay como operadora; valor NÃO na fala (R-12).
+    expect(msg).toContain("canal oficial de negociação da VMAX, operado pela AlteaPay")
+    expect(msg).not.toContain("R$")
     expect(msg).toContain("Você reconhece esta cobrança em seu nome?")
     // não menciona contagem de faturas
     expect(msg.toLowerCase()).not.toContain("fatura")
     expect(msg).not.toContain("7")
   })
 
-  it("firstName vazio → saudação genérica 'Olá!'", async () => {
+  it("firstName vazio → saudação genérica 'Olá.'", async () => {
     const { acknowledgementQuestion } = await import("@/lib/journey/acknowledgement")
     const msg = acknowledgementQuestion({
       firstName: "",
@@ -152,8 +152,8 @@ describe("acknowledgementQuestion", () => {
       invoiceCount: 1,
       oldestDueDate: "2020-01-15",
     })
-    // R14/D36: copy alinhada — "pendência" (não "dívida em seu nome").
-    expect(msg.startsWith("Olá! Encontramos uma pendência")).toBe(true)
+    // A4/S23: abertura do Apêndice B (sem nome → "Olá.").
+    expect(msg.startsWith("Olá. Este é o canal oficial de negociação da VMAX")).toBe(true)
     expect(msg).not.toContain("Olá, !")
   })
 })
@@ -187,7 +187,7 @@ describe("buildAckContext", () => {
     const ctx = await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] })
     expect(ctx.firstName).toBe("")
     expect(ctx.creditorName).toBe("VMAX LTDA") // cai no company.name
-    expect(acknowledgementQuestion(ctx).startsWith("Olá! Encontramos uma pendência")).toBe(true)
+    expect(acknowledgementQuestion(ctx).startsWith("Olá. Este é o canal oficial de negociação da VMAX LTDA")).toBe(true)
   })
 })
 

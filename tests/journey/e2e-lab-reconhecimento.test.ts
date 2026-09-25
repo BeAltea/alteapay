@@ -247,8 +247,9 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     // dados da dívida (debtInfoMessage) E o reply — os DOIS no histórico local,
     // sem depender do n8n empurrar nada (bug histórico: reply só era gravado se
     // engineOwner==='platform', deixando o lado do assistente vazio).
-    expect(assistantTexts.some((t) => t.includes("dados da sua pendência"))).toBe(true)
-    expect(assistantTexts.some((t) => t.includes("trabalhar juntos para sanar"))).toBe(true)
+    // A4/S24+S22: detalhes compactos (sem valor) + a confirmação do Apêndice B (S7).
+    expect(assistantTexts.some((t) => t.startsWith("Vencimento original"))).toBe(true)
+    expect(assistantTexts.some((t) => t === "Certo. Estas são as condições disponíveis para você:")).toBe(true)
   })
 
   it("Negociar [3] grava o reconhecimento (button_id=3) — não é mais descartado pelo CHECK", async () => {

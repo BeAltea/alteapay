@@ -256,7 +256,7 @@ describe("T1 / R-24 — abertura (carta de voz)", () => {
     const s = threeOptionsSummary(ACK)
     expect(s).toContain("VMAX")
     expect(s).toContain("AlteaPay")
-    expect(s).toMatch(/canal de negociação/i)
+    expect(s).toMatch(/canal oficial de negociação/i)
     expect(s).toMatch(/prefere seguir/i)
   })
   it("R-12: o VALOR não aparece na fala (mora no card fixo e no rótulo do botão)", () => {
@@ -275,14 +275,14 @@ describe("T1 / R-24 — abertura (carta de voz)", () => {
 })
 
 describe("T4 / R-27 — debtConsultReply (consultar)", () => {
-  it("vencimento + serviço do cedente + caminho de volta; plural condicional", () => {
+  it("Apêndice B (A4/S10): 'Vencimento original {venc} · {n} fatura(s) · {descrição}.'; plural condicional", () => {
     const multi = debtConsultReply(ACK) // invoiceCount 3
-    expect(multi).toMatch(/vencimento original em/i)
-    expect(multi).toMatch(/reúne 3 faturas/i) // N>1 → cita as faturas
-    expect(multi).toMatch(/serviço da VMAX/i)
-    expect(multi).toMatch(/escolher abaixo/i) // sempre oferece caminho
+    expect(multi).toMatch(/^Vencimento original \d{2}\/\d{2}\/\d{4} · 3 faturas · serviço da VMAX\.$/)
     const single = debtConsultReply(ACK_SINGLE) // invoiceCount 1
-    expect(single).not.toMatch(/faturas/i) // N=1 → não cita quantidade
+    expect(single).toMatch(/ · 1 fatura · /)
+    expect(single).not.toMatch(/faturas/i)
+    // a pergunta "Como prefere seguir?" vem do menu reemitido (uma só na tela)
+    expect(multi).not.toMatch(/prefere seguir/i)
   })
   it("R-12: sem valor na fala", () => {
     expect(debtConsultReply(ACK)).not.toContain("R$")
@@ -298,8 +298,9 @@ describe("T6 / R-45 — offerButtonLabel (âncora de economia)", () => {
     }
     const label = offerButtonLabel(withDisc)
     expect(label).toMatch(/À vista R\$\s?175,00/)
-    expect(label).toMatch(/você economiza R\$\s?75,00/)
+    expect(label).toMatch(/economia de R\$\s?75,00/) // A4/S9: sem travessão
     expect(label).toContain("(recomendado)")
+    expect(label).not.toContain("—")
     expect(label).not.toContain("desconto") // âncora é a economia, não a palavra "desconto"
   })
   it("à vista SEM desconto: recomenda mas NÃO insinua economia inexistente", () => {
@@ -327,11 +328,10 @@ describe("T6 / R-45 — offerButtonLabel (âncora de economia)", () => {
 })
 
 describe("T7 / R-29 — link entregue (ponto de maior conversão)", () => {
-  it("valor + vencimento + reforço de segurança; sem 'Pronto!'", () => {
+  it("valor + validade do link (Apêndice B, A4/S14); sem 'Pronto!'", () => {
     const t = payLinkMessageText({ link: "https://asaas/x", valor: 250, vencimentoLink: "2026-08-18", alreadyCharged: false })
     expect(t).toMatch(/R\$\s?250,00/)
-    expect(t).toContain("18/08/2026")
-    expect(t).toContain("O link é pessoal e seguro")
+    expect(t).toContain("válido até 18/08/2026")
     expect(t).not.toMatch(/^Pronto!/)
     expect(t).toContain("https://asaas/x")
   })
@@ -368,11 +368,10 @@ describe("T12 / R-33 — handoff", () => {
 })
 
 describe("T13 / R-34 — já paguei (não declara pago — D6)", () => {
-  it("registra p/ conferência da equipe, orienta comprovante, sem 'Obrigado por avisar'", () => {
+  it("Apêndice B (A4/S18): 'Obrigado por avisar. Vamos conferir o pagamento…' — conferência, sem declarar pago", () => {
     const t = paymentClaimReply("VMAX")
-    expect(t).toMatch(/nossa equipe vai conferir/i)
-    expect(t).toMatch(/comprovante/i)
-    expect(t).not.toMatch(/obrigado por avisar/i)
+    expect(t.startsWith("Obrigado por avisar. Vamos conferir o pagamento.")).toBe(true)
+    expect(t).not.toContain("—")
     // D6/M15: NUNCA declara pago/quitado/confirmado.
     expect(t).not.toMatch(/pagamento (confirmado|recebido)|quitad[oa]|est[aá] pago/i)
   })
@@ -382,8 +381,9 @@ describe("R-46 — não reconheço (fallback seguro + voz)", () => {
   it("cita o cedente, AlteaPay como operadora, não promete pagamento; sem muleta", () => {
     const t = notRecognizedReply({ creditorName: "VMAX", hasConfig: false, channelLabel: null, channelUrl: null })
     expect(t).toContain("VMAX")
-    expect(t).toContain("A AlteaPay opera o canal de negociação")
-    expect(t).toMatch(/não vamos gerar nenhum pagamento/i)
+    // A4/S11 (Apêndice B): registra a contestação e encaminha ao cedente.
+    expect(t.startsWith("Registramos que você não reconhece esta cobrança. ")).toBe(true)
+    expect(t).toMatch(/fale com a VMAX pelo canal informado na sua fatura/i)
     expect(t).not.toContain("null")
     expect(t).not.toMatch(/obrigado por avisar/i)
   })
@@ -393,7 +393,7 @@ describe("T2 = T3 (R-26) — uma só frase para o clique 'Negociar'", () => {
   it("a bolha optimistic do client é exatamente a confirmação do servidor (sem duplicar)", () => {
     // T3 (client): mesmíssima string que o servidor persiste (T2, button/route.ts).
     expect(NEGOTIATION_PENDING_TEXT).toBe(
-      "Certo. Vou buscar as condições de pagamento disponíveis para você.",
+      "Certo. Estas são as condições disponíveis para você:", // A4/S7 (Apêndice B)
     )
     expect(NEGOTIATION_PENDING_TEXT).not.toMatch(/Perfeito\./)
     expect(NEGOTIATION_PENDING_TEXT).not.toMatch(/seu caso/)

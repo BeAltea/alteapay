@@ -37,16 +37,20 @@ function hasPaymentLink(text: string | null | undefined): boolean {
 }
 
 /**
- * Reconhece a bolha PRESERVADA de "Já paguei" (paymentClaimReply em actions.ts:397
- * — "Registramos que você já pagou este valor. A nossa equipe vai conferir…").
- * O payment_claim NÃO seta wait_state (handlePaymentClaim só registra o caso e
- * persiste esta bolha), então o recap detecta o desfecho pelo TEXTO preservado (a
- * mesma fonte canônica de C7/R-42: chat_messages), sem depender de uma coluna de
- * estado nem tocar journey_events. Casa a âncora estável da frase, não a copy
- * inteira (D3 pode refinar o final da frase sem quebrar a detecção).
+ * Reconhece a bolha PRESERVADA de "Já paguei" (paymentClaimReply em actions.ts —
+ * A4/S18: "Obrigado por avisar. Vamos conferir o pagamento…"; histórico anterior:
+ * "Registramos que você já pagou este valor…"). O payment_claim NÃO seta
+ * wait_state (handlePaymentClaim só registra o caso e persiste esta bolha), então
+ * o recap detecta o desfecho pelo TEXTO preservado (a mesma fonte canônica de
+ * C7/R-42: chat_messages), sem depender de uma coluna de estado nem tocar
+ * journey_events. Casa a âncora estável de CADA geração da frase, não a copy
+ * inteira (bolhas já gravadas continuam reconhecidas).
  */
 function hasPaymentClaim(text: string | null | undefined): boolean {
-  return typeof text === "string" && /registramos que você já pagou/i.test(text)
+  return (
+    typeof text === "string" &&
+    /vamos conferir o pagamento|registramos que você já pagou/i.test(text)
+  )
 }
 
 /**
@@ -176,24 +180,20 @@ export function resolveRecapState(
 }
 
 /**
- * Frase única do recap por estado retomável (carta de voz §10.2: adulto, curta,
- * uma ideia, sem muleta/valor repetido — o valor mora no card fixo, não aqui). O
- * label real do clique (R-42) dá a memória da escolha ("Você escolheu 3x de …").
- * D3 pode refinar a copy; a estrutura (1 frase, por estado) é de D2.
+ * A4/S6 (Apêndice B "Saudação de retorno") — a frase do bloco de retomada é a
+ * saudação de retorno, ÚNICA para todos os estados: "Olá de novo, {primeiro_nome}.
+ * Você já viu os detalhes do valor em aberto. Como prefere seguir?". O que a
+ * última escolha produziu (link/acordo/"já paguei") NÃO é narrado aqui: o outcome
+ * preservado é exibido acima do menu (§2.2 — mecanismo da A3), e o valor mora no
+ * card fixo. `state`/`decisionLabel` seguem na assinatura (o Recap os expõe para
+ * a UI/A3). `firstName` ausente → "Olá de novo." (nunca "Olá de novo, ."). Sem PII.
  */
-export function recapText(state: RecapState, decisionLabel: string | null): string {
-  const choice = decisionLabel ? decisionLabel : "uma opção"
-  switch (state) {
-    case "after_link":
-      return `Você retomou a conversa. Seu link de pagamento já está aqui embaixo, é só abrir.`
-    case "after_negotiate":
-      return `Você retomou a conversa. Estávamos vendo as condições de pagamento para você.`
-    case "after_payment_claim":
-      return `Você retomou a conversa. Você avisou que já pagou; nossa equipe está conferindo.`
-    case "after_not_recognized":
-      return `Você retomou a conversa. Você indicou que não reconhece esta cobrança.`
-    case "after_decision":
-    default:
-      return `Você retomou a conversa. Sua última escolha foi: ${choice}.`
-  }
+export function recapText(
+  _state: RecapState,
+  _decisionLabel: string | null,
+  firstName?: string | null,
+): string {
+  const name = typeof firstName === "string" ? firstName.trim() : ""
+  const greeting = name ? `Olá de novo, ${name}.` : "Olá de novo."
+  return `${greeting} Você já viu os detalhes do valor em aberto. Como prefere seguir?`
 }
