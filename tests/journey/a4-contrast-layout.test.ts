@@ -58,8 +58,12 @@ describe("N-D5-2 — nenhum text-white sobre --brand-secondary (fonte)", () => {
     // o link auto-linkado não usa mais a cor da marca sobre fundo claro
     expect(chat).not.toContain('style={{ color: "var(--brand-secondary)" }}')
   })
-  it("prompt-buttons.tsx e public-auth-form.tsx: marca sempre com --brand-secondary-fg; zero text-white", () => {
-    for (const rel of ["components/journey/prompt-buttons.tsx", "components/journey/public-auth-form.tsx"]) {
+  it("prompt-buttons.tsx, public-auth-form.tsx e generic-auth-form.tsx (/t/, B3-F3): marca sempre com --brand-secondary-fg; zero text-white", () => {
+    for (const rel of [
+      "components/journey/prompt-buttons.tsx",
+      "components/journey/public-auth-form.tsx",
+      "components/journey/generic-auth-form.tsx",
+    ]) {
       const s = src(rel)
       expect(s, rel).not.toContain("text-white")
       const fills = s.match(/backgroundColor: "var\(--brand-secondary\)"[^}]*\}/g) ?? []
@@ -71,6 +75,10 @@ describe("N-D5-2 — nenhum text-white sobre --brand-secondary (fonte)", () => {
     for (const rel of ["app/(journey)/n/[code]/layout.tsx", "app/(journey)/c/[token]/layout.tsx"]) {
       expect(src(rel)).toContain('"--brand-secondary-fg": adaptiveTextColor(view.secondary)')
     }
+    // B3-F3: o layout do /t/ aplica a marca do tenant ANTES do login — a cor adaptativa vale desde a porta
+    expect(src("app/t/[tenantSlug]/negociar/layout.tsx")).toContain(
+      '"--brand-secondary-fg": adaptiveTextColor(branding.brandSecondaryColor)',
+    )
   })
 })
 
@@ -125,9 +133,12 @@ describe("N-D5-5 — alvos de toque ≥ 44px", () => {
     // nenhum botão de painel ficou em h-9 (36px)
     expect(chat).not.toMatch(/className="h-9 /)
   })
-  it("porta: 'Quem somos…' (disclosure) ≥ 44px e submit h-11", () => {
-    const form = src("components/journey/public-auth-form.tsx")
-    expect(classBefore(form, "{ENTRY_SEAL_WHO_LABEL}")).toContain("min-h-[44px]")
-    expect(classBefore(form, '{submitting ? "Confirmando..." : "Continuar"}')).toContain("h-11")
+  it("portas (/n/ e /t/, B3-F3): 'Quem somos…' (disclosure) ≥ 44px e submit h-11", () => {
+    for (const rel of ["components/journey/public-auth-form.tsx", "components/journey/generic-auth-form.tsx"]) {
+      const form = src(rel)
+      expect(classBefore(form, "{ENTRY_SEAL_WHO_LABEL}"), rel).toContain("min-h-[44px]")
+      expect(classBefore(form, "{ENTRY_SEAL_WHO_LABEL}"), rel).not.toContain("text-xs")
+      expect(classBefore(form, '{submitting ? "Confirmando..." : "Continuar"}'), rel).toContain("h-11")
+    }
   })
 })

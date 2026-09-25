@@ -49,7 +49,7 @@ import {
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { engineName } from "@/lib/negotiation/engine"
-import { NEGOTIATION_PENDING_TEXT } from "@/lib/journey/wait-machine"
+import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"
 import {
   BTN_BACK,
   BTN_CONSULT,
@@ -442,8 +442,10 @@ export async function POST(req: NextRequest) {
         })
         // Confirmação NOSSA imediata (T2 / R-26 — a MESMA constante da bolha otimista
         // do client e da pergunta das parcelas: A4/S7, NEGOTIATION_PENDING_TEXT em
-        // lib/journey/wait-machine.ts; o alias em acknowledgement.ts tem o mesmo
-        // valor) — escrita já em curso.
+        // lib/journey/wait-machine.ts) — escrita já em curso, ANTES do resultado da
+        // matriz (latência A2). Sem parcelas, a máquina de espera (D2: d3/d4) narra
+        // a sequência na tela; a frase sem dois-pontos (NEGOTIATION_SEARCHING_TEXT)
+        // é dos ramos legados, onde nada vem depois (A4 r2, B3-F2).
         const reply = NEGOTIATION_PENDING_TEXT
         const ackWrite = persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
         let presented: PresentMatrixOffersResult | null = null
@@ -773,8 +775,12 @@ export async function POST(req: NextRequest) {
     } catch (err) {
       console.warn("[chat:button] negotiation.start falhou (fallback assistido):", (err as Error).message)
     }
-    // A4/S22: sem "Perfeito!"/"sanar o seu débito" — a frase do Apêndice B (S7).
-    const recognizedReply = NEGOTIATION_PENDING_TEXT
+    // A4/S22: sem "Perfeito!"/"sanar o seu débito". A4 r2 (B3-F2): este ramo só
+    // dispara o kickoff em background e NÃO apresenta as parcelas — nada vem
+    // depois da frase, então ela é a completa, sem dois-pontos
+    // (NEGOTIATION_SEARCHING_TEXT). S7 ("…disponíveis para você:") fica só onde
+    // as condições seguem de fato (menu de 3 opções, T2 acima).
+    const recognizedReply = NEGOTIATION_SEARCHING_TEXT
     // SEMPRE persiste o reply (bug histórico: condicionar a engineOwner==='platform'
     // deixava o lado do assistente VAZIO no banco quando o n8n era dado como dono
     // mas não empurrava nada — a sessão reaberta só trazia a pergunta + o clique

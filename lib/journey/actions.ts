@@ -441,18 +441,21 @@ export async function handlePaymentClaim(
 
 /**
  * R5 — copy do "Já paguei". Registramos a informação para conferência (NÃO declara
- * pago — D6/M15) e orientamos o devedor a guardar o comprovante. Sem ameaça (D36),
- * sem prometer baixa imediata. `creditorName` já resolvido (R15). Sem PII.
+ * pago — D6/M15). Sem ameaça (D36), sem prometer baixa imediata. Sem PII.
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-export function paymentClaimReply(_creditorName?: string, contact?: string | null): string {
+export function paymentClaimReply(_creditorName?: string): string {
   // A4/S18 (Apêndice B "Já paguei"): "Obrigado por avisar. Vamos conferir o
   // pagamento. Se quiser adiantar, fale com o atendimento: {contato}." NÃO declara
-  // pago (D6/M15). `{contato}` só entra quando há um contato configurado; sem ele,
-  // a frase termina em "fale com o atendimento." (o botão de atendimento existe).
-  // `_creditorName` é mantido por compatibilidade com os chamadores. Sem PII.
-  const who = contact && contact.trim() ? `fale com o atendimento: ${contact.trim()}.` : "fale com o atendimento."
-  return `Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, ${who}`
+  // pago (D6/M15). A4 r2 (B3-F5): o tenant NÃO tem campo de contato de atendimento
+  // (official_channel_* é o canal do CREDOR, usado na contestação — não é o
+  // atendimento da negociação), então o segmento ": {contato}" fica fora e a
+  // frase termina em "fale com o atendimento." — texto fixo, sem parâmetro morto
+  // e sem promessa (o botão "Falar com atendimento" existe). Quando o campo
+  // existir (ex.: tenant_chat_config.support_contact), reintroduzir o segmento
+  // aqui e ligá-lo no chamador (handlePaymentClaim). `_creditorName` é a
+  // assinatura pré-A4 (chamador e testes intocados). Sem PII.
+  return "Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento."
 }
 
 // ---------- session.close ----------

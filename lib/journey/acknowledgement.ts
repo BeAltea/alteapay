@@ -31,18 +31,30 @@ import {
 import { createPrompt, answerPrompt, promptView, type PromptRow, type PromptView } from "./prompts"
 import { listOffers, type ListedOffer, type SessionCtx } from "./actions"
 import type { OfferTerms } from "@/lib/negotiation/offers"
-import { NEGOTIATION_PENDING_TEXT } from "./wait-machine"
+import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "./wait-machine"
+import { formatDueDatePt } from "./pay-poll"
 
 const BRL = (v: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v || 0)
 
-/** dd/mm/aaaa; ausente/inválida → "" (o chamador omite o segmento — nunca um
- *  placeholder na fala do devedor). */
+/**
+ * dd/mm/aaaa; ausente/inválida → "" (o chamador omite o segmento — nunca um
+ * placeholder na fala do devedor). A4 r2 (B3-F4), sem depender do fuso do runtime:
+ *  - data civil (`YYYY-MM-DD`, coluna `date`: vencimento) → componentes por regex
+ *    (formatDueDatePt, sem `Date`): "2026-08-15" é 15/08 em qualquer fuso;
+ *  - instante (`timestamptz` ISO: pagamento recebido) → dia civil em
+ *    America/Sao_Paulo (o runtime da Netlify é UTC; 22h de Brasília não vira o
+ *    dia seguinte).
+ */
 function formatDatePt(iso: string | null): string {
   if (!iso) return ""
-  const d = new Date(iso)
+  const s = iso.trim()
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return formatDueDatePt(s)
+  const d = new Date(s)
   if (Number.isNaN(d.getTime())) return ""
-  return d.toLocaleDateString("pt-BR")
+  return d.toLocaleDateString("pt-BR", {
+    timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", year: "numeric",
+  })
 }
 
 /**
@@ -59,15 +71,19 @@ function channelGreeting(ctx: Pick<AckContext, "firstName" | "creditorName">): s
 /**
  * A4 (S10/S24, Apêndice B "Detalhes") — linha compacta de detalhes da dívida:
  * "Vencimento original {venc} · {n} fatura(s) · serviço da {credor}". Segmentos
- * ausentes são omitidos (nunca "—"/vazio). SEM valor (mora no card — R-12) e sem
- * PII. A pergunta "Como prefere seguir?" NÃO entra aqui: quem pergunta é o menu
- * reemitido logo abaixo (REOPEN_MENU_QUESTION) — uma pergunta só na tela.
+ * ausentes são omitidos (nunca "—"/vazio). A4 r2 (B3-F6): sem vencimento E sem
+ * nº de faturas a linha nunca degenera em fragmento ("serviço da X.") — vira a
+ * frase completa "Este valor refere-se a um serviço da {credor}". SEM valor (mora
+ * no card — R-12) e sem PII. A pergunta "Como prefere seguir?" NÃO entra aqui:
+ * quem pergunta é o menu reemitido logo abaixo (REOPEN_MENU_QUESTION) — uma
+ * pergunta só na tela.
  */
 function debtDetailLine(ctx: AckContext): string {
   const parts: string[] = []
   const venc = formatDatePt(ctx.oldestDueDate)
   if (venc) parts.push(`Vencimento original ${venc}`)
   if (ctx.invoiceCount > 0) parts.push(`${ctx.invoiceCount} ${ctx.invoiceCount === 1 ? "fatura" : "faturas"}`)
+  if (parts.length === 0) return `Este valor refere-se a um serviço da ${ctx.creditorName}`
   parts.push(`serviço da ${ctx.creditorName}`)
   return parts.join(" · ")
 }
@@ -808,16 +824,6 @@ export type PresentMatrixOffersResult =
     }
   | { ok: true; presented: false; reason: "no_offers" }
   | { ok: false; error: string }
-
-/**
- * T2 / R-26 — confirmação IMEDIATA e persistida do "Negociar" (Apêndice B
- * "Negociar - antes"). A MESMA constante da bolha otimista do client e da
- * pergunta das parcelas (A4/S7: NEGOTIATION_PENDING_TEXT em
- * lib/journey/wait-machine.ts, re-exportada por chat-display.ts): uma só bolha
- * para o mesmo instante (o dedup por conteúdo colapsa as duas). Fonte única
- * (N-D5-8) — a copy muda só em wait-machine.ts.
- */
-export const NEGOTIATE_ACK_TEXT = NEGOTIATION_PENDING_TEXT
 
 /**
  * R1 — apresenta as OPÇÕES DE PARCELAMENTO DETERMINÍSTICAS da matriz do servidor
@@ -1907,10 +1913,12 @@ export async function handleDebtNegotiate(input: {
       customerId: input.customerId,
       debtId: input.debtId,
       precedingWrite: () =>
+        // T2 / R-26 (A4/S7): a MESMA constante da bolha otimista do client e da
+        // pergunta das parcelas (fonte única em wait-machine.ts, N-D5-8).
         persistAssistantMessage({
           companyId: input.companyId,
           sessionId: input.sessionId,
-          text: NEGOTIATE_ACK_TEXT,
+          text: NEGOTIATION_PENDING_TEXT,
         }),
     })
   } catch (err) {
@@ -1919,9 +1927,11 @@ export async function handleDebtNegotiate(input: {
   const offersPresented = !!presented && presented.ok && presented.presented === true
   const prompt = offersPresented && presented && presented.ok && presented.presented ? presented.prompt : null
 
-  // A4/S22: sem "Perfeito!"/"sanar o seu débito" — a mesma frase (S7) em todo
-  // caminho de Negociar. Com parcelas ela já foi gravada como precedingWrite.
-  const reply = NEGOTIATE_ACK_TEXT
+  // A4/S22: sem "Perfeito!"/"sanar o seu débito". Com parcelas, a confirmação S7
+  // (T2, "…disponíveis para você:") já foi gravada como precedingWrite e as
+  // condições vêm logo abaixo. A4 r2 (B3-F2): sem parcelas NADA vem depois, então
+  // a frase é a completa, sem dois-pontos (NEGOTIATION_SEARCHING_TEXT).
+  const reply = offersPresented ? NEGOTIATION_PENDING_TEXT : NEGOTIATION_SEARCHING_TEXT
   if (!offersPresented) {
     // Sem parcelas (sem faixa de matriz/falha): indicador "trabalhando" até o n8n
     // empurrar o próximo turno (via chat.send) ou a espera degradar (D2). Sem PII.

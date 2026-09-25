@@ -137,19 +137,20 @@ describe("A2 — Negociar devolve o offer_choice no corpo do POST", () => {
     expect(active()!.created_by).toBe("platform")
   })
 
-  it("histórico: eco → 'Certo…' (T2) → pergunta das parcelas, nesta ordem; T2 = NEGOTIATE_ACK_TEXT", async () => {
+  it("histórico: eco → 'Certo…' (T2) → pergunta das parcelas, nesta ordem; T2 = NEGOTIATION_PENDING_TEXT", async () => {
     const { POST } = await import("@/app/api/chat/button/route")
-    const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
+    // A4 r2: fonte única em wait-machine.ts (o alias NEGOTIATE_ACK_TEXT saiu)
+    const { NEGOTIATION_PENDING_TEXT } = await import("@/lib/journey/wait-machine")
     const p1 = await bootstrap()
     const before = db.chat_messages.length
     const r = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 1 }))
     const b = await r.json()
-    expect(b.reply).toBe(NEGOTIATE_ACK_TEXT)
+    expect(b.reply).toBe(NEGOTIATION_PENDING_TEXT)
     const added = db.chat_messages.slice(before)
     const roles = added.map((m) => `${m.role}:${m.prompt_id ? "p" : "-"}`)
     // eco do clique (customer), confirmação (assistant sem prompt), pergunta (assistant ligada ao prompt)
     expect(roles).toEqual(["customer:p", "assistant:-", "assistant:p"])
-    expect(added[1].text).toBe(NEGOTIATE_ACK_TEXT)
+    expect(added[1].text).toBe(NEGOTIATION_PENDING_TEXT)
     expect(added[2].prompt_id).toBe(b.prompt.id)
     expect(added[2].engine).toBe("platform")
   })

@@ -179,8 +179,13 @@ describe("histórico do fluxo assistido (sessão reaberta)", () => {
     // dados da dívida (assistant)
     expect(ordered[2].role).toBe("assistant")
     expect(ordered[2].text).toMatch(/^Vencimento original /)
-    // resposta do assistente
+    // resposta do assistente. A4/S22 + r2 (B3-F2): esta seed NÃO tem faixa de matriz
+    // (4 mensagens, sem prompt de parcelas) → nada vem depois da frase, então ela é a
+    // completa, sem dois-pontos (NEGOTIATION_SEARCHING_TEXT); S7 ("…para você:") só
+    // quando as parcelas seguem (a2-legacy-negotiate / e2e-lab-reconhecimento).
+    const { NEGOTIATION_SEARCHING_TEXT } = await import("@/lib/journey/wait-machine")
     expect(ordered[3].role).toBe("assistant")
-    expect(ordered[3].text).toBe("Certo. Estas são as condições disponíveis para você:") // A4/S22
+    expect(ordered[3].text).toBe(NEGOTIATION_SEARCHING_TEXT)
+    expect(ordered[3].text).toBe("Certo. Vou buscar as condições de pagamento disponíveis para você.")
   })
 })

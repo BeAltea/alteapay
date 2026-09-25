@@ -31,7 +31,7 @@ import { payLinkMessageText as payLinkFromPay, postPaymentLinkButtons } from "@/
 import { payLinkMessageText } from "@/lib/journey/pay-poll"
 import { paymentClaimReply } from "@/lib/journey/actions"
 import { recapText, type RecapState } from "@/lib/journey/recap"
-import { NEGOTIATION_PENDING_TEXT, waitStepCopy } from "@/lib/journey/wait-machine"
+import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT, waitStepCopy } from "@/lib/journey/wait-machine"
 import { NEGOTIATION_PENDING_TEXT as PENDING_FROM_CLIENT } from "@/components/journey/chat-display"
 import type { OfferTerms } from "@/lib/negotiation/offers"
 
@@ -41,7 +41,6 @@ const src = (rel: string) => readFileSync(join(ROOT, rel), "utf8")
 const ACK: AckContext = { firstName: "Fabio", creditorName: "VMAX", updatedValue: 250, invoiceCount: 3, oldestDueDate: "2026-08-15" }
 const ACK_ONE: AckContext = { ...ACK, invoiceCount: 1 }
 const ACK_NO_NAME: AckContext = { ...ACK, firstName: "" }
-const DATE = "\\d{2}\\/\\d{2}\\/\\d{4}"
 const PENDING = "Certo. Estas são as condições disponíveis para você:"
 
 describe("S1–S4 — rótulos do menu de 3 opções (Apêndice B)", () => {
@@ -92,15 +91,31 @@ describe("S7/S8/S22 — 'Negociar - antes': uma frase, uma constante", () => {
   it("S8: a pergunta do prompt de parcelas é a mesma frase", () => {
     expect(offerChoiceQuestion()).toBe(PENDING)
   })
-  it("T2 (button/route.ts) usa a constante — sem literal inline, sem 'Vou buscar', sem 'Perfeito!' (S22)", () => {
+  it("T2 (button/route.ts) usa as constantes — sem literal inline, sem 'Perfeito!' (S22)", () => {
     const route = src("app/api/chat/button/route.ts")
-    expect(route).toContain('import { NEGOTIATION_PENDING_TEXT } from "@/lib/journey/wait-machine"')
+    expect(route).toContain('import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"')
+    // menu de 3 opções: as parcelas seguem → S7 (com dois-pontos)
     expect(route).toContain("const reply = NEGOTIATION_PENDING_TEXT")
-    expect(route).toContain("const recognizedReply = NEGOTIATION_PENDING_TEXT")
+    // legado "Sim, reconheço": só kickoff em background, nada vem depois → frase completa (B3-F2)
+    expect(route).toContain("const recognizedReply = NEGOTIATION_SEARCHING_TEXT")
+    expect(route).not.toContain("const recognizedReply = NEGOTIATION_PENDING_TEXT")
     expect(route).not.toContain('"Certo. Vou buscar as condições')
+    expect(route).not.toContain('"Certo. Estas são as condições')
     // a string legada era atribuída ("= \"Perfeito!…\"" / linha começando em "\"Perfeito!"); comentários não contam
     expect(route).not.toMatch(/=\s*"Perfeito!|\n\s*"Perfeito!/)
     expect(src("lib/journey/acknowledgement.ts")).not.toMatch(/=\s*"Perfeito!|\n\s*"Perfeito!/)
+  })
+  it("B3-F2: S7 termina em dois-pontos SÓ onde as parcelas seguem; sem parcelas a frase é completa (NEGOTIATION_SEARCHING_TEXT)", () => {
+    expect(NEGOTIATION_PENDING_TEXT.endsWith(":")).toBe(true)
+    expect(NEGOTIATION_SEARCHING_TEXT).toBe("Certo. Vou buscar as condições de pagamento disponíveis para você.")
+    expect(NEGOTIATION_SEARCHING_TEXT.endsWith(".")).toBe(true)
+    expect(NEGOTIATION_SEARCHING_TEXT).not.toMatch(/Estas são|:$/)
+    // fonte única (N-D5-8): o alias NEGOTIATE_ACK_TEXT saiu; handleDebtNegotiate escolhe
+    // a frase pelo desfecho (com parcelas → S7 gravada como precedingWrite; sem → completa).
+    const ack = src("lib/journey/acknowledgement.ts")
+    expect(ack).not.toContain("NEGOTIATE_ACK_TEXT")
+    expect(ack).toContain("const reply = offersPresented ? NEGOTIATION_PENDING_TEXT : NEGOTIATION_SEARCHING_TEXT")
+    // comportamento: a2-legacy-negotiate (sem faixa → SEARCHING; com parcelas → S7) e e2e-lab-reconhecimento.
   })
 })
 
@@ -123,14 +138,24 @@ describe("S9 — rótulo da oferta à vista (sem travessão)", () => {
 describe("S10/S24 — Detalhes da dívida", () => {
   it("bolha + pergunta do menu = 'Vencimento original {venc} · {n} fatura(s) · {descrição}. Como prefere seguir?'", () => {
     const onScreen = `${debtConsultReply(ACK)} ${REOPEN_MENU_QUESTION}`
-    expect(onScreen).toMatch(new RegExp(`^Vencimento original ${DATE} · 3 faturas · serviço da VMAX\\. Como prefere seguir\\?$`))
-    expect(debtConsultReply(ACK_ONE)).toMatch(new RegExp(`^Vencimento original ${DATE} · 1 fatura · serviço da VMAX\\.$`))
+    // B3-F4: "2026-08-15" (coluna date) é 15/08/2026 em QUALQUER fuso do runtime (componentes, sem Date)
+    expect(onScreen).toBe("Vencimento original 15/08/2026 · 3 faturas · serviço da VMAX. Como prefere seguir?")
+    expect(debtConsultReply(ACK_ONE)).toBe("Vencimento original 15/08/2026 · 1 fatura · serviço da VMAX.")
   })
   it("segmentos ausentes são omitidos (nunca '—'/vazio); sem valor na fala", () => {
-    const noDate = debtConsultReply({ ...ACK, oldestDueDate: null, invoiceCount: 0 })
-    expect(noDate).toBe("serviço da VMAX.")
-    expect(noDate).not.toContain("—")
+    expect(debtConsultReply({ ...ACK, invoiceCount: 0 })).toBe("Vencimento original 15/08/2026 · serviço da VMAX.")
+    expect(debtConsultReply({ ...ACK, oldestDueDate: null })).toBe("3 faturas · serviço da VMAX.")
+    expect(debtConsultReply({ ...ACK, oldestDueDate: "não é data" })).toBe("3 faturas · serviço da VMAX.")
     expect(debtConsultReply(ACK)).not.toContain("R$")
+  })
+  it("B3-F6: sem vencimento E sem nº de faturas a bolha é uma frase completa, nunca o fragmento 'serviço da VMAX.'", () => {
+    const bare = debtConsultReply({ ...ACK, oldestDueDate: null, invoiceCount: 0 })
+    expect(bare).toBe("Este valor refere-se a um serviço da VMAX.")
+    expect(bare).not.toContain("—")
+    expect(bare).not.toContain("R$")
+    // na tela: bolha + pergunta do menu reemitido (uma pergunta só, decisão §4.1)
+    expect(`${bare} ${REOPEN_MENU_QUESTION}`).toBe("Este valor refere-se a um serviço da VMAX. Como prefere seguir?")
+    expect(debtInfoMessage({ ...ACK, oldestDueDate: null, invoiceCount: 0 })).toBe(bare)
   })
   it("debtInfoMessage (legado) usa a mesma linha compacta", () => {
     expect(debtInfoMessage(ACK)).toBe(debtConsultReply(ACK))
@@ -211,15 +236,18 @@ describe("S14/S15 — link de pagamento (fonte única: pay-poll.ts, re-exportada
 })
 
 describe("S18 — Já paguei", () => {
-  it("Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento: {contato}.", () => {
-    expect(paymentClaimReply("VMAX", "WhatsApp (11) 0000-0000")).toBe(
-      "Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento: WhatsApp (11) 0000-0000.",
-    )
-  })
-  it("sem {contato} configurado: termina em 'fale com o atendimento.' (nunca ': .'); não declara pago", () => {
+  it("texto fixo (B3-F5): 'Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento.'", () => {
+    // O tenant não tem campo de contato de atendimento (official_channel_* é o canal do
+    // CREDOR, da contestação), então o segmento ": {contato}" do Apêndice B fica fora —
+    // sem parâmetro morto e sem promessa; termina em "fale com o atendimento." (nunca ": .").
     const t = paymentClaimReply("VMAX")
     expect(t).toBe("Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento.")
-    expect(t).not.toMatch(/pagamento (confirmado|recebido)|quitad[oa]|est[aá] pago/i)
+    expect(t).not.toMatch(/: \.$|\{contato\}/)
+    expect(paymentClaimReply()).toBe(t)
+    expect(src("lib/journey/actions.ts")).toMatch(/export function paymentClaimReply\(_creditorName\?: string\): string/)
+  })
+  it("não declara pago (D6/M15)", () => {
+    expect(paymentClaimReply("VMAX")).not.toMatch(/pagamento (confirmado|recebido)|quitad[oa]|est[aá] pago/i)
   })
   it("a âncora do recap reconhece a copy nova E a geração anterior (bolhas já gravadas)", () => {
     const recap = src("lib/journey/recap.ts")
@@ -243,7 +271,12 @@ describe("S20/S21 — quitação", () => {
     expect(settledMessage(base)).toMatch(
       /^Olá, Fabio\. Não há valor em aberto em seu nome com a VMAX: o pagamento de R\$\s?250,00 consta como recebido\. Se precisar de algo, fale com o atendimento\.$/,
     )
-    expect(settledMessage({ ...base, paidAt: "2026-09-20T12:00:00Z" })).toMatch(new RegExp(`consta como recebido em ${DATE}\\. Se precisar`))
+    // B3-F4: dia civil em America/Sao_Paulo (runtime UTC na Netlify): 12h UTC = 09h BRT → 20/09;
+    // 01:30 UTC de 21/09 = 22:30 BRT de 20/09 → 20/09 (não o dia seguinte); data civil pura → componentes.
+    expect(settledMessage({ ...base, paidAt: "2026-09-20T12:00:00Z" })).toContain("consta como recebido em 20/09/2026. Se precisar")
+    expect(settledMessage({ ...base, paidAt: "2026-09-21T01:30:00Z" })).toContain("consta como recebido em 20/09/2026. Se precisar")
+    expect(settledMessage({ ...base, paidAt: "2026-09-20" })).toContain("consta como recebido em 20/09/2026. Se precisar")
+    expect(settledMessage({ ...base, paidAt: "inválida" })).toContain("consta como recebido. Se precisar")
     expect(settledMessage({ ...base, firstName: "" }).startsWith("Olá. Não há valor")).toBe(true)
     expect(settledMessage(base)).not.toMatch(/PAGA|Obrigado!|!/)
   })
@@ -272,9 +305,16 @@ describe("S25/S26 — casca (layouts) e porta", () => {
       expect(s).not.toContain("parceira oficial de cobrança")
     }
   })
-  it("S26: o submit da porta é 'Continuar' (não colide com 'Detalhes da dívida')", () => {
-    const s = src("components/journey/public-auth-form.tsx")
-    expect(s).toContain('{submitting ? "Confirmando..." : "Continuar"}')
-    expect(s).not.toContain(': "Consultar"')
+  it("S25 na entrada viva /t/[tenantSlug]/negociar (B3-F3): mesmo subtítulo, sem 'parceira oficial de cobrança'", () => {
+    const s = src("app/t/[tenantSlug]/negociar/layout.tsx")
+    expect(s).toContain("AlteaPay · canal oficial de negociação da {branding.brandName}")
+    expect(s).not.toContain("parceira oficial")
+  })
+  it("S26: o submit das duas portas é 'Continuar' (não colide com 'Detalhes da dívida')", () => {
+    for (const rel of ["components/journey/public-auth-form.tsx", "components/journey/generic-auth-form.tsx"]) {
+      const s = src(rel)
+      expect(s, rel).toContain('{submitting ? "Confirmando..." : "Continuar"}')
+      expect(s, rel).not.toContain(': "Consultar"')
+    }
   })
 })

@@ -103,14 +103,24 @@ export function shouldShowSlowExits(step: WaitStep): boolean {
 // espera (não empilha bolha nova).
 // ---------------------------------------------------------------------------
 /**
- * A4/S7 (Apêndice B "Negociar - antes") — a ÚNICA frase de confirmação do clique
- * Negociar. É persistida pelo servidor (T2, button/route.ts), injetada como bolha
- * optimistic pelo client (T3, chat.tsx) e é a pergunta do prompt de parcelas
- * (offerChoiceQuestion): uma só frase para o mesmo instante, nunca duplicada.
- * Vive aqui (módulo puro, client-safe) para servidor e client importarem a MESMA
- * constante (N-D5-8). Sem PII.
+ * A4/S7 (Apêndice B "Negociar - antes") — a frase de confirmação do clique
+ * Negociar QUANDO AS PARCELAS VÊM NA SEQUÊNCIA (termina em dois-pontos: promete
+ * a lista logo abaixo). É persistida pelo servidor (T2, button/route.ts),
+ * injetada como bolha optimistic pelo client (T3, chat.tsx) e é a pergunta do
+ * prompt de parcelas (offerChoiceQuestion): uma só frase para o mesmo instante,
+ * nunca duplicada. Vive aqui (módulo puro, client-safe) para servidor e client
+ * importarem a MESMA constante (N-D5-8). Sem PII.
  */
 export const NEGOTIATION_PENDING_TEXT = "Certo. Estas são as condições disponíveis para você:"
+
+/**
+ * A4 r2 (B3-F2) — confirmação do Negociar quando NENHUMA condição vem na
+ * sequência: legado "Sim, reconheço" (só kickoff em background, sem matriz) e
+ * legado "Negociar Dívida" sem faixa de matriz/falha (cai na espera). Frase
+ * completa, sem dois-pontos e sem prometer uma lista que não aparece (é a T2 da
+ * geração anterior, já aprovada). Fonte única (N-D5-8). Sem PII.
+ */
+export const NEGOTIATION_SEARCHING_TEXT = "Certo. Vou buscar as condições de pagamento disponíveis para você."
 
 /** Copy narrada exibida em cada degrau da espera (bolha de espera reescrita).
  *  Vazio ("") = sem texto próprio (D0 usa o eco do servidor; D1 é só indicador). */

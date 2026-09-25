@@ -32,7 +32,7 @@ import {
 import { payLinkMessageText, postPaymentLinkButtons, paymentLinkAction } from "@/lib/journey/pay"
 import { humanHandoffReply, paymentClaimReply } from "@/lib/journey/actions"
 import { recapText } from "@/lib/journey/recap"
-import { DEGRADED_MENU_COPY, NEGOTIATION_PENDING_TEXT, waitStepCopy } from "@/lib/journey/wait-machine"
+import { DEGRADED_MENU_COPY, NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT, waitStepCopy } from "@/lib/journey/wait-machine"
 import { isNegotiateLabel } from "@/components/journey/chat-display"
 import { ENTRY_SEAL_WHO_LABEL, entrySealText, entrySealWhoText } from "@/lib/journey/entry-seal"
 import type { OfferTerms } from "@/lib/negotiation/offers"
@@ -65,6 +65,7 @@ function journeyStrings(): Array<[string, string]> {
     ["S6 retorno", recapText("after_link", "Pagar R$ 250,00", "Fabio")],
     ["S6 retorno sem nome", recapText("after_decision", null)],
     ["S7 negociar-antes", NEGOTIATION_PENDING_TEXT],
+    ["S7 negociar-antes sem parcelas (B3-F2)", NEGOTIATION_SEARCHING_TEXT],
     ["S8 pergunta parcelas", offerChoiceQuestion()],
     ["S9 à vista", offerButtonLabel(cash)],
     ["S9 parcelado", offerButtonLabel({ ...cash, installments: 3, installment_value: 78.33, total_value: 235 })],
@@ -77,7 +78,6 @@ function journeyStrings(): Array<[string, string]> {
     ["S15 já existia", payLinkMessageText({ link: "https://x/1", valor: 250, vencimentoLink: null, alreadyCharged: true })],
     ["ação do link", paymentLinkAction("https://x/1").label],
     ["S18 já paguei", paymentClaimReply("VMAX")],
-    ["S18 já paguei com contato", paymentClaimReply("VMAX", "0800 000 000")],
     ["S19 d3", waitStepCopy("d3_slow")],
     ["degradação", DEGRADED_MENU_COPY],
     ["handoff", humanHandoffReply("VMAX")],
@@ -116,6 +116,7 @@ describe("(a) saída das funções de copy — antipadrões D45 banidos", () => 
       threeOptionsSummary(ACK), recapText("after_link", null, "Fabio"), debtConsultReply(ACK), debtInfoMessage(ACK),
       notRecognizedReply({ creditorName: "VMAX", hasConfig: false, channelLabel: null, channelUrl: null }),
       acknowledgementQuestion(ACK), consultNegotiateQuestion(ACK), paymentClaimReply("VMAX"), NEGOTIATION_PENDING_TEXT,
+      NEGOTIATION_SEARCHING_TEXT,
     ]
     for (const t of noValue) expect(t).not.toMatch(/R\$|250/)
   })
@@ -150,6 +151,9 @@ const SCOPE_FILES = [
   "components/journey/debt-card.tsx",
   "components/journey/button-tiers.ts",
   "components/journey/public-auth-form.tsx",
+  // A4 r2 (B3-F3): entrada viva /t/[tenantSlug]/negociar (porta + casca)
+  "components/journey/generic-auth-form.tsx",
+  "app/t/[tenantSlug]/negociar/layout.tsx",
   "app/(journey)/n/[code]/layout.tsx",
   "app/(journey)/c/[token]/layout.tsx",
 ]

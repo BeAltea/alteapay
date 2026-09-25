@@ -252,12 +252,13 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     // A2 (G2-c): com faixa de matriz vigente (esta seed tem a oferta 'off-1'), o
     // caminho legado apresenta as PARCELAS — o reply é a confirmação T2 e a
     // pergunta das parcelas fica ativa (nunca mais "preparando… só um instante").
-    // A4/S22+S7: T2 = NEGOTIATE_ACK_TEXT = NEGOTIATION_PENDING_TEXT (Apêndice B).
-    const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
+    // A4/S22+S7: T2 = NEGOTIATION_PENDING_TEXT (Apêndice B; fonte única em wait-machine.ts —
+    // o alias NEGOTIATE_ACK_TEXT saiu na A4 r2).
+    const { NEGOTIATION_PENDING_TEXT } = await import("@/lib/journey/wait-machine")
     expect(out.offersPresented).toBe(true)
-    expect(out.reply).toBe(NEGOTIATE_ACK_TEXT)
-    expect(NEGOTIATE_ACK_TEXT).toBe("Certo. Estas são as condições disponíveis para você:")
-    expect(assistantTexts).toContain(NEGOTIATE_ACK_TEXT)
+    expect(out.reply).toBe(NEGOTIATION_PENDING_TEXT)
+    expect(NEGOTIATION_PENDING_TEXT).toBe("Certo. Estas são as condições disponíveis para você:")
+    expect(assistantTexts).toContain(NEGOTIATION_PENDING_TEXT)
     expect((db.chat_prompts ?? []).some((p) => p.kind === "offer_choice" && p.status === "active")).toBe(true)
   })
 

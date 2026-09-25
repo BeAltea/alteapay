@@ -87,7 +87,8 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
 
   it("POST [3] → offers_presented + prompt offer_choice no corpo; reconhecimento explícito gravado; reply T2", async () => {
     const { POST } = await import("@/app/api/chat/button/route")
-    const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
+    // A4 r2: fonte única em wait-machine.ts (o alias NEGOTIATE_ACK_TEXT saiu)
+    const { NEGOTIATION_PENDING_TEXT } = await import("@/lib/journey/wait-machine")
     const pid = await bootstrapLegacy()
     const r = await POST(buttonReq(await signed(), { prompt_id: pid, button_id: 3 }))
     const b = await r.json()
@@ -97,7 +98,7 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
     expect(b.offers_presented).toBe(true)
     expect(b.prompt.kind).toBe("offer_choice")
     expect(b.prompt.buttons.map((x: { id: number }) => x.id)).toEqual([2, 3, 4, 98])
-    expect(b.reply).toBe(NEGOTIATE_ACK_TEXT)
+    expect(b.reply).toBe(NEGOTIATION_PENDING_TEXT)
     expect(b.wait_state).toBeUndefined()
     // parcelas ATIVAS no banco (nunca mais "preparando… só um instante" sem saída)
     expect(active()!.kind).toBe("offer_choice")
@@ -111,7 +112,7 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
     // verificada pelo vínculo ao prompt (T2 sem prompt_id, pergunta ligada ao
     // offer_choice ativo), não pelo texto.
     const rows = db.chat_messages.filter((m) => m.role === "assistant")
-    const iAck = rows.findIndex((m) => m.text === NEGOTIATE_ACK_TEXT && !m.prompt_id)
+    const iAck = rows.findIndex((m) => m.text === NEGOTIATION_PENDING_TEXT && !m.prompt_id)
     const iQ = rows.findIndex((m) => m.prompt_id === active()!.id)
     expect(iAck).toBeGreaterThanOrEqual(0)
     expect(iQ).toBeGreaterThan(iAck)
@@ -127,9 +128,15 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
     expect(b.ok).toBe(true)
     expect(b.wait_state).toBe("aguardando_motor")
     expect(b.offers_presented).toBeUndefined()
-    // A4/S22: sem "Perfeito!… preparando…"; o reply sem parcelas é a mesma frase S7 (T2).
-    const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
-    expect(b.reply).toBe(NEGOTIATE_ACK_TEXT)
+    // A4/S22 + r2 (B3-F2): sem "Perfeito!… preparando…"; sem parcelas NADA vem depois da
+    // frase, então o reply é a frase completa (sem dois-pontos), persistida no histórico —
+    // e S7 ("…disponíveis para você:") NÃO é gravada (o precedingWrite só roda com parcelas).
+    const { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } = await import("@/lib/journey/wait-machine")
+    expect(b.reply).toBe(NEGOTIATION_SEARCHING_TEXT)
+    expect(b.reply.endsWith(":")).toBe(false)
+    const assistant = db.chat_messages.filter((m) => m.role === "assistant").map((m) => m.text)
+    expect(assistant).toContain(NEGOTIATION_SEARCHING_TEXT)
+    expect(assistant).not.toContain(NEGOTIATION_PENDING_TEXT)
     expect(db.chat_prompts.some((p) => p.kind === "offer_choice")).toBe(false)
   })
 
