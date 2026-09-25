@@ -701,8 +701,11 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       return NextResponse.json({ ok: true, prompt_id: r.prompt_id })
     }
     case "prompt.close": {
+      // A2 (N-D2-5): um menu protegido do assistido (3 opções/parcelas/pós-link)
+      // NÃO é fechado pelo n8n — só substituído por prompt acionável → 422.
       const { promptClose } = await import("@/lib/journey/chat-send")
       const r = await promptClose(ctx)
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
       return NextResponse.json({ ok: true, closed: r.closed })
     }
     case "negotiation.note": {

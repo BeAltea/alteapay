@@ -248,7 +248,14 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     // sem depender do n8n empurrar nada (bug histórico: reply só era gravado se
     // engineOwner==='platform', deixando o lado do assistente vazio).
     expect(assistantTexts.some((t) => t.includes("dados da sua pendência"))).toBe(true)
-    expect(assistantTexts.some((t) => t.includes("trabalhar juntos para sanar"))).toBe(true)
+    // A2 (G2-c): com faixa de matriz vigente (esta seed tem a oferta 'off-1'), o
+    // caminho legado apresenta as PARCELAS — o reply é a confirmação T2 e a
+    // pergunta das parcelas fica ativa (nunca mais "preparando… só um instante").
+    const { NEGOTIATE_ACK_TEXT } = await import("@/lib/journey/acknowledgement")
+    expect(out.offersPresented).toBe(true)
+    expect(out.reply).toBe(NEGOTIATE_ACK_TEXT)
+    expect(assistantTexts).toContain(NEGOTIATE_ACK_TEXT)
+    expect((db.chat_prompts ?? []).some((p) => p.kind === "offer_choice" && p.status === "active")).toBe(true)
   })
 
   it("Negociar [3] grava o reconhecimento (button_id=3) — não é mais descartado pelo CHECK", async () => {

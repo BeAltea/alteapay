@@ -28,6 +28,7 @@ import {
   DEGRADED_MENU_COPY,
   deriveWaitStep,
   elapsedSince,
+  engineTextDisplay,
   hydrateWaitState,
   resolveWaitView,
   shouldRenderEngineMsg,
@@ -116,6 +117,21 @@ function textWithoutUrl(text: string, href: string): string {
     .trim()
 }
 
+/** A2 — prompt devolvido no CORPO do POST do clique (mesmo shape do GET
+ *  active_prompt). Só aceita o que o PromptButtons consegue renderizar. */
+function asActivePrompt(raw: unknown): ActivePrompt | null {
+  if (!raw || typeof raw !== "object") return null
+  const p = raw as Record<string, unknown>
+  if (typeof p.id !== "string" || !p.id || typeof p.kind !== "string") return null
+  if (!Array.isArray(p.buttons) || p.buttons.length === 0) return null
+  const buttons = p.buttons.filter(
+    (b): b is ActivePrompt["buttons"][number] =>
+      !!b && typeof b === "object" && typeof (b as { id?: unknown }).id === "number" && typeof (b as { label?: unknown }).label === "string",
+  )
+  if (buttons.length === 0) return null
+  return { id: p.id, kind: p.kind, question: typeof p.question === "string" ? p.question : "", buttons }
+}
+
 /** Só http(s) — nunca javascript:/data:. Usado para auto-linkar URLs no histórico. */
 function isSafeHttpUrl(raw: string): boolean {
   return /^https?:\/\/\S+$/i.test(raw)
@@ -176,6 +192,11 @@ export function JourneyChat() {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const sinceRef = useRef<string | null>(null)
   const seenIds = useRef<Set<string>>(new Set())
+  // A2 — prompts já CONSUMIDOS por um clique (respondidos no servidor). Um poll
+  // que estava em voo antes do clique ainda pode trazê-los como active_prompt e
+  // sobrescrever o prompt novo renderizado do corpo do POST (as parcelas); esses
+  // ids são ignorados na re-hidratação.
+  const consumedPromptIds = useRef<Set<string>>(new Set())
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const endedRef = useRef(false)
@@ -411,17 +432,22 @@ export function JourneyChat() {
         }
         seenIds.current.add(m.id)
         sinceRef.current = m.created_at
+        // A2 (N-D2-6 / §2.3): texto do motor SEM prompt (sem botões) NÃO conta como
+        // condução — não derruba a bolha de confirmação nem resolve a espera; só
+        // um prompt acionável (mensagem ligada a um prompt) o faz.
+        const engineTextOnly = isEngineMsg && !m.prompt_id
         // Se havia uma bolha "preparando negociação" local e chegou a 1ª
-        // mensagem real do assistente (resposta do n8n), removemos a optimistic
-        // ao inserir a real — troca sem piscar duplicado.
+        // mensagem real do assistente (nossa confirmação persistida — mesmo texto —
+        // ou um prompt do n8n), removemos a optimistic ao inserir a real — troca
+        // sem piscar duplicado.
         const optimisticId = pendingNegotiationRef.current
-        const dropOptimistic = isAssistant && optimisticId !== null
+        const dropOptimistic = isAssistant && optimisticId !== null && !engineTextOnly
         if (dropOptimistic) pendingNegotiationRef.current = null
-        // A resposta do motor RESOLVE a espera (aguardando_motor OU menu_degradado
-        // → negociando): remove a bolha de espera, encerra o tick, some o
-        // indicador. Se estava degradado, a tardia ainda renderiza (menu_degradado
-        // NÃO é absorvente) — só some o menu de degradação.
-        if (isEngineMsg && (waitStateRef.current === "aguardando_motor" || waitStateRef.current === "menu_degradado")) {
+        // A resposta ACIONÁVEL do motor RESOLVE a espera (aguardando_motor OU
+        // menu_degradado → negociando): remove a bolha de espera, encerra o tick,
+        // some o indicador. Se estava degradado, a tardia ainda renderiza
+        // (menu_degradado NÃO é absorvente) — só some o menu de degradação.
+        if (isEngineMsg && !engineTextOnly && (waitStateRef.current === "aguardando_motor" || waitStateRef.current === "menu_degradado")) {
           resolveWaitToNegotiating()
         }
         const action = safeMessageAction(m.action)
@@ -460,7 +486,13 @@ export function JourneyChat() {
         })
       }
       // Nunca sobrescreve o prompt depois de encerrado (preserva o histórico).
-      if (!endedRef.current) setActivePrompt(data?.active_prompt ?? null)
+      // A2: um poll em voo desde antes do clique pode trazer o prompt já
+      // consumido — não sobrescreve o prompt novo (ex.: as parcelas do corpo).
+      if (!endedRef.current) {
+        const ap = data?.active_prompt ?? null
+        const apId = ap && typeof ap === "object" ? (ap as { id?: unknown }).id : null
+        if (!(typeof apId === "string" && consumedPromptIds.current.has(apId))) setActivePrompt(ap)
+      }
     } catch {
       /* silencioso */
     }
@@ -720,6 +752,9 @@ export function JourneyChat() {
         return { ok: false, code: "unauthorized" }
       }
       const data = await res.json().catch(() => ({}))
+      // A2: o prompt clicado foi consumido no servidor (200) ou já era obsoleto
+      // (409) — um poll atrasado não o repõe por cima do prompt novo.
+      if (res.ok || res.status === 409) consumedPromptIds.current.add(promptId)
       // PAGAR — o button/route.ts (D1) devolve o shape do payService (D3) NO
       // corpo do clique (com HTTP 200 mesmo em erro de negócio). Renderizamos o
       // resultado (link/processando/erro) aqui, sem depender do poll. O guard de
@@ -745,10 +780,33 @@ export function JourneyChat() {
         //      de degradação (M10).
         if (data?.action === "negotiate") {
           if (data?.offers_presented === true) {
-            clearPendingNegotiation()
+            const offerPrompt = asActivePrompt(data?.prompt)
             resetWaitToIdle()
+            setPromptNotice(null)
+            if (offerPrompt && !endedRef.current) {
+              // A2 (G2): as PARCELAS vêm no corpo do POST → renderiza NA HORA, sem
+              // depender do poll de 2,5 s. A bolha otimista "Certo…" vira histórico
+              // (o dedup por conteúdo a colapsa com a persistida quando o poll chegar);
+              // nenhuma mensagem posterior a derruba (ref limpa). O poll segue em
+              // paralelo para trazer eco + bolhas persistidas.
+              pendingNegotiationRef.current = null
+              setActivePrompt(offerPrompt)
+              void pollMessages()
+              return { ok: true }
+            }
+            // compat: servidor antigo sem `prompt` no corpo → o poll traz as parcelas.
+            clearPendingNegotiation()
           }
           // senão: mantém aguardando_motor; o poll trará wait_started_at do servidor.
+        }
+        // A2 — prompt genérico (criado pelo n8n) / fallback do assistido: quando o
+        // servidor devolve o prompt seguinte no corpo (menu reaberto ou o ativo),
+        // renderiza já — nunca uma tela sem caminho enquanto o poll não chega.
+        const bodyPrompt = asActivePrompt(data?.prompt)
+        if (bodyPrompt && !endedRef.current && data?.action !== "consult" && data?.action !== "not_recognized") {
+          setActivePrompt(bodyPrompt)
+          void pollMessages()
+          return { ok: true }
         }
         // FEEDBACK IMEDIATO <1s (R-01/R-02, C13): renderiza a resposta do servidor
         // NA HORA (do corpo do POST), sem depender do timing do poll de 2,5s. Cobre
@@ -1071,8 +1129,19 @@ export function JourneyChat() {
   //  4) TETO de 20 (capHistory): guidance velho recolhe atrás de "ver conversa
   //     completa"; decision/outcome NUNCA recolhem (C8/R-15/R-41).
   const activePromptId = activePrompt && !ended ? activePrompt.id : null
+  // A2 (N-D2-6 / N-D5-9) — texto do motor (engine='n8n') sem prompt: regra de
+  // exibição pura (wait-machine.engineTextDisplay): 'hidden' (fallback genérico /
+  // estado absorvente) sai do log; 'note' (menu do assistido ativo) vira nota
+  // discreta acima do bloco de botões; 'bubble' é a bolha comum. Markdown e nome
+  // de sistema nunca chegam ao devedor.
+  const engineDisplayOf = (m: ChatMsg) =>
+    m.from === "assistant" && m.engine === "n8n"
+      ? engineTextDisplay({ text: m.text, hasPrompt: !!m.promptId, activePromptKind: activePromptId ? activePrompt?.kind : null, waitState })
+      : null
   const visibleMessages = messages.filter(
-    (m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id),
+    (m) =>
+      !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id) &&
+      engineDisplayOf(m)?.mode !== "hidden",
   )
   const prunedMessages = prunePresentation(visibleMessages, activePromptId, waitState)
   const dedupedMessages = dedupAssistantByContent(prunedMessages)
@@ -1157,7 +1226,20 @@ export function JourneyChat() {
             </button>
           </div>
         ) : null}
-        {capped.visible.map((m) => (
+        {capped.visible.map((m) => {
+          const engineDisplay = engineDisplayOf(m)
+          // A2: nota discreta do motor (texto solto com o assistido ativo) — sem
+          // bolha, sem markdown, não "responde" nem empurra o menu.
+          if (engineDisplay?.mode === "note") {
+            return (
+              <div key={m.id} className="flex flex-col items-start">
+                <p className="max-w-[85%] whitespace-pre-line px-1 text-xs italic text-neutral-500">
+                  {engineDisplay.text}
+                </p>
+              </div>
+            )
+          }
+          return (
           <div
             key={m.id}
             className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}
@@ -1175,9 +1257,11 @@ export function JourneyChat() {
               }
             >
               {renderRichText(
-                m.from === "assistant" && m.action?.type === "open_payment_link"
-                  ? textWithoutUrl(m.text, m.action.href)
-                  : m.text,
+                engineDisplay
+                  ? engineDisplay.text
+                  : m.from === "assistant" && m.action?.type === "open_payment_link"
+                    ? textWithoutUrl(m.text, m.action.href)
+                    : m.text,
               )}
             </div>
             {/* A1 (N-D1-3/N-D1-8) — LINK DE PAGAMENTO: o painel deriva da bolha
@@ -1218,7 +1302,8 @@ export function JourneyChat() {
               </a>
             ) : null}
           </div>
-        ))}
+          )
+        })}
 
         {/* --- Máquina de espera (§6.3): indicador acessível + copy narrada + saídas --- */}
         {!ended && waitState === "aguardando_motor" ? (

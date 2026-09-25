@@ -704,15 +704,24 @@ export async function buildNegotiationStartPayload(
  */
 async function enqueueNegotiationStart(p: NegotiationStartPayload): Promise<void> {
   const { createServiceClient } = await import("@/lib/supabase/service")
+  const { isOutboxUnavailableError, noteOutboxUnavailable, outboxKnownUnavailable } = await import("./outbox")
+  if (outboxKnownUnavailable()) return // no-op explícito (já logado 1x)
   const supabase = createServiceClient()
   // idempotente por event_id (UNIQUE) — reentrada não duplica.
-  const { data: existing } = await supabase
+  const { data: existing, error: readErr } = await supabase
     .from("engine_outbox")
     .select("id")
     .eq("event_id", p.event_id)
     .maybeSingle()
+  // A2 / N-D2-7: engine_outbox NÃO existe em produção (PGRST205). Antes o erro
+  // era engolido e a "entrega durável" ficava fictícia em silêncio. Agora o
+  // no-op é EXPLÍCITO (log 1x por processo) e a função sai sem tentar o insert.
+  if (readErr && isOutboxUnavailableError(readErr)) {
+    noteOutboxUnavailable("enqueueNegotiationStart")
+    return
+  }
   if (existing) return
-  await supabase.from("engine_outbox").insert({
+  const { error: insErr } = await supabase.from("engine_outbox").insert({
     session_id: p.session_id,
     company_id: p.company_id,
     event_type: p.type, // rótulo negotiation.start resolvido (por tenant)
@@ -722,22 +731,27 @@ async function enqueueNegotiationStart(p: NegotiationStartPayload): Promise<void
     attempts: 0,
     next_attempt_at: new Date().toISOString(),
   })
+  if (insErr && isOutboxUnavailableError(insErr)) noteOutboxUnavailable("enqueueNegotiationStart")
 }
 
 /**
  * §C3: marca a linha do outbox como 'sent' quando o POST curto do clique já
  * entregou — evita um re-POST duplicado no próximo flush. Idempotente por
- * event_id. Best-effort e não-fatal: nunca lança.
+ * event_id. Best-effort e não-fatal: nunca lança. Tabela ausente (N-D2-7) →
+ * no-op explícito (log 1x), sem tentar de novo a cada clique.
  */
 async function markOutboxSent(eventId: string): Promise<void> {
   try {
     const { createServiceClient } = await import("@/lib/supabase/service")
+    const { isOutboxUnavailableError, noteOutboxUnavailable, outboxKnownUnavailable } = await import("./outbox")
+    if (outboxKnownUnavailable()) return
     const now = new Date().toISOString()
-    await createServiceClient()
+    const { error } = await createServiceClient()
       .from("engine_outbox")
       .update({ status: "sent", sent_at: now, next_attempt_at: null, updated_at: now })
       .eq("event_id", eventId)
       .select("id")
+    if (error && isOutboxUnavailableError(error)) noteOutboxUnavailable("markOutboxSent")
   } catch (err) {
     console.warn("[engine:n8n] markOutboxSent falhou (não-fatal):", (err as Error).message)
   }

@@ -32,16 +32,20 @@ import {
   handleDebtConsult,
   handleDebtNegotiate,
   handleDebtNotRecognized,
+  kickoffDeadlineMs,
+  kickoffNegotiationStart,
+  NEGOTIATE_ACK_TEXT,
   notRecognizedReply,
   persistAssistantMessage,
   presentMatrixOffers,
-  recognizeImplicit,
   recognizeImplicitOnce,
   recordAcknowledgement,
   reopenThreeOptions,
   resolveCreditorChannel,
   resolveOfferIdFromButton,
+  resolveSessionDebtIds,
   startN8nNegotiation,
+  type PresentMatrixOffersResult,
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
@@ -100,6 +104,56 @@ async function staleResponse(sessionId: string) {
     { ok: false, error: "prompt_stale", code: "prompt_stale", active_prompt: promptView(active) },
     { status: 409 },
   )
+}
+
+/**
+ * A2 (N-D2-1) — timeout CURTO do turno ao n8n no clique em prompts criados pelo
+ * fluxo ("demais prompts"). Com NEGOTIATION_ENGINE=n8n em produção, o clique ia
+ * a runJourneyTurn com 20 s (+5 s) de espera; nenhum clique do devedor fica preso
+ * esperando o n8n: estourado o deadline, o assistido volta (menu de 3 opções) e o
+ * n8n, se responder depois, só assume por prompt ACIONÁVEL (chat.send/prompt.ask).
+ */
+function n8nClickTimeoutMs(): number {
+  const n = Number(process.env.N8N_CLICK_TIMEOUT_MS)
+  return Number.isFinite(n) && n > 0 ? n : 4000
+}
+
+/** Promise.race com deadline: `settled:false` quando estoura (a promise segue solta). */
+async function withDeadline<T>(p: Promise<T>, ms: number): Promise<{ settled: true; value: T } | { settled: false }> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race<{ settled: true; value: T } | { settled: false }>([
+      p.then((value) => ({ settled: true as const, value })),
+      new Promise<{ settled: false }>((resolve) => {
+        timer = setTimeout(() => resolve({ settled: false }), ms)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
+ * A2 — rede de segurança do assistido: garante que a sessão tem um prompt ATIVO
+ * depois de um turno de prompt genérico (n8n). Sem ativo → reabre o menu de 3
+ * opções (curto, sem saudação) e devolve o prompt no shape do GET. Nunca lança.
+ */
+async function ensureAssistedPrompt(ctx: { sessionId: string; companyId: string; customerId: string; debtId: string }) {
+  try {
+    const active = await getActivePrompt(ctx.sessionId)
+    if (active) return { prompt: promptView(active), reopened: false }
+    const { debtIds, primaryDebtId } = await resolveSessionDebtIds(ctx.sessionId, ctx.debtId)
+    const back = await reopenThreeOptions({
+      companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId, debtIds, primaryDebtId,
+    })
+    if (!back.ok) return { prompt: null, reopened: false }
+    const reopened = await getActivePrompt(ctx.sessionId)
+    return { prompt: promptView(reopened), reopened: true }
+  } catch (err) {
+    console.warn("[chat:button] ensureAssistedPrompt falhou (não-fatal):", (err as Error).message)
+    return { prompt: null, reopened: false }
+  }
 }
 
 /** debt_ids/primary_debt_id do contexto do prompt (fallback: dívida do ctx). */
@@ -346,69 +400,77 @@ export async function POST(req: NextRequest) {
       }
 
       // --- NEGOCIAR [1] ------------------------------------------------------
+      // A2 (G2 / N-D2-2 / N-D2-10 / N-D2-12) — ASSISTIDO SEMPRE, clique < 3 s:
+      //  1) answerPrompt (integridade + eco + auditoria);
+      //  2) kickoff negotiation.start começa JÁ (fora do caminho crítico) e só é
+      //     aguardado no fim, até um deadline curto (Promise.race) — nunca um
+      //     `void` solto em serverless;
+      //  3) em PARALELO: reconhecimento implícito (1x — não regrava), a confirmação
+      //     T2 e a apresentação das PARCELAS DA MATRIZ (uma leitura de contexto,
+      //     inserts/eventos em lote); a confirmação precede a pergunta no histórico;
+      //  4) a resposta devolve o prompt 'offer_choice' COMPLETO (question+buttons)
+      //     para o client renderizar as parcelas NA HORA, sem depender do poll;
+      //  5) engine_owner devolvido = o gravado no banco pelo kickoff (ou platform).
+      // Se o n8n assumir depois, só o faz por prompt ACIONÁVEL (chat-send.ts); a
+      // apresentação assistida é a rede de segurança. NUNCA lança.
       if (buttonId === BTN_YES) {
+        const t0 = Date.now()
         const answered = await answerPrompt(answerInput)
         if (!answered.ok) {
           if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
-        // Reconhecimento IMPLÍCITO (M4) — clicar negociar reconhece a dívida.
-        await recognizeImplicit({
-          companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-          debtId: ctx.debtId, promptId, buttonId, source: "chat_three_options_negotiate", ip, userAgent,
+        const kickoff = kickoffNegotiationStart({
+          companyId: ctx.companyId, sessionId: ctx.sessionId,
+          customerId: ctx.customerId, debtId: ctx.debtId,
         })
-        // Confirmação NOSSA imediata (A.2) — persistida para o histórico. Nada do
-        // n8n é aguardado: a espera é client-side em D2.
-        // T2 / R-26: mesma frase EXATA da bolha optimistic do client
-        // (NEGOTIATION_PENDING_TEXT em chat-display.ts) — 1 só bolha para o mesmo
-        // instante (M4). "Certo." (não "Perfeito."), "para você" (não "seu caso").
-        const reply = "Certo. Vou buscar as condições de pagamento disponíveis para você."
-        await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
-        // Dispara negotiation.start em BACKGROUND (best-effort/resiliente H8): se o
-        // n8n um dia conduzir, ele assume os próximos turnos. NÃO aguardamos.
-        let engineOwner: "platform" | "n8n" = "platform"
-        try {
-          const start = await startN8nNegotiation({
+        // Confirmação NOSSA imediata (T2 / R-26 — a MESMA frase da bolha otimista
+        // do client, 1 só bolha para o mesmo instante) — escrita já em curso.
+        const reply = NEGOTIATE_ACK_TEXT
+        const ackWrite = persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
+        let presented: PresentMatrixOffersResult | null = null
+        const [, pres] = await Promise.all([
+          // Reconhecimento IMPLÍCITO (M4) — clicar negociar reconhece a dívida.
+          // A1/N-D1-5: 1x por sessão (clique repetido não regrava).
+          recognizeImplicitOnce({
+            companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+            debtId: ctx.debtId, promptId, buttonId, source: "chat_three_options_negotiate", ip, userAgent,
+          }),
+          // R1 — PARCELAS DA MATRIZ como botões (servidor dono da matriz — D8).
+          // NUNCA lança: falha aqui cai na espera instrumentada (D2).
+          presentMatrixOffers({
             companyId: ctx.companyId, sessionId: ctx.sessionId,
             customerId: ctx.customerId, debtId: ctx.debtId,
-          })
-          engineOwner = start.owner
-        } catch (err) {
-          console.warn("[chat:button] negotiation.start (3 opções) falhou (fallback assistido):", (err as Error).message)
-        }
+            precedingWrite: () => ackWrite,
+          }).catch((err: Error) => {
+            console.warn("[chat:button] presentMatrixOffers falhou (cai na espera D2):", err.message)
+            return null
+          }),
+        ])
+        presented = pres
+        await ackWrite
+        const presentedOffers = !!presented && presented.ok && presented.presented === true
 
-        // R1 — FALLBACK ASSISTIDO (sem n8n): apresentamos JÁ as PARCELAS DA MATRIZ
-        // como botões (modo assistido, servidor dono da matriz — D8). O gatilho é
-        // IMEDIATO após o nosso kickoff: o devedor NÃO fica 15s olhando o spinner
-        // para só então ver as parcelas — as opções determinísticas aparecem agora.
-        // Se o n8n assumir (engine_owner='n8n'), ele conduz os próximos turnos e
-        // esta apresentação assistida é a rede de segurança. NUNCA lança: uma falha
-        // aqui cai na espera instrumentada (D2), nunca em beco sem saída.
-        let presentedOffers = false
-        try {
-          const pres = await presentMatrixOffers({
-            companyId: ctx.companyId, sessionId: ctx.sessionId,
-            customerId: ctx.customerId, debtId: ctx.debtId,
-          })
-          presentedOffers = pres.ok && pres.presented === true
-        } catch (err) {
-          console.warn("[chat:button] presentMatrixOffers falhou (cai na espera D2):", (err as Error).message)
-        }
+        // Kickoff: aguarda só o que resta do deadline (default 2,5 s desde o clique).
+        const kick = await kickoff.settle(Math.max(0, kickoffDeadlineMs() - (Date.now() - t0)))
 
         // Só armamos a espera instrumentada (M11/D2) quando NÃO conseguimos
         // apresentar as parcelas agora (sem faixa de matriz vigente / falha): aí o
         // devedor vê a espera e, aos 15s, o menu de degradação (M10). Com as
         // parcelas na tela, não há spinner — a ação está imediatamente disponível.
-        if (!presentedOffers) {
+        if (!presentedOffers || !presented || !presented.ok || !presented.presented) {
           await markWaitingForEngine(ctx.sessionId)
           return NextResponse.json({
             ok: true, button_id: buttonId, action: "negotiate", acknowledged: true,
-            wait_state: "aguardando_motor", engine_owner: engineOwner, reply,
+            wait_state: "aguardando_motor", engine_owner: kick.owner, kickoff: kick.status, reply,
+            ...(retargetedFrom ? { retargeted_from: retargetedFrom } : {}),
           })
         }
         return NextResponse.json({
           ok: true, button_id: buttonId, action: "negotiate", acknowledged: true,
-          offers_presented: true, engine_owner: engineOwner, reply,
+          offers_presented: true, engine_owner: kick.owner, kickoff: kick.status, reply,
+          prompt: presented.prompt,
+          ...(retargetedFrom ? { retargeted_from: retargetedFrom } : {}),
         })
       }
 
@@ -559,13 +621,19 @@ export async function POST(req: NextRequest) {
     }
 
     if (buttonId === BTN_NEGOTIATE) {
+      // A2 (G2-c): o caminho legado passa a apresentar a MATRIZ (nenhum "negociar"
+      // sem parcelas na tela); sem parcelas (sem faixa/falha) arma a espera D2.
       const out = await handleDebtNegotiate({
         companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
         debtId: ctx.debtId, debtIds, promptId, buttonId, ip, userAgent,
       })
+      if (!out.offersPresented) await markWaitingForEngine(ctx.sessionId)
       return NextResponse.json({
         ok: true, button_id: buttonId, action: "negotiate",
-        acknowledged: true, engine_owner: out.engineOwner, reply: out.reply,
+        acknowledged: true, engine_owner: out.engineOwner, kickoff: out.kickoff, reply: out.reply,
+        ...(out.offersPresented && out.prompt
+          ? { offers_presented: true, prompt: out.prompt }
+          : { wait_state: "aguardando_motor" }),
       })
     }
 
@@ -720,25 +788,54 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
   }
 
-  // Demais prompts: responde (marca answered + grava a mensagem do cliente).
+  // Demais prompts (criados pelo n8n): responde (marca answered + grava a mensagem
+  // do cliente).
   const answered = await answerPrompt(answerInput)
   if (!answered.ok) {
     if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
     return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
   }
 
-  // Engine ativa (n8n): envia um turno de BOTÃO e devolve o reply. Engine
-  // disabled: a próxima etapa é determinística (sem reply do n8n).
+  // A2 (N-D2-1) — Engine ativa (n8n, NEGOTIATION_ENGINE=n8n em produção): envia
+  // um turno de BOTÃO ao fluxo com timeout CURTO (N8N_CLICK_TIMEOUT_MS, 4 s). O
+  // devedor NUNCA fica preso 20 s: estourado o deadline, o turno segue solto (a
+  // resposta real do n8n chega por chat.send e só assume por prompt acionável) e
+  // o ASSISTIDO volta — menu de 3 opções reaberto e devolvido no corpo. Em
+  // qualquer desfecho a sessão termina com um prompt ativo (rede de segurança).
   if (engineName() === "n8n") {
     try {
       const { runJourneyTurn } = await import("@/lib/journey/chat-turn")
       const label = answered.button.label
-      const out = await runJourneyTurn(ctx, label)
-      return NextResponse.json({ ok: true, button_id: buttonId, reply: out.reply, offers: out.offers, action: out.action })
-    } catch {
-      return NextResponse.json({ ok: true, button_id: buttonId })
+      const turn = await withDeadline(
+        runJourneyTurn(ctx, label).catch((err: Error) => {
+          console.warn("[chat:button] turno n8n falhou (fallback assistido):", err.message)
+          return null
+        }),
+        n8nClickTimeoutMs(),
+      )
+      const safety = await ensureAssistedPrompt(ctx)
+      if (!turn.settled) {
+        return NextResponse.json({
+          ok: true, button_id: buttonId, action: "engine_timeout", processing: true,
+          prompt: safety.prompt, assisted_reopened: safety.reopened,
+        })
+      }
+      const out = turn.value
+      return NextResponse.json({
+        ok: true, button_id: buttonId,
+        reply: out?.reply ?? null, offers: out?.offers ?? [], action: out?.action ?? null,
+        processing: out?.processing === true,
+        prompt: safety.prompt, assisted_reopened: safety.reopened,
+      })
+    } catch (err) {
+      console.warn("[chat:button] ramo n8n falhou (fallback assistido):", (err as Error).message)
+      const safety = await ensureAssistedPrompt(ctx)
+      return NextResponse.json({ ok: true, button_id: buttonId, prompt: safety.prompt, assisted_reopened: safety.reopened })
     }
   }
 
-  return NextResponse.json({ ok: true, button_id: buttonId })
+  // Engine disabled: a próxima etapa é determinística — garante um prompt ativo
+  // (o assistido nunca deixa o devedor sem caminho após um prompt genérico).
+  const safety = await ensureAssistedPrompt(ctx)
+  return NextResponse.json({ ok: true, button_id: buttonId, prompt: safety.prompt, assisted_reopened: safety.reopened })
 }

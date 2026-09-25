@@ -96,6 +96,15 @@ export interface CreatePromptInput {
   expiresAt?: string | null
   /** época já lida pelo chamador (evita 1 round-trip); ausente → lê aqui. */
   threadEpoch?: number
+  /**
+   * A2 (N-D2-5) — só para `createdBy:'n8n'`: resultado da avaliação de
+   * acionabilidade (chat-send.assessPromptActionability). Um prompt do n8n só
+   * SUPERSEDE um prompt ATIVO do assistido da plataforma (kinds protegidos) quando
+   * `actionable === true`; caso contrário a criação é recusada
+   * (`platform_prompt_protected`) e o assistido fica. Prompts da plataforma
+   * nunca passam por esta regra.
+   */
+  actionable?: boolean
 }
 
 export type CreatePromptResult =
@@ -103,13 +112,41 @@ export type CreatePromptResult =
   | { ok: false; error: string }
 
 /**
+ * A2 (N-D2-5) — kinds do ASSISTIDO cujo prompt ativo, quando criado pela
+ * plataforma, é PROTEGIDO: só um prompt do n8n ACIONÁVEL (validateButtons + ação
+ * mapeável) pode substituí-lo; texto sem botões e prompts inválidos/não mapeáveis
+ * NÃO calam o assistido (regra de ouro §2.3/§2.5: o assistido é a rede de
+ * segurança sempre presente; o n8n conduz só por prompt acionável).
+ */
+export const PLATFORM_PROTECTED_KINDS: ReadonlySet<string> = new Set([
+  "debt_three_options",
+  "offer_choice",
+  "post_payment_link",
+])
+
+/** true quando `p` é um prompt ATIVO do assistido criado pela plataforma. */
+export function isProtectedPlatformPrompt(
+  p: Pick<PromptRow, "kind" | "created_by" | "status"> | null | undefined,
+): boolean {
+  return !!p && p.status === "active" && p.created_by === "platform" && PLATFORM_PROTECTED_KINDS.has(p.kind)
+}
+
+/**
  * Cria um prompt novo. Valida os botões (ids únicos/reservados no código) e
  * supersede qualquer prompt 'active' anterior da MESMA sessão (só uma pergunta
  * viva por vez). Retorna a linha criada (com botões normalizados por id).
+ * A2: um prompt `createdBy:'n8n'` sem `actionable:true` NÃO supersede um prompt
+ * protegido da plataforma (ver isProtectedPlatformPrompt) — devolve
+ * `{ ok:false, error:'platform_prompt_protected' }` sem escrever nada.
  */
 export async function createPrompt(input: CreatePromptInput): Promise<CreatePromptResult> {
   const verdict = validateButtons(input.buttons)
   if (!verdict.ok) return { ok: false, error: verdict.error }
+
+  if (input.createdBy === "n8n" && input.actionable !== true) {
+    const active = await getActivePrompt(input.sessionId)
+    if (isProtectedPlatformPrompt(active)) return { ok: false, error: "platform_prompt_protected" }
+  }
 
   const supabase = createServiceClient()
   const now = new Date().toISOString()

@@ -68,6 +68,41 @@ function eventFlowUrl(): string {
   return process.env.N8N_EVENT_FLOW_URL || process.env.N8N_CHAT_FLOW_URL || ""
 }
 
+// ---------------------------------------------------------------------------
+// A2 / N-D2-7: a tabela engine_outbox NÃO existe em produção (PGRST205). Sem a
+// migration (fora desta onda), todo acesso virava um no-op SILENCIOSO — a
+// "entrega durável" era fictícia e ninguém sabia. Agora: o erro de tabela ausente
+// é reconhecido, logado UMA vez por processo (rótulo curto, sem PII/segredo) e as
+// funções saem cedo (no-op EXPLÍCITO), sem repetir a round-trip falha a cada clique.
+// ---------------------------------------------------------------------------
+let outboxUnavailable = false
+
+/** true para o erro do PostgREST/Postgres de tabela inexistente (PGRST205 = schema
+ *  cache sem a relação; 42P01 = undefined_table). Nunca lança. */
+export function isOutboxUnavailableError(error: { code?: string | null; message?: string | null } | null | undefined): boolean {
+  if (!error) return false
+  if (error.code === "PGRST205" || error.code === "42P01") return true
+  const msg = (error.message ?? "").toLowerCase()
+  return msg.includes("engine_outbox") && (msg.includes("does not exist") || msg.includes("schema cache") || msg.includes("could not find"))
+}
+
+/** Marca o outbox como indisponível neste processo e loga 1x (no-op explícito). */
+export function noteOutboxUnavailable(where: string): void {
+  if (outboxUnavailable) return
+  outboxUnavailable = true
+  console.warn(`[engine:outbox] engine_outbox ausente (migration pendente) — entrega durável DESATIVADA; ${where} vira no-op explícito`)
+}
+
+/** true quando este processo já constatou que a tabela não existe. */
+export function outboxKnownUnavailable(): boolean {
+  return outboxUnavailable
+}
+
+/** Só para testes: zera a memória de indisponibilidade. */
+export function resetOutboxAvailability(): void {
+  outboxUnavailable = false
+}
+
 export interface EnqueueInput {
   sessionId: string
   companyId: string
@@ -89,16 +124,21 @@ export type EnqueueResult =
  * login, ou flushOutbox no próximo turno).
  */
 export async function enqueueEvent(input: EnqueueInput): Promise<EnqueueResult> {
+  if (outboxUnavailable) return { ok: false, error: "engine_outbox_unavailable" } // no-op explícito (N-D2-7)
   const supabase = input.supabase ?? createServiceClient()
   const gated = engineName() === "disabled"
   const status: OutboxStatus = gated ? "skipped_engine_disabled" : "pending"
 
   // Idempotência: se já existe o event_id, não recria (reentrada da mesma abertura).
-  const { data: existing } = await supabase
+  const { data: existing, error: readErr } = await supabase
     .from("engine_outbox")
     .select("id, status")
     .eq("event_id", input.envelope.event_id)
     .maybeSingle()
+  if (readErr && isOutboxUnavailableError(readErr)) {
+    noteOutboxUnavailable("enqueueEvent")
+    return { ok: false, error: "engine_outbox_unavailable" }
+  }
   if (existing) {
     return { ok: true, id: existing.id as string, status: existing.status as OutboxStatus, created: false }
   }
@@ -119,6 +159,10 @@ export async function enqueueEvent(input: EnqueueInput): Promise<EnqueueResult> 
     .single()
 
   if (error || !data) {
+    if (error && isOutboxUnavailableError(error)) {
+      noteOutboxUnavailable("enqueueEvent")
+      return { ok: false, error: "engine_outbox_unavailable" }
+    }
     // corrida rara: outro request inseriu o mesmo event_id entre o SELECT e o
     // INSERT (UNIQUE violado). Trata como já-existe (idempotente), não como erro.
     const { data: race } = await supabase
@@ -233,6 +277,8 @@ export interface FlushResult {
  * sem ele, faz o flush global (script ops).
  */
 export async function flushOutbox(opts?: { sessionId?: string; limit?: number }): Promise<FlushResult> {
+  const empty: FlushResult = { scanned: 0, sent: 0, failed: 0, pending: 0 }
+  if (outboxUnavailable) return empty // no-op explícito (N-D2-7)
   const supabase = createServiceClient()
   const limit = opts?.limit ?? 50
   const nowIso = new Date().toISOString()
@@ -247,7 +293,8 @@ export async function flushOutbox(opts?: { sessionId?: string; limit?: number })
   if (opts?.sessionId) query = query.eq("session_id", opts.sessionId)
 
   const { data, error } = await query
-  if (error || !data) return { scanned: 0, sent: 0, failed: 0, pending: 0 }
+  if (error && isOutboxUnavailableError(error)) noteOutboxUnavailable("flushOutbox")
+  if (error || !data) return empty
 
   const result: FlushResult = { scanned: data.length, sent: 0, failed: 0, pending: 0 }
   // Ordem preservada: entrega uma a uma (não paraleliza) para não inverter a
