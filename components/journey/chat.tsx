@@ -16,10 +16,14 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { PromptButtons, PROMPT_STALE_NOTICE, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 import {
   capHistory,
+  collapseConsecutiveDecisions,
+  currentGenerationOf,
   dedupAssistantByContent,
   isNegotiateLabel,
   NEGOTIATION_PENDING_TEXT,
   prunePresentation,
+  splitResumeHistory,
+  stripDuplicateQuestion,
   type ChatMsg,
   type MsgAction,
 } from "./chat-display"
@@ -173,6 +177,14 @@ export function JourneyChat() {
   const [pinnedDebt, setPinnedDebt] = useState<PinnedDebtData | null>(null)
   const [recap, setRecap] = useState<{ text: string } | null>(null)
   const [historyExpanded, setHistoryExpanded] = useState(false)
+  // A3 — RETOMADA (§2.2): instante do MENU CORRENTE no 1º poll da retomada (recap
+  // != null). Tudo o que veio ANTES fica recolhido atrás de "Ver conversa
+  // completa", salvo o último outcome (link/acordo/desfecho). Fixado UMA vez por
+  // montagem (o que chega depois, via poll, é conversa nova e aparece).
+  const [resumeCutoffAt, setResumeCutoffAt] = useState<string | null>(null)
+  const resumeInitRef = useRef(false)
+  // A3 (G7) — bloco do menu (FORA do log): alvo do scrollIntoView pós-login.
+  const menuRef = useRef<HTMLDivElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const sinceRef = useRef<string | null>(null)
   const seenIds = useRef<Set<string>>(new Set())
@@ -382,6 +394,22 @@ export function JourneyChat() {
       if (data?.recap && typeof data.recap === "object" && typeof data.recap.text === "string") {
         setRecap({ text: data.recap.text })
       }
+      // A3 — RETOMADA: no 1º poll COM recap, o corte é o created_at do menu
+      // corrente (sem prompt ativo, o relógio do servidor). Sem recap (1º login,
+      // nenhuma decisão ainda) não há corte — nada é recolhido.
+      if (!resumeInitRef.current) {
+        resumeInitRef.current = true
+        if (data?.recap && typeof data.recap === "object") {
+          const ap = data?.active_prompt as { created_at?: unknown } | null | undefined
+          const cut =
+            ap && typeof ap.created_at === "string"
+              ? ap.created_at
+              : typeof data?.server_time === "string"
+                ? data.server_time
+                : new Date().toISOString()
+          setResumeCutoffAt(cut)
+        }
+      }
       const pushed: Array<{
         id: string
         role: string
@@ -392,6 +420,7 @@ export function JourneyChat() {
         action?: unknown
         engine?: string | null
         stage?: string | null
+        generation?: number | null
       }> = Array.isArray(data?.messages) ? data.messages : []
       for (const m of pushed) {
         if (seenIds.current.has(m.id)) continue
@@ -455,6 +484,10 @@ export function JourneyChat() {
               engine: m.engine ?? null,
               buttonId: m.button_id ?? null,
               stage: m.stage ?? null,
+              // A3: geração anotada pelo servidor (poda §2.4) e instante da
+              // linha (a retomada recolhe o que veio antes do menu corrente).
+              generation: typeof m.generation === "number" ? m.generation : null,
+              createdAt: typeof m.created_at === "string" ? m.created_at : null,
             },
           ]
         })
@@ -600,7 +633,11 @@ export function JourneyChat() {
     // rAF para garantir que o nó já está no DOM antes de focar.
     requestAnimationFrame(() => {
       try {
-        el.focus({ preventScroll: false })
+        // A3 (N2/G7): NUNCA rola ao focar — com preventScroll:false o foco
+        // rolava a janela ao topo do log e escondia card e recap. O menu (fora
+        // do log) é trazido à vista só se não estiver visível.
+        el.focus({ preventScroll: true })
+        menuRef.current?.scrollIntoView({ block: "nearest" })
       } catch {
         /* noop */
       }
@@ -1063,20 +1100,46 @@ export function JourneyChat() {
     }
   }
 
-  // D2 — PIPELINE DE APRESENTAÇÃO (§10.1), na ordem:
+  // D2/A3 — PIPELINE DE APRESENTAÇÃO (§10.1 / §2.2 / §2.4), na ordem:
   //  1) filtra a bolha do prompt ATIVO (sua pergunta aparece no bloco de botões);
   //  2) PODA por classe (prunePresentation): system fora (R-16), superseded colapsa
-  //     (menus antigos não empilham, R-13);
-  //  3) dedup por conteúdo (só a última guidance idêntica);
-  //  4) TETO de 20 (capHistory): guidance velho recolhe atrás de "ver conversa
-  //     completa"; decision/outcome NUNCA recolhem (C8/R-15/R-41).
+  //     (menus antigos não empilham, R-13) — inclusive GERAÇÕES ANTERIORES do fluxo
+  //     (A3: Sim/Não → Consultar/Negociar), pela geração anotada pelo servidor;
+  //  3) COLAPSO de decisions consecutivas iguais (A3): cliques repetidos sem outcome
+  //     entre eles viram um;
+  //  4) dedup por conteúdo (só a última guidance idêntica);
+  //  5) RETOMADA (A3): tudo o que veio antes do menu corrente fica recolhido atrás
+  //     de "Ver conversa completa", salvo o último outcome (link/acordo/desfecho);
+  //  6) TETO de 20 (capHistory): guidance velho recolhe; decision/outcome NUNCA
+  //     recolhem (C8/R-15/R-41).
+  // "Ver conversa completa" desliga a regra de geração (as gerações anteriores
+  // voltam a renderizar) e o corte da retomada.
   const activePromptId = activePrompt && !ended ? activePrompt.id : null
+  const currentGeneration = historyExpanded
+    ? null
+    : currentGenerationOf(messages, activePrompt && !ended ? activePrompt.kind : null)
   const visibleMessages = messages.filter(
     (m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id),
   )
-  const prunedMessages = prunePresentation(visibleMessages, activePromptId, waitState)
-  const dedupedMessages = dedupAssistantByContent(prunedMessages)
-  const capped = capHistory(dedupedMessages, activePromptId, waitState, { expanded: historyExpanded })
+  const prunedMessages = prunePresentation(visibleMessages, activePromptId, waitState, currentGeneration)
+  const collapsedDecisions = collapseConsecutiveDecisions(prunedMessages, activePromptId, waitState, currentGeneration)
+  const dedupedMessages = dedupAssistantByContent(collapsedDecisions)
+  const resume = splitResumeHistory(dedupedMessages, {
+    cutoffAt: resumeCutoffAt,
+    expanded: historyExpanded,
+    activePromptId,
+    waitState,
+    currentGeneration,
+  })
+  const capped = capHistory(resume.visible, activePromptId, waitState, {
+    expanded: historyExpanded,
+    currentGeneration,
+  })
+  const hiddenCount = resume.collapsed.length + capped.collapsed.length
+  // A3 (§2.2): uma só pergunta na tela — se a saudação de retorno já pergunta
+  // "Como prefere seguir?", o bloco de botões não a repete.
+  const promptForRender =
+    activePrompt && recap && !ended ? stripDuplicateQuestion(activePrompt, recap.text) : activePrompt
   // A1: há bolha persistida do link (ação open_payment_link) para o link corrente?
   const hasPersistedLink = messages.some(
     (m) =>
@@ -1113,8 +1176,9 @@ export function JourneyChat() {
           aparece 1x no topo, imutável entre polls, sobrevive a reload. O valor mora
           aqui (e nos outcomes), não nas guidance/perguntas (R-12). D3 estiliza. */}
       <DebtCard debt={pinnedDebt} />
-      {/* D2 — RECAP de retomada (C7/R-17): ACIMA do log, no lugar da repetição
-          integral. Só aparece na retomada (recap != null vindo do 1º poll). */}
+      {/* D2/A3 — SAUDAÇÃO DE RETORNO (§2.2, C7/R-17): ACIMA do log, no lugar da
+          repetição integral e da saudação original (recolhida). Só na retomada
+          (recap != null vindo do 1º poll). Uma só saudação na tela. */}
       {recap && !ended ? (
         <div
           role="status"
@@ -1128,7 +1192,11 @@ export function JourneyChat() {
           respostas do assistente são anunciados ao leitor de tela (aria-live
           polite, só adições), e a região recebe FOCO uma vez após o login (M18).
           Os BOTÕES ficam num bloco com aria-live=off (abaixo) para não serem
-          re-anunciados em loop — a live region envolve só a copy. */}
+          re-anunciados em loop — a live region envolve só a copy.
+          A3 (G7/N2): o log tem ALTURA LIMITADA e rola POR DENTRO (é ele que o
+          auto-scroll rola); o menu fica logo abaixo, FORA do log — em 360×800 o
+          primeiro botão de ação está na tela sem rolar. Sem flex-1: o log cresce
+          só com o conteúdo (até o teto), não engole o espaço da tela. */}
       <div
         ref={(node) => {
           scrollRef.current = node
@@ -1140,23 +1208,8 @@ export function JourneyChat() {
         aria-atomic="false"
         aria-label="Conversa de negociação"
         tabIndex={-1}
-        className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-secondary)]/40"
-        style={{ minHeight: 320 }}
+        className="min-h-[96px] max-h-[42dvh] space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-secondary)]/40 sm:max-h-[58dvh]"
       >
-        {/* R-41 — "ver conversa completa": quando o teto (20) recolheu guidance
-            velho, o controle expande o histórico. decision/outcome NUNCA são
-            recolhidos (C8), então nunca ficam atrás deste botão. */}
-        {capped.hasMore ? (
-          <div className="flex justify-center">
-            <button
-              type="button"
-              onClick={() => setHistoryExpanded(true)}
-              className="rounded-md px-3 py-1 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
-            >
-              Ver conversa completa
-            </button>
-          </div>
-        ) : null}
         {capped.visible.map((m) => (
           <div
             key={m.id}
@@ -1466,46 +1519,68 @@ export function JourneyChat() {
           </div>
         ) : null}
 
-        {activePrompt && !ended ? (
-          // R8 — aria-live=off: os BOTÕES não entram no anúncio do log (evita
-          // re-anúncio das labels em loop; A-07). group + aria-label dão contexto
-          // ao leitor de tela; a navegação por teclado alcança os botões na ordem.
-          <div className="pt-1" aria-live="off" role="group" aria-label="Opções de negociação">
-            {/* A1 — aviso humano do 409 (prompt substituído): fica no pai para
-                sobreviver à remontagem do bloco de botões. */}
-            {promptNotice ? (
-              <p className="mb-2 text-xs text-neutral-600" role="status" aria-live="polite">
-                {promptNotice}
-              </p>
-            ) : null}
-            {/* key por id do prompt: ao trocar de prompt (ex.: Consultar reabre o
-                menu pós-consulta) o componente REMONTA, zerando o estado local
-                'answered'/'pending' — sem isso o novo menu nasceria desabilitado. */}
-            <PromptButtons key={activePrompt.id} prompt={activePrompt} onClick={clickButton} />
-            {/* R5 — afordância "Já paguei": secundária/discreta, disponível no menu de
-                3 opções (payável). Registra o payment_claim (conferência da equipe),
-                sem declarar pago; o servidor reabre o menu em seguida. Some após o
-                clique (claimSent) para não empilhar.
-                R-36 — COERÊNCIA em nao_reconhecida: o prompt de VOLTA do "Não
-                reconheço" também é kind 'debt_three_options', mas traz só o botão
-                [98] (sem PAGAR). Oferecer "Já paguei" a quem acabou de dizer que NÃO
-                reconhece o débito é incoerente (C13/C14). Por isso só mostramos a
-                afordância quando o menu é o MENU PAYÁVEL de fato — tem o botão PAGAR
-                (id 4) —, não o menu-volta de contestação. */}
-            {((activePrompt.kind === "debt_three_options" && activePrompt.buttons.some((b) => b.id === 4)) ||
-              activePrompt.kind === "post_payment_link") &&
-            !claimSent ? (
-              <button
-                type="button"
-                onClick={requestPaymentClaim}
-                className="mt-2 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
-              >
-                Já paguei este valor
-              </button>
-            ) : null}
-          </div>
-        ) : null}
       </div>
+
+      {activePrompt && !ended ? (
+        // R8 — aria-live=off: os BOTÕES não entram no anúncio do log (evita
+        // re-anúncio das labels em loop; A-07). group + aria-label dão contexto
+        // ao leitor de tela; a navegação por teclado alcança os botões na ordem.
+        // A3 (G7): o menu fica FORA do log, logo após card / saudação de retorno /
+        // outcome — visível sem rolar; ref para o scrollIntoView pós-login.
+        <div ref={menuRef} className="pt-1" aria-live="off" role="group" aria-label="Opções de negociação">
+          {/* A1 — aviso humano do 409 (prompt substituído): fica no pai para
+              sobreviver à remontagem do bloco de botões. */}
+          {promptNotice ? (
+            <p className="mb-2 text-xs text-neutral-600" role="status" aria-live="polite">
+              {promptNotice}
+            </p>
+          ) : null}
+          {/* key por id do prompt: ao trocar de prompt (ex.: Consultar reabre o
+              menu pós-consulta) o componente REMONTA, zerando o estado local
+              'answered'/'pending' — sem isso o novo menu nasceria desabilitado.
+              A3: promptForRender = o prompt ativo sem a pergunta quando a saudação
+              de retorno já a faz (uma só pergunta na tela). */}
+          <PromptButtons key={activePrompt.id} prompt={promptForRender ?? activePrompt} onClick={clickButton} />
+          {/* R5 — afordância "Já paguei": secundária/discreta, disponível no menu de
+              3 opções (payável). Registra o payment_claim (conferência da equipe),
+              sem declarar pago; o servidor reabre o menu em seguida. Some após o
+              clique (claimSent) para não empilhar.
+              R-36 — COERÊNCIA em nao_reconhecida: o prompt de VOLTA do "Não
+              reconheço" também é kind 'debt_three_options', mas traz só o botão
+              [98] (sem PAGAR). Oferecer "Já paguei" a quem acabou de dizer que NÃO
+              reconhece o débito é incoerente (C13/C14). Por isso só mostramos a
+              afordância quando o menu é o MENU PAYÁVEL de fato — tem o botão PAGAR
+              (id 4) —, não o menu-volta de contestação. */}
+          {((activePrompt.kind === "debt_three_options" && activePrompt.buttons.some((b) => b.id === 4)) ||
+            activePrompt.kind === "post_payment_link") &&
+          !claimSent ? (
+            <button
+              type="button"
+              onClick={requestPaymentClaim}
+              className="mt-2 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
+            >
+              Já paguei este valor
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* A3 (§2.2 / R-41) — "Ver conversa completa": discreto, abaixo do menu, e
+          SEMPRE que houver algo recolhido (retomada e/ou teto de 20) — não só
+          acima de 20. Expandido → "Recolher conversa"; enquanto expandido, as
+          gerações anteriores voltam a renderizar (regra de geração desligada). */}
+      {hiddenCount > 0 || historyExpanded ? (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={() => setHistoryExpanded((v) => !v)}
+            aria-expanded={historyExpanded}
+            className="min-h-[44px] rounded-md px-3 py-1 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
+          >
+            {historyExpanded ? "Recolher conversa" : "Ver conversa completa"}
+          </button>
+        </div>
+      ) : null}
 
       {idleModal ? (
         <div
