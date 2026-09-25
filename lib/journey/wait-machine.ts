@@ -144,6 +144,81 @@ export function shouldRenderEngineMsg(state: WaitState): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// A2 (N-D2-6 / N-D5-9) — TEXTO DO MOTOR SEM BOTÕES × ASSISTIDO. Regra de
+// EXIBIÇÃO pura: enquanto o prompt ativo é um menu do ASSISTIDO da plataforma
+// (3 opções / parcelas / pós-link), uma mensagem engine='n8n' SEM prompt (texto
+// solto) não é "condução": não empurra as parcelas para fora da tela nem soa como
+// resposta — vira uma NOTA discreta (ou some, quando é o fallback genérico do
+// fluxo, que expõe nome de sistema/"opções válidas"). Markdown é sanitizado.
+// ---------------------------------------------------------------------------
+/** Kinds do assistido da plataforma (espelho de prompts.PLATFORM_PROTECTED_KINDS —
+ *  duplicado aqui de propósito: este módulo é importado pelo client bundle). */
+export const PLATFORM_ASSISTED_KINDS: ReadonlySet<string> = new Set([
+  "debt_three_options",
+  "offer_choice",
+  "post_payment_link",
+])
+
+/** Padrões do FALLBACK GENÉRICO do fluxo n8n (não é resposta ao devedor: expõe
+ *  "canal de atendimento automático"/"opções válidas"/nome de sistema). */
+const GENERIC_ENGINE_FALLBACK: readonly RegExp[] = [
+  /op[cç][õo]es v[áa]lidas/i,
+  /canal de atendimento autom[áa]tico/i,
+  /selecione uma das op/i,
+  /\bn8n\b|\bworkflow\b|\bwebhook\b/i,
+]
+
+/** Remove markdown leve (**negrito**, __negrito__, *itálico*, `código`, #títulos)
+ *  e normaliza espaços/quebras. Nunca injeta HTML; puro. */
+export function sanitizeEngineText(raw: string): string {
+  return (raw ?? "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1$2")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+}
+
+/** true quando o texto é o fallback genérico do fluxo (nunca chega ao devedor). */
+export function isGenericEngineFallback(text: string): boolean {
+  const t = text ?? ""
+  return GENERIC_ENGINE_FALLBACK.some((re) => re.test(t))
+}
+
+export type EngineTextMode = "hidden" | "note" | "bubble"
+
+export interface EngineTextDisplayInput {
+  text: string
+  /** true quando a mensagem está ligada a um prompt (n8n mandou botões). */
+  hasPrompt: boolean
+  /** kind do prompt ATIVO na tela (null = nenhum). */
+  activePromptKind: string | null | undefined
+  waitState: WaitState
+}
+
+/**
+ * Decide COMO uma mensagem engine='n8n' aparece (pura, testável):
+ *  - estado absorvente → hidden (M12, regra existente);
+ *  - fallback genérico do fluxo → hidden (nome de sistema/código nunca ao devedor);
+ *  - com prompt (n8n mandou botões acionáveis) → bubble;
+ *  - texto solto com um menu do assistido ATIVO → note (discreta, não empurra
+ *    nem "responde" — o assistido continua sendo o caminho);
+ *  - demais → bubble. O texto devolvido já vem sanitizado.
+ */
+export function engineTextDisplay(input: EngineTextDisplayInput): { mode: EngineTextMode; text: string } {
+  const text = sanitizeEngineText(input.text)
+  if (isAbsorbingForEngineMsg(input.waitState)) return { mode: "hidden", text }
+  if (!text) return { mode: "hidden", text }
+  if (isGenericEngineFallback(text)) return { mode: "hidden", text }
+  if (input.hasPrompt) return { mode: "bubble", text }
+  if (input.activePromptKind && PLATFORM_ASSISTED_KINDS.has(input.activePromptKind)) return { mode: "note", text }
+  return { mode: "bubble", text }
+}
+
+// ---------------------------------------------------------------------------
 // Reidratação no reload (M11). O client reconstrói o waitState a partir de
 // (wait_state, wait_started_at) do servidor + o relógio local. Um wait_state
 // desconhecido/ausente → idle (degradação graciosa: sem a coluna M-4, a UI só

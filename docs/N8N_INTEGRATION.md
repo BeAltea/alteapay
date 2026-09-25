@@ -431,3 +431,40 @@ foi observado (bloqueado por N-D1-2).
 - `availableInMCP` de 1.5/1.6/1.7 foi resetado para `false` pelo PUT da API pública (chave fora do
   schema); reativar na UI se for usado. Os nós `Webhook` de teste dos sub-fluxos são públicos e
   sem autenticação (hoje inertes: corpo aninhado em `body`) — convém removê-los.
+
+## 13. 2026-09-25 — Regra de supersede do assistido (trilha A2, D1 híbrido)
+
+O assistido da plataforma (menu de 3 opções → parcelas da matriz → pós-link) é a **rede de
+segurança sempre presente**. O n8n **conduz** o diálogo **só por prompt acionável**. Vale para
+`chat.send` (com `args.prompt`), `prompt.ask` e `prompt.close` quando o prompt ATIVO da sessão é
+um menu do assistido criado pela plataforma (`kind ∈ {debt_three_options, offer_choice,
+post_payment_link}`, `created_by='platform'`):
+
+| Entrada do n8n | Efeito |
+|---|---|
+| `chat.send` só com `args.text` (sem botões) | bolha `engine='n8n'` gravada; **não supersede** (o menu continua ativo). Na tela vira nota discreta acima do menu; o fallback genérico do fluxo ("selecione uma das opções válidas", "canal de atendimento automático…") **não é exibido**; markdown é removido |
+| `chat.send`/`prompt.ask` com botões inválidos (`validateButtons`: ids não-inteiros, duplicados, `label` ausente, lista vazia) | **422** `{code:<erro de validação>}`; nada é gravado (nem o texto); o menu fica |
+| `chat.send`/`prompt.ask` com prompt válido mas **não mapeável** | **422** `{code:'prompt_not_actionable', error:'… (<motivo>)'}`; nada é gravado; o menu fica |
+| `chat.send`/`prompt.ask` com prompt **acionável** | supersede o menu (o ativo vira `superseded`; o novo é `created_by='n8n'`) |
+| `prompt.close` | **422** `{code:'platform_prompt_protected'}` — o menu só é substituído por prompt acionável (fechar sem substituir deixaria o devedor sem caminho). Prompts criados pelo n8n continuam fechando normalmente |
+
+**Acionável** (`lib/journey/chat-send.ts:assessPromptActionability`) = `validateButtons` OK **e**:
+- `offer_choice`: todo item de lista (2..97) leva `value` = `offer_id` de uma oferta `presented`
+  desta sessão (obtida por `offer.list`/`offer.propose` — a matriz é do servidor);
+- `payment_method_choice`: itens com `value` ∈ `PIX | BOLETO | CREDIT_CARD`;
+- kinds booleanos (`debt_acknowledgement`, `generic_yes_no`, `payment_confirmation`): catálogo
+  Sim/Não (`1`/`0`, `99` opcional);
+- kind desconhecido: só se **todo** botão for reservado (`0/1/98/99`) ou mapear um `offer_id`;
+- `debt_three_options`, `debt_consult`, `post_payment_link`: reservados à plataforma (nunca).
+
+Sem menu protegido ativo (ex.: já respondido, ou o ativo é do próprio n8n) vale o comportamento
+anterior (qualquer prompt válido supersede).
+
+Cliques em prompts criados pelo n8n com `NEGOTIATION_ENGINE=n8n`: o `chat.turn` ao fluxo tem
+timeout curto (`N8N_CLICK_TIMEOUT_MS`, default 4000 ms); estourado, o clique responde
+`{action:'engine_timeout', processing:true, prompt:<menu de 3 opções reaberto>}` e a resposta
+tardia do fluxo entra pelas regras acima (texto → nota; prompt acionável → substitui). O
+`negotiation.start` do "Negociar" é disparado em paralelo à apresentação das parcelas e aguardado
+só até `N8N_KICKOFF_DEADLINE_MS` (default 2500 ms; `kickoff: delivered|unavailable|pending` na
+resposta do clique). `engine_outbox` continua ausente em produção: a "entrega durável" é um no-op
+explícito (log único por processo) até a migration ser aplicada.

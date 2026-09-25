@@ -91,7 +91,9 @@ describe("promptAsk / promptClose", () => {
     const { promptAsk, promptClose } = await import("@/lib/journey/chat-send")
     await promptAsk(ctx, { kind: "generic_yes_no", question: "q", buttons: [{ id: 1, label: "Sim" }, { id: 0, label: "Não" }] })
     const r = await promptClose(ctx)
-    expect(r.closed).toBe(true)
+    // A2: promptClose devolve ok:false só para um menu protegido da plataforma;
+    // um prompt do n8n (este) é fechado normalmente.
+    expect(r.ok && r.closed).toBe(true)
     expect(db.chat_prompts[0].status).toBe("superseded")
   })
 })

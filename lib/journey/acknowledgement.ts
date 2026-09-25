@@ -28,7 +28,7 @@ import {
   BTN_YES,
   type Button,
 } from "./buttons"
-import { createPrompt, answerPrompt, type PromptRow } from "./prompts"
+import { createPrompt, answerPrompt, promptView, type PromptRow, type PromptView } from "./prompts"
 import { listOffers, type ListedOffer, type SessionCtx } from "./actions"
 import type { OfferTerms } from "@/lib/negotiation/offers"
 
@@ -788,9 +788,28 @@ export function offerChoiceQuestion(): string {
 }
 
 export type PresentMatrixOffersResult =
-  | { ok: true; presented: true; offers: ListedOffer[]; promptId: string }
+  | {
+      ok: true
+      presented: true
+      offers: ListedOffer[]
+      promptId: string
+      /** A2: o prompt COMPLETO (shape do GET /api/chat/messages.active_prompt) para o
+       *  POST do clique devolvê-lo e o client renderizar as parcelas NA HORA. */
+      prompt: PromptView
+      /** true quando um 'offer_choice' já estava ativo e foi reusado (idempotência). */
+      reused: boolean
+    }
   | { ok: true; presented: false; reason: "no_offers" }
   | { ok: false; error: string }
+
+/**
+ * T2 / R-26 — confirmação IMEDIATA e persistida do "Negociar" (Apêndice B
+ * "Negociar - antes"). A MESMA frase da bolha otimista do client
+ * (NEGOTIATION_PENDING_TEXT em components/journey/chat-display.ts): uma só bolha
+ * para o mesmo instante (o dedup por conteúdo colapsa as duas). A A4 pode trocar
+ * a copy aqui e lá em conjunto.
+ */
+export const NEGOTIATE_ACK_TEXT = "Certo. Vou buscar as condições de pagamento disponíveis para você."
 
 /**
  * R1 — apresenta as OPÇÕES DE PARCELAMENTO DETERMINÍSTICAS da matriz do servidor
@@ -801,12 +820,21 @@ export type PresentMatrixOffersResult =
  * `presented:false` (o chamador cai no caminho de degradação, nunca beco sem
  * saída). NÃO cobra nada aqui — só apresenta; a cobrança é no aceite. NÃO decide
  * desconto/parcela (D8): só exibe o que a matriz gerou.
+ *
+ * A2 (N-D2-2, clique < 3 s): UMA leitura de contexto — o prompt ativo, as ofertas
+ * (listOffers já é 1 leitura + lote) e a época correm em PARALELO; a pergunta é
+ * gravada sem o dedup de conteúdo (é única por prompt) e com a época já lida.
+ * `precedingWrite` (opcional) produz a escrita que deve PRECEDER a bolha-pergunta
+ * no histórico (ex.: a confirmação "Certo…" do clique) — é chamada só quando há
+ * parcelas a apresentar, e as leituras não esperam por ela, só a escrita da
+ * pergunta (o chamador pode devolver uma Promise já em curso).
  */
 export async function presentMatrixOffers(input: {
   companyId: string
   sessionId: string
   customerId: string
   debtId: string
+  precedingWrite?: () => Promise<unknown>
 }): Promise<PresentMatrixOffersResult> {
   const ctx: SessionCtx = {
     companyId: input.companyId,
@@ -816,26 +844,29 @@ export async function presentMatrixOffers(input: {
   }
   const supabase = createServiceClient()
 
-  // idempotência: se já existe um 'offer_choice' ATIVO, reusa (não re-apresenta).
-  const { data: existing } = await supabase
-    .from("chat_prompts")
-    .select("id, buttons")
-    .eq("session_id", input.sessionId)
-    .eq("kind", "offer_choice")
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
+  const [{ data: existing }, offers, epoch] = await Promise.all([
+    // idempotência: se já existe um 'offer_choice' ATIVO, reusa (não re-apresenta).
+    supabase
+      .from("chat_prompts")
+      .select("*")
+      .eq("session_id", input.sessionId)
+      .eq("kind", "offer_choice")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    listOffers(ctx),
+    getCurrentThreadEpoch(input.sessionId),
+  ])
   if (existing) {
-    // devolve as ofertas ainda vivas (para o chamador reidratar, se precisar)
-    const offers = await listOffers(ctx)
-    return { ok: true, presented: true, offers, promptId: (existing as { id: string }).id }
+    const row = existing as PromptRow
+    return { ok: true, presented: true, offers, promptId: row.id, prompt: promptView(row)!, reused: true }
   }
-
-  const offers = await listOffers(ctx)
   if (offers.length === 0) return { ok: true, presented: false, reason: "no_offers" }
 
   const question = offerChoiceQuestion()
+  // a bolha de confirmação do clique (se houver) entra ANTES do prompt/pergunta.
+  if (input.precedingWrite) await input.precedingWrite().catch(() => {})
   const created = await createPrompt({
     companyId: input.companyId,
     sessionId: input.sessionId,
@@ -849,6 +880,7 @@ export async function presentMatrixOffers(input: {
       source: "assisted_matrix",
     },
     createdBy: "platform",
+    threadEpoch: epoch,
   })
   if (!created.ok) return { ok: false, error: created.error }
   await persistAssistantMessage({
@@ -856,8 +888,40 @@ export async function presentMatrixOffers(input: {
     sessionId: input.sessionId,
     text: question,
     promptId: created.prompt.id,
+    threadEpoch: epoch,
+    skipContentDedup: true,
   })
-  return { ok: true, presented: true, offers, promptId: created.prompt.id }
+  return {
+    ok: true, presented: true, offers, promptId: created.prompt.id,
+    prompt: promptView(created.prompt)!, reused: false,
+  }
+}
+
+/**
+ * debt_ids/primary_debt_id da SESSÃO (o menu de 3 opções consolida o valor sobre
+ * todas as dívidas). Para reabrir o menu assistido a partir de um prompt que não
+ * carrega `context.debt_ids` (ex.: prompt criado pelo n8n). Nunca lança —
+ * degrada para [fallbackDebtId].
+ */
+export async function resolveSessionDebtIds(
+  sessionId: string,
+  fallbackDebtId: string,
+): Promise<{ debtIds: string[]; primaryDebtId: string }> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_sessions")
+      .select("debt_ids, primary_debt_id, debt_id")
+      .eq("id", sessionId)
+      .maybeSingle()
+    const row = data as { debt_ids?: string[] | null; primary_debt_id?: string | null; debt_id?: string | null } | null
+    const primaryDebtId = row?.primary_debt_id ?? row?.debt_id ?? fallbackDebtId
+    const rawIds = row?.debt_ids ?? []
+    const debtIds = rawIds.length > 0 ? rawIds : [primaryDebtId]
+    return { debtIds, primaryDebtId }
+  } catch {
+    return { debtIds: [fallbackDebtId], primaryDebtId: fallbackDebtId }
+  }
 }
 
 /**
@@ -1489,17 +1553,29 @@ export type StartN8nResult =
  * vão ao fluxo (a resposta DESTE clique já foi persistida localmente pelo
  * chamador — o histórico nunca depende do n8n). NUNCA lança.
  */
-async function dispatchNegotiationStartInBackground(input: {
+/** Desfecho do disparo do negotiation.start (A2): o que foi gravado no banco. */
+export type NegotiationStartOutcome =
+  | { delivered: true; owner: "n8n" }
+  | { delivered: false; owner: "platform"; reason: string }
+
+/**
+ * Executa o negotiation.start ao n8n e grava a auditoria/engine_owner conforme o
+ * desfecho. É a unidade que dispatchNegotiationStartInBackground (fire-and-forget
+ * legado) e kickoffNegotiationStart (com deadline — A2) compartilham. NUNCA lança:
+ * qualquer falha vira `delivered:false` com um rótulo curto (sem URL/segredo/PII).
+ */
+async function runNegotiationStartDispatch(input: {
   companyId: string
   sessionId: string
   customerId: string
   debtId: string
   eventId: string
-}): Promise<void> {
+}): Promise<NegotiationStartOutcome> {
   try {
     const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
     const emit = await emitNegotiationStart(input.sessionId, input.eventId)
     const delivered = emit.ok === true && "delivered" in emit && emit.delivered === true
+    const reason = "reason" in emit ? String(emit.reason) : "unknown"
 
     const supabase = createServiceClient()
     // Só promove o dono a n8n quando o disparo foi de fato ENTREGUE. Sem entrega
@@ -1524,12 +1600,92 @@ async function dispatchNegotiationStartInBackground(input: {
       eventId: delivered ? `neg_start:${input.eventId}` : `neg_start_unavailable:${input.eventId}`,
       payload: delivered
         ? { event: "negotiation.start", engine_owner: "n8n" }
-        : { event: "engine_unavailable", engine_owner: "platform", reason: "reason" in emit ? emit.reason : "unknown" },
+        : { event: "engine_unavailable", engine_owner: "platform", reason },
     })
+    return delivered ? { delivered: true, owner: "n8n" } : { delivered: false, owner: "platform", reason }
   } catch (err) {
-    // Best-effort: uma falha no handoff em background jamais afeta o clique já
-    // respondido. Só loga um rótulo curto (sem URL/segredo/PII).
-    console.warn("[journey] negotiation.start (background) falhou:", (err as Error).message)
+    // Best-effort: uma falha no handoff jamais afeta o clique. Só loga um rótulo
+    // curto (sem URL/segredo/PII).
+    console.warn("[journey] negotiation.start (dispatch) falhou:", (err as Error).message)
+    return { delivered: false, owner: "platform", reason: "dispatch_error" }
+  }
+}
+
+async function dispatchNegotiationStartInBackground(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+  eventId: string
+}): Promise<void> {
+  await runNegotiationStartDispatch(input)
+}
+
+/** Estado do kickoff no momento da RESPOSTA ao clique (A2). `pending` = o disparo
+ *  não resolveu dentro do deadline e segue solto (a resposta não espera). */
+export type KickoffStatus =
+  | { status: "delivered"; owner: "n8n" }
+  | { status: "unavailable"; owner: "platform"; reason: string }
+  | { status: "pending"; owner: "platform" }
+
+export interface KickoffHandle {
+  eventId: string
+  /** Aguarda o disparo até `deadlineMs` (≥ 0). Se resolver, devolve o desfecho
+   *  gravado no banco (engine_owner alinhado — N-D2-12); senão `pending`. */
+  settle(deadlineMs: number): Promise<KickoffStatus>
+}
+
+/** Deadline padrão do kickoff no caminho do clique (ms). Configurável por env
+ *  N8N_KICKOFF_DEADLINE_MS; o POST ao n8n tem o seu próprio N8N_KICKOFF_TIMEOUT_MS. */
+export function kickoffDeadlineMs(): number {
+  const n = Number(process.env.N8N_KICKOFF_DEADLINE_MS)
+  return Number.isFinite(n) && n >= 0 ? n : 2500
+}
+
+/**
+ * A2 (N-D2-10) — kickoff do negotiation.start FORA do caminho crítico mas
+ * CONFIÁVEL em serverless: o disparo começa JÁ (em paralelo com a apresentação
+ * das parcelas) e a resposta ao clique só o aguarda até um deadline curto
+ * (Promise.race, o mesmo mecanismo do handleDebtNegotiate). Na prática o POST
+ * ao webhook do n8n responde na hora ("Workflow was started") e o disparo resolve
+ * antes das parcelas — o `engine_owner` devolvido é então o que está no banco.
+ * Estourado o deadline, a resposta não espera e o disparo segue solto (o mesmo
+ * risco de congelamento de antes, agora BOUNDED e sinalizado como `pending`).
+ * NUNCA lança.
+ */
+export function kickoffNegotiationStart(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+}): KickoffHandle {
+  const eventId = randomUUID()
+  const dispatch = runNegotiationStartDispatch({ ...input, eventId })
+  let settled: KickoffStatus | null = null
+  const settledPromise: Promise<KickoffStatus> = dispatch.then((out) => {
+    settled = out.delivered
+      ? { status: "delivered", owner: "n8n" }
+      : { status: "unavailable", owner: "platform", reason: out.reason }
+    return settled
+  })
+  return {
+    eventId,
+    async settle(deadlineMs: number): Promise<KickoffStatus> {
+      if (settled) return settled
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race<KickoffStatus>([
+          settledPromise,
+          new Promise<KickoffStatus>((resolve) => {
+            timer = setTimeout(() => resolve({ status: "pending", owner: "platform" }), Math.max(0, deadlineMs))
+            // não segura o event loop: o disparo, se estourar, segue solto.
+            timer.unref?.()
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    },
   }
 }
 
@@ -1663,10 +1819,16 @@ export async function handleDebtConsult(input: {
 }
 
 /**
- * "Negociar Dívida" [3]: mostra os dados da dívida, registra o reconhecimento
- * ("Sim") a partir do prompt debt_consult e INICIA a negociação no n8n
- * (engine_owner='n8n' + negotiation.start). RESILIENTE (H8): se o n8n não
- * responder, mantém o assistido e persiste o reply — o cliente nunca vê erro.
+ * "Negociar Dívida" [3] (caminho LEGADO do prompt debt_consult): mostra os dados
+ * da dívida, registra o reconhecimento ("Sim") e INICIA a negociação no n8n
+ * (negotiation.start). RESILIENTE (H8): se o n8n não responder, mantém o
+ * assistido e persiste o reply — o cliente nunca vê erro.
+ *
+ * A2 (G2-c): este caminho NUNCA apresentava as parcelas (a única chamada a
+ * presentMatrixOffers era o ramo 3-opções) — o devedor ficava em "preparando…
+ * só um instante" para sempre. Agora apresenta a MATRIZ como o ramo 3-opções:
+ * nenhum caminho de "negociar" sem parcelas na tela. O kickoff corre em paralelo
+ * (kickoffNegotiationStart) e só é aguardado até o deadline curto.
  */
 export async function handleDebtNegotiate(input: {
   companyId: string
@@ -1678,91 +1840,95 @@ export async function handleDebtNegotiate(input: {
   buttonId: number
   ip?: string | null
   userAgent?: string | null
-  dispatchDeadlineMs?: number // deadline do kickoff no caminho do clique (default 2500)
-}): Promise<{ ok: true; engineOwner: "platform" | "n8n"; reply: string }> {
+  dispatchDeadlineMs?: number // deadline do kickoff no caminho do clique (default N8N_KICKOFF_DEADLINE_MS/2500)
+}): Promise<{
+  ok: true
+  engineOwner: "platform" | "n8n"
+  reply: string
+  kickoff: KickoffStatus["status"]
+  offersPresented: boolean
+  prompt: PromptView | null
+}> {
+  const t0 = Date.now()
+  // kickoff JÁ (fora do caminho crítico; aguardado só até o deadline no fim).
+  const kickoff = kickoffNegotiationStart({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    customerId: input.customerId,
+    debtId: input.debtId,
+  })
+
   const ackCtx = await buildAckContext({
     companyId: input.companyId,
     customerId: input.customerId,
     debtIds: input.debtIds,
   })
-  await persistAssistantMessage({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    text: debtInfoMessage(ackCtx),
-  })
+  // dados da dívida (histórico legado) e reconhecimento em PARALELO (independentes).
+  await Promise.all([
+    persistAssistantMessage({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      text: debtInfoMessage(ackCtx),
+    }),
+    // Reconhecimento implícito ao Negociar: o devedor quer negociar → reconhece a
+    // dívida. Grava os efeitos append-only (o prompt já foi respondido pela rota).
+    persistDebtRecognition({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      customerId: input.customerId,
+      debtId: input.debtId,
+      promptId: input.promptId,
+      buttonId: input.buttonId,
+      acknowledged: true,
+      source: "chat_button_negotiate",
+      ip: input.ip,
+      userAgent: input.userAgent,
+    }),
+  ])
 
-  // Reconhecimento implícito ao Negociar: o devedor quer negociar → reconhece a
-  // dívida. Grava os efeitos append-only (o prompt já foi respondido pela rota).
-  await persistDebtRecognition({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    customerId: input.customerId,
-    debtId: input.debtId,
-    promptId: input.promptId,
-    buttonId: input.buttonId,
-    acknowledged: true,
-    source: "chat_button_negotiate",
-    ip: input.ip,
-    userAgent: input.userAgent,
-  })
-
-  // Kickoff n8n CONFIÁVEL sem travar o clique: dispara negotiation.start e AGUARDA
-  // até um deadline CURTO (default 2500ms) via Promise.race. `waitForDispatch:true`
-  // é passado DE PROPÓSITO (garante que o disparo é de fato iniciado e não é
-  // perdido pelo serverless num fire-and-forget puro); o race contra o deadline
-  // nos protege da trava do POST síncrono. Se entregar dentro do deadline, promove
-  // engine_owner a 'n8n' já nesta resposta; se estourar, o clique retorna em ≤2.5s
-  // e o disparo segue resolvendo em background (emitNegotiationStart tem timeout
-  // próprio ~5s < maxDuration=60s e grava engine_owner/auditoria ao concluir).
-  // NUNCA lança.
-  let engineOwner: "platform" | "n8n" = "platform"
-  const deadlineMs = input.dispatchDeadlineMs ?? 2500
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+  // Parcelas da matriz (assistido SEMPRE — A2 item 1). A confirmação T2 precede a
+  // pergunta das parcelas no histórico (gravada só quando há parcelas). NUNCA
+  // lança: falha → cai na espera.
+  let presented: PresentMatrixOffersResult | null = null
   try {
-    const start = await Promise.race<StartN8nResult>([
-      startN8nNegotiation({
-        companyId: input.companyId,
-        sessionId: input.sessionId,
-        customerId: input.customerId,
-        debtId: input.debtId,
-        waitForDispatch: true,
-      }),
-      new Promise<StartN8nResult>((resolve) => {
-        deadlineTimer = setTimeout(
-          () => resolve({ ok: true, owner: "platform", delivered: false }),
-          deadlineMs,
-        )
-        // não segura o event loop: o dispatch, se estourar o deadline, segue solto
-        // e o timer não deve impedir o encerramento da função serverless nem do teste.
-        deadlineTimer.unref?.()
-      }),
-    ])
-    engineOwner = start.owner
+    presented = await presentMatrixOffers({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      customerId: input.customerId,
+      debtId: input.debtId,
+      precedingWrite: () =>
+        persistAssistantMessage({
+          companyId: input.companyId,
+          sessionId: input.sessionId,
+          text: NEGOTIATE_ACK_TEXT,
+        }),
+    })
   } catch (err) {
-    console.warn("[journey] negotiation.start falhou (fallback assistido):", (err as Error).message)
-  } finally {
-    if (deadlineTimer) clearTimeout(deadlineTimer)
+    console.warn("[journey] presentMatrixOffers (legado) falhou (cai na espera):", (err as Error).message)
+  }
+  const offersPresented = !!presented && presented.ok && presented.presented === true
+  const prompt = offersPresented && presented && presented.ok && presented.presented ? presented.prompt : null
+
+  let reply = NEGOTIATE_ACK_TEXT
+  if (!offersPresented) {
+    // Sem parcelas (sem faixa de matriz/falha): indicador "trabalhando" até o n8n
+    // empurrar o próximo turno (via chat.send) ou a espera degradar (D2). Sem PII.
+    reply =
+      "Perfeito! Então vamos trabalhar juntos para sanar o seu débito. " +
+      "Estou preparando sua negociação, só um instante…"
+    // SEMPRE persiste o reply localmente (o histórico não depende do n8n).
+    await persistAssistantMessage({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      text: reply,
+    })
   }
 
-  // Indicador "trabalhando": até o n8n empurrar o próximo turno (via chat.send), a
-  // única sinalização de que a negociação está em curso é este reply. Deixa
-  // explícito que estamos PREPARANDO a negociação (o front o mostra no pollMessages
-  // pós-clique; a resposta do n8n aparece depois por polling normal). Sem PII.
-  const reply =
-    "Perfeito! Então vamos trabalhar juntos para sanar o seu débito. " +
-    "Estou preparando sua negociação, só um instante…"
-  // SEMPRE persiste o reply localmente (bug histórico: condicionar a
-  // engineOwner==='platform' deixava o lado do assistente VAZIO no banco quando o
-  // n8n era assumido dono mas NÃO devolvia/empurrava nada — a sessão reaberta só
-  // trazia a pergunta + o clique). Como o handoff n8n agora é best-effort/em
-  // background e a entrega não é garantida (papel B não confirmado no clique), o
-  // histórico não pode depender dele: gravamos o reply aqui, incondicionalmente.
-  await persistAssistantMessage({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    text: reply,
-  })
-  return { ok: true, engineOwner, reply }
+  // Kickoff: aguarda só o que resta do deadline curto (Promise.race). Se entregou,
+  // engine_owner devolvido = o gravado no banco ('n8n'); senão platform/pending.
+  const deadlineMs = input.dispatchDeadlineMs ?? kickoffDeadlineMs()
+  const kick = await kickoff.settle(Math.max(0, deadlineMs - (Date.now() - t0)))
+  return { ok: true, engineOwner: kick.owner, reply, kickoff: kick.status, offersPresented, prompt }
 }
 
 /**

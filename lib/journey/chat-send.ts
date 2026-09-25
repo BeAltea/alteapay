@@ -11,12 +11,132 @@
 // dedupe por event_id é local (chat_messages não repetem para o mesmo event_id).
 
 import { createServiceClient } from "@/lib/supabase/service"
-import { validateButtons, type Button } from "./buttons"
-import { createPrompt, closeActivePrompt, type PromptRow } from "./prompts"
+import {
+  assertBooleanButtons,
+  BTN_BACK,
+  BTN_HANDOFF,
+  BTN_NO,
+  BTN_YES,
+  validateButtons,
+  type Button,
+} from "./buttons"
+import {
+  createPrompt,
+  closeActivePrompt,
+  getActivePrompt,
+  isProtectedPlatformPrompt,
+  type PromptRow,
+} from "./prompts"
 import { recordEvent } from "./events"
 import type { SessionCtx } from "./actions"
 
 const DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000
+
+// ---------------------------------------------------------------------------
+// A2 (N-D2-5) — ACIONABILIDADE de um prompt vindo do n8n. Regra §2.3/§2.5 (D1
+// híbrido): o assistido da plataforma é a rede de segurança sempre presente; o
+// n8n só CONDUZ (substitui o menu ativo) quando manda um prompt que a plataforma
+// sabe executar no clique. "Acionável" = validateButtons OK **e** ação mapeável:
+//   - offer_choice: todo item de lista (2..97) carrega `value` = offer_id de uma
+//     oferta 'presented' desta sessão (a matriz é do SERVIDOR — D8/D11);
+//   - payment_method_choice: itens com `value` ∈ {PIX, BOLETO, CREDIT_CARD};
+//   - kinds booleanos (debt_acknowledgement, generic_yes_no,
+//     payment_confirmation): catálogo Sim/Não (+99);
+//   - kind desconhecido: só se TODO botão for reservado (0/1/98/99) ou mapear um
+//     offer_id da sessão;
+//   - kinds reservados à plataforma (debt_three_options, debt_consult,
+//     post_payment_link): nunca (colidiriam com a semântica do assistido).
+// Puro e testável. Texto sem prompt NUNCA passa por aqui (não supersede nada).
+// ---------------------------------------------------------------------------
+export type PromptActionability = { ok: true; reason: string } | { ok: false; code: string }
+
+const BILLING_TYPE_VALUES: ReadonlySet<string> = new Set(["PIX", "BOLETO", "CREDIT_CARD"])
+const PLATFORM_RESERVED_KINDS: ReadonlySet<string> = new Set(["debt_three_options", "debt_consult", "post_payment_link"])
+const BOOLEAN_KINDS: ReadonlySet<string> = new Set(["debt_acknowledgement", "generic_yes_no", "payment_confirmation"])
+
+function isReservedId(id: number): boolean {
+  return id === BTN_YES || id === BTN_NO || id === BTN_BACK || id === BTN_HANDOFF
+}
+
+export function assessPromptActionability(
+  prompt: { kind: string; buttons: Button[] },
+  sessionOfferIds: ReadonlySet<string>,
+): PromptActionability {
+  const verdict = validateButtons(prompt.buttons)
+  if (!verdict.ok) return { ok: false, code: verdict.error }
+  const kind = (prompt.kind ?? "").trim()
+  if (!kind) return { ok: false, code: "kind_missing" }
+  if (PLATFORM_RESERVED_KINDS.has(kind)) return { ok: false, code: "kind_reserved_platform" }
+
+  const listItems = prompt.buttons.filter((b) => !isReservedId(b.id))
+  const mapsOffer = (b: Button) => typeof b.value === "string" && sessionOfferIds.has(b.value)
+
+  if (kind === "offer_choice") {
+    if (listItems.length === 0) return { ok: false, code: "offer_choice_without_items" }
+    if (!listItems.every(mapsOffer)) return { ok: false, code: "offer_id_unknown" }
+    return { ok: true, reason: "offer_choice_matrix" }
+  }
+  if (kind === "payment_method_choice") {
+    if (listItems.length === 0) return { ok: false, code: "payment_method_without_items" }
+    if (!listItems.every((b) => typeof b.value === "string" && BILLING_TYPE_VALUES.has(b.value))) {
+      return { ok: false, code: "billing_type_unknown" }
+    }
+    return { ok: true, reason: "payment_method_choice" }
+  }
+  if (BOOLEAN_KINDS.has(kind)) {
+    const bool = assertBooleanButtons(prompt.buttons)
+    if (!bool.ok) return { ok: false, code: bool.error }
+    return { ok: true, reason: "boolean_prompt" }
+  }
+  // kind desconhecido: acionável só quando TODO botão é mapeável pela plataforma.
+  if (!listItems.every(mapsOffer)) return { ok: false, code: "button_action_unmapped" }
+  return { ok: true, reason: "all_buttons_mapped" }
+}
+
+/** offer_ids 'presented' (válidas) da sessão — o universo de valores que um
+ *  botão de lista pode mapear. Leitura enxuta; nunca lança (vazio em falha). */
+async function sessionPresentedOfferIds(sessionId: string): Promise<Set<string>> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_offers")
+      .select("id")
+      .eq("session_id", sessionId)
+      .eq("status", "presented")
+    return new Set(((data ?? []) as Array<{ id: string }>).map((o) => o.id))
+  } catch {
+    return new Set()
+  }
+}
+
+type ProtectedGuard =
+  | { actionable: true; protectedActive: boolean }
+  | { actionable: false; refusal: { ok: false; status: 422; code: string; message: string } }
+
+/**
+ * Guard do supersede (A2): se o prompt ATIVO é um menu protegido do assistido da
+ * plataforma, o prompt do n8n só entra se for acionável; senão 422 e o assistido
+ * fica. Sem prompt protegido ativo → comportamento legado (supersede livre).
+ */
+async function guardProtectedActive(
+  ctx: SessionCtx,
+  prompt: { kind: string; buttons: Button[] },
+): Promise<ProtectedGuard> {
+  const active = await getActivePrompt(ctx.sessionId)
+  if (!isProtectedPlatformPrompt(active)) return { actionable: true, protectedActive: false }
+  const offerIds = await sessionPresentedOfferIds(ctx.sessionId)
+  const verdict = assessPromptActionability(prompt, offerIds)
+  if (verdict.ok) return { actionable: true, protectedActive: true }
+  return {
+    actionable: false,
+    refusal: {
+      ok: false,
+      status: 422,
+      code: "prompt_not_actionable",
+      message: `prompt do n8n não acionável (${verdict.code}); o menu assistido (${active!.kind}) foi preservado`,
+    },
+  }
+}
 
 export interface ChatSendArgs {
   text: string
@@ -64,11 +184,17 @@ export async function chatSend(
   }
 
   // valida botões ANTES de qualquer escrita (rejeita ids inválidos)
+  let promptActionable = false
   if (args.prompt) {
     const verdict = validateButtons(args.prompt.buttons)
     if (!verdict.ok) {
       return { ok: false, status: 422, code: verdict.error, message: "botões inválidos" }
     }
+    // A2 (N-D2-5): com um menu protegido do assistido ATIVO, o prompt só entra se
+    // for acionável (422 caso contrário — nada é gravado; o assistido fica).
+    const guard = await guardProtectedActive(ctx, args.prompt)
+    if (!guard.actionable) return guard.refusal
+    promptActionable = true
   }
 
   // dedupe local por event_id
@@ -105,6 +231,8 @@ export async function chatSend(
   // ("Estou preparando…" → resposta real), leitura natural. A dedup por conteúdo
   // abaixo usa o TEXTO exato, e o placeholder tem texto diferente das respostas do
   // n8n, então nunca há falso-positivo de duplicata entre eles.
+  // Texto SEM prompt nunca toca chat_prompts (não supersede, não cala o
+  // assistido — provado em D2 §4.3); só a bolha é gravada.
   let prompt: PromptRow | null = null
   if (args.prompt) {
     const created = await createPrompt({
@@ -115,6 +243,7 @@ export async function chatSend(
       buttons: args.prompt.buttons,
       createdBy: "n8n",
       n8nExecutionId: args.n8n_execution_id ?? null,
+      actionable: promptActionable,
     })
     if (!created.ok) {
       return { ok: false, status: 422, code: created.error, message: "falha ao criar prompt" }
@@ -159,11 +288,16 @@ export type PromptAskResult =
   | { ok: true; prompt_id: string }
   | { ok: false; status: number; code: string; message: string }
 
-/** prompt.ask (papel B): cria só um prompt (sem mensagem). */
+/** prompt.ask (papel B): cria só um prompt (sem mensagem). A2: com um menu
+ *  protegido do assistido ativo, só um prompt ACIONÁVEL substitui (senão 422). */
 export async function promptAsk(
   ctx: SessionCtx,
   args: { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string },
 ): Promise<PromptAskResult> {
+  const verdict = validateButtons(args.buttons)
+  if (!verdict.ok) return { ok: false, status: 422, code: verdict.error, message: "botões inválidos" }
+  const guard = await guardProtectedActive(ctx, { kind: args.kind, buttons: args.buttons })
+  if (!guard.actionable) return guard.refusal
   const created = await createPrompt({
     companyId: ctx.companyId,
     sessionId: ctx.sessionId,
@@ -172,6 +306,7 @@ export async function promptAsk(
     buttons: args.buttons,
     createdBy: "n8n",
     n8nExecutionId: args.n8n_execution_id ?? null,
+    actionable: true,
   })
   if (!created.ok) {
     return { ok: false, status: 422, code: created.error, message: "prompt inválido" }
@@ -179,8 +314,23 @@ export async function promptAsk(
   return { ok: true, prompt_id: created.prompt.id }
 }
 
-/** prompt.close (papel B): supersede o prompt ativo da sessão. */
-export async function promptClose(ctx: SessionCtx): Promise<{ ok: true; closed: boolean }> {
+export type PromptCloseResult =
+  | { ok: true; closed: boolean }
+  | { ok: false; status: 422; code: "platform_prompt_protected"; message: string }
+
+/** prompt.close (papel B): supersede o prompt ativo da sessão. A2: NÃO fecha um
+ *  menu protegido do assistido da plataforma (fechar sem substituir por algo
+ *  acionável deixaria o devedor sem caminho) → 422 e o assistido fica. */
+export async function promptClose(ctx: SessionCtx): Promise<PromptCloseResult> {
+  const active = await getActivePrompt(ctx.sessionId)
+  if (isProtectedPlatformPrompt(active)) {
+    return {
+      ok: false,
+      status: 422,
+      code: "platform_prompt_protected",
+      message: `o menu assistido ativo (${active!.kind}) só é substituído por um prompt acionável (chat.send/prompt.ask)`,
+    }
+  }
   const closed = await closeActivePrompt(ctx.sessionId)
   return { ok: true, closed }
 }
