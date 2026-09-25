@@ -9,6 +9,8 @@ import { buildPinnedDebt } from "@/lib/journey/pinned-debt"
 import { buildRecap } from "@/lib/journey/recap"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 export async function GET(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
@@ -61,15 +63,18 @@ export async function GET(req: NextRequest) {
     return Number(row.thread_epoch) === currentEpoch
   })
 
-  // Anexa o botão-link externo (ex.: quitação → #contato) quando a mensagem o
-  // carrega em offers_snapshot.message_action. A UI renderiza como <a> abaixo da
-  // bolha; offers_snapshot cru não vaza para o cliente. Sem PII.
+  // Anexa o botão-link (ex.: quitação → #contato; link de pagamento) quando a
+  // mensagem o carrega em offers_snapshot.message_action, e o marcador de
+  // estágio (offers_snapshot.stage: greeting | detail | payment_link |
+  // not_recognized | payment_claim — A1) que a poda/retomada usa. A UI renderiza
+  // a ação como <a> abaixo da bolha; offers_snapshot cru não vaza. Sem PII.
   const messages = inCurrentThread.map((m) => {
-    const snapshot = m.offers_snapshot as { message_action?: unknown } | null
+    const snapshot = m.offers_snapshot as { message_action?: unknown; stage?: unknown } | null
     const action =
       snapshot && typeof snapshot === "object" && snapshot.message_action ? snapshot.message_action : null
+    const stage = snapshot && typeof snapshot === "object" && typeof snapshot.stage === "string" ? snapshot.stage : null
     const { offers_snapshot: _drop, archived_at: _arch, ...rest } = m as Record<string, unknown>
-    return action ? { ...rest, action } : rest
+    return { ...rest, ...(action ? { action } : {}), ...(stage ? { stage } : {}) }
   })
 
   const { data: activePromptRaw } = await supabase

@@ -3,17 +3,29 @@
 //
 // Fluxo:
 //  - integridade do clique (§2.3): prompt da sessão + ativo + botão existe,
-//    senão 409 prompt_not_active / 404 prompt_not_found / 409 button_invalid;
+//    senão 409 prompt_stale / 404 prompt_not_found / 409 button_invalid;
+//  - A1 (N-D3-3/N-D1-4) — 409 NUNCA é mudo: se o prompt clicado já não está
+//    ativo mas o prompt ATIVO da sessão tem o MESMO kind e o MESMO button_id, o
+//    clique é RE-ALVEJADO para o ativo (a intenção do devedor é a mesma — 2ª aba/
+//    client atrasado ainda funcionam; auditoria com payload.retargeted_from);
+//    senão 409 { code:'prompt_stale', active_prompt } para o client re-hidratar
+//    e avisar, nunca reabilitar o mesmo menu em silêncio;
 //  - se o prompt é debt_acknowledgement → recordAcknowledgement grava os 4
 //    efeitos e (Não/[99]) aplica on_debt_not_recognized (continue|dispute|human);
-//  - senão → answerPrompt (marca answered + grava a mensagem do cliente);
+//  - senão → answerPrompt (marca answered + grava a mensagem do cliente + evento);
 //  - engine ativa (n8n) → envia um turno de BOTÃO ao fluxo (Apêndice A.2) e
 //    devolve o reply; engine disabled → próxima etapa determinística (sem reply).
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
 import { createServiceClient } from "@/lib/supabase/service"
-import { getPrompt, answerPrompt } from "@/lib/journey/prompts"
+import {
+  answerPrompt,
+  getActivePrompt,
+  getPrompt,
+  promptView,
+  type PromptRow,
+} from "@/lib/journey/prompts"
 import {
   buildAckContext,
   debtConsultReply,
@@ -24,6 +36,7 @@ import {
   persistAssistantMessage,
   presentMatrixOffers,
   recognizeImplicit,
+  recognizeImplicitOnce,
   recordAcknowledgement,
   reopenThreeOptions,
   resolveCreditorChannel,
@@ -31,7 +44,7 @@ import {
   startN8nNegotiation,
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
-import { payService } from "@/lib/journey/pay"
+import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { engineName } from "@/lib/negotiation/engine"
 import {
   BTN_BACK,
@@ -41,9 +54,12 @@ import {
   BTN_NO,
   BTN_PAY,
   BTN_YES,
+  findButton,
 } from "@/lib/journey/buttons"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 export const maxDuration = 60
 
 function clientIp(req: NextRequest): string | null {
@@ -74,6 +90,30 @@ async function markWaitingForEngine(sessionId: string): Promise<void> {
   }
 }
 
+/**
+ * A1 — 409 com o prompt ATIVO no corpo (mesmo shape do GET /api/chat/messages),
+ * para o client re-hidratar SEM round-trip extra e avisar o devedor. Nunca mudo.
+ */
+async function staleResponse(sessionId: string) {
+  const active = await getActivePrompt(sessionId).catch(() => null)
+  return NextResponse.json(
+    { ok: false, error: "prompt_stale", code: "prompt_stale", active_prompt: promptView(active) },
+    { status: 409 },
+  )
+}
+
+/** debt_ids/primary_debt_id do contexto do prompt (fallback: dívida do ctx). */
+function debtIdsOf(prompt: PromptRow, fallbackDebtId: string): { debtIds: string[]; primaryDebtId: string } {
+  const debtIds = Array.isArray((prompt.context as { debt_ids?: unknown } | null)?.debt_ids)
+    ? ((prompt.context as { debt_ids: string[] }).debt_ids)
+    : [fallbackDebtId]
+  const primaryDebtId =
+    (typeof (prompt.context as { primary_debt_id?: unknown } | null)?.primary_debt_id === "string"
+      ? (prompt.context as { primary_debt_id: string }).primary_debt_id
+      : null) ?? fallbackDebtId
+  return { debtIds, primaryDebtId }
+}
+
 export async function POST(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return NextResponse.json({ error: "not found" }, { status: 404 })
@@ -86,17 +126,37 @@ export async function POST(req: NextRequest) {
   if (!ctx) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
 
   const body = await req.json().catch(() => ({} as Record<string, unknown>))
-  const promptId = String(body.prompt_id ?? "")
+  let promptId = String(body.prompt_id ?? "")
   const buttonId = Number(body.button_id)
   if (!promptId || !Number.isInteger(buttonId)) {
     return NextResponse.json({ error: "prompt_id e button_id obrigatórios" }, { status: 422 })
   }
 
-  const prompt = await getPrompt(promptId, ctx.sessionId)
+  let prompt = await getPrompt(promptId, ctx.sessionId)
   if (!prompt) return NextResponse.json({ error: "prompt não encontrado", code: "prompt_not_found" }, { status: 404 })
+
+  // A1 — RE-ALVEJAMENTO (N-D3-3): prompt clicado já não está ativo (respondido/
+  // substituído: 2ª aba, poll atrasado, clique duplo tardio). Se o prompt ATIVO
+  // tem o MESMO kind e contém o MESMO button_id, a intenção é a mesma → o clique
+  // vale para o ativo. Senão, 409 prompt_stale com o ativo no corpo (nunca mudo).
+  let retargetedFrom: string | null = null
+  if (prompt.status !== "active") {
+    const active = await getActivePrompt(ctx.sessionId)
+    if (active && active.kind === prompt.kind && findButton(active.buttons ?? [], buttonId)) {
+      retargetedFrom = prompt.id
+      prompt = active
+      promptId = active.id
+    } else {
+      return NextResponse.json(
+        { ok: false, error: "prompt_stale", code: "prompt_stale", active_prompt: promptView(active) },
+        { status: 409 },
+      )
+    }
+  }
 
   const ip = clientIp(req)
   const userAgent = req.headers.get("user-agent")
+  const answerInput = { sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId, retargetedFrom }
 
   // R1 — ESCOLHA DE PARCELA (kind 'offer_choice'): o devedor escolheu uma das
   // OPÇÕES DE PARCELAMENTO DETERMINÍSTICAS da matriz (apresentadas no fallback
@@ -111,16 +171,13 @@ export async function POST(req: NextRequest) {
   if (prompt.kind === "offer_choice") {
     try {
       // 1) integridade do clique (ativo/botão existe) + grava a mensagem do cliente.
-      const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
-      if (!answered.ok) return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+      const answered = await answerPrompt(answerInput)
+      if (!answered.ok) {
+        if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+        return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+      }
 
-      const debtIds = Array.isArray((prompt.context as { debt_ids?: unknown } | null)?.debt_ids)
-        ? ((prompt.context as { debt_ids: string[] }).debt_ids)
-        : [ctx.debtId]
-      const primaryDebtId =
-        (typeof (prompt.context as { primary_debt_id?: unknown } | null)?.primary_debt_id === "string"
-          ? (prompt.context as { primary_debt_id: string }).primary_debt_id
-          : null) ?? ctx.debtId
+      const { debtIds, primaryDebtId } = debtIdsOf(prompt, ctx.debtId)
 
       // --- VOLTA [98] → reabre o menu de 3 opções (M7). ----------------------
       if (buttonId === BTN_BACK) {
@@ -151,7 +208,8 @@ export async function POST(req: NextRequest) {
       }
       // O reconhecimento IMPLÍCITO já foi gravado no clique NEGOCIAR (M4) que
       // apresentou estas ofertas; o guard D18 já está destravado. acceptMatrixCondition
-      // reusa paymentCreateOrExistingLink (guard duplo D7 + revalidação de matriz).
+      // reusa paymentCreateOrExistingLink (guard duplo D7 + revalidação de matriz)
+      // e persiste o link (outcome) + o prompt pós-link.
       const accepted = await acceptMatrixCondition(ctx, offerId)
       if (!accepted.ok) {
         // Rótulo de negócio (não erro de transporte): o D2 mostra a copy humana
@@ -201,11 +259,48 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // A1 (N-D1-3) — PROMPT PÓS-LINK (kind 'post_payment_link'), persistido pelo
+  // servidor logo após a bolha do link: [98] reabre o menu curto de 3 opções;
+  // [99] transfere ao atendimento. ("Já paguei este valor" é afordância do client
+  // sob este prompt → POST /api/chat/reopen {action:'payment_claim'}.)
+  if (prompt.kind === POST_PAYMENT_LINK_KIND) {
+    try {
+      const answered = await answerPrompt(answerInput)
+      if (!answered.ok) {
+        if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+        return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+      }
+      const { debtIds, primaryDebtId } = debtIdsOf(prompt, ctx.debtId)
+      if (buttonId === BTN_BACK) {
+        const back = await reopenThreeOptions({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+          debtIds, primaryDebtId,
+        })
+        if (!back.ok) {
+          return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
+        }
+        return NextResponse.json({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply })
+      }
+      if (buttonId === BTN_HANDOFF) {
+        await transferToHuman(ctx, "handoff_button", "customer")
+        return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+      }
+      return NextResponse.json({ ok: true, button_id: buttonId })
+    } catch (err) {
+      console.error("[chat:button] post_payment_link falhou:", (err as Error).message)
+      return NextResponse.json(
+        { ok: false, code: "post_payment_link_flow_error", error: "post_payment_link_flow_error" },
+        { status: 500 },
+      )
+    }
+  }
+
   // Onda "3 opções" (§6.1, §6.2, M2–M7): menu pós-login com Pagar(4) › Negociar(1)
   // › Não reconheço(0) (+ Atendimento[99]); depois do "Não reconheço", volta[98].
   //  - Pagar [4]     → reconhecimento IMPLÍCITO + payService(ctx) do D3 (link ASAAS);
   //  - Negociar [1]  → reconhecimento IMPLÍCITO + negotiation.start + apresenta as
   //                    parcelas da matriz (fallback assistido R1) OU arma a espera D2;
+  //  - Detalhes [2]  → detalhes da dívida (outcome) + menu curto, sem saudação;
   //  - Não reconheço [0] → ack negativo + copy do cedente (fallback seguro) + volta;
   //  - Volta [98]    → reabre o menu de 3 opções (M7);
   //  - Atendente [99] → handoff.
@@ -214,32 +309,28 @@ export async function POST(req: NextRequest) {
   // {code:'three_options_flow_error'} e o front re-habilita os botões.
   if (prompt.kind === "debt_three_options") {
     try {
-      // 1) integridade do clique (ativo/botão existe) + grava a mensagem do cliente.
-      const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
-      if (!answered.ok) return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
-
-      const debtIds = Array.isArray((prompt.context as { debt_ids?: unknown } | null)?.debt_ids)
-        ? ((prompt.context as { debt_ids: string[] }).debt_ids)
-        : [ctx.debtId]
-      const primaryDebtId =
-        (typeof (prompt.context as { primary_debt_id?: unknown } | null)?.primary_debt_id === "string"
-          ? (prompt.context as { primary_debt_id: string }).primary_debt_id
-          : null) ?? ctx.debtId
+      const { debtIds, primaryDebtId } = debtIdsOf(prompt, ctx.debtId)
 
       // --- PAGAR [4] ---------------------------------------------------------
       if (buttonId === BTN_PAY) {
+        // 1) integridade do clique + eco + evento.
+        const answered = await answerPrompt(answerInput)
+        if (!answered.ok) {
+          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+        }
         // Reconhecimento IMPLÍCITO ANTES do payService (M4): destrava o guard D18.
-        await recognizeImplicit({
+        // A1 (N-D1-5): NÃO regrava se a sessão já reconheceu (clique repetido).
+        await recognizeImplicitOnce({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtId: ctx.debtId, promptId, buttonId, source: "chat_three_options_pay", ip, userAgent,
         })
         // payService (trilha D3): oferta integral 0% → link ASAAS canônico. NUNCA
-        // 2ª cobrança; NUNCA declara pago. A copy humana (link/erro) é da UI (D2);
-        // aqui devolvemos o shape estruturado para o D2 renderizar. Passamos os
-        // MESMOS debtIds que geraram o rótulo do botão (prompt.context.debt_ids)
-        // para o valor cobrado bater com o valor exibido (D3 ALTO — valor
-        // divergente do botão seria BLOQUEANTE em sessão multi-fatura).
-        const pay = await payService(ctx, { debtIds })
+        // 2ª cobrança; NUNCA declara pago. Persiste a bolha do link (outcome) e o
+        // prompt pós-link ANTES de responder. Passamos os MESMOS debtIds que
+        // geraram o rótulo do botão (prompt.context.debt_ids) para o valor cobrado
+        // bater com o valor exibido (D3 ALTO).
+        const pay = await payService(ctx, { debtIds, primaryDebtId })
         if (!pay.ok) {
           return NextResponse.json(
             { ok: false, button_id: buttonId, action: "pay", error: pay.error },
@@ -250,12 +341,17 @@ export async function POST(req: NextRequest) {
           ok: true, button_id: buttonId, action: "pay", acknowledged: true,
           link: pay.link, valor: pay.valor, vencimento_link: pay.vencimento_link,
           already_charged: pay.already_charged, processing: pay.processing,
-          agreement_id: pay.agreement_id,
+          agreement_id: pay.agreement_id, post_prompt_id: pay.post_prompt_id,
         })
       }
 
       // --- NEGOCIAR [1] ------------------------------------------------------
       if (buttonId === BTN_YES) {
+        const answered = await answerPrompt(answerInput)
+        if (!answered.ok) {
+          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+        }
         // Reconhecimento IMPLÍCITO (M4) — clicar negociar reconhece a dívida.
         await recognizeImplicit({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
@@ -316,24 +412,43 @@ export async function POST(req: NextRequest) {
         })
       }
 
-      // --- CONSULTAR [2] (informativo — NÃO reconhece a dívida) --------------
+      // --- DETALHES DA DÍVIDA [2] (informativo — NÃO reconhece a dívida) ------
+      // A1 (G3/N-D3-1): UM buildAckContext (em paralelo com o answerPrompt — a
+      // leitura é independente do clique); a resposta é persistida como OUTCOME
+      // (prompt_id do prompt respondido + stage 'detail') ANTES do menu; o menu
+      // volta CURTO (sem saudação) reusando o mesmo ackCtx.
       if (buttonId === BTN_CONSULT) {
-        const ackCtx = await buildAckContext({
-          companyId: ctx.companyId, customerId: ctx.customerId, debtIds,
-        })
+        const [answered, ackCtx] = await Promise.all([
+          answerPrompt(answerInput),
+          buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds }),
+        ])
+        if (!answered.ok) {
+          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+        }
         const reply = debtConsultReply(ackCtx)
-        await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
-        // Consultar é informativo: reabre o menu de 3 opções para o devedor seguir
-        // (Pagar/Negociar/Não reconheço). Sem reconhecimento implícito.
-        await reopenThreeOptions({
-          companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-          debtIds, primaryDebtId,
+        await persistAssistantMessage({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply,
+          promptId, stage: "detail",
         })
-        return NextResponse.json({ ok: true, button_id: buttonId, action: "consult", acknowledged: false, reply })
+        const reopened = await reopenThreeOptions({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+          debtIds, primaryDebtId, ackCtx,
+        })
+        return NextResponse.json({
+          ok: true, button_id: buttonId, action: "consult", acknowledged: false, reply,
+          ...(retargetedFrom ? { retargeted_from: retargetedFrom } : {}),
+          prompt_id: reopened.ok ? reopened.promptId : null,
+        })
       }
 
       // --- NÃO RECONHEÇO [0] -------------------------------------------------
       if (buttonId === BTN_NO) {
+        const answered = await answerPrompt(answerInput)
+        if (!answered.ok) {
+          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+        }
         const out = await handleDebtNotRecognized({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtId: ctx.debtId, promptId, buttonId, ip, userAgent,
@@ -353,7 +468,11 @@ export async function POST(req: NextRequest) {
           console.warn(`[chat:button] GNLink: official_channel_label ausente (company=${ctx.companyId}) — usando fallback seguro`)
         }
         const reply = notRecognizedReply(channel)
-        await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
+        // A1: resultado da ação como OUTCOME (ligado ao clique) ANTES do menu-volta.
+        await persistAssistantMessage({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply,
+          promptId, stage: "not_recognized",
+        })
         // Botão de VOLTA (M7): [98] reabre o menu de 3 opções. Só um botão-link de
         // ação; a UI (D2) o renderiza. Persistido como prompt para a re-entrada.
         const { createPrompt } = await import("@/lib/journey/prompts")
@@ -373,6 +492,11 @@ export async function POST(req: NextRequest) {
 
       // --- VOLTA [98] --------------------------------------------------------
       if (buttonId === BTN_BACK) {
+        const answered = await answerPrompt(answerInput)
+        if (!answered.ok) {
+          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+        }
         const back = await reopenThreeOptions({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtIds, primaryDebtId,
@@ -384,12 +508,16 @@ export async function POST(req: NextRequest) {
       }
 
       // --- ATENDIMENTO [99] --------------------------------------------------
+      // (e qualquer botão fora do catálogo esperado: responde, sem efeito.)
+      const answered = await answerPrompt(answerInput)
+      if (!answered.ok) {
+        if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+        return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+      }
       if (buttonId === BTN_HANDOFF) {
         await transferToHuman(ctx, "handoff_button", "customer")
         return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
       }
-
-      // Botão fora do catálogo esperado: já respondido, sem efeito.
       return NextResponse.json({ ok: true, button_id: buttonId })
     } catch (err) {
       console.error("[chat:button] debt_three_options falhou:", (err as Error).message)
@@ -414,18 +542,13 @@ export async function POST(req: NextRequest) {
    try {
     // 1) responde o prompt (marca answered + grava a mensagem do cliente = label).
     //    A integridade do clique (ativo/botão existe) é validada aqui.
-    const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
-    if (!answered.ok) return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+    const answered = await answerPrompt(answerInput)
+    if (!answered.ok) {
+      if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+      return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+    }
 
-    // debtIds do prompt.context (buildAckContext consolida o valor). Fallback: o
-    // debt primário do ctx quando o contexto não trouxer a lista.
-    const debtIds = Array.isArray((prompt.context as { debt_ids?: unknown } | null)?.debt_ids)
-      ? ((prompt.context as { debt_ids: string[] }).debt_ids)
-      : [ctx.debtId]
-    const primaryDebtId =
-      (typeof (prompt.context as { primary_debt_id?: unknown } | null)?.primary_debt_id === "string"
-        ? (prompt.context as { primary_debt_id: string }).primary_debt_id
-        : null) ?? ctx.debtId
+    const { debtIds, primaryDebtId } = debtIdsOf(prompt, ctx.debtId)
 
     if (buttonId === BTN_CONSULT) {
       const out = await handleDebtConsult({
@@ -505,7 +628,10 @@ export async function POST(req: NextRequest) {
       ip,
       userAgent,
     })
-    if (!res.ok) return NextResponse.json({ error: res.code, code: res.code }, { status: res.status })
+    if (!res.ok) {
+      if (res.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+      return NextResponse.json({ error: res.code, code: res.code }, { status: res.status })
+    }
 
     // "Não reconheço" ou [99]: aplica on_debt_not_recognized (default continue).
     if (!res.acknowledged) {
@@ -585,15 +711,21 @@ export async function POST(req: NextRequest) {
 
   // Handoff genérico ([99]) em qualquer prompt: transfere e responde.
   if (buttonId === BTN_HANDOFF) {
-    const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
-    if (!answered.ok) return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+    const answered = await answerPrompt(answerInput)
+    if (!answered.ok) {
+      if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+      return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+    }
     await transferToHuman(ctx, "handoff_button", "customer")
     return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
   }
 
   // Demais prompts: responde (marca answered + grava a mensagem do cliente).
-  const answered = await answerPrompt({ sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId })
-  if (!answered.ok) return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+  const answered = await answerPrompt(answerInput)
+  if (!answered.ok) {
+    if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+    return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
+  }
 
   // Engine ativa (n8n): envia um turno de BOTÃO e devolve o reply. Engine
   // disabled: a próxima etapa é determinística (sem reply do n8n).

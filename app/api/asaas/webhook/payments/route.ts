@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
+import { effectiveAsaasStatusFromWebhook } from "@/lib/asaas-idempotency"
 
 /**
  * ASAAS Payment Webhook Endpoint
@@ -261,8 +262,12 @@ export async function POST(request: NextRequest) {
     const newDebtStatus = DEBT_STATUS_MAP[event]
 
     // 8. Build the update object for agreement
+    // N-D1-2: o ASAAS mantém status=PENDING numa cobrança deletada (só liga
+    // `deleted:true`). Gravar payment.status cru deixava asaas_status='PENDING'
+    // e o guard local (isBlockingAgreement) travava o devedor em already_charged
+    // com link morto. DELETED/REFUNDED passam a ser persistidos explicitamente.
     const agreementUpdate: Record<string, any> = {
-      asaas_status: payment.status,
+      asaas_status: effectiveAsaasStatusFromWebhook(event, payment),
       asaas_last_webhook_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }

@@ -1,5 +1,5 @@
 // Trilha PAGAR AGORA (§6.4, M13–M16) — caminho canônico, 100% NOSSO (independe
-// do n8n): o botão "Quero pagar — R$ X" gera o link ASAAS na hora.
+// do n8n): o botão "Pagar R$ X" gera o link ASAAS na hora.
 //
 // payService(ctx) é o serviço server-side que a rota /api/chat/button (trilha D1)
 // chama no clique PAGAR (button_id=4). NÃO reimplementa cobrança: reusa o
@@ -23,16 +23,37 @@
 //   • Erro do ASAAS → { ok:false, error } com RÓTULO CURTO (a copy humana é da
 //     UI, §5.4). NUNCA vaza mensagem crua/HTTP/nome de sistema externo.
 //
+// A1 (2026-09-25, G1 com dado fresco):
+//   • latência (N-D1-1): debtSummary/buildAcceptSummary/buildAckContext UMA vez,
+//     eventos em paralelo, sem criar+rejeitar oferta integral por clique repetido
+//     (reusa a oferta `accepted` do acordo VIVO — N-D1-5);
+//   • o RESULTADO é persistido como outcome (bolha do link com
+//     offers_snapshot.message_action = open_payment_link + stage 'payment_link')
+//     e, LOGO APÓS, o servidor persiste o prompt pós-link (kind
+//     'post_payment_link': [98 Voltar às opções] [99 Falar com atendimento]) —
+//     o painel do client deriva da mensagem persistida e sobrevive ao reload
+//     (N-D1-3/N-D1-8);
+//   • already_charged só com cobrança VIVA (N-D1-2): a resposta idempotente
+//     (mesma oferta já aceita) também é reportada como already_charged.
+//
 // PII: nada de nome/CPF/e-mail/telefone em log ou no retorno.
 
-import { buildAckContext, persistAssistantMessage } from "./acknowledgement"
-import { debtSummary, type SessionCtx } from "./actions"
+import {
+  buildAckContext,
+  persistAssistantMessage,
+  REOPEN_MENU_QUESTION,
+  type MessageAction,
+} from "./acknowledgement"
+import { debtSummary, type DebtSummary, type SessionCtx } from "./actions"
+import { BTN_BACK, BTN_HANDOFF, type Button } from "./buttons"
 import { recordEvent } from "./events"
 import {
   paymentCreateOrExistingLink,
   type PaymentDetails,
 } from "./payment-actions"
+import { createPrompt, getActivePrompt, type PromptRow } from "./prompts"
 import { createServiceClient } from "@/lib/supabase/service"
+import { isBlockingAgreement } from "@/lib/asaas-idempotency"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import {
   persistOffer,
@@ -100,26 +121,111 @@ export function payLinkMessageText(input: {
   return `${head}${vencPart}. É só abrir e escolher entre Pix, boleto ou cartão. O link é pessoal e seguro.${linkLine}`
 }
 
+/** Marcador de estágio da bolha do link (offers_snapshot.stage). */
+export const PAYMENT_LINK_STAGE = "payment_link"
+
+/** Kind do prompt pós-link (servidor persiste após a bolha do link — N-D1-3). */
+export const POST_PAYMENT_LINK_KIND = "post_payment_link"
+
+/** Ação anexada à bolha do link: o client renderiza "Abrir link de pagamento"
+ *  (+ "Copiar link") a partir DESTA mensagem persistida (fonte única, N-D1-8). */
+export function paymentLinkAction(href: string): MessageAction {
+  return { type: "open_payment_link", label: "Abrir link de pagamento", href }
+}
+
+/** Botões do prompt pós-link: [98 Voltar às opções] [99 Falar com atendimento].
+ *  O client mantém a afordância "Já paguei este valor" sob este prompt. */
+export function postPaymentLinkButtons(): Button[] {
+  return [
+    { id: BTN_BACK, label: "Voltar às opções", order: 0 },
+    { id: BTN_HANDOFF, label: "Falar com atendimento", order: 1 },
+  ]
+}
+
 /**
- * R7 — persiste a mensagem do link no histórico da sessão. Best-effort e
- * IDEMPOTENTE: persistAssistantMessage deduplica por conteúdo (mesmo link/valor
- * numa janela curta), então clique repetido / already_charged não empilha. Uma
- * falha aqui NÃO derruba o pagamento (o link já volta no corpo do POST/payResult).
+ * R7/A1 — persiste a bolha do link (OUTCOME) no histórico da sessão, com a ação
+ * `open_payment_link` e o stage 'payment_link'. Best-effort e IDEMPOTENTE:
+ * persistAssistantMessage deduplica por conteúdo (mesmo link/valor/copy numa
+ * janela curta) — clique repetido não empilha. Uma falha aqui NÃO derruba o
+ * pagamento (o link já volta no corpo do POST). Devolve o id da bolha (ou null).
  */
-async function persistPayLinkMessage(
+export async function persistPaymentLinkMessage(
   ctx: SessionCtx,
-  input: { link: string | null; valor: number | null; vencimentoLink: string | null; alreadyCharged: boolean },
-): Promise<void> {
+  input: {
+    link: string | null
+    valor: number | null
+    vencimentoLink: string | null
+    alreadyCharged: boolean
+    agreementId?: string | null
+  },
+): Promise<string | null> {
   // Sem link nenhum não há o que restaurar (processing persiste depois, no poll).
-  if (!input.link) return
+  if (!input.link) return null
   try {
-    await persistAssistantMessage({
+    return await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
       text: payLinkMessageText(input),
+      stage: PAYMENT_LINK_STAGE,
+      action: paymentLinkAction(input.link),
+      snapshot: {
+        agreement_id: input.agreementId ?? null,
+        already_charged: input.alreadyCharged,
+        valor: input.valor,
+        vencimento_link: input.vencimentoLink,
+      },
     })
   } catch (err) {
-    console.warn("[journey] persistPayLinkMessage falhou (não fatal):", (err as Error).message)
+    console.warn("[journey] persistPaymentLinkMessage falhou (não fatal):", (err as Error).message)
+    return null
+  }
+}
+
+/**
+ * A1 (N-D1-3) — o SERVIDOR persiste, logo após a bolha do link, o prompt pós-link
+ * (kind 'post_payment_link', pergunta curta, [98 Voltar às opções] [99 Falar com
+ * atendimento]). Assim o próximo passo NÃO vive só no client: após F5 o devedor
+ * ainda tem link + ações. Idempotente: se já há um post_payment_link ATIVO para o
+ * MESMO link, reusa. Best-effort: NUNCA lança (o link já foi entregue).
+ */
+export async function publishPostPaymentLinkPrompt(
+  ctx: SessionCtx,
+  input: { link: string | null; agreementId: string | null; debtIds: string[]; primaryDebtId?: string | null },
+): Promise<PromptRow | null> {
+  if (!input.link) return null
+  try {
+    const active = await getActivePrompt(ctx.sessionId)
+    if (active && active.kind === POST_PAYMENT_LINK_KIND) {
+      const link = (active.context as { link?: unknown } | null)?.link
+      if (link === input.link) return active
+    }
+    const created = await createPrompt({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      kind: POST_PAYMENT_LINK_KIND,
+      question: REOPEN_MENU_QUESTION,
+      buttons: postPaymentLinkButtons(),
+      context: {
+        stage: "post_payment_link",
+        link: input.link,
+        agreement_id: input.agreementId,
+        debt_ids: input.debtIds,
+        primary_debt_id: input.primaryDebtId ?? ctx.debtId,
+      },
+      createdBy: "platform",
+    })
+    if (!created.ok) return null
+    await persistAssistantMessage({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      text: REOPEN_MENU_QUESTION,
+      promptId: created.prompt.id,
+      skipContentDedup: true,
+    })
+    return created.prompt
+  } catch (err) {
+    console.warn("[journey] publishPostPaymentLinkPrompt falhou (não fatal):", (err as Error).message)
+    return null
   }
 }
 
@@ -145,6 +251,8 @@ export interface PayServiceOk {
    *  A UI faz polling via /api/chat/payment; NUNCA declara pago. */
   processing: boolean
   agreement_id: string | null
+  /** id do prompt pós-link persistido pelo servidor (null se sem link). */
+  post_prompt_id: string | null
 }
 
 export interface PayServiceErr {
@@ -155,6 +263,15 @@ export interface PayServiceErr {
 
 export type PayServiceResult = PayServiceOk | PayServiceErr
 
+function isIntegralTerms(t: OfferTerms | null, valor: number): boolean {
+  return (
+    !!t &&
+    t.installments === 1 &&
+    Number(t.discount_value ?? 0) === 0 &&
+    Math.abs(Number(t.total_value) - valor) <= 0.01
+  )
+}
+
 /**
  * Gera (ou reusa) a oferta INTEGRAL 0% da sessão e devolve o offer_id.
  *
@@ -164,58 +281,64 @@ export type PayServiceResult = PayServiceOk | PayServiceErr
  * (source 'system'), então paymentCreateOrExistingLink cobra ELA pelo caminho
  * canônico (com revalidação de matriz: uma oferta 0%/1x sempre cabe na faixa).
  *
- * Idempotência do PRÓPRIO passo: se já existe uma oferta integral 0% presented
- * nesta sessão, reusa (não empilha ofertas a cada clique repetido em PAGAR).
+ * Idempotência do PRÓPRIO passo (N-D1-5): reusa
+ *   - uma oferta integral ainda 'presented' nesta sessão, ou
+ *   - uma oferta integral já 'accepted' cujo acordo continua VIVO (cobrança em
+ *     aberto) — paymentCreate devolve o MESMO acordo/link (idempotente) sem criar
+ *     e rejeitar uma oferta nova a cada clique repetido.
+ * Uma oferta aceita cujo acordo foi cancelado/deletado NÃO é reusada: o clique
+ * gera oferta nova → cobrança nova (runbook Q3.5).
  */
 async function ensureIntegralOffer(
   ctx: SessionCtx,
   debtIds: string[],
 ): Promise<
-  | { ok: true; offerId: string; valor: number }
+  | { ok: true; offerId: string; valor: number; summary?: DebtSummary }
   | { ok: false; error: string }
 > {
   // Valor canônico (fonte única do rótulo do botão e do e-mail — D39/D41). O
   // conjunto `debtIds` é o MESMO que gerou o rótulo do botão (o menu de 3 opções
-  // persiste debt_ids no prompt.context e a rota os repassa). Sem isso, o valor
-  // cobrado somaria só a dívida primária enquanto o rótulo somava todas — em
-  // sessão multi-fatura o devedor clicaria "R$ 500,00" e a cobrança sairia
-  // "R$ 250,00" (D3 ALTO: valor divergente do botão = BLOQUEANTE, §6.4/4).
-  const ack = await buildAckContext({
-    companyId: ctx.companyId,
-    customerId: ctx.customerId,
-    debtIds,
-  })
+  // persiste debt_ids no prompt.context e a rota os repassa).
+  const supabase = createServiceClient()
+  const [ack, { data: candidates }] = await Promise.all([
+    buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds }),
+    supabase
+      .from("negotiation_offers")
+      .select("id, terms, status")
+      .eq("session_id", ctx.sessionId)
+      .in("status", ["presented", "accepted"]),
+  ])
   const valor = round2(ack.updatedValue)
   if (!(valor > 0)) return { ok: false, error: "no_open_amount" }
 
-  // Reusa uma oferta integral já apresentada nesta sessão (clique repetido em
-  // PAGAR não deve empilhar ofertas). Leitura DIRETA (sem listOffers, que geraria
-  // as ofertas COM desconto da matriz como efeito colateral — não queremos isso
-  // no caminho "à vista integral").
-  const supabase = createServiceClient()
-  const { data: presented } = await supabase
-    .from("negotiation_offers")
-    .select("id, terms")
-    .eq("session_id", ctx.sessionId)
-    .eq("status", "presented")
-  const integral = (presented ?? []).find((o) => {
-    const t = o.terms as OfferTerms | null
-    return (
-      !!t &&
-      t.installments === 1 &&
-      Number(t.discount_value ?? 0) === 0 &&
-      Math.abs(Number(t.total_value) - valor) <= 0.01
-    )
-  })
-  if (integral) return { ok: true, offerId: integral.id, valor }
+  const integrals = ((candidates ?? []) as Array<{ id: string; terms: OfferTerms | null; status: string }>).filter((o) =>
+    isIntegralTerms(o.terms, valor),
+  )
+  const presented = integrals.find((o) => o.status === "presented")
+  if (presented) return { ok: true, offerId: presented.id, valor }
+
+  // Oferta integral já ACEITA: só reusa se o acordo dela continua VIVO.
+  for (const accepted of integrals.filter((o) => o.status === "accepted")) {
+    const { data: acc } = await supabase
+      .from("negotiation_acceptances")
+      .select("agreement_id")
+      .eq("offer_id", accepted.id)
+      .maybeSingle()
+    const agreementId = (acc as { agreement_id?: string | null } | null)?.agreement_id
+    if (!agreementId) continue
+    const { data: ag } = await supabase
+      .from("agreements")
+      .select("id, asaas_payment_id, payment_status, asaas_status, status")
+      .eq("id", agreementId)
+      .eq("company_id", ctx.companyId)
+      .maybeSingle()
+    if (ag && isBlockingAgreement(ag)) return { ok: true, offerId: accepted.id, valor }
+  }
 
   // Resolve a faixa da matriz vigente para o (aging, valor) do débito. Sem
   // linha de matriz → sem billing permitido conhecido → rótulo curto (a UI cai
-  // no menu com atendimento). A revalidação de matriz do payment.create também
-  // barraria depois; aqui damos o erro cedo e legível. debtValue = `valor`
-  // (valor efetivamente cobrado = updatedValue consolidado), NÃO o originalValue
-  // da dívida primária: garante que a BANDA da matriz corresponde ao que será
-  // cobrado (D3 BAIXO), consistente com o rótulo do botão.
+  // no menu com atendimento). debtValue = `valor` (valor efetivamente cobrado =
+  // updatedValue consolidado), consistente com o rótulo do botão.
   const summary = await debtSummary(ctx)
   const row = await resolveMatrixRow({
     companyId: ctx.companyId,
@@ -265,7 +388,7 @@ async function ensureIntegralOffer(
     actor: "system",
     payload: { offer_id: offerId, integral: true, installments: 1, discount_pct: 0 },
   })
-  return { ok: true, offerId, valor }
+  return { ok: true, offerId, valor, summary }
 }
 
 /**
@@ -275,7 +398,7 @@ async function ensureIntegralOffer(
  * Fluxo: oferta integral 0% (ensureIntegralOffer) → paymentCreateOrExistingLink
  * (guard idempotência D7 + revalidação de matriz + guard de reconhecimento +
  * already_charged/D23) → charge-inline via closeAgreement (CHARGE_MODE=inline) →
- * link.
+ * link → bolha do link (outcome) → prompt pós-link.
  *
  * @param opts.debtIds conjunto de dívidas cobradas — DEVE ser o MESMO que gerou o
  *                rótulo do botão (o menu de 3 opções persiste debt_ids no
@@ -286,7 +409,7 @@ async function ensureIntegralOffer(
  */
 export async function payService(
   ctx: SessionCtx,
-  opts?: { debtIds?: string[]; eventId?: string },
+  opts?: { debtIds?: string[]; eventId?: string; primaryDebtId?: string | null },
 ): Promise<PayServiceResult> {
   const eventId = opts?.eventId
   // Conjunto de dívidas cobradas = o MESMO do rótulo do botão (D3 ALTO). Sem
@@ -294,51 +417,31 @@ export async function payService(
   const debtIds =
     opts?.debtIds && opts.debtIds.length > 0 ? opts.debtIds : [ctx.debtId]
 
-  // Telemetria: clique PAGAR chegou (gerando_cobranca). Sem PII.
-  await recordEvent({
-    companyId: ctx.companyId,
-    customerId: ctx.customerId,
-    debtId: ctx.debtId,
-    sessionId: ctx.sessionId,
-    type: "pay.requested",
-    actor: "customer",
-    payload: { option: "pagar" },
-  }).catch(() => {})
-
-  const offer = await ensureIntegralOffer(ctx, debtIds)
+  // Telemetria (clique PAGAR chegou) em PARALELO com a oferta integral.
+  const [, offer] = await Promise.all([
+    recordEvent({
+      companyId: ctx.companyId,
+      customerId: ctx.customerId,
+      debtId: ctx.debtId,
+      sessionId: ctx.sessionId,
+      type: "pay.requested",
+      actor: "customer",
+      payload: { option: "pagar" },
+    }).catch(() => ({ ok: false, duplicate: false })),
+    ensureIntegralOffer(ctx, debtIds),
+  ])
   if (!offer.ok) {
     await emitPayFailed(ctx, offer.error)
     return { ok: false, error: offer.error }
   }
 
-  const r = await paymentCreateOrExistingLink(ctx, offer.offerId, eventId)
+  const r = await paymentCreateOrExistingLink(ctx, offer.offerId, eventId, { summary: offer.summary })
 
   if (!r.ok) {
     // Rótulo curto e estável (a copy humana é da UI, §5.4). NUNCA a mensagem
     // crua do ASAAS/HTTP/"n8n". Guards conhecidos (409/422) e erro genérico.
     await emitPayFailed(ctx, r.code)
     return { ok: false, error: r.code }
-  }
-
-  if (r.status === "already_charged") {
-    // D23/M14: devolve o LINK EXISTENTE, nunca cria 2ª cobrança.
-    await emitPayLinkReady(ctx, r.payment, { already_charged: true })
-    // R7 — grava o link no histórico (idempotente): reload/reuso restaura o link.
-    await persistPayLinkMessage(ctx, {
-      link: linkOf(r.payment),
-      valor: offer.valor,
-      vencimentoLink: r.payment?.due_date ?? null,
-      alreadyCharged: true,
-    })
-    return {
-      ok: true,
-      link: linkOf(r.payment),
-      valor: offer.valor,
-      vencimento_link: r.payment?.due_date ?? null,
-      already_charged: true,
-      processing: false,
-      agreement_id: r.payment?.agreement_id ?? null,
-    }
   }
 
   if (r.status === "processing") {
@@ -362,31 +465,52 @@ export async function payService(
       already_charged: false,
       processing: true,
       agreement_id: r.agreement_id,
+      post_prompt_id: null,
     }
   }
 
-  // status: 'created' — link pronto (inline).
-  await emitPayLinkReady(ctx, r.payment, { already_charged: false })
-  // R7 — grava o link no histórico (idempotente): reload/reuso restaura o link.
-  await persistPayLinkMessage(ctx, {
-    link: linkOf(r.payment),
-    valor: offer.valor,
-    vencimentoLink: r.payment.due_date ?? null,
-    alreadyCharged: false,
+  // already_charged (guard D7/D23: acordo vivo, link existente) OU resposta
+  // IDEMPOTENTE (a mesma oferta integral já aceita → mesmo acordo/link): nos dois
+  // casos o devedor JÁ tem esta cobrança — copy "você já tem uma cobrança ativa".
+  const alreadyCharged = r.status === "already_charged" || (r.status === "created" && r.idempotent === true)
+  const payment = r.payment
+  const link = linkOf(payment)
+  const vencimento = payment?.due_date ?? null
+  const agreementId = payment?.agreement_id ?? null
+
+  // Resultado da ação como OUTCOME, ANTES de qualquer menu: bolha do link
+  // (com ação/stage) + telemetria em paralelo; depois o prompt pós-link.
+  await Promise.all([
+    emitPayLinkReady(ctx, payment, { already_charged: alreadyCharged }),
+    persistPaymentLinkMessage(ctx, {
+      link,
+      valor: offer.valor,
+      vencimentoLink: vencimento,
+      alreadyCharged,
+      agreementId,
+    }),
+  ])
+  const post = await publishPostPaymentLinkPrompt(ctx, {
+    link,
+    agreementId,
+    debtIds,
+    primaryDebtId: opts?.primaryDebtId ?? ctx.debtId,
   })
+
   return {
     ok: true,
-    link: linkOf(r.payment),
+    link,
     valor: offer.valor,
-    vencimento_link: r.payment.due_date ?? null,
-    already_charged: false,
+    vencimento_link: vencimento,
+    already_charged: alreadyCharged,
     processing: false,
-    agreement_id: r.payment.agreement_id,
+    agreement_id: agreementId,
+    post_prompt_id: post?.id ?? null,
   }
 }
 
 /** Melhor URL de pagamento: invoice (checkout ASAAS) › boleto › PIX copia-e-cola. */
-function linkOf(p: PaymentDetails | null): string | null {
+export function linkOf(p: PaymentDetails | null): string | null {
   if (!p) return null
   return p.invoice_url ?? p.boleto_url ?? p.pix_copy_paste ?? null
 }

@@ -372,10 +372,14 @@ export async function handlePaymentClaim(
   const reply = paymentClaimReply(creditor.name)
   try {
     const { persistAssistantMessage } = await import("./acknowledgement")
+    // A1: resultado da ação como OUTCOME (stage 'payment_claim') — persistido
+    // ANTES de o menu ser reemitido pelo chamador.
     await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
       text: reply,
+      stage: "payment_claim",
+      snapshot: { case_id: caseId },
     })
   } catch (err) {
     console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)

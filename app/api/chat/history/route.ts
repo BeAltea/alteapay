@@ -6,6 +6,8 @@ import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { customerHistory } from "@/lib/journey/history"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 export async function GET(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {

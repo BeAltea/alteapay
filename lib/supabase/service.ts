@@ -2,10 +2,15 @@ import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "./url"
 
 /**
- * @param opts.noStore injeta `fetch` com `cache: 'no-store'` — para leituras que
- *   NÃO podem ser cacheadas pelo Data Cache do Next (ex.: flags MUTÁVEIS do link
- *   público `public_link_enabled`/`public_link_valid_until`, que precisam
- *   refletir ligar/DESLIGAR em tempo real, inclusive rollback/kill rápido).
+ * Client de service role (server-side).
+ *
+ * N1 (2026-09-25): o `fetch` interno do supabase-js é interceptado pelo Data
+ * Cache do Next 14 em Route Handlers/serverless (Netlify "Durable"): a MESMA URL
+ * de PostgREST (ex.: o prompt ativo da sessão) voltava congelada por dezenas de
+ * minutos mesmo com `dynamic = "force-dynamic"`. Um client de service role
+ * nunca deve servir leitura cacheada — por isso `cache: 'no-store'` passa a ser
+ * o PADRÃO. A assinatura é mantida: `{ noStore: false }` é o opt-out explícito
+ * (só para quem QUER o Data Cache, hoje ninguém).
  */
 export function createServiceClient(opts?: { noStore?: boolean }) {
   const supabaseUrl = getServerSupabaseUrl()
@@ -15,12 +20,14 @@ export function createServiceClient(opts?: { noStore?: boolean }) {
     throw new Error("Missing Supabase service role credentials")
   }
 
+  const noStore = opts?.noStore !== false
+
   return createClient(supabaseUrl, supabaseServiceKey, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,
     },
-    ...(opts?.noStore
+    ...(noStore
       ? {
           global: {
             fetch: (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>

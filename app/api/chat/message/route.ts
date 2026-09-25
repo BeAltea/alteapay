@@ -11,6 +11,8 @@ import { recordEvent } from "@/lib/journey/events"
 import { MAX_MESSAGE_CHARS } from "@/lib/negotiation/config"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 export const maxDuration = 60
 
 async function sessionFromCookie(req: NextRequest) {

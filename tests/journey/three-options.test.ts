@@ -386,7 +386,7 @@ describe("resumo objetivo + Consultar + reset 24h", () => {
   //  (c) o reply não persistir em chat_messages (com prompt_id null — não filtrado
   //      pelo render de prompt ativo, chat.tsx:942-944).
   // Exercita a ROTA real (não só as libs) para travar o contrato que a UI consome.
-  it("R-01 guard: CONSULTAR devolve reply no corpo do POST + menu active + reply persistido (prompt_id null)", async () => {
+  it("R-01 guard: CONSULTAR devolve reply no corpo do POST + menu active + reply persistido (outcome ligado ao prompt)", async () => {
     const { bootstrapThreeOptionsPrompt } = await import("@/lib/journey/acknowledgement")
     const { POST } = await import("@/app/api/chat/button/route")
     const { signChatJwt } = await import("@/lib/negotiation/crypto")
@@ -410,10 +410,12 @@ describe("resumo objetivo + Consultar + reset 24h", () => {
     const active = db.chat_prompts.find((p) => p.status === "active")
     expect(active!.kind).toBe("debt_three_options")
     expect(active!.id).not.toBe(prompt.id)
-    // (c) reply persistido, com prompt_id null (não some no render de prompt ativo)
+    // (c) reply persistido como OUTCOME (A1): prompt_id do prompt RESPONDIDO (não
+    //     é o ativo → não some no render de prompt ativo) + stage 'detail'
     const replyMsg = db.chat_messages.find((m) => m.role === "assistant" && m.text === body.reply)
     expect(replyMsg).toBeTruthy()
-    expect(replyMsg!.prompt_id == null).toBe(true)
+    expect(replyMsg!.prompt_id).toBe(prompt.id)
+    expect(replyMsg!.offers_snapshot?.stage).toBe("detail")
   })
 
   // C3 — DECISÃO G3 D.3 (fim do DELETE): o reset de 24h PRESERVA as linhas.

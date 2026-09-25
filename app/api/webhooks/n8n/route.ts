@@ -51,6 +51,8 @@ import type { ChatSendArgs } from "@/lib/journey/chat-send"
 import type { Button } from "@/lib/journey/buttons"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 export const maxDuration = 300
 
 const N8N_IP_LIMIT = { limit: 120, windowSeconds: 60 }

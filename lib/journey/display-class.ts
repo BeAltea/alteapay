@@ -66,7 +66,19 @@ export interface ClassifiableMessage {
   promptId?: string | null
   /** texto (usado só para reconhecer o link de pagamento persistido como texto). */
   text?: string | null
+  /** marcador de estágio da bolha (offers_snapshot.stage — A1): 'detail',
+   *  'payment_link', 'not_recognized', 'payment_claim' são RESULTADOS de ação
+   *  (outcome, ligados ao prompt respondido); 'greeting' é a saudação única. */
+  stage?: string | null
 }
+
+/** Estágios que marcam o RESULTADO de uma ação do devedor (outcome, C8). */
+export const OUTCOME_STAGES: ReadonlySet<string> = new Set([
+  "detail",
+  "payment_link",
+  "not_recognized",
+  "payment_claim",
+])
 
 /** Contexto opcional da classificação (sem ele, cai em heurística por sinais). */
 export interface ClassifyContext {
@@ -128,6 +140,11 @@ export function classifyMessage(
   //    Sempre visível/destacado; NUNCA some (C8).
   if (msg.hasAction === true) return "outcome"
   if (carriesPaymentLink(msg.text)) return "outcome"
+  // A1: resultado de ação marcado por stage (ex.: detalhes da dívida ligados ao
+  // prompt respondido) é outcome — NUNCA superseded/colapsado, mesmo com promptId.
+  if (msg.stage && OUTCOME_STAGES.has(msg.stage)) return "outcome"
+  // A1: a saudação única da thread (sem promptId) é guidance.
+  if (msg.stage === "greeting") return "guidance"
 
   // 5) SUPERSEDED: bolha-pergunta de um prompt que NÃO é mais o ativo. A pergunta
   //    do prompt vivo aparece no bloco de botões (filtrada do log); as perguntas

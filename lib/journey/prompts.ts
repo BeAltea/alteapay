@@ -24,7 +24,7 @@ import { recordEvent } from "./events"
  * (comportamento de hoje). O caller só inclui o campo quando > 0 (época 0 = default
  * = dispensa a coluna, para não quebrar em prod antes da migration). NUNCA lança.
  */
-async function currentThreadEpoch(sessionId: string): Promise<number> {
+export async function currentThreadEpoch(sessionId: string): Promise<number> {
   try {
     const supabase = createServiceClient()
     const { data } = await supabase
@@ -57,6 +57,33 @@ export interface PromptRow {
   created_at: string
 }
 
+/**
+ * Shape PÚBLICO do prompt (o mesmo que GET /api/chat/messages devolve em
+ * `active_prompt`): id, kind, question, buttons, status, created_at. Usado pelo
+ * 409 `prompt_stale` do POST /api/chat/button para o client re-hidratar sem um
+ * round-trip extra. Nunca expõe context/épocas.
+ */
+export interface PromptView {
+  id: string
+  kind: string
+  question: string
+  buttons: Button[]
+  status: string
+  created_at: string
+}
+
+export function promptView(p: PromptRow | null | undefined): PromptView | null {
+  if (!p) return null
+  return {
+    id: p.id,
+    kind: p.kind,
+    question: p.question,
+    buttons: p.buttons,
+    status: p.status,
+    created_at: p.created_at,
+  }
+}
+
 export interface CreatePromptInput {
   companyId: string
   sessionId: string
@@ -67,6 +94,8 @@ export interface CreatePromptInput {
   createdBy?: "platform" | "n8n"
   n8nExecutionId?: string | null
   expiresAt?: string | null
+  /** época já lida pelo chamador (evita 1 round-trip); ausente → lê aqui. */
+  threadEpoch?: number
 }
 
 export type CreatePromptResult =
@@ -86,16 +115,21 @@ export async function createPrompt(input: CreatePromptInput): Promise<CreateProm
   const now = new Date().toISOString()
 
   // supersede os ativos anteriores da sessão (transição atômica no nível do row)
-  await supabase
-    .from("chat_prompts")
-    .update({ status: "superseded" })
-    .eq("session_id", input.sessionId)
-    .eq("status", "active")
+  // em PARALELO com a leitura da época (independentes — A1: latência do clique).
+  const [, epoch] = await Promise.all([
+    supabase
+      .from("chat_prompts")
+      .update({ status: "superseded" })
+      .eq("session_id", input.sessionId)
+      .eq("status", "active"),
+    typeof input.threadEpoch === "number"
+      ? Promise.resolve(input.threadEpoch)
+      : currentThreadEpoch(input.sessionId),
+  ])
 
   const buttons = sortButtons(input.buttons)
   // C3: carimba a época corrente (thread) — só quando > 0 (época 0 = default,
   // dispensa a coluna e não quebra em prod antes da 20260935).
-  const epoch = await currentThreadEpoch(input.sessionId)
   const promptRow: Record<string, unknown> = {
     company_id: input.companyId,
     session_id: input.sessionId,
@@ -163,7 +197,10 @@ export type AnswerPromptResult =
  *  - prompt não-'active' (já respondido, superseded, expirado) → 409 prompt_not_active;
  *  - button_id não existe no catálogo → 409 button_invalid.
  * Ao responder: 'answered' (+answered_button_id, +answered_value, +answered_at) e
- * grava chat_messages(role='customer', text=label, button_id, prompt_id).
+ * grava chat_messages(role='customer', text=label, button_id, prompt_id) E o
+ * evento de auditoria `chat.turn.customer` (N-D3-2: TODO clique deixa rastro em
+ * journey_events; `retargeted_from` marca um clique re-alvejado de um prompt
+ * obsoleto para o ativo equivalente — ver POST /api/chat/button).
  * A transição 'active'→'answered' é condicional (eq status='active'): dois
  * cliques concorrentes → só o primeiro converte, o 2º devolve 409.
  */
@@ -172,6 +209,8 @@ export async function answerPrompt(input: {
   companyId: string
   promptId: string
   buttonId: number
+  /** id do prompt obsoleto que o devedor clicou (re-alvejado para este). */
+  retargetedFrom?: string | null
 }): Promise<AnswerPromptResult> {
   const supabase = createServiceClient()
   const prompt = await getPrompt(input.promptId, input.sessionId)
@@ -213,7 +252,24 @@ export async function answerPrompt(input: {
     prompt_id: prompt.id,
   }
   if (clickEpoch > 0) clickRow.thread_epoch = clickEpoch
-  await supabase.from("chat_messages").insert(clickRow)
+  // eco do clique + auditoria em PARALELO (independentes). O evento é dedupado
+  // por (prompt, botão) — um prompt só é respondido uma vez.
+  await Promise.all([
+    supabase.from("chat_messages").insert(clickRow),
+    recordEvent({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      type: "chat.turn.customer",
+      actor: "customer",
+      eventId: `chat.turn.customer|${prompt.id}|${button.id}`,
+      payload: {
+        button_id: button.id,
+        prompt_id: prompt.id,
+        kind: prompt.kind,
+        ...(input.retargetedFrom ? { retargeted_from: input.retargetedFrom } : {}),
+      },
+    }).catch(() => ({ ok: false, duplicate: false })),
+  ])
 
   const answeredRow = Array.isArray(updated) ? (updated[0] as PromptRow) : (updated as PromptRow)
   return { ok: true, prompt: answeredRow, button }

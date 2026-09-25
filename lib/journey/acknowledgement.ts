@@ -106,7 +106,9 @@ export async function buildAckContext(input: {
     firstName,
     creditorName,
     updatedValue,
-    invoiceCount: invoices?.length ?? (debts?.length ?? 0),
+    // N5: `??` nunca caía em debts.length quando vmax_invoices devolvia [] (0 é
+    // não-nulo). Sem faturas VMAX, o nº de faturas é o nº de dívidas abertas.
+    invoiceCount: invoices?.length || debts?.length || 0,
     oldestDueDate: oldestInvoiceDue ?? oldestDebtDue,
   }
 }
@@ -352,14 +354,124 @@ export type BootstrapThreeOptionsResult =
   | { ok: true; created: true; prompt: PromptRow }
   | { ok: false; error: string }
 
+/** Modo do menu de 3 opções: 'initial' (pós-login, com saudação) ou 'reopen'
+ *  (menu reemitido após um clique — Detalhes/Voltar/Já paguei/reopen). */
+export type ThreeOptionsMenuMode = "initial" | "reopen"
+
+/**
+ * Pergunta CURTA do menu reemitido (A1 / §2.3): o menu que volta depois de uma
+ * ação NÃO repete a saudação — só pergunta como seguir.
+ */
+export const REOPEN_MENU_QUESTION = "Como prefere seguir?"
+
+/**
+ * Pergunta do bloco de botões por modo. No menu INICIAL a saudação já é uma
+ * bolha própria do log (stage 'greeting', que termina com "Como você prefere
+ * seguir?") — o bloco de botões vem SEM texto para não repetir a pergunta na
+ * tela (§2.1: card + UMA saudação + UM menu). No reopen, a pergunta curta.
+ */
+export function menuQuestion(mode: ThreeOptionsMenuMode): string {
+  return mode === "reopen" ? REOPEN_MENU_QUESTION : ""
+}
+
+/** Marcador de estágio da bolha de saudação (offers_snapshot.stage). */
+export const GREETING_STAGE = "greeting"
+
+/**
+ * A1 / G6 — persiste a SAUDAÇÃO (threeOptionsSummary) UMA vez por thread
+ * (sessão + thread_epoch), como bolha própria: sem prompt_id (não é a pergunta
+ * de nenhum menu — não vira `superseded` quando o menu é reemitido) e com
+ * `offers_snapshot.stage='greeting'` (marcador para a poda/retomada da A3).
+ * Idempotente por (sessão, época, stage): re-login/reopen NÃO empilham. Best-
+ * effort: NUNCA lança.
+ */
+export async function ensureGreetingMessage(input: {
+  companyId: string
+  sessionId: string
+  text: string
+  threadEpoch?: number
+}): Promise<string | null> {
+  try {
+    const supabase = createServiceClient()
+    const epoch =
+      typeof input.threadEpoch === "number" ? input.threadEpoch : await getCurrentThreadEpoch(input.sessionId)
+    const { data: rows } = await supabase
+      .from("chat_messages")
+      .select("id, offers_snapshot, thread_epoch, archived_at")
+      .eq("session_id", input.sessionId)
+      .eq("role", "assistant")
+      .is("archived_at", null)
+      .order("created_at", { ascending: false })
+      .limit(200)
+    const existing = (rows ?? []).find((r) => {
+      const row = r as { offers_snapshot?: { stage?: unknown } | null; thread_epoch?: number | null }
+      const stage = row.offers_snapshot && typeof row.offers_snapshot === "object" ? row.offers_snapshot.stage : null
+      if (stage !== GREETING_STAGE) return false
+      const e = row.thread_epoch
+      return e == null ? epoch === 0 : Number(e) === epoch
+    })
+    if (existing) return (existing as { id: string }).id
+    return await persistAssistantMessage({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      text: input.text,
+      stage: GREETING_STAGE,
+      threadEpoch: epoch,
+      // a saudação é única por thread — nunca cair no dedup de conteúdo de 15min
+      // (que devolveria a saudação de outra época e não gravaria a desta).
+      skipContentDedup: true,
+    })
+  } catch (err) {
+    console.warn("[journey] ensureGreetingMessage falhou (não-fatal):", (err as Error).message)
+    return null
+  }
+}
+
+/** Contexto do prompt de 3 opções (menu_mode marca initial/reopen). */
+function threeOptionsContext(
+  ackCtx: AckContext,
+  input: { primaryDebtId: string; debtIds: string[] },
+  mode: ThreeOptionsMenuMode,
+): Record<string, unknown> {
+  return {
+    creditor_name: ackCtx.creditorName,
+    updated_value: ackCtx.updatedValue,
+    invoice_count: ackCtx.invoiceCount,
+    oldest_due_date: ackCtx.oldestDueDate,
+    primary_debt_id: input.primaryDebtId,
+    debt_ids: input.debtIds,
+    menu_mode: mode,
+  }
+}
+
+function sameButtons(a: Button[], b: Button[]): boolean {
+  if (a.length !== b.length) return false
+  const key = (x: Button) => `${x.id}|${x.label}|${x.value ?? ""}|${x.order ?? ""}`
+  const as = a.map(key).sort()
+  const bs = b.map(key).sort()
+  return as.every((v, i) => v === bs[i])
+}
+
 /**
  * Cria o prompt INICIAL da sessão no formato de 3 opções (§6.1). Idempotente na
  * RE-ENTRADA: só recria quando NÃO há prompt ativo da jornada
  * (debt_three_options/debt_consult/debt_acknowledgement) — assim uma sessão
  * reaberta não perde o menu, e um reload durante a negociação não duplica o
- * prompt. A pergunta-resumo (com valor/vencimento) é persistida em chat_messages
- * ligada ao prompt (histórico da re-entrada). Respeita acknowledgement_enabled.
- * NÃO grava reconhecimento — só apresenta (o reconhecimento implícito é no clique).
+ * prompt. Respeita acknowledgement_enabled. NÃO grava reconhecimento — só
+ * apresenta (o reconhecimento implícito é no clique).
+ *
+ * A1 (G6/N-D5-7):
+ *  - `mode:'initial'` (default, login): garante a SAUDAÇÃO 1x por thread como
+ *    bolha própria (ensureGreetingMessage) e cria o menu SEM pergunta no bloco de
+ *    botões (a saudação já pergunta);
+ *  - `mode:'reopen'` (Detalhes/Voltar/Já paguei/reopen): menu com a pergunta
+ *    curta e NENHUMA saudação nova;
+ *  - `question` explícita sobrepõe a pergunta do modo;
+ *  - `ackCtx` já calculado pelo chamador evita recalcular (latência);
+ *  - `already_active`: se a pergunta/botões do prompt ativo diferirem do que o
+ *    código gera hoje (copy nova, valor novo), atualiza IN-PLACE (mesmo id e
+ *    status) — a copy nova chega a prompts já gravados. O menu-volta do "não
+ *    reconheço" (stage not_recognized_back) não é tocado.
  */
 export async function bootstrapThreeOptionsPrompt(input: {
   companyId: string
@@ -367,59 +479,109 @@ export async function bootstrapThreeOptionsPrompt(input: {
   customerId: string
   debtIds: string[]
   primaryDebtId: string
+  question?: string
+  mode?: ThreeOptionsMenuMode
+  ackCtx?: AckContext
 }): Promise<BootstrapThreeOptionsResult> {
   const supabase = createServiceClient()
-  const { data: cfg } = await supabase
-    .from("tenant_chat_config")
-    .select("acknowledgement_enabled, show_handoff_button")
-    .eq("company_id", input.companyId)
-    .maybeSingle()
+  const mode: ThreeOptionsMenuMode = input.mode ?? "initial"
+  const [{ data: cfg }, { data: existingRaw }, threadEpoch] = await Promise.all([
+    supabase
+      .from("tenant_chat_config")
+      .select("acknowledgement_enabled, show_handoff_button")
+      .eq("company_id", input.companyId)
+      .maybeSingle(),
+    supabase
+      .from("chat_prompts")
+      .select("*")
+      .eq("session_id", input.sessionId)
+      .in("kind", ["debt_three_options", "debt_consult", "debt_acknowledgement"])
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    getCurrentThreadEpoch(input.sessionId),
+  ])
   if (cfg?.acknowledgement_enabled === false) {
     return { ok: true, created: false, reason: "disabled" }
   }
+  const showHandoff = cfg?.show_handoff_button === true
+  const existing = (existingRaw as PromptRow | null) ?? null
 
-  const { data: existing } = await supabase
-    .from("chat_prompts")
-    .select("*")
-    .eq("session_id", input.sessionId)
-    .in("kind", ["debt_three_options", "debt_consult", "debt_acknowledgement"])
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
+  const ackCtx =
+    input.ackCtx ??
+    (await buildAckContext({
+      companyId: input.companyId,
+      customerId: input.customerId,
+      debtIds: input.debtIds,
+    }))
+  const greeting = threeOptionsSummary(ackCtx)
+
   if (existing) {
-    return { ok: true, created: false, reason: "already_active", prompt: existing as PromptRow }
+    // Saudação 1x por thread: garantida também na re-entrada com menu vivo (a
+    // thread pode ter nascido antes desta regra, sem bolha de saudação).
+    if (mode === "initial") {
+      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+    }
+    // N-D5-7: copy atual no prompt ativo (só o menu payável de 3 opções).
+    const ctx = (existing.context ?? {}) as { stage?: unknown; menu_mode?: unknown }
+    const isPayableMenu =
+      existing.kind === "debt_three_options" &&
+      ctx.stage !== "not_recognized_back" &&
+      (existing.buttons ?? []).some((b) => b.id === BTN_PAY)
+    if (isPayableMenu) {
+      const existingMode: ThreeOptionsMenuMode =
+        ctx.menu_mode === "reopen" || ctx.menu_mode === "initial" ? ctx.menu_mode : mode
+      const expectedQuestion = input.question ?? menuQuestion(existingMode)
+      const expectedButtons = threeOptionsButtons(ackCtx.updatedValue, showHandoff)
+      const questionDiffers = existing.question !== expectedQuestion
+      const buttonsDiffer = !sameButtons(existing.buttons ?? [], expectedButtons)
+      if (questionDiffers || buttonsDiffer) {
+        const patch: Record<string, unknown> = {}
+        if (questionDiffers) patch.question = expectedQuestion
+        if (buttonsDiffer) patch.buttons = expectedButtons
+        patch.context = { ...(existing.context ?? {}), ...threeOptionsContext(ackCtx, input, existingMode) }
+        const { data: refreshed } = await supabase
+          .from("chat_prompts")
+          .update(patch)
+          .eq("id", existing.id)
+          .eq("session_id", input.sessionId)
+          .eq("status", "active")
+          .select("*")
+        const row = Array.isArray(refreshed) && refreshed[0] ? (refreshed[0] as PromptRow) : { ...existing, ...patch } as PromptRow
+        return { ok: true, created: false, reason: "already_active", prompt: row }
+      }
+    }
+    return { ok: true, created: false, reason: "already_active", prompt: existing }
   }
 
-  const ackCtx = await buildAckContext({
-    companyId: input.companyId,
-    customerId: input.customerId,
-    debtIds: input.debtIds,
-  })
-  const question = threeOptionsSummary(ackCtx)
+  // Saudação ANTES do menu (ordem cronológica na tela): só no modo inicial e só
+  // uma vez por thread.
+  if (mode === "initial") {
+    await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+  }
+
+  const question = input.question ?? menuQuestion(mode)
   const created = await createPrompt({
     companyId: input.companyId,
     sessionId: input.sessionId,
     kind: "debt_three_options",
     question,
-    buttons: threeOptionsButtons(ackCtx.updatedValue, cfg?.show_handoff_button === true),
-    context: {
-      creditor_name: ackCtx.creditorName,
-      updated_value: ackCtx.updatedValue,
-      invoice_count: ackCtx.invoiceCount,
-      oldest_due_date: ackCtx.oldestDueDate,
-      primary_debt_id: input.primaryDebtId,
-      debt_ids: input.debtIds,
-    },
+    buttons: threeOptionsButtons(ackCtx.updatedValue, showHandoff),
+    context: threeOptionsContext(ackCtx, input, mode),
     createdBy: "platform",
+    threadEpoch,
   })
   if (!created.ok) return { ok: false, error: created.error }
 
+  // A pergunta do menu (quando houver) fica ligada ao prompt (histórico/painel);
+  // no modo inicial a pergunta é vazia → nada a persistir (a saudação já está).
   await persistAssistantMessage({
     companyId: input.companyId,
     sessionId: input.sessionId,
     text: question,
     promptId: created.prompt.id,
+    threadEpoch,
   })
   return { ok: true, created: true, prompt: created.prompt }
 }
@@ -545,10 +707,12 @@ export async function bootstrapThreeOptionsSafe(input: {
 }
 
 /**
- * Reabre o menu de 3 opções após "Não reconheço" → volta ([98]). Recria o prompt
- * de 3 opções com a mesma mensagem-resumo. Reusa bootstrapThreeOptionsPrompt (que
- * é idempotente); se ainda houver um prompt ativo (não deveria — o clique de volta
- * já respondeu o prompt do "não reconheço"), devolve o ativo.
+ * Reemite o menu de 3 opções depois de uma ação (Detalhes [2], Voltar [98],
+ * "Já paguei", /api/chat/reopen). A1 / G6: modo 'reopen' — pergunta CURTA
+ * ("Como prefere seguir?") e NENHUMA saudação nova (a saudação é 1x por thread).
+ * Reusa bootstrapThreeOptionsPrompt (idempotente); se ainda houver um prompt
+ * ativo, devolve o ativo. `ackCtx` do chamador evita o 2º buildAckContext
+ * (N-D3-5). O `reply` devolvido é a pergunta curta (o client não injeta bolha).
  */
 export async function reopenThreeOptions(input: {
   companyId: string
@@ -556,15 +720,11 @@ export async function reopenThreeOptions(input: {
   customerId: string
   debtIds: string[]
   primaryDebtId: string
-}): Promise<{ ok: true; reply: string } | { ok: false; error: string }> {
-  const res = await bootstrapThreeOptionsPrompt(input)
+  ackCtx?: AckContext
+}): Promise<{ ok: true; reply: string; promptId: string | null } | { ok: false; error: string }> {
+  const res = await bootstrapThreeOptionsPrompt({ ...input, mode: "reopen" })
   if (!res.ok) return res
-  const ackCtx = await buildAckContext({
-    companyId: input.companyId,
-    customerId: input.customerId,
-    debtIds: input.debtIds,
-  })
-  return { ok: true, reply: threeOptionsSummary(ackCtx) }
+  return { ok: true, reply: REOPEN_MENU_QUESTION, promptId: res.prompt?.id ?? null }
 }
 
 // ============================================================================
@@ -1005,66 +1165,100 @@ export async function bootstrapAcknowledgementPrompt(input: {
   return { ok: true, created: true, prompt: created.prompt }
 }
 
+/** Ação anexada a uma bolha (botão-link renderizado pelo client abaixo dela). */
+export interface MessageAction {
+  type: "external_link" | "open_payment_link"
+  label: string
+  href: string
+}
+
 /**
  * Grava uma mensagem do assistente em chat_messages (engine='platform', fluxo
  * assistido). Reusa o mesmo caminho que /api/chat/messages lê. Idempotente por
- * `prompt_id` quando informado (a pergunta do reconhecimento é gravada uma única
- * vez, mesmo que o bootstrap rode de novo). O texto já é neutro/sem PII (o resumo
- * do reconhecimento não expõe documento). NUNCA lança — uma falha aqui não pode
- * derrubar a criação do prompt nem o processamento do clique.
+ * (prompt_id, stage) quando `promptId` é informado: a pergunta de um prompt é
+ * gravada uma única vez (stage null), e uma resposta ligada ao prompt respondido
+ * (ex.: stage 'detail') idem — os dois convivem no mesmo prompt_id. O texto já é
+ * neutro/sem PII. NUNCA lança — uma falha aqui não pode derrubar a criação do
+ * prompt nem o processamento do clique.
+ *
+ * `stage` e `action` vão para offers_snapshot ({ stage, message_action, ... }):
+ * marcadores que a rota /api/chat/messages expõe ao client (stage/action) e que
+ * a poda/retomada (A3) usa para classificar outcome/greeting.
  */
 export async function persistAssistantMessage(input: {
   companyId: string
   sessionId: string
   text: string
   promptId?: string | null
+  /** marcador de estágio (greeting | detail | payment_link | not_recognized | payment_claim). */
+  stage?: string | null
+  /** botão-link anexado à bolha (offers_snapshot.message_action). */
+  action?: MessageAction | null
+  /** campos extras de offers_snapshot (ex.: agreement_id). */
+  snapshot?: Record<string, unknown> | null
+  /** época já lida pelo chamador (evita 1 round-trip). */
+  threadEpoch?: number
+  /** pula o dedup de conteúdo de 15min (bolhas únicas por natureza, ex.: saudação). */
+  skipContentDedup?: boolean
 }): Promise<string | null> {
   const text = (input.text ?? "").trim()
   if (!text) return null
   const supabase = createServiceClient()
+  const stage = input.stage ?? null
+  // Um OUTCOME ligado ao clique (stage + promptId — ex.: detalhes da dívida do
+  // prompt X) é uma resposta ÀQUELE clique: não cai no dedup de conteúdo de 15min
+  // (a idempotência por (prompt_id, stage) já impede a duplicata do mesmo clique;
+  // textos idênticos de cliques distintos colapsam só na EXIBIÇÃO, no client).
+  const skipContentDedup = input.skipContentDedup === true || (!!stage && !!input.promptId)
   try {
-    // idempotência: a pergunta de um prompt é gravada uma única vez.
-    if (input.promptId) {
-      const { data: existing } = await supabase
-        .from("chat_messages")
-        .select("id")
-        .eq("session_id", input.sessionId)
-        .eq("prompt_id", input.promptId)
-        .eq("role", "assistant")
-        .limit(1)
-        .maybeSingle()
-      if (existing) return (existing as { id: string }).id
-    }
+    // Leituras INDEPENDENTES em paralelo (A1: latência do clique): idempotência por
+    // (prompt_id, stage), dedup por conteúdo (15min) e época corrente.
+    const since = new Date(Date.now() - 15 * 60_000).toISOString()
+    const [byPrompt, byContent, epoch] = await Promise.all([
+      input.promptId
+        ? supabase
+            .from("chat_messages")
+            .select("id, offers_snapshot")
+            .eq("session_id", input.sessionId)
+            .eq("prompt_id", input.promptId)
+            .eq("role", "assistant")
+            .limit(20)
+        : Promise.resolve({ data: null as Array<{ id: string; offers_snapshot?: unknown }> | null }),
+      skipContentDedup
+        ? Promise.resolve({ data: null as { id: string } | null })
+        : supabase
+            .from("chat_messages")
+            .select("id")
+            .eq("session_id", input.sessionId)
+            .eq("role", "assistant")
+            .eq("text", text)
+            .gte("created_at", since)
+            .limit(1)
+            .maybeSingle(),
+      typeof input.threadEpoch === "number"
+        ? Promise.resolve(input.threadEpoch)
+        : getCurrentThreadEpoch(input.sessionId),
+    ])
+
+    // idempotência: a pergunta (stage null) / a resposta (stage X) de um prompt é
+    // gravada uma única vez cada.
+    const existing = ((byPrompt.data ?? []) as Array<{ id: string; offers_snapshot?: unknown }>).find((r) => {
+      const snap = r.offers_snapshot && typeof r.offers_snapshot === "object" ? (r.offers_snapshot as { stage?: unknown }) : null
+      const rowStage = snap && typeof snap.stage === "string" ? snap.stage : null
+      return rowStage === stage
+    })
+    if (existing) return existing.id
 
     // DEDUP POR CONTEÚDO — "manter só a última" (mesmo padrão provado em
-    // chat-send.ts:87-99). Fluxos plataforma (debtInfoMessage, replies de
-    // Negociar/Não-reconheço) e o re-bootstrap da saudação re-persistiam texto
-    // IDÊNTICO a cada clique/re-entrada — sem promptId, ou com um prompt NOVO
-    // (a idempotência por prompt_id acima não pega prompt novo). Se uma mensagem
+    // chat-send.ts:87-99). Fluxos plataforma re-persistiam texto IDÊNTICO a cada
+    // clique/re-entrada — sem promptId, ou com um prompt NOVO. Se uma mensagem
     // 'assistant' com o MESMO texto já existe nesta sessão nos últimos 15min, NÃO
-    // re-insere: devolve o id existente. O texto já é neutro/mascarado (valor/venc
-    // ok, sem documento) — nenhuma PII nova é envolvida. Cobre também o caminho COM
-    // promptId (saudação re-bootstrapada com prompt novo → mesmo texto suprimido; o
-    // prompt/menu é recriado por createPrompt, mas a bolha não duplica).
-    const since = new Date(Date.now() - 15 * 60_000).toISOString()
-    const { data: dup } = await supabase
-      .from("chat_messages")
-      .select("id")
-      .eq("session_id", input.sessionId)
-      .eq("role", "assistant")
-      .eq("text", text)
-      .gte("created_at", since)
-      .limit(1)
-      .maybeSingle()
-    if (dup) return (dup as { id: string }).id
+    // re-insere: devolve o id existente.
+    const dup = byContent.data as { id: string } | null
+    if (dup) return dup.id
 
-    // C3: carimba a ÉPOCA corrente na bolha nova, para o GET filtrar a thread atual
-    // (o reset 24h incrementa thread_epoch; sem o carimbo, uma bolha nova cairia na
-    // época 0/velha). Best-effort: se a coluna não existir (20260935 pendente em
-    // prod), o insert com thread_epoch é ignorado pelo PostgREST? Não — colunas
-    // desconhecidas causam erro. Por isso lemos a época e só incluímos o campo
-    // quando > 0 (época 0 = default = comportamento de hoje, dispensa a coluna).
-    const epoch = await getCurrentThreadEpoch(input.sessionId)
+    // C3: carimba a ÉPOCA corrente na bolha nova (só quando > 0 — época 0 =
+    // default = dispensa a coluna e não quebra em prod antes da 20260935).
     const insertRow: Record<string, unknown> = {
       company_id: input.companyId,
       session_id: input.sessionId,
@@ -1074,6 +1268,10 @@ export async function persistAssistantMessage(input: {
       prompt_id: input.promptId ?? null,
     }
     if (epoch > 0) insertRow.thread_epoch = epoch
+    const snapshot: Record<string, unknown> = { ...(input.snapshot ?? {}) }
+    if (stage) snapshot.stage = stage
+    if (input.action) snapshot.message_action = input.action
+    if (Object.keys(snapshot).length > 0) insertRow.offers_snapshot = snapshot
     const { data } = await supabase
       .from("chat_messages")
       .insert(insertRow)
@@ -1632,6 +1830,31 @@ export async function recognizeImplicit(input: {
     ip: input.ip,
     userAgent: input.userAgent,
   })
+}
+
+/**
+ * A1 / N-D1-5: reconhecimento implícito SEM regravar. Se a sessão já tem um
+ * reconhecimento positivo para a dívida (view debt_acknowledgement_latest), NÃO
+ * grava outro (3 escritas a menos por clique repetido em PAGAR). Senão, delega a
+ * recognizeImplicit. Nunca lança além do que recognizeImplicit lança.
+ */
+export async function recognizeImplicitOnce(
+  input: Parameters<typeof recognizeImplicit>[0],
+): Promise<{ recorded: boolean }> {
+  // Lê o APPEND-LOG (fonte da view debt_acknowledgement_latest): a última
+  // resposta desta (sessão, dívida). Positiva → nada a regravar.
+  const supabase = createServiceClient()
+  const { data: latest } = await supabase
+    .from("debt_acknowledgements")
+    .select("acknowledged, created_at")
+    .eq("session_id", input.sessionId)
+    .eq("debt_id", input.debtId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if ((latest as { acknowledged?: boolean } | null)?.acknowledged === true) return { recorded: false }
+  await recognizeImplicit(input)
+  return { recorded: true }
 }
 
 export type AckGuard =

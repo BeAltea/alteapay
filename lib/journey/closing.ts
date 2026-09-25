@@ -60,6 +60,9 @@ export interface ConfirmAcceptInput {
   ip?: string | null
   userAgent?: string | null
   eventId?: string
+  /** A1 (N-D1-1): resumo JÁ montado pelo chamador (paymentCreate) — evita o 2º
+   *  buildAcceptSummary. Só é usado se o termsHash bater. */
+  pre?: AcceptSummary
 }
 
 export type ConfirmAcceptResult =
@@ -81,14 +84,18 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
     .maybeSingle()
   if (prevAccept?.agreement_id) return { ok: true, agreementId: prevAccept.agreement_id }
 
-  const pre = await buildAcceptSummary(ctx, input.offerId)
+  const pre =
+    input.pre && input.pre.offerId === input.offerId && input.pre.termsHash === input.termsHash
+      ? ({ ok: true, summary: input.pre } as const)
+      : await buildAcceptSummary(ctx, input.offerId)
   if (!pre.ok) return { ok: false, error: pre.error as "OFFER_NOT_AVAILABLE" | "OFFER_EXPIRED" }
   if (pre.summary.termsHash !== input.termsHash) return { ok: false, error: "TERMS_CHANGED" }
 
-  // ---- guard D7, nível local
+  // ---- guard D7, nível local (status/payment_status terminais têm precedência —
+  //      acordo cancelado/cobrança deletada NUNCA bloqueia, N-D1-2)
   const { data: agreements } = await supabase
     .from("agreements")
-    .select("id, asaas_payment_id, payment_status, asaas_status")
+    .select("id, asaas_payment_id, payment_status, asaas_status, status")
     .eq("customer_id", ctx.customerId)
     .eq("company_id", ctx.companyId)
     .not("asaas_payment_id", "is", null)
@@ -166,9 +173,12 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
     sessionId: ctx.sessionId, agreementId: closed.agreement_id,
   }
-  await recordEvent({ ...base, eventId: input.eventId, type: "offer.accepted", actor: "customer", payload: { offer_id: input.offerId } })
-  await recordEvent({ ...base, type: "agreement.created", actor: "system" })
-  await recordEvent({ ...base, type: "payment.generated", actor: "system", payload: { billing_type: pre.summary.terms.billing_type, installments: pre.summary.terms.installments } })
+  // eventos em PARALELO (independentes; A1: latência do PAGAR).
+  await Promise.all([
+    recordEvent({ ...base, eventId: input.eventId, type: "offer.accepted", actor: "customer", payload: { offer_id: input.offerId } }),
+    recordEvent({ ...base, type: "agreement.created", actor: "system" }),
+    recordEvent({ ...base, type: "payment.generated", actor: "system", payload: { billing_type: pre.summary.terms.billing_type, installments: pre.summary.terms.installments } }),
+  ])
 
   return { ok: true, agreementId: closed.agreement_id }
 }

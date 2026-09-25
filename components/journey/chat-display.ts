@@ -32,6 +32,8 @@ export interface ChatMsg {
   engine?: string | null
   // button_id (eco do clique) — sinal p/ classificar decision.
   buttonId?: number | null
+  // marcador de estágio (offers_snapshot.stage — A1): outcome/greeting.
+  stage?: string | null
 }
 
 // TETO de itens visíveis antes de "ver conversa completa" (Apêndice D.4 = 20). O
@@ -99,6 +101,7 @@ export function classOf(
       hasAction: !!m.action,
       promptId: m.promptId ?? null,
       text: m.text,
+      stage: m.stage ?? null,
     },
     { activePromptId, waitState },
   )

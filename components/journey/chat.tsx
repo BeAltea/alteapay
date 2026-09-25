@@ -13,7 +13,7 @@
 // - Timer de inatividade: 5min sem interação → volta para a tela de login do CHAT
 //   (/n/{code}), NÃO o login da AlteaPay.
 import { useCallback, useEffect, useRef, useState } from "react"
-import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
+import { PromptButtons, PROMPT_STALE_NOTICE, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 import {
   capHistory,
   dedupAssistantByContent,
@@ -55,9 +55,19 @@ interface PayResult {
   valor: number | null
   vencimento_link: string | null
   already_charged: boolean
+  /** A1: só true quando o SERVIDOR respondeu ok:false (erro de negócio) — é a
+   *  única situação em que "Nenhuma cobrança foi criada" é verdade. Timeout/rede
+   *  NUNCA afirmam isso (a cobrança pode ter sido criada). */
+  confirmedNotCreated?: boolean
 }
 
 const TICK_MS = 250 // granularidade da troca de copy (menor que o poll de 2500ms)
+// A1 (G1): o POST de cobrança NUNCA é abortado em 8s — o caminho válido pode levar
+// vários segundos (ASAAS + persistência). Abort próprio do PAGAR, generoso; após
+// PAY_LONG_WAIT_MS a copy da espera muda ("Ainda estou gerando…").
+const PAY_ABORT_MS = 45_000
+const PAY_LONG_WAIT_MS = 8_000
+const CLICK_ABORT_MS = 8_000
 
 /** Formata reais no MESMO padrão do buildAckContext (R$ 250,00). null → "". */
 function formatBRL(valor: number | null): string {
@@ -82,15 +92,28 @@ function formatDueDate(iso: string | null): string {
 // no render p/ não duplicar; respondido o prompt (sem active_prompt) a bolha
 // reaparece e mantém o resumo no histórico.
 
-/** Só aceitamos links externos http(s) — nunca javascript:/relativos suspeitos. */
-function safeExternalAction(raw: unknown): MsgAction | null {
+/** Só aceitamos links http(s) — nunca javascript:/relativos suspeitos. Dois tipos:
+ *  external_link (ex.: quitação → #contato) e open_payment_link (A1: a bolha do
+ *  link de pagamento persistida carrega a ação — o painel deriva DELA). */
+function safeMessageAction(raw: unknown): MsgAction | null {
   if (!raw || typeof raw !== "object") return null
   const a = raw as Record<string, unknown>
-  if (a.type !== "external_link") return null
+  if (a.type !== "external_link" && a.type !== "open_payment_link") return null
   const label = typeof a.label === "string" ? a.label : ""
   const href = typeof a.href === "string" ? a.href : ""
   if (!label || !/^https?:\/\//i.test(href)) return null
-  return { type: "external_link", label, href }
+  return { type: a.type, label, href }
+}
+
+/** A1 (N-D1-8): a bolha do link persistida traz a URL crua numa linha própria
+ *  (histórico/painel); na tela o botão "Abrir link de pagamento" já a carrega —
+ *  removemos a linha da URL do texto exibido para o link não aparecer 2x. */
+function textWithoutUrl(text: string, href: string): string {
+  return text
+    .split("\n")
+    .filter((line) => line.trim() !== href.trim())
+    .join("\n")
+    .trim()
 }
 
 /** Só http(s) — nunca javascript:/data:. Usado para auto-linkar URLs no histórico. */
@@ -178,6 +201,15 @@ export function JourneyChat() {
   // Resultado do PAGAR (link/processando/erro) renderizado abaixo do histórico.
   const [payResult, setPayResult] = useState<PayResult | null>(null)
   const [copied, setCopied] = useState(false)
+  // A1 — aviso humano do 409 (prompt substituído), acima do bloco de botões. Vive
+  // no pai (não no PromptButtons) para sobreviver à remontagem por key={id}.
+  const [promptNotice, setPromptNotice] = useState<string | null>(null)
+  const payResultRef = useRef<PayResult | null>(null)
+  payResultRef.current = payResult
+  // A1 — copy progressiva do PAGAR: após PAY_LONG_WAIT_MS sem resposta, "Ainda
+  // estou gerando o seu link de pagamento."
+  const [payLongWait, setPayLongWait] = useState(false)
+  const payLongWaitRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // R3 — poll do link quando a cobrança volta 'processing' (worker gerando).
   // payPollRef: timer do poll; payPollAttempts: nº de tentativas (para oferecer a
   // saída acionável após o teto, nunca espera muda infinita).
@@ -359,6 +391,7 @@ export function JourneyChat() {
         prompt_id?: string | null
         action?: unknown
         engine?: string | null
+        stage?: string | null
       }> = Array.isArray(data?.messages) ? data.messages : []
       for (const m of pushed) {
         if (seenIds.current.has(m.id)) continue
@@ -391,6 +424,21 @@ export function JourneyChat() {
         if (isEngineMsg && (waitStateRef.current === "aguardando_motor" || waitStateRef.current === "menu_degradado")) {
           resolveWaitToNegotiating()
         }
+        const action = safeMessageAction(m.action)
+        // A1 (G1): a bolha do LINK persistida pelo servidor chegou pelo poll — é o
+        // resultado do PAGAR (outcome), fonte única do painel. Se ainda estávamos
+        // em "gerando" (POST em voo/abortado) ou em 'processing', o link resolve
+        // a espera aqui mesmo: link_entregue (absorvente, M12), sem painel
+        // duplicado (o client só renderiza o painel próprio quando NÃO há bolha).
+        if (isAssistant && action?.type === "open_payment_link") {
+          const local = waitStateRef.current
+          if (local === "gerando_cobranca" || payResultRef.current?.status === "processing") {
+            stopTick()
+            waitStartedAtRef.current = null
+            setPayResult({ status: "link", link: action.href, valor: null, vencimento_link: null, already_charged: false })
+            setWaitState("link_entregue")
+          }
+        }
         setMessages((prev) => {
           const base = dropOptimistic ? prev.filter((x) => x.id !== optimisticId) : prev
           return [
@@ -399,12 +447,14 @@ export function JourneyChat() {
               id: m.id,
               from: isAssistant ? "assistant" : "customer",
               text: m.text,
-              action: safeExternalAction(m.action),
+              action,
               promptId: m.prompt_id ?? null,
               // sinais p/ a poda por classe (§10.1): engine distingue system;
-              // button_id distingue decision (eco do clique).
+              // button_id distingue decision (eco do clique); stage marca
+              // outcome/greeting (A1).
               engine: m.engine ?? null,
               buttonId: m.button_id ?? null,
+              stage: m.stage ?? null,
             },
           ]
         })
@@ -645,12 +695,12 @@ export function JourneyChat() {
     // sempre. Com o timeout, o "..." SEMPRE resolve e o PromptButtons reabilita os
     // botões e mostra um aviso ("conexão lenta, toque de novo").
     const controller = new AbortController()
-    // 8s: cobre folgadamente o caminho feliz (build+persist ~1-2s) e ainda dá
-    // margem se o kickoff ainda estiver awaitado (5s) num runtime não-corrigido —
-    // nesse caso, com Negociar, o optimistic acima já mostrou "preparando", então
-    // um abort não deixa a tela muda. Para Consultar (que não chama n8n) é folga
-    // enorme. Acima disso o cliente desiste em vez de prender o botão por 15s.
-    const timeoutId = setTimeout(() => controller.abort(), 8_000)
+    // 8s cobre folgadamente Consultar/Negociar/Voltar. O PAGAR (A1/G1) tem abort
+    // próprio e generoso (PAY_ABORT_MS): um POST de cobrança NUNCA é abortado em
+    // 8s — e, se abortar, consultamos o servidor antes de afirmar qualquer coisa.
+    const timeoutId = setTimeout(() => controller.abort(), isPay ? PAY_ABORT_MS : CLICK_ABORT_MS)
+    if (isPay) startPayLongWait()
+    setPromptNotice(null)
     try {
       const res = await fetch("/api/chat/button", {
         method: "POST",
@@ -676,8 +726,9 @@ export function JourneyChat() {
       // cobrança e a idempotência são do servidor; o client só exibe a copy §5.
       if (isPay && data && data.action === "pay") {
         applyPayResult(data)
-        // O menu de 3 opções já foi respondido; o poll traz o histórico. O botão
-        // sai do "..." (ok) — o resultado do pagamento aparece no painel próprio.
+        // O menu de 3 opções já foi respondido; o poll traz a bolha do link
+        // (outcome) e o prompt pós-link persistidos pelo servidor (A1). O botão
+        // sai do "..." (ok) — o painel deriva da mensagem persistida.
         setActivePrompt(null)
         await pollMessages()
         return { ok: true }
@@ -708,7 +759,9 @@ export function JourneyChat() {
         // O dedup por conteúdo (chat-display) colapsa esta bolha local com a
         // persistida que o poll trouxer (mesmo texto) — nunca duplica, nunca some.
         // Sem esta injeção, sob rede ruim o clique ficava mudo até o poll voltar.
-        const immediateReplyActions = new Set(["consult", "not_recognized", "back_to_options"])
+        // A1: back_to_options NÃO injeta bolha — o menu curto ("Como prefere
+        // seguir?") que o poll traz É o feedback; injetar a pergunta duplicaria.
+        const immediateReplyActions = new Set(["consult", "not_recognized"])
         if (
           typeof data?.action === "string" &&
           immediateReplyActions.has(data.action) &&
@@ -738,37 +791,100 @@ export function JourneyChat() {
         }
         return { ok: true }
       }
-      // 409 prompt_not_active: recarrega o prompt ativo atual (o PromptButtons será
-      // remontado via key={activePrompt.id} e não mostra aviso neste caso).
-      if (res.status === 409 && data?.code === "prompt_not_active") {
+      // A1 (N-D3-3/N-D1-4) — 409 prompt_stale/prompt_not_active NUNCA é mudo: o
+      // prompt clicado foi substituído (2ª aba, poll atrasado). Re-hidrata com o
+      // active_prompt do corpo (mesmo shape do GET) E com um poll fresco, mostra o
+      // aviso humano e devolve o code para o PromptButtons também avisar. Nunca
+      // reabilita o mesmo menu em silêncio.
+      if (res.status === 409 && (data?.code === "prompt_stale" || data?.code === "prompt_not_active")) {
         clearPendingNegotiation()
         if (isPay) resetWaitToIdle() // prompt já consumido: não trava em gerando_cobranca
         else if (isNegotiate) resetWaitToIdle()
+        setPromptNotice(PROMPT_STALE_NOTICE)
+        if (data?.active_prompt && typeof data.active_prompt === "object" && !endedRef.current) {
+          setActivePrompt(data.active_prompt as ActivePrompt)
+        }
         await pollMessages()
-        return { ok: false, code: "prompt_not_active" }
+        return { ok: false, code: "prompt_stale" }
       }
       // Demais erros (404/409/422/5xx): devolve o code p/ o PromptButtons avisar
       // o cliente e reabilitar os botões (o loading para no finally do filho).
+      // Para o PAGAR, um 5xx NÃO confirma "nenhuma cobrança criada" — consulta o
+      // servidor antes de qualquer afirmação.
       clearPendingNegotiation()
-      if (isPay) clearWaitForPayFailure()
-      else if (isNegotiate) resetWaitToIdle()
+      if (isPay) {
+        await recoverPayAfterTransportFailure()
+        return { ok: true }
+      }
+      if (isNegotiate) resetWaitToIdle()
       return { ok: false, code: typeof data?.code === "string" ? data.code : "error" }
     } catch (err) {
       // AbortError = estouramos o nosso timeout (servidor lento) → code "timeout"
       // para o PromptButtons mostrar "conexão lenta, toque de novo". Demais erros
       // de rede caem em code genérico. Em ambos, o botão SAI do "..." e a bolha
-      // optimistic é removida (o clique não avançou). O PAGAR cai num menu de erro
-      // acionável (nunca beco sem saída); o NEGOCIAR volta a idle (pode retentar).
+      // optimistic é removida. A1: ANTES de reabilitar, re-hidrata o estado (o
+      // servidor pode ter respondido o clique) — nunca reabilita em silêncio um
+      // prompt que já foi consumido. O PAGAR nunca afirma "nenhuma cobrança foi
+      // criada" por timeout/rede: consulta GET /api/chat/payment e segue em
+      // 'processing' (poll) até o link aparecer (ou oferecer atendimento).
       clearPendingNegotiation()
-      if (isPay) clearWaitForPayFailure()
-      else if (isNegotiate) resetWaitToIdle()
+      if (isPay) {
+        await recoverPayAfterTransportFailure()
+        return { ok: true }
+      }
+      if (isNegotiate) resetWaitToIdle()
+      await pollMessages()
       if (err instanceof DOMException && err.name === "AbortError") {
         return { ok: false, code: "timeout" }
       }
       return { ok: false, code: "network" }
     } finally {
       clearTimeout(timeoutId)
+      stopPayLongWait()
     }
+  }
+
+  // A1 — copy progressiva do PAGAR (timer local; some quando há resultado).
+  function startPayLongWait() {
+    stopPayLongWait()
+    setPayLongWait(false)
+    payLongWaitRef.current = setTimeout(() => setPayLongWait(true), PAY_LONG_WAIT_MS)
+  }
+  function stopPayLongWait() {
+    if (payLongWaitRef.current) {
+      clearTimeout(payLongWaitRef.current)
+      payLongWaitRef.current = null
+    }
+    setPayLongWait(false)
+  }
+
+  // A1 (G1) — falha de TRANSPORTE no PAGAR (timeout/rede/5xx): o servidor pode ter
+  // criado a cobrança. Antes de dizer qualquer coisa, consulta GET /api/chat/
+  // payment: link pronto → entrega o link; senão fica em 'processing' (o poll R3
+  // segue até o link ou oferece atendimento). NUNCA "Nenhuma cobrança foi criada".
+  async function recoverPayAfterTransportFailure() {
+    stopTick()
+    waitStartedAtRef.current = null
+    let ready = false
+    try {
+      const res = await fetch("/api/chat/payment", { cache: "no-store" })
+      if (res.ok) {
+        const out = interpretPaymentPoll(await res.json().catch(() => null))
+        if (out.status === "ready") {
+          ready = true
+          setPayResult({ status: "link", link: out.link, valor: out.valor, vencimento_link: out.vencimentoLink, already_charged: false })
+          setWaitState("link_entregue")
+        }
+      }
+    } catch {
+      /* silencioso: cai no processing/poll abaixo */
+    }
+    if (!ready) {
+      setPayResult({ status: "processing", link: null, valor: null, vencimento_link: null, already_charged: false })
+      setWaitState("gerando_cobranca")
+    }
+    setActivePrompt(null)
+    await pollMessages()
   }
 
   // Traduz o shape do payService (D3) em PayResult para render (§5.2/§5.3/§5.4).
@@ -791,18 +907,19 @@ export function JourneyChat() {
     } else {
       // Erro de negócio (rótulo curto do servidor) → copy humana §5.4 (nunca o
       // rótulo cru). Menu [Tentar novamente] [Falar com atendimento].
-      setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false })
+      // A1: só aqui (ok:false do SERVIDOR) "Nenhuma cobrança foi criada" é verdade.
+      setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false, confirmedNotCreated: true })
       setWaitState("erro_cobranca")
     }
   }
 
-  // Falha de transporte no PAGAR (timeout/rede/401): cai no menu de erro §5.4
-  // (nunca beco sem saída, nunca erro técnico). "Nenhuma cobrança foi criada"
-  // tranquiliza sobre duplicidade — o servidor não chegou a cobrar.
+  // Falha de transporte no PAGAR (401/sessão): cai no menu de erro §5.4 (nunca
+  // beco sem saída, nunca erro técnico), SEM afirmar que nenhuma cobrança foi
+  // criada (o servidor pode ter cobrado).
   function clearWaitForPayFailure() {
     stopTick()
     waitStartedAtRef.current = null
-    setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false })
+    setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false, confirmedNotCreated: false })
     setWaitState("erro_cobranca")
   }
 
@@ -960,6 +1077,24 @@ export function JourneyChat() {
   const prunedMessages = prunePresentation(visibleMessages, activePromptId, waitState)
   const dedupedMessages = dedupAssistantByContent(prunedMessages)
   const capped = capHistory(dedupedMessages, activePromptId, waitState, { expanded: historyExpanded })
+  // A1: há bolha persistida do link (ação open_payment_link) para o link corrente?
+  const hasPersistedLink = messages.some(
+    (m) =>
+      m.from === "assistant" &&
+      m.action?.type === "open_payment_link" &&
+      (!payResult?.link || m.action.href === payResult.link),
+  )
+  // A1: só a ÚLTIMA bolha de link ganha o painel (Abrir/Copiar). Bolhas de links
+  // anteriores (ex.: cobrança cancelada e recriada) ficam só como texto, sem
+  // botão para um link que pode estar morto — o link vivo é sempre o mais recente.
+  let latestPaymentLinkId: string | null = null
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.from === "assistant" && m.action?.type === "open_payment_link") {
+      latestPaymentLinkId = m.id
+      break
+    }
+  }
 
   return (
     <div className="flex flex-1 flex-col gap-3">
@@ -1039,10 +1174,39 @@ export function JourneyChat() {
                   : "max-w-[85%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800"
               }
             >
-              {renderRichText(m.text)}
+              {renderRichText(
+                m.from === "assistant" && m.action?.type === "open_payment_link"
+                  ? textWithoutUrl(m.text, m.action.href)
+                  : m.text,
+              )}
             </div>
+            {/* A1 (N-D1-3/N-D1-8) — LINK DE PAGAMENTO: o painel deriva da bolha
+                PERSISTIDA (fonte única, sobrevive ao reload): "Abrir link de
+                pagamento" + "Copiar link". As ações seguintes (Voltar às opções /
+                Falar com atendimento) vêm do prompt pós-link do servidor; "Já
+                paguei" é a afordância sob esse prompt. */}
+            {m.from === "assistant" && m.action?.type === "open_payment_link" && m.id === latestPaymentLinkId ? (
+              <div className="mt-2 flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
+                <a
+                  href={m.action.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ backgroundColor: "var(--brand-secondary)" }}
+                  className="inline-block rounded-md px-4 py-2 text-center text-sm font-semibold text-white"
+                >
+                  {m.action.label}
+                </a>
+                <button
+                  type="button"
+                  onClick={() => onCopyLink((m.action as MsgAction).href)}
+                  className="rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                >
+                  {copied ? "Link copiado!" : "Copiar link"}
+                </button>
+              </div>
+            ) : null}
             {/* Botão-link externo anexado à bolha (ex.: quitação → #contato). */}
-            {m.from === "assistant" && m.action ? (
+            {m.from === "assistant" && m.action && m.action.type === "external_link" ? (
               <a
                 href={m.action.href}
                 target="_blank"
@@ -1147,13 +1311,19 @@ export function JourneyChat() {
         {!ended && waitState === "gerando_cobranca" && !payResult ? (
           <div role="status" aria-live="polite" className="flex flex-col items-start">
             <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-              Certo. Estou gerando o seu link de pagamento. Só um instante.
+              {/* A1: copy progressiva — após PAY_LONG_WAIT_MS sem resposta. */}
+              {payLongWait
+                ? "Ainda estou gerando o seu link de pagamento."
+                : "Certo. Estou gerando o seu link de pagamento. Só um instante."}
             </div>
           </div>
         ) : null}
 
-        {/* --- Resultado do PAGAR: link (com copiar) / processando / erro --- */}
-        {!ended && payResult ? (
+        {/* --- Resultado do PAGAR: link (com copiar) / processando / erro ---
+            A1: o painel do LINK só renderiza como FALLBACK quando a bolha
+            persistida (com ação open_payment_link) ainda não chegou pelo poll —
+            a bolha é a fonte única (sem copy duplicada, N-D1-8). */}
+        {!ended && payResult && !(payResult.status === "link" && hasPersistedLink) ? (
           <div className="flex flex-col items-start gap-2" role="status" aria-live="polite">
             {payResult.status === "link" ? (
               <>
@@ -1257,7 +1427,9 @@ export function JourneyChat() {
                   {/* T11 / R-32: tranquilização de duplicidade ("Nenhuma cobrança
                       foi criada.") ANTES das ações; frases curtas, sem código/erro
                       técnico exposto. */}
-                  Não consegui gerar o seu link de pagamento agora. Nenhuma cobrança foi criada. Você pode tentar de novo ou falar com o nosso atendimento.
+                  {payResult.confirmedNotCreated
+                    ? "Não consegui gerar o seu link de pagamento agora. Nenhuma cobrança foi criada. Você pode tentar de novo ou falar com o nosso atendimento."
+                    : "Não consegui gerar o seu link de pagamento agora. Você pode tentar de novo ou falar com o nosso atendimento."}
                 </div>
                 {/* R-06 (C13) — erro_cobranca NÃO prende o devedor entre "tentar de
                     novo" (que pode falhar de novo) e um atendimento: além de Tentar
@@ -1299,6 +1471,13 @@ export function JourneyChat() {
           // re-anúncio das labels em loop; A-07). group + aria-label dão contexto
           // ao leitor de tela; a navegação por teclado alcança os botões na ordem.
           <div className="pt-1" aria-live="off" role="group" aria-label="Opções de negociação">
+            {/* A1 — aviso humano do 409 (prompt substituído): fica no pai para
+                sobreviver à remontagem do bloco de botões. */}
+            {promptNotice ? (
+              <p className="mb-2 text-xs text-neutral-600" role="status" aria-live="polite">
+                {promptNotice}
+              </p>
+            ) : null}
             {/* key por id do prompt: ao trocar de prompt (ex.: Consultar reabre o
                 menu pós-consulta) o componente REMONTA, zerando o estado local
                 'answered'/'pending' — sem isso o novo menu nasceria desabilitado. */}
@@ -1313,8 +1492,8 @@ export function JourneyChat() {
                 reconhece o débito é incoerente (C13/C14). Por isso só mostramos a
                 afordância quando o menu é o MENU PAYÁVEL de fato — tem o botão PAGAR
                 (id 4) —, não o menu-volta de contestação. */}
-            {activePrompt.kind === "debt_three_options" &&
-            activePrompt.buttons.some((b) => b.id === 4) &&
+            {((activePrompt.kind === "debt_three_options" && activePrompt.buttons.some((b) => b.id === 4)) ||
+              activePrompt.kind === "post_payment_link") &&
             !claimSent ? (
               <button
                 type="button"

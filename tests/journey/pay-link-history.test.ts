@@ -104,11 +104,22 @@ describe("payService — link no histórico (R7)", () => {
     expect(persisted[0].text.toLowerCase()).not.toMatch(/pagamento (confirmado|recebido)|quitad/)
   })
 
-  it("clique repetido em PAGAR NÃO duplica a mensagem do link (idempotente)", async () => {
+  it("clique repetido em PAGAR (A1): responde 'já tem cobrança' com o MESMO link e não empilha além disso", async () => {
     const { payService } = await import("@/lib/journey/pay")
-    await payService(ctx)
-    await payService(ctx)
-    expect(assistantLinkMessages("https://asaas/checkout/pay_new").length).toBe(1)
+    const r1 = await payService(ctx)
+    const r2 = await payService(ctx)
+    const r3 = await payService(ctx)
+    expect(r1.ok && r2.ok && r3.ok).toBe(true)
+    if (r1.ok && r2.ok) {
+      expect(r1.already_charged).toBe(false)
+      // idempotente (mesma oferta já aceita → mesmo acordo/link) = already_charged
+      expect(r2.already_charged).toBe(true)
+      expect(r2.link).toBe(r1.link)
+    }
+    const msgs = assistantLinkMessages("https://asaas/checkout/pay_new")
+    // 1 "Aqui está" + 1 "Você já tem" (o 3º clique NÃO empilha — dedup 15min)
+    expect(msgs.length).toBe(2)
+    expect(msgs[1].text).toMatch(/já tem uma cobrança ativa/i)
   })
 
   it("already_charged: persiste a mensagem com o LINK EXISTENTE (sem 2ª cobrança)", async () => {
