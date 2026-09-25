@@ -352,6 +352,7 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
 - **Request:** `{ "action":"offer.propose", "session_id":"uuid", "args":{ "terms":{ "discount_pct","installments","entry_value","billing_type","total_value","installment_value","first_due_date","original_value","discount_value" } } }`
 - **Response ok:** `{ "success":true, "offer_id":"uuid" }` · **inválida:** `422 { "code":"DISCOUNT_ABOVE_MAX"|..., "offer_id" }`
 - **Ao cliente:** só ofereça o que a matriz permite; se recusar, explique que essa condição não está disponível.
+- **Atenção (2026-09-25):** hoje o servidor interpreta `terms` em **reais** (não em centavos) e não confere `original_value` contra a dívida. Até a correção, prefira `offer.list` + `payment.create` (é o que o fluxo `1.7` faz) — o n8n escolhe entre as ofertas geradas, nunca monta os termos.
 
 ### 7.4 `offer.accept`
 - **Request:** `{ "action":"offer.accept", "session_id":"uuid", "args":{ "offer_id":"uuid" } }`
@@ -546,6 +547,7 @@ Sempre `{ "ok":false, "code", "message" }` (ou `{ "success":false, "error", "cod
 **Glossário:** *tenant/credor* (empresa, isolada por `company_id`) · *cliente/devedor* · *dívida/fatura* · *sessão* (`thread_id` = memória) · *oferta* (da matriz) · *matriz* (regras do tenant) · *acordo* (oferta fechada) · *cobrança* (pagamento ASAAS) · *reconhecimento* (Sim/Não append-only) · *prompt* (pergunta com botões) · *guard* (proteção de idempotência da cobrança) · *variante A* (AlteaPay executa a cobrança — único caminho desta onda).
 
 **Changelog do contrato:**
+- **2026-09-25 (D2/D4):** o fluxo `1.7` deixou de criar cobrança no ASAAS e passou a chamar `offer.list` + `payment.create`; URL singular corrigida em `1.5`/`1.6`. Ver `docs/N8N_INTEGRATION.md` §12.
 - **v2.1 — 2026-09-21 (Hub/link único, H7–H9) — VERSÃO ATUAL:**
   - Evento **`negotiation.start`** (§4.1): emitido no clique "Sim" do reconhecimento; passa a sessão para `engine_owner='n8n'`. Payload = contrato do Apêndice B (session/tenant/customer/debt/acknowledgement/matrix/offers/available_actions), centavos, doc mascarado.
   - Conceito **`engine_owner`** (`platform`|`n8n`): quem conduz os turnos. Vira `n8n` no "Sim"; fallback assistido resiliente se o n8n não estiver plugado (mesmo contrato quando entrar).
