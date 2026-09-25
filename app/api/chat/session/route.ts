@@ -17,6 +17,8 @@ import { buildAcceptSummary } from "@/lib/journey/closing"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 function clientIp(req: NextRequest): string | null {
   return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null

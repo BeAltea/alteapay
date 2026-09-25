@@ -79,7 +79,7 @@ export async function createAsaasChargeInline(
   // ---- Idempotência: agreement já tem cobrança viva? devolve a existente.
   const { data: existing, error: existingError } = await supabase
     .from("agreements")
-    .select("id, asaas_payment_id, asaas_invoice_url, asaas_payment_url, payment_status, asaas_status")
+    .select("id, asaas_payment_id, asaas_invoice_url, asaas_payment_url, payment_status, asaas_status, status")
     .eq("id", agreementId)
     .eq("company_id", metadata.companyId)
     .maybeSingle()

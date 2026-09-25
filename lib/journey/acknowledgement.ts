@@ -28,18 +28,64 @@ import {
   BTN_YES,
   type Button,
 } from "./buttons"
-import { createPrompt, answerPrompt, type PromptRow } from "./prompts"
+import { createPrompt, answerPrompt, promptView, type PromptRow, type PromptView } from "./prompts"
 import { listOffers, type ListedOffer, type SessionCtx } from "./actions"
 import type { OfferTerms } from "@/lib/negotiation/offers"
+import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "./wait-machine"
+import { formatDueDatePt } from "./pay-poll"
 
 const BRL = (v: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v || 0)
 
+/**
+ * dd/mm/aaaa; ausente/inválida → "" (o chamador omite o segmento — nunca um
+ * placeholder na fala do devedor). A4 r2 (B3-F4), sem depender do fuso do runtime:
+ *  - data civil (`YYYY-MM-DD`, coluna `date`: vencimento) → componentes por regex
+ *    (formatDueDatePt, sem `Date`): "2026-08-15" é 15/08 em qualquer fuso;
+ *  - instante (`timestamptz` ISO: pagamento recebido) → dia civil em
+ *    America/Sao_Paulo (o runtime da Netlify é UTC; 22h de Brasília não vira o
+ *    dia seguinte).
+ */
 function formatDatePt(iso: string | null): string {
-  if (!iso) return "—"
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return "—"
-  return d.toLocaleDateString("pt-BR")
+  if (!iso) return ""
+  const s = iso.trim()
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return formatDueDatePt(s)
+  const d = new Date(s)
+  if (Number.isNaN(d.getTime())) return ""
+  return d.toLocaleDateString("pt-BR", {
+    timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", year: "numeric",
+  })
+}
+
+/**
+ * A4 (Apêndice B) — abertura comum a TODAS as saudações da jornada: identifica o
+ * canal (oficial, de negociação, da {credor}) e a AlteaPay como operadora. Sem
+ * valor, sem "Tudo bem?", sem emoji, sem "se já pagou desconsidere". Sem nome →
+ * "Olá." (nunca "Olá, ."/"null").
+ */
+function channelGreeting(ctx: Pick<AckContext, "firstName" | "creditorName">): string {
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
+  return `${greeting} Este é o canal oficial de negociação da ${ctx.creditorName}, operado pela AlteaPay.`
+}
+
+/**
+ * A4 (S10/S24, Apêndice B "Detalhes") — linha compacta de detalhes da dívida:
+ * "Vencimento original {venc} · {n} fatura(s) · serviço da {credor}". Segmentos
+ * ausentes são omitidos (nunca "—"/vazio). A4 r2 (B3-F6): sem vencimento E sem
+ * nº de faturas a linha nunca degenera em fragmento ("serviço da X.") — vira a
+ * frase completa "Este valor refere-se a um serviço da {credor}". SEM valor (mora
+ * no card — R-12) e sem PII. A pergunta "Como prefere seguir?" NÃO entra aqui:
+ * quem pergunta é o menu reemitido logo abaixo (REOPEN_MENU_QUESTION) — uma
+ * pergunta só na tela.
+ */
+function debtDetailLine(ctx: AckContext): string {
+  const parts: string[] = []
+  const venc = formatDatePt(ctx.oldestDueDate)
+  if (venc) parts.push(`Vencimento original ${venc}`)
+  if (ctx.invoiceCount > 0) parts.push(`${ctx.invoiceCount} ${ctx.invoiceCount === 1 ? "fatura" : "faturas"}`)
+  if (parts.length === 0) return `Este valor refere-se a um serviço da ${ctx.creditorName}`
+  parts.push(`serviço da ${ctx.creditorName}`)
+  return parts.join(" · ")
 }
 
 export interface AckContext {
@@ -50,8 +96,9 @@ export interface AckContext {
   oldestDueDate: string | null
 }
 
-/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver. */
-function firstNameOf(name: string | null | undefined): string {
+/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver.
+ *  Exportado (A3) para a saudação de retorno do recap usar a mesma regra. */
+export function firstNameOf(name: string | null | undefined): string {
   return (name ?? "").trim().split(/\s+/)[0] ?? ""
 }
 
@@ -106,7 +153,9 @@ export async function buildAckContext(input: {
     firstName,
     creditorName,
     updatedValue,
-    invoiceCount: invoices?.length ?? (debts?.length ?? 0),
+    // N5: `??` nunca caía em debts.length quando vmax_invoices devolvia [] (0 é
+    // não-nulo). Sem faturas VMAX, o nº de faturas é o nº de dívidas abertas.
+    invoiceCount: invoices?.length || debts?.length || 0,
     oldestDueDate: oldestInvoiceDue ?? oldestDebtDue,
   }
 }
@@ -126,14 +175,9 @@ export function acknowledgementButtons(showHandoff: boolean): Button[] {
  * pergunta). Sem contagem de faturas. Se firstName vazio, cai no genérico.
  */
 export function acknowledgementQuestion(ctx: AckContext): string {
-  // R14/D36: "pendência" (não "dívida"); tom neutro, sem ameaça.
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
-  return (
-    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
-    `Valor atualizado ${BRL(ctx.updatedValue)}, ` +
-    `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}. ` +
-    `Você reconhece esta cobrança em seu nome? Se já pagou, é só desconsiderar esta mensagem.`
-  )
+  // A4/S23 (Apêndice B): abertura comum + pergunta. Sem valor na fala (R-12), sem
+  // "desconsiderar" (é o botão "Já paguei"), sem exclamação. D36: sem ameaça.
+  return `${channelGreeting(ctx)} Você reconhece esta cobrança em seu nome?`
 }
 
 // --- fluxo Consultar/Negociar (prompt inicial pedido pelo dono) -------------
@@ -150,8 +194,8 @@ export function acknowledgementQuestion(ctx: AckContext): string {
 /** Botões do prompt inicial: [2] Consultar, [3] Negociar (+[99] se handoff). */
 export function consultNegotiateButtons(showHandoff: boolean): Button[] {
   const buttons: Button[] = [
-    { id: BTN_CONSULT, label: "Consultar Dívida" },
-    { id: BTN_NEGOTIATE, label: "Negociar Dívida" },
+    { id: BTN_CONSULT, label: "Detalhes da dívida" },
+    { id: BTN_NEGOTIATE, label: "Negociar" },
   ]
   if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
@@ -164,8 +208,8 @@ export function consultNegotiateButtons(showHandoff: boolean): Button[] {
  */
 export function postConsultButtons(showHandoff: boolean): Button[] {
   const buttons: Button[] = [
-    { id: BTN_NEGOTIATE, label: "Negociar Dívida" },
-    { id: BTN_NO, label: "Não reconheço a dívida" },
+    { id: BTN_NEGOTIATE, label: "Negociar" },
+    { id: BTN_NO, label: "Não reconheço" },
   ]
   if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento" })
   return buttons
@@ -177,12 +221,8 @@ export function postConsultButtons(showHandoff: boolean): Button[] {
  * (na mensagem `debtInfoMessage`), evitando repetir os números duas vezes.
  */
 export function consultNegotiateQuestion(ctx: AckContext): string {
-  // R14/D36: "pendência" (não "dívida"); sem ameaça.
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
-  return (
-    `${greeting} Encontramos uma pendência em seu nome com a ${ctx.creditorName}. ` +
-    `O que você deseja fazer?`
-  )
+  // A4/S24 (Apêndice B): abertura comum + convite. Sem valor, sem exclamação.
+  return `${channelGreeting(ctx)} O que você deseja fazer?`
 }
 
 /** Pergunta do menu pós-consulta (após mostrar os dados da dívida). */
@@ -196,16 +236,9 @@ export function postConsultQuestion(): string {
  * (nada de documento) — só os dados financeiros que o devedor pode ver.
  */
 export function debtInfoMessage(ctx: AckContext): string {
-  const invoiceLine =
-    ctx.invoiceCount > 0
-      ? ` em ${ctx.invoiceCount} fatura(s)`
-      : ""
-  // R14/D36: "pendência" (não "dívida").
-  return (
-    `Aqui estão os dados da sua pendência com a ${ctx.creditorName}: ` +
-    `valor atualizado ${BRL(ctx.updatedValue)}${invoiceLine}, ` +
-    `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}.`
-  )
+  // A3 (§2.4 / R-12): o VALOR mora só no card fixo e nos outcomes — nunca numa
+  // guidance. A4/S24: a mesma linha compacta do "Detalhes da dívida" (sem valor).
+  return `${debtDetailLine(ctx)}.`
 }
 
 // ============================================================================
@@ -215,7 +248,7 @@ export function debtInfoMessage(ctx: AckContext): string {
 
 /** Rótulo/valor exibidos em REAIS, com o mesmo Intl do resumo (R$ 250,00). */
 function payLabel(value: number): string {
-  return `Quero pagar — ${BRL(value)}`
+  return `Pagar ${BRL(value)}`
 }
 
 /**
@@ -228,9 +261,9 @@ function payLabel(value: number): string {
 export function threeOptionsButtons(value: number, showHandoff: boolean): Button[] {
   const buttons: Button[] = [
     { id: BTN_PAY, label: payLabel(value), order: 0 },
-    { id: BTN_YES, label: "Quero negociar", order: 1 },
-    { id: BTN_CONSULT, label: "Consultar dívida", order: 2 },
-    { id: BTN_NO, label: "Não reconheço esta dívida", order: 3 },
+    { id: BTN_YES, label: "Negociar", order: 1 },
+    { id: BTN_CONSULT, label: "Detalhes da dívida", order: 2 },
+    { id: BTN_NO, label: "Não reconheço", order: 3 },
   ]
   if (showHandoff) buttons.push({ id: BTN_HANDOFF, label: "Falar com atendimento", order: 4 })
   return buttons
@@ -238,7 +271,7 @@ export function threeOptionsButtons(value: number, showHandoff: boolean): Button
 
 /** Botão único de VOLTA do "Não reconheço" (M7): reabre o menu de 3 opções. */
 export function backToOptionsButtons(): Button[] {
-  return [{ id: BTN_BACK, label: "Na verdade, quero ver as opções", order: 0 }]
+  return [{ id: BTN_BACK, label: "Voltar às opções", order: 0 }]
 }
 
 /**
@@ -250,13 +283,8 @@ export function backToOptionsButtons(): Button[] {
  * LGPD — R-24). Variação sem nome cai em "Olá." (nunca "Olá, ."/"null"). Sem PII.
  */
 export function threeOptionsSummary(ctx: AckContext): string {
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
-  return (
-    `${greeting} Encontramos um valor em aberto em seu nome com a ${ctx.creditorName}. ` +
-    `Dá para resolver agora mesmo por aqui. ` +
-    `A AlteaPay opera este canal de negociação; a dívida é da ${ctx.creditorName}. ` +
-    `Como você prefere seguir?`
-  )
+  // A4/S5 — texto do Apêndice B, ipsis litteris.
+  return `${channelGreeting(ctx)} Como você prefere seguir?`
 }
 
 /**
@@ -267,12 +295,8 @@ export function threeOptionsSummary(ctx: AckContext): string {
  * na fala (mora no card/rótulo — R-12). Sem PII (nada de documento).
  */
 export function debtConsultReply(ctx: AckContext): string {
-  const faturas = ctx.invoiceCount > 1 ? ` e reúne ${ctx.invoiceCount} faturas` : ""
-  return (
-    `Este valor tem vencimento original em ${formatDatePt(ctx.oldestDueDate)}${faturas} ` +
-    `e refere-se a um serviço da ${ctx.creditorName}. ` +
-    `Se quiser, é só escolher abaixo como prefere seguir.`
-  )
+  // A4/S10 (Apêndice B "Detalhes"): bloco compacto; a pergunta vem do menu abaixo.
+  return `${debtDetailLine(ctx)}.`
 }
 
 /**
@@ -334,16 +358,15 @@ export async function resolveCreditorChannel(input: {
  */
 export function notRecognizedReply(channel: CreditorChannel): string {
   const { creditorName } = channel
-  const channelSentence = channel.hasConfig
-    ? `Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName} pelo canal oficial: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}.`
-    : `Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName} pelo canal informado na sua fatura ou no site oficial da ${creditorName}.`
-  // R-46 (carta de voz): adulto, sem "Obrigado por avisar" (muleta), sem "se já
-  // pagou desconsidere". Preserva o conteúdo jurídico (não gera pagamento;
-  // contestação segue disponível) e identifica VMAX (dona) e AlteaPay (operadora).
+  // A4/S11 (Apêndice B): "…fale com a {credor}: {canal_oficial}." COM config; SEM
+  // config (VMAX hoje) o fallback seguro "pelo canal informado na sua fatura ou no
+  // site oficial da {credor}" ocupa o lugar de {canal_oficial}. Nunca "null"/vazio.
+  const contact = channel.hasConfig
+    ? `: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}`
+    : ` pelo canal informado na sua fatura ou no site oficial da ${creditorName}`
   return (
-    `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. ` +
-    `${channelSentence} ` +
-    `A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
+    `Registramos que você não reconhece esta cobrança. ` +
+    `Para entender a origem e contestar, fale com a ${creditorName}${contact}.`
   )
 }
 
@@ -352,14 +375,124 @@ export type BootstrapThreeOptionsResult =
   | { ok: true; created: true; prompt: PromptRow }
   | { ok: false; error: string }
 
+/** Modo do menu de 3 opções: 'initial' (pós-login, com saudação) ou 'reopen'
+ *  (menu reemitido após um clique — Detalhes/Voltar/Já paguei/reopen). */
+export type ThreeOptionsMenuMode = "initial" | "reopen"
+
+/**
+ * Pergunta CURTA do menu reemitido (A1 / §2.3): o menu que volta depois de uma
+ * ação NÃO repete a saudação — só pergunta como seguir.
+ */
+export const REOPEN_MENU_QUESTION = "Como prefere seguir?"
+
+/**
+ * Pergunta do bloco de botões por modo. No menu INICIAL a saudação já é uma
+ * bolha própria do log (stage 'greeting', que termina com "Como você prefere
+ * seguir?") — o bloco de botões vem SEM texto para não repetir a pergunta na
+ * tela (§2.1: card + UMA saudação + UM menu). No reopen, a pergunta curta.
+ */
+export function menuQuestion(mode: ThreeOptionsMenuMode): string {
+  return mode === "reopen" ? REOPEN_MENU_QUESTION : ""
+}
+
+/** Marcador de estágio da bolha de saudação (offers_snapshot.stage). */
+export const GREETING_STAGE = "greeting"
+
+/**
+ * A1 / G6 — persiste a SAUDAÇÃO (threeOptionsSummary) UMA vez por thread
+ * (sessão + thread_epoch), como bolha própria: sem prompt_id (não é a pergunta
+ * de nenhum menu — não vira `superseded` quando o menu é reemitido) e com
+ * `offers_snapshot.stage='greeting'` (marcador para a poda/retomada da A3).
+ * Idempotente por (sessão, época, stage): re-login/reopen NÃO empilham. Best-
+ * effort: NUNCA lança.
+ */
+export async function ensureGreetingMessage(input: {
+  companyId: string
+  sessionId: string
+  text: string
+  threadEpoch?: number
+}): Promise<string | null> {
+  try {
+    const supabase = createServiceClient()
+    const epoch =
+      typeof input.threadEpoch === "number" ? input.threadEpoch : await getCurrentThreadEpoch(input.sessionId)
+    const { data: rows } = await supabase
+      .from("chat_messages")
+      .select("id, offers_snapshot, thread_epoch, archived_at")
+      .eq("session_id", input.sessionId)
+      .eq("role", "assistant")
+      .is("archived_at", null)
+      .order("created_at", { ascending: false })
+      .limit(200)
+    const existing = (rows ?? []).find((r) => {
+      const row = r as { offers_snapshot?: { stage?: unknown } | null; thread_epoch?: number | null }
+      const stage = row.offers_snapshot && typeof row.offers_snapshot === "object" ? row.offers_snapshot.stage : null
+      if (stage !== GREETING_STAGE) return false
+      const e = row.thread_epoch
+      return e == null ? epoch === 0 : Number(e) === epoch
+    })
+    if (existing) return (existing as { id: string }).id
+    return await persistAssistantMessage({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      text: input.text,
+      stage: GREETING_STAGE,
+      threadEpoch: epoch,
+      // a saudação é única por thread — nunca cair no dedup de conteúdo de 15min
+      // (que devolveria a saudação de outra época e não gravaria a desta).
+      skipContentDedup: true,
+    })
+  } catch (err) {
+    console.warn("[journey] ensureGreetingMessage falhou (não-fatal):", (err as Error).message)
+    return null
+  }
+}
+
+/** Contexto do prompt de 3 opções (menu_mode marca initial/reopen). */
+function threeOptionsContext(
+  ackCtx: AckContext,
+  input: { primaryDebtId: string; debtIds: string[] },
+  mode: ThreeOptionsMenuMode,
+): Record<string, unknown> {
+  return {
+    creditor_name: ackCtx.creditorName,
+    updated_value: ackCtx.updatedValue,
+    invoice_count: ackCtx.invoiceCount,
+    oldest_due_date: ackCtx.oldestDueDate,
+    primary_debt_id: input.primaryDebtId,
+    debt_ids: input.debtIds,
+    menu_mode: mode,
+  }
+}
+
+function sameButtons(a: Button[], b: Button[]): boolean {
+  if (a.length !== b.length) return false
+  const key = (x: Button) => `${x.id}|${x.label}|${x.value ?? ""}|${x.order ?? ""}`
+  const as = a.map(key).sort()
+  const bs = b.map(key).sort()
+  return as.every((v, i) => v === bs[i])
+}
+
 /**
  * Cria o prompt INICIAL da sessão no formato de 3 opções (§6.1). Idempotente na
  * RE-ENTRADA: só recria quando NÃO há prompt ativo da jornada
  * (debt_three_options/debt_consult/debt_acknowledgement) — assim uma sessão
  * reaberta não perde o menu, e um reload durante a negociação não duplica o
- * prompt. A pergunta-resumo (com valor/vencimento) é persistida em chat_messages
- * ligada ao prompt (histórico da re-entrada). Respeita acknowledgement_enabled.
- * NÃO grava reconhecimento — só apresenta (o reconhecimento implícito é no clique).
+ * prompt. Respeita acknowledgement_enabled. NÃO grava reconhecimento — só
+ * apresenta (o reconhecimento implícito é no clique).
+ *
+ * A1 (G6/N-D5-7):
+ *  - `mode:'initial'` (default, login): garante a SAUDAÇÃO 1x por thread como
+ *    bolha própria (ensureGreetingMessage) e cria o menu SEM pergunta no bloco de
+ *    botões (a saudação já pergunta);
+ *  - `mode:'reopen'` (Detalhes/Voltar/Já paguei/reopen): menu com a pergunta
+ *    curta e NENHUMA saudação nova;
+ *  - `question` explícita sobrepõe a pergunta do modo;
+ *  - `ackCtx` já calculado pelo chamador evita recalcular (latência);
+ *  - `already_active`: se a pergunta/botões do prompt ativo diferirem do que o
+ *    código gera hoje (copy nova, valor novo), atualiza IN-PLACE (mesmo id e
+ *    status) — a copy nova chega a prompts já gravados. O menu-volta do "não
+ *    reconheço" (stage not_recognized_back) não é tocado.
  */
 export async function bootstrapThreeOptionsPrompt(input: {
   companyId: string
@@ -367,59 +500,109 @@ export async function bootstrapThreeOptionsPrompt(input: {
   customerId: string
   debtIds: string[]
   primaryDebtId: string
+  question?: string
+  mode?: ThreeOptionsMenuMode
+  ackCtx?: AckContext
 }): Promise<BootstrapThreeOptionsResult> {
   const supabase = createServiceClient()
-  const { data: cfg } = await supabase
-    .from("tenant_chat_config")
-    .select("acknowledgement_enabled, show_handoff_button")
-    .eq("company_id", input.companyId)
-    .maybeSingle()
+  const mode: ThreeOptionsMenuMode = input.mode ?? "initial"
+  const [{ data: cfg }, { data: existingRaw }, threadEpoch] = await Promise.all([
+    supabase
+      .from("tenant_chat_config")
+      .select("acknowledgement_enabled, show_handoff_button")
+      .eq("company_id", input.companyId)
+      .maybeSingle(),
+    supabase
+      .from("chat_prompts")
+      .select("*")
+      .eq("session_id", input.sessionId)
+      .in("kind", ["debt_three_options", "debt_consult", "debt_acknowledgement"])
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    getCurrentThreadEpoch(input.sessionId),
+  ])
   if (cfg?.acknowledgement_enabled === false) {
     return { ok: true, created: false, reason: "disabled" }
   }
+  const showHandoff = cfg?.show_handoff_button === true
+  const existing = (existingRaw as PromptRow | null) ?? null
 
-  const { data: existing } = await supabase
-    .from("chat_prompts")
-    .select("*")
-    .eq("session_id", input.sessionId)
-    .in("kind", ["debt_three_options", "debt_consult", "debt_acknowledgement"])
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
+  const ackCtx =
+    input.ackCtx ??
+    (await buildAckContext({
+      companyId: input.companyId,
+      customerId: input.customerId,
+      debtIds: input.debtIds,
+    }))
+  const greeting = threeOptionsSummary(ackCtx)
+
   if (existing) {
-    return { ok: true, created: false, reason: "already_active", prompt: existing as PromptRow }
+    // Saudação 1x por thread: garantida também na re-entrada com menu vivo (a
+    // thread pode ter nascido antes desta regra, sem bolha de saudação).
+    if (mode === "initial") {
+      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+    }
+    // N-D5-7: copy atual no prompt ativo (só o menu payável de 3 opções).
+    const ctx = (existing.context ?? {}) as { stage?: unknown; menu_mode?: unknown }
+    const isPayableMenu =
+      existing.kind === "debt_three_options" &&
+      ctx.stage !== "not_recognized_back" &&
+      (existing.buttons ?? []).some((b) => b.id === BTN_PAY)
+    if (isPayableMenu) {
+      const existingMode: ThreeOptionsMenuMode =
+        ctx.menu_mode === "reopen" || ctx.menu_mode === "initial" ? ctx.menu_mode : mode
+      const expectedQuestion = input.question ?? menuQuestion(existingMode)
+      const expectedButtons = threeOptionsButtons(ackCtx.updatedValue, showHandoff)
+      const questionDiffers = existing.question !== expectedQuestion
+      const buttonsDiffer = !sameButtons(existing.buttons ?? [], expectedButtons)
+      if (questionDiffers || buttonsDiffer) {
+        const patch: Record<string, unknown> = {}
+        if (questionDiffers) patch.question = expectedQuestion
+        if (buttonsDiffer) patch.buttons = expectedButtons
+        patch.context = { ...(existing.context ?? {}), ...threeOptionsContext(ackCtx, input, existingMode) }
+        const { data: refreshed } = await supabase
+          .from("chat_prompts")
+          .update(patch)
+          .eq("id", existing.id)
+          .eq("session_id", input.sessionId)
+          .eq("status", "active")
+          .select("*")
+        const row = Array.isArray(refreshed) && refreshed[0] ? (refreshed[0] as PromptRow) : { ...existing, ...patch } as PromptRow
+        return { ok: true, created: false, reason: "already_active", prompt: row }
+      }
+    }
+    return { ok: true, created: false, reason: "already_active", prompt: existing }
   }
 
-  const ackCtx = await buildAckContext({
-    companyId: input.companyId,
-    customerId: input.customerId,
-    debtIds: input.debtIds,
-  })
-  const question = threeOptionsSummary(ackCtx)
+  // Saudação ANTES do menu (ordem cronológica na tela): só no modo inicial e só
+  // uma vez por thread.
+  if (mode === "initial") {
+    await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+  }
+
+  const question = input.question ?? menuQuestion(mode)
   const created = await createPrompt({
     companyId: input.companyId,
     sessionId: input.sessionId,
     kind: "debt_three_options",
     question,
-    buttons: threeOptionsButtons(ackCtx.updatedValue, cfg?.show_handoff_button === true),
-    context: {
-      creditor_name: ackCtx.creditorName,
-      updated_value: ackCtx.updatedValue,
-      invoice_count: ackCtx.invoiceCount,
-      oldest_due_date: ackCtx.oldestDueDate,
-      primary_debt_id: input.primaryDebtId,
-      debt_ids: input.debtIds,
-    },
+    buttons: threeOptionsButtons(ackCtx.updatedValue, showHandoff),
+    context: threeOptionsContext(ackCtx, input, mode),
     createdBy: "platform",
+    threadEpoch,
   })
   if (!created.ok) return { ok: false, error: created.error }
 
+  // A pergunta do menu (quando houver) fica ligada ao prompt (histórico/painel);
+  // no modo inicial a pergunta é vazia → nada a persistir (a saudação já está).
   await persistAssistantMessage({
     companyId: input.companyId,
     sessionId: input.sessionId,
     text: question,
     promptId: created.prompt.id,
+    threadEpoch,
   })
   return { ok: true, created: true, prompt: created.prompt }
 }
@@ -510,7 +693,7 @@ export async function resetStaleChatIfInactive(sessionId: string, _companyId: st
       .then(() => {}, () => {})
     return true
   } catch (err) {
-    console.warn("[journey] reset 24h — rotação de thread (não-fatal):", (err as Error).message)
+    console.warn("[journey] reset 24h: rotação de thread (não-fatal):", (err as Error).message)
     return false
   }
 }
@@ -545,10 +728,12 @@ export async function bootstrapThreeOptionsSafe(input: {
 }
 
 /**
- * Reabre o menu de 3 opções após "Não reconheço" → volta ([98]). Recria o prompt
- * de 3 opções com a mesma mensagem-resumo. Reusa bootstrapThreeOptionsPrompt (que
- * é idempotente); se ainda houver um prompt ativo (não deveria — o clique de volta
- * já respondeu o prompt do "não reconheço"), devolve o ativo.
+ * Reemite o menu de 3 opções depois de uma ação (Detalhes [2], Voltar [98],
+ * "Já paguei", /api/chat/reopen). A1 / G6: modo 'reopen' — pergunta CURTA
+ * ("Como prefere seguir?") e NENHUMA saudação nova (a saudação é 1x por thread).
+ * Reusa bootstrapThreeOptionsPrompt (idempotente); se ainda houver um prompt
+ * ativo, devolve o ativo. `ackCtx` do chamador evita o 2º buildAckContext
+ * (N-D3-5). O `reply` devolvido é a pergunta curta (o client não injeta bolha).
  */
 export async function reopenThreeOptions(input: {
   companyId: string
@@ -556,15 +741,11 @@ export async function reopenThreeOptions(input: {
   customerId: string
   debtIds: string[]
   primaryDebtId: string
-}): Promise<{ ok: true; reply: string } | { ok: false; error: string }> {
-  const res = await bootstrapThreeOptionsPrompt(input)
+  ackCtx?: AckContext
+}): Promise<{ ok: true; reply: string; promptId: string | null } | { ok: false; error: string }> {
+  const res = await bootstrapThreeOptionsPrompt({ ...input, mode: "reopen" })
   if (!res.ok) return res
-  const ackCtx = await buildAckContext({
-    companyId: input.companyId,
-    customerId: input.customerId,
-    debtIds: input.debtIds,
-  })
-  return { ok: true, reply: threeOptionsSummary(ackCtx) }
+  return { ok: true, reply: REOPEN_MENU_QUESTION, promptId: res.prompt?.id ?? null }
 }
 
 // ============================================================================
@@ -596,7 +777,7 @@ export function offerButtonLabel(terms: OfferTerms): string {
   if (terms.installments <= 1) {
     const base = `À vista ${BRL(terms.total_value)}`
     return terms.discount_value > 0
-      ? `${base} — você economiza ${BRL(terms.discount_value)} (recomendado)`
+      ? `${base}, economia de ${BRL(terms.discount_value)} (recomendado)`
       : `${base} (recomendado)`
   }
   return `${terms.installments}x de ${BRL(terms.installment_value)} (total ${BRL(terms.total_value)})`
@@ -622,14 +803,25 @@ export function offerChoiceButtons(offers: ListedOffer[]): Button[] {
  *  Uma ideia, sem "se já pagou desconsidere" (isso é o botão "Já paguei" — C10).
  *  Sem PII; sem ameaça/negativação; sem valor na fala (mora no card/rótulo — R-12). */
 export function offerChoiceQuestion(): string {
-  return (
-    "Estas são as condições disponíveis para você. " +
-    "Escolha a que preferir e eu gero o seu pagamento."
-  )
+  // A4/S8: a MESMA frase do eco do clique Negociar (S7). T2 (S7) é persistida
+  // antes deste prompt; na tela, o client (chat-display.resolvePromptForRender)
+  // omite a pergunta do bloco de botões quando ela já é a última bolha visível —
+  // S7 aparece uma vez. Aqui a pergunta segue gravada (histórico/retomada).
+  return NEGOTIATION_PENDING_TEXT
 }
 
 export type PresentMatrixOffersResult =
-  | { ok: true; presented: true; offers: ListedOffer[]; promptId: string }
+  | {
+      ok: true
+      presented: true
+      offers: ListedOffer[]
+      promptId: string
+      /** A2: o prompt COMPLETO (shape do GET /api/chat/messages.active_prompt) para o
+       *  POST do clique devolvê-lo e o client renderizar as parcelas NA HORA. */
+      prompt: PromptView
+      /** true quando um 'offer_choice' já estava ativo e foi reusado (idempotência). */
+      reused: boolean
+    }
   | { ok: true; presented: false; reason: "no_offers" }
   | { ok: false; error: string }
 
@@ -642,12 +834,21 @@ export type PresentMatrixOffersResult =
  * `presented:false` (o chamador cai no caminho de degradação, nunca beco sem
  * saída). NÃO cobra nada aqui — só apresenta; a cobrança é no aceite. NÃO decide
  * desconto/parcela (D8): só exibe o que a matriz gerou.
+ *
+ * A2 (N-D2-2, clique < 3 s): UMA leitura de contexto — o prompt ativo, as ofertas
+ * (listOffers já é 1 leitura + lote) e a época correm em PARALELO; a pergunta é
+ * gravada sem o dedup de conteúdo (é única por prompt) e com a época já lida.
+ * `precedingWrite` (opcional) produz a escrita que deve PRECEDER a bolha-pergunta
+ * no histórico (ex.: a confirmação "Certo…" do clique) — é chamada só quando há
+ * parcelas a apresentar, e as leituras não esperam por ela, só a escrita da
+ * pergunta (o chamador pode devolver uma Promise já em curso).
  */
 export async function presentMatrixOffers(input: {
   companyId: string
   sessionId: string
   customerId: string
   debtId: string
+  precedingWrite?: () => Promise<unknown>
 }): Promise<PresentMatrixOffersResult> {
   const ctx: SessionCtx = {
     companyId: input.companyId,
@@ -657,26 +858,29 @@ export async function presentMatrixOffers(input: {
   }
   const supabase = createServiceClient()
 
-  // idempotência: se já existe um 'offer_choice' ATIVO, reusa (não re-apresenta).
-  const { data: existing } = await supabase
-    .from("chat_prompts")
-    .select("id, buttons")
-    .eq("session_id", input.sessionId)
-    .eq("kind", "offer_choice")
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
+  const [{ data: existing }, offers, epoch] = await Promise.all([
+    // idempotência: se já existe um 'offer_choice' ATIVO, reusa (não re-apresenta).
+    supabase
+      .from("chat_prompts")
+      .select("*")
+      .eq("session_id", input.sessionId)
+      .eq("kind", "offer_choice")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    listOffers(ctx),
+    getCurrentThreadEpoch(input.sessionId),
+  ])
   if (existing) {
-    // devolve as ofertas ainda vivas (para o chamador reidratar, se precisar)
-    const offers = await listOffers(ctx)
-    return { ok: true, presented: true, offers, promptId: (existing as { id: string }).id }
+    const row = existing as PromptRow
+    return { ok: true, presented: true, offers, promptId: row.id, prompt: promptView(row)!, reused: true }
   }
-
-  const offers = await listOffers(ctx)
   if (offers.length === 0) return { ok: true, presented: false, reason: "no_offers" }
 
   const question = offerChoiceQuestion()
+  // a bolha de confirmação do clique (se houver) entra ANTES do prompt/pergunta.
+  if (input.precedingWrite) await input.precedingWrite().catch(() => {})
   const created = await createPrompt({
     companyId: input.companyId,
     sessionId: input.sessionId,
@@ -690,6 +894,7 @@ export async function presentMatrixOffers(input: {
       source: "assisted_matrix",
     },
     createdBy: "platform",
+    threadEpoch: epoch,
   })
   if (!created.ok) return { ok: false, error: created.error }
   await persistAssistantMessage({
@@ -697,8 +902,40 @@ export async function presentMatrixOffers(input: {
     sessionId: input.sessionId,
     text: question,
     promptId: created.prompt.id,
+    threadEpoch: epoch,
+    skipContentDedup: true,
   })
-  return { ok: true, presented: true, offers, promptId: created.prompt.id }
+  return {
+    ok: true, presented: true, offers, promptId: created.prompt.id,
+    prompt: promptView(created.prompt)!, reused: false,
+  }
+}
+
+/**
+ * debt_ids/primary_debt_id da SESSÃO (o menu de 3 opções consolida o valor sobre
+ * todas as dívidas). Para reabrir o menu assistido a partir de um prompt que não
+ * carrega `context.debt_ids` (ex.: prompt criado pelo n8n). Nunca lança —
+ * degrada para [fallbackDebtId].
+ */
+export async function resolveSessionDebtIds(
+  sessionId: string,
+  fallbackDebtId: string,
+): Promise<{ debtIds: string[]; primaryDebtId: string }> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_sessions")
+      .select("debt_ids, primary_debt_id, debt_id")
+      .eq("id", sessionId)
+      .maybeSingle()
+    const row = data as { debt_ids?: string[] | null; primary_debt_id?: string | null; debt_id?: string | null } | null
+    const primaryDebtId = row?.primary_debt_id ?? row?.debt_id ?? fallbackDebtId
+    const rawIds = row?.debt_ids ?? []
+    const debtIds = rawIds.length > 0 ? rawIds : [primaryDebtId]
+    return { debtIds, primaryDebtId }
+  } catch {
+    return { debtIds: [fallbackDebtId], primaryDebtId: fallbackDebtId }
+  }
 }
 
 /**
@@ -763,7 +1000,7 @@ export function debtSettledContactHref(): string {
 export function debtSettledContactAction(): MessageLinkAction {
   return {
     type: "external_link",
-    label: "Recebi uma cobrança — falar com atendimento",
+    label: "Falar com atendimento",
     href: debtSettledContactHref(),
   }
 }
@@ -773,13 +1010,15 @@ export function debtSettledContactAction(): MessageLinkAction {
  * de pagamento for desconhecida, omite o "em {data}" e mantém o "consta como paga".
  */
 export function settledMessage(ctx: SettledContext): string {
-  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}!` : "Olá!"
-  const paidWhen = ctx.paidAt ? ` em ${formatDatePt(ctx.paidAt)}` : ""
-  const dueWhen = ctx.oldestDueDate ? ` (vencimento ${formatDatePt(ctx.oldestDueDate)})` : ""
+  // A4/S21: sem exclamação, sem CAPS, sem "Obrigado!". O valor é o do OUTCOME
+  // (pagamento recebido), permitido pela R-12.
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
+  const paidDate = ctx.paidAt ? formatDatePt(ctx.paidAt) : ""
+  const paidWhen = paidDate ? ` em ${paidDate}` : ""
   return (
-    `${greeting} Verificamos aqui: sua dívida com a ${ctx.creditorName} ` +
-    `no valor de ${BRL(ctx.totalPaid)}${dueWhen} consta como PAGA${paidWhen} e está quitada. ` +
-    `Obrigado! Se precisar de algo, fale com o nosso atendimento.`
+    `${greeting} Não há valor em aberto em seu nome com a ${ctx.creditorName}: ` +
+    `o pagamento de ${BRL(ctx.totalPaid)} consta como recebido${paidWhen}. ` +
+    `Se precisar de algo, fale com o atendimento.`
   )
 }
 
@@ -1005,66 +1244,100 @@ export async function bootstrapAcknowledgementPrompt(input: {
   return { ok: true, created: true, prompt: created.prompt }
 }
 
+/** Ação anexada a uma bolha (botão-link renderizado pelo client abaixo dela). */
+export interface MessageAction {
+  type: "external_link" | "open_payment_link"
+  label: string
+  href: string
+}
+
 /**
  * Grava uma mensagem do assistente em chat_messages (engine='platform', fluxo
  * assistido). Reusa o mesmo caminho que /api/chat/messages lê. Idempotente por
- * `prompt_id` quando informado (a pergunta do reconhecimento é gravada uma única
- * vez, mesmo que o bootstrap rode de novo). O texto já é neutro/sem PII (o resumo
- * do reconhecimento não expõe documento). NUNCA lança — uma falha aqui não pode
- * derrubar a criação do prompt nem o processamento do clique.
+ * (prompt_id, stage) quando `promptId` é informado: a pergunta de um prompt é
+ * gravada uma única vez (stage null), e uma resposta ligada ao prompt respondido
+ * (ex.: stage 'detail') idem — os dois convivem no mesmo prompt_id. O texto já é
+ * neutro/sem PII. NUNCA lança — uma falha aqui não pode derrubar a criação do
+ * prompt nem o processamento do clique.
+ *
+ * `stage` e `action` vão para offers_snapshot ({ stage, message_action, ... }):
+ * marcadores que a rota /api/chat/messages expõe ao client (stage/action) e que
+ * a poda/retomada (A3) usa para classificar outcome/greeting.
  */
 export async function persistAssistantMessage(input: {
   companyId: string
   sessionId: string
   text: string
   promptId?: string | null
+  /** marcador de estágio (greeting | detail | payment_link | not_recognized | payment_claim). */
+  stage?: string | null
+  /** botão-link anexado à bolha (offers_snapshot.message_action). */
+  action?: MessageAction | null
+  /** campos extras de offers_snapshot (ex.: agreement_id). */
+  snapshot?: Record<string, unknown> | null
+  /** época já lida pelo chamador (evita 1 round-trip). */
+  threadEpoch?: number
+  /** pula o dedup de conteúdo de 15min (bolhas únicas por natureza, ex.: saudação). */
+  skipContentDedup?: boolean
 }): Promise<string | null> {
   const text = (input.text ?? "").trim()
   if (!text) return null
   const supabase = createServiceClient()
+  const stage = input.stage ?? null
+  // Um OUTCOME ligado ao clique (stage + promptId — ex.: detalhes da dívida do
+  // prompt X) é uma resposta ÀQUELE clique: não cai no dedup de conteúdo de 15min
+  // (a idempotência por (prompt_id, stage) já impede a duplicata do mesmo clique;
+  // textos idênticos de cliques distintos colapsam só na EXIBIÇÃO, no client).
+  const skipContentDedup = input.skipContentDedup === true || (!!stage && !!input.promptId)
   try {
-    // idempotência: a pergunta de um prompt é gravada uma única vez.
-    if (input.promptId) {
-      const { data: existing } = await supabase
-        .from("chat_messages")
-        .select("id")
-        .eq("session_id", input.sessionId)
-        .eq("prompt_id", input.promptId)
-        .eq("role", "assistant")
-        .limit(1)
-        .maybeSingle()
-      if (existing) return (existing as { id: string }).id
-    }
+    // Leituras INDEPENDENTES em paralelo (A1: latência do clique): idempotência por
+    // (prompt_id, stage), dedup por conteúdo (15min) e época corrente.
+    const since = new Date(Date.now() - 15 * 60_000).toISOString()
+    const [byPrompt, byContent, epoch] = await Promise.all([
+      input.promptId
+        ? supabase
+            .from("chat_messages")
+            .select("id, offers_snapshot")
+            .eq("session_id", input.sessionId)
+            .eq("prompt_id", input.promptId)
+            .eq("role", "assistant")
+            .limit(20)
+        : Promise.resolve({ data: null as Array<{ id: string; offers_snapshot?: unknown }> | null }),
+      skipContentDedup
+        ? Promise.resolve({ data: null as { id: string } | null })
+        : supabase
+            .from("chat_messages")
+            .select("id")
+            .eq("session_id", input.sessionId)
+            .eq("role", "assistant")
+            .eq("text", text)
+            .gte("created_at", since)
+            .limit(1)
+            .maybeSingle(),
+      typeof input.threadEpoch === "number"
+        ? Promise.resolve(input.threadEpoch)
+        : getCurrentThreadEpoch(input.sessionId),
+    ])
+
+    // idempotência: a pergunta (stage null) / a resposta (stage X) de um prompt é
+    // gravada uma única vez cada.
+    const existing = ((byPrompt.data ?? []) as Array<{ id: string; offers_snapshot?: unknown }>).find((r) => {
+      const snap = r.offers_snapshot && typeof r.offers_snapshot === "object" ? (r.offers_snapshot as { stage?: unknown }) : null
+      const rowStage = snap && typeof snap.stage === "string" ? snap.stage : null
+      return rowStage === stage
+    })
+    if (existing) return existing.id
 
     // DEDUP POR CONTEÚDO — "manter só a última" (mesmo padrão provado em
-    // chat-send.ts:87-99). Fluxos plataforma (debtInfoMessage, replies de
-    // Negociar/Não-reconheço) e o re-bootstrap da saudação re-persistiam texto
-    // IDÊNTICO a cada clique/re-entrada — sem promptId, ou com um prompt NOVO
-    // (a idempotência por prompt_id acima não pega prompt novo). Se uma mensagem
+    // chat-send.ts:87-99). Fluxos plataforma re-persistiam texto IDÊNTICO a cada
+    // clique/re-entrada — sem promptId, ou com um prompt NOVO. Se uma mensagem
     // 'assistant' com o MESMO texto já existe nesta sessão nos últimos 15min, NÃO
-    // re-insere: devolve o id existente. O texto já é neutro/mascarado (valor/venc
-    // ok, sem documento) — nenhuma PII nova é envolvida. Cobre também o caminho COM
-    // promptId (saudação re-bootstrapada com prompt novo → mesmo texto suprimido; o
-    // prompt/menu é recriado por createPrompt, mas a bolha não duplica).
-    const since = new Date(Date.now() - 15 * 60_000).toISOString()
-    const { data: dup } = await supabase
-      .from("chat_messages")
-      .select("id")
-      .eq("session_id", input.sessionId)
-      .eq("role", "assistant")
-      .eq("text", text)
-      .gte("created_at", since)
-      .limit(1)
-      .maybeSingle()
-    if (dup) return (dup as { id: string }).id
+    // re-insere: devolve o id existente.
+    const dup = byContent.data as { id: string } | null
+    if (dup) return dup.id
 
-    // C3: carimba a ÉPOCA corrente na bolha nova, para o GET filtrar a thread atual
-    // (o reset 24h incrementa thread_epoch; sem o carimbo, uma bolha nova cairia na
-    // época 0/velha). Best-effort: se a coluna não existir (20260935 pendente em
-    // prod), o insert com thread_epoch é ignorado pelo PostgREST? Não — colunas
-    // desconhecidas causam erro. Por isso lemos a época e só incluímos o campo
-    // quando > 0 (época 0 = default = comportamento de hoje, dispensa a coluna).
-    const epoch = await getCurrentThreadEpoch(input.sessionId)
+    // C3: carimba a ÉPOCA corrente na bolha nova (só quando > 0 — época 0 =
+    // default = dispensa a coluna e não quebra em prod antes da 20260935).
     const insertRow: Record<string, unknown> = {
       company_id: input.companyId,
       session_id: input.sessionId,
@@ -1074,6 +1347,10 @@ export async function persistAssistantMessage(input: {
       prompt_id: input.promptId ?? null,
     }
     if (epoch > 0) insertRow.thread_epoch = epoch
+    const snapshot: Record<string, unknown> = { ...(input.snapshot ?? {}) }
+    if (stage) snapshot.stage = stage
+    if (input.action) snapshot.message_action = input.action
+    if (Object.keys(snapshot).length > 0) insertRow.offers_snapshot = snapshot
     const { data } = await supabase
       .from("chat_messages")
       .insert(insertRow)
@@ -1292,17 +1569,29 @@ export type StartN8nResult =
  * vão ao fluxo (a resposta DESTE clique já foi persistida localmente pelo
  * chamador — o histórico nunca depende do n8n). NUNCA lança.
  */
-async function dispatchNegotiationStartInBackground(input: {
+/** Desfecho do disparo do negotiation.start (A2): o que foi gravado no banco. */
+export type NegotiationStartOutcome =
+  | { delivered: true; owner: "n8n" }
+  | { delivered: false; owner: "platform"; reason: string }
+
+/**
+ * Executa o negotiation.start ao n8n e grava a auditoria/engine_owner conforme o
+ * desfecho. É a unidade que dispatchNegotiationStartInBackground (fire-and-forget
+ * legado) e kickoffNegotiationStart (com deadline — A2) compartilham. NUNCA lança:
+ * qualquer falha vira `delivered:false` com um rótulo curto (sem URL/segredo/PII).
+ */
+async function runNegotiationStartDispatch(input: {
   companyId: string
   sessionId: string
   customerId: string
   debtId: string
   eventId: string
-}): Promise<void> {
+}): Promise<NegotiationStartOutcome> {
   try {
     const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
     const emit = await emitNegotiationStart(input.sessionId, input.eventId)
     const delivered = emit.ok === true && "delivered" in emit && emit.delivered === true
+    const reason = "reason" in emit ? String(emit.reason) : "unknown"
 
     const supabase = createServiceClient()
     // Só promove o dono a n8n quando o disparo foi de fato ENTREGUE. Sem entrega
@@ -1327,12 +1616,92 @@ async function dispatchNegotiationStartInBackground(input: {
       eventId: delivered ? `neg_start:${input.eventId}` : `neg_start_unavailable:${input.eventId}`,
       payload: delivered
         ? { event: "negotiation.start", engine_owner: "n8n" }
-        : { event: "engine_unavailable", engine_owner: "platform", reason: "reason" in emit ? emit.reason : "unknown" },
+        : { event: "engine_unavailable", engine_owner: "platform", reason },
     })
+    return delivered ? { delivered: true, owner: "n8n" } : { delivered: false, owner: "platform", reason }
   } catch (err) {
-    // Best-effort: uma falha no handoff em background jamais afeta o clique já
-    // respondido. Só loga um rótulo curto (sem URL/segredo/PII).
-    console.warn("[journey] negotiation.start (background) falhou:", (err as Error).message)
+    // Best-effort: uma falha no handoff jamais afeta o clique. Só loga um rótulo
+    // curto (sem URL/segredo/PII).
+    console.warn("[journey] negotiation.start (dispatch) falhou:", (err as Error).message)
+    return { delivered: false, owner: "platform", reason: "dispatch_error" }
+  }
+}
+
+async function dispatchNegotiationStartInBackground(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+  eventId: string
+}): Promise<void> {
+  await runNegotiationStartDispatch(input)
+}
+
+/** Estado do kickoff no momento da RESPOSTA ao clique (A2). `pending` = o disparo
+ *  não resolveu dentro do deadline e segue solto (a resposta não espera). */
+export type KickoffStatus =
+  | { status: "delivered"; owner: "n8n" }
+  | { status: "unavailable"; owner: "platform"; reason: string }
+  | { status: "pending"; owner: "platform" }
+
+export interface KickoffHandle {
+  eventId: string
+  /** Aguarda o disparo até `deadlineMs` (≥ 0). Se resolver, devolve o desfecho
+   *  gravado no banco (engine_owner alinhado — N-D2-12); senão `pending`. */
+  settle(deadlineMs: number): Promise<KickoffStatus>
+}
+
+/** Deadline padrão do kickoff no caminho do clique (ms). Configurável por env
+ *  N8N_KICKOFF_DEADLINE_MS; o POST ao n8n tem o seu próprio N8N_KICKOFF_TIMEOUT_MS. */
+export function kickoffDeadlineMs(): number {
+  const n = Number(process.env.N8N_KICKOFF_DEADLINE_MS)
+  return Number.isFinite(n) && n >= 0 ? n : 2500
+}
+
+/**
+ * A2 (N-D2-10) — kickoff do negotiation.start FORA do caminho crítico mas
+ * CONFIÁVEL em serverless: o disparo começa JÁ (em paralelo com a apresentação
+ * das parcelas) e a resposta ao clique só o aguarda até um deadline curto
+ * (Promise.race, o mesmo mecanismo do handleDebtNegotiate). Na prática o POST
+ * ao webhook do n8n responde na hora ("Workflow was started") e o disparo resolve
+ * antes das parcelas — o `engine_owner` devolvido é então o que está no banco.
+ * Estourado o deadline, a resposta não espera e o disparo segue solto (o mesmo
+ * risco de congelamento de antes, agora BOUNDED e sinalizado como `pending`).
+ * NUNCA lança.
+ */
+export function kickoffNegotiationStart(input: {
+  companyId: string
+  sessionId: string
+  customerId: string
+  debtId: string
+}): KickoffHandle {
+  const eventId = randomUUID()
+  const dispatch = runNegotiationStartDispatch({ ...input, eventId })
+  let settled: KickoffStatus | null = null
+  const settledPromise: Promise<KickoffStatus> = dispatch.then((out) => {
+    settled = out.delivered
+      ? { status: "delivered", owner: "n8n" }
+      : { status: "unavailable", owner: "platform", reason: out.reason }
+    return settled
+  })
+  return {
+    eventId,
+    async settle(deadlineMs: number): Promise<KickoffStatus> {
+      if (settled) return settled
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race<KickoffStatus>([
+          settledPromise,
+          new Promise<KickoffStatus>((resolve) => {
+            timer = setTimeout(() => resolve({ status: "pending", owner: "platform" }), Math.max(0, deadlineMs))
+            // não segura o event loop: o disparo, se estourar, segue solto.
+            timer.unref?.()
+          }),
+        ])
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    },
   }
 }
 
@@ -1466,10 +1835,16 @@ export async function handleDebtConsult(input: {
 }
 
 /**
- * "Negociar Dívida" [3]: mostra os dados da dívida, registra o reconhecimento
- * ("Sim") a partir do prompt debt_consult e INICIA a negociação no n8n
- * (engine_owner='n8n' + negotiation.start). RESILIENTE (H8): se o n8n não
- * responder, mantém o assistido e persiste o reply — o cliente nunca vê erro.
+ * "Negociar Dívida" [3] (caminho LEGADO do prompt debt_consult): mostra os dados
+ * da dívida, registra o reconhecimento ("Sim") e INICIA a negociação no n8n
+ * (negotiation.start). RESILIENTE (H8): se o n8n não responder, mantém o
+ * assistido e persiste o reply — o cliente nunca vê erro.
+ *
+ * A2 (G2-c): este caminho NUNCA apresentava as parcelas (a única chamada a
+ * presentMatrixOffers era o ramo 3-opções) — o devedor ficava em "preparando…
+ * só um instante" para sempre. Agora apresenta a MATRIZ como o ramo 3-opções:
+ * nenhum caminho de "negociar" sem parcelas na tela. O kickoff corre em paralelo
+ * (kickoffNegotiationStart) e só é aguardado até o deadline curto.
  */
 export async function handleDebtNegotiate(input: {
   companyId: string
@@ -1481,91 +1856,98 @@ export async function handleDebtNegotiate(input: {
   buttonId: number
   ip?: string | null
   userAgent?: string | null
-  dispatchDeadlineMs?: number // deadline do kickoff no caminho do clique (default 2500)
-}): Promise<{ ok: true; engineOwner: "platform" | "n8n"; reply: string }> {
+  dispatchDeadlineMs?: number // deadline do kickoff no caminho do clique (default N8N_KICKOFF_DEADLINE_MS/2500)
+}): Promise<{
+  ok: true
+  engineOwner: "platform" | "n8n"
+  reply: string
+  kickoff: KickoffStatus["status"]
+  offersPresented: boolean
+  prompt: PromptView | null
+}> {
+  const t0 = Date.now()
+  // kickoff JÁ (fora do caminho crítico; aguardado só até o deadline no fim).
+  const kickoff = kickoffNegotiationStart({
+    companyId: input.companyId,
+    sessionId: input.sessionId,
+    customerId: input.customerId,
+    debtId: input.debtId,
+  })
+
   const ackCtx = await buildAckContext({
     companyId: input.companyId,
     customerId: input.customerId,
     debtIds: input.debtIds,
   })
-  await persistAssistantMessage({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    text: debtInfoMessage(ackCtx),
-  })
+  // dados da dívida (histórico legado) e reconhecimento em PARALELO (independentes).
+  await Promise.all([
+    persistAssistantMessage({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      text: debtInfoMessage(ackCtx),
+    }),
+    // Reconhecimento implícito ao Negociar: o devedor quer negociar → reconhece a
+    // dívida. Grava os efeitos append-only (o prompt já foi respondido pela rota).
+    persistDebtRecognition({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      customerId: input.customerId,
+      debtId: input.debtId,
+      promptId: input.promptId,
+      buttonId: input.buttonId,
+      acknowledged: true,
+      source: "chat_button_negotiate",
+      ip: input.ip,
+      userAgent: input.userAgent,
+    }),
+  ])
 
-  // Reconhecimento implícito ao Negociar: o devedor quer negociar → reconhece a
-  // dívida. Grava os efeitos append-only (o prompt já foi respondido pela rota).
-  await persistDebtRecognition({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    customerId: input.customerId,
-    debtId: input.debtId,
-    promptId: input.promptId,
-    buttonId: input.buttonId,
-    acknowledged: true,
-    source: "chat_button_negotiate",
-    ip: input.ip,
-    userAgent: input.userAgent,
-  })
-
-  // Kickoff n8n CONFIÁVEL sem travar o clique: dispara negotiation.start e AGUARDA
-  // até um deadline CURTO (default 2500ms) via Promise.race. `waitForDispatch:true`
-  // é passado DE PROPÓSITO (garante que o disparo é de fato iniciado e não é
-  // perdido pelo serverless num fire-and-forget puro); o race contra o deadline
-  // nos protege da trava do POST síncrono. Se entregar dentro do deadline, promove
-  // engine_owner a 'n8n' já nesta resposta; se estourar, o clique retorna em ≤2.5s
-  // e o disparo segue resolvendo em background (emitNegotiationStart tem timeout
-  // próprio ~5s < maxDuration=60s e grava engine_owner/auditoria ao concluir).
-  // NUNCA lança.
-  let engineOwner: "platform" | "n8n" = "platform"
-  const deadlineMs = input.dispatchDeadlineMs ?? 2500
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
+  // Parcelas da matriz (assistido SEMPRE — A2 item 1). A confirmação T2 precede a
+  // pergunta das parcelas no histórico (gravada só quando há parcelas). NUNCA
+  // lança: falha → cai na espera.
+  let presented: PresentMatrixOffersResult | null = null
   try {
-    const start = await Promise.race<StartN8nResult>([
-      startN8nNegotiation({
-        companyId: input.companyId,
-        sessionId: input.sessionId,
-        customerId: input.customerId,
-        debtId: input.debtId,
-        waitForDispatch: true,
-      }),
-      new Promise<StartN8nResult>((resolve) => {
-        deadlineTimer = setTimeout(
-          () => resolve({ ok: true, owner: "platform", delivered: false }),
-          deadlineMs,
-        )
-        // não segura o event loop: o dispatch, se estourar o deadline, segue solto
-        // e o timer não deve impedir o encerramento da função serverless nem do teste.
-        deadlineTimer.unref?.()
-      }),
-    ])
-    engineOwner = start.owner
+    presented = await presentMatrixOffers({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      customerId: input.customerId,
+      debtId: input.debtId,
+      precedingWrite: () =>
+        // T2 / R-26 (A4/S7): a MESMA constante da bolha otimista do client e da
+        // pergunta das parcelas (fonte única em wait-machine.ts, N-D5-8).
+        persistAssistantMessage({
+          companyId: input.companyId,
+          sessionId: input.sessionId,
+          text: NEGOTIATION_PENDING_TEXT,
+        }),
+    })
   } catch (err) {
-    console.warn("[journey] negotiation.start falhou (fallback assistido):", (err as Error).message)
-  } finally {
-    if (deadlineTimer) clearTimeout(deadlineTimer)
+    console.warn("[journey] presentMatrixOffers (legado) falhou (cai na espera):", (err as Error).message)
+  }
+  const offersPresented = !!presented && presented.ok && presented.presented === true
+  const prompt = offersPresented && presented && presented.ok && presented.presented ? presented.prompt : null
+
+  // A4/S22: sem "Perfeito!"/"sanar o seu débito". Com parcelas, a confirmação S7
+  // (T2, "…disponíveis para você:") já foi gravada como precedingWrite e as
+  // condições vêm logo abaixo. A4 r2 (B3-F2): sem parcelas NADA vem depois, então
+  // a frase é a completa, sem dois-pontos (NEGOTIATION_SEARCHING_TEXT).
+  const reply = offersPresented ? NEGOTIATION_PENDING_TEXT : NEGOTIATION_SEARCHING_TEXT
+  if (!offersPresented) {
+    // Sem parcelas (sem faixa de matriz/falha): indicador "trabalhando" até o n8n
+    // empurrar o próximo turno (via chat.send) ou a espera degradar (D2). Sem PII.
+    // SEMPRE persiste o reply localmente (o histórico não depende do n8n).
+    await persistAssistantMessage({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      text: reply,
+    })
   }
 
-  // Indicador "trabalhando": até o n8n empurrar o próximo turno (via chat.send), a
-  // única sinalização de que a negociação está em curso é este reply. Deixa
-  // explícito que estamos PREPARANDO a negociação (o front o mostra no pollMessages
-  // pós-clique; a resposta do n8n aparece depois por polling normal). Sem PII.
-  const reply =
-    "Perfeito! Então vamos trabalhar juntos para sanar o seu débito. " +
-    "Estou preparando sua negociação, só um instante…"
-  // SEMPRE persiste o reply localmente (bug histórico: condicionar a
-  // engineOwner==='platform' deixava o lado do assistente VAZIO no banco quando o
-  // n8n era assumido dono mas NÃO devolvia/empurrava nada — a sessão reaberta só
-  // trazia a pergunta + o clique). Como o handoff n8n agora é best-effort/em
-  // background e a entrega não é garantida (papel B não confirmado no clique), o
-  // histórico não pode depender dele: gravamos o reply aqui, incondicionalmente.
-  await persistAssistantMessage({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    text: reply,
-  })
-  return { ok: true, engineOwner, reply }
+  // Kickoff: aguarda só o que resta do deadline curto (Promise.race). Se entregou,
+  // engine_owner devolvido = o gravado no banco ('n8n'); senão platform/pending.
+  const deadlineMs = input.dispatchDeadlineMs ?? kickoffDeadlineMs()
+  const kick = await kickoff.settle(Math.max(0, deadlineMs - (Date.now() - t0)))
+  return { ok: true, engineOwner: kick.owner, reply, kickoff: kick.status, offersPresented, prompt }
 }
 
 /**
@@ -1632,6 +2014,31 @@ export async function recognizeImplicit(input: {
     ip: input.ip,
     userAgent: input.userAgent,
   })
+}
+
+/**
+ * A1 / N-D1-5: reconhecimento implícito SEM regravar. Se a sessão já tem um
+ * reconhecimento positivo para a dívida (view debt_acknowledgement_latest), NÃO
+ * grava outro (3 escritas a menos por clique repetido em PAGAR). Senão, delega a
+ * recognizeImplicit. Nunca lança além do que recognizeImplicit lança.
+ */
+export async function recognizeImplicitOnce(
+  input: Parameters<typeof recognizeImplicit>[0],
+): Promise<{ recorded: boolean }> {
+  // Lê o APPEND-LOG (fonte da view debt_acknowledgement_latest): a última
+  // resposta desta (sessão, dívida). Positiva → nada a regravar.
+  const supabase = createServiceClient()
+  const { data: latest } = await supabase
+    .from("debt_acknowledgements")
+    .select("acknowledged, created_at")
+    .eq("session_id", input.sessionId)
+    .eq("debt_id", input.debtId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if ((latest as { acknowledged?: boolean } | null)?.acknowledged === true) return { recorded: false }
+  await recognizeImplicit(input)
+  return { recorded: true }
 }
 
 export type AckGuard =

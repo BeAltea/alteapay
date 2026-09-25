@@ -55,12 +55,26 @@ export interface RecordEventInput {
   occurredAt?: string
 }
 
+/** Chaves do payload que DISCRIMINAM eventos legitimamente repetidos no mesmo
+ *  segundo (A2 / N-D2-8): 3 `offer.presented` (uma por oferta), 2 `prompt.ask`
+ *  etc. Sem isto, o event_id derivado por (tipo, ids, segundo) colapsava as
+ *  ofertas 2x/3x em 1 só linha de auditoria. Só valores escalares entram. */
+const PAYLOAD_DISCRIMINATORS = ["offer_id", "prompt_id", "button_id", "agreement_id", "message_id"] as const
+
+function payloadDiscriminator(payload: Record<string, unknown> | undefined): string {
+  if (!payload) return ""
+  return PAYLOAD_DISCRIMINATORS.map((k) => {
+    const v = payload[k]
+    return typeof v === "string" || typeof v === "number" ? `${k}=${v}` : ""
+  }).filter(Boolean).join(",")
+}
+
 function defaultEventId(input: RecordEventInput, occurredAt: string): string {
   const second = occurredAt.slice(0, 19)
   const key = [
     input.type, input.companyId, input.customerId ?? "", input.debtId ?? "",
     input.sessionId ?? "", input.campaignId ?? "", input.messageId ?? "",
-    input.agreementId ?? "", second,
+    input.agreementId ?? "", second, payloadDiscriminator(input.payload),
   ].join("|")
   return createHash("sha256").update(key).digest("hex")
 }

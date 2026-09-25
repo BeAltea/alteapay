@@ -359,3 +359,119 @@ Por tenant (`tenant_chat_config`): `n8n_chat_flow_url`, `payment_origin`,
 HMAC do nosso lado e devolve uma resposta no contrato de A.2. **404 em produção**
 (só existe fora de prod ou com `MOCK_ALL_INTEGRATIONS=1`). Uso:
 `NEGOTIATION_ENGINE=n8n` + `N8N_CHAT_FLOW_URL=<origin>/api/dev/n8n-stub`.
+
+---
+
+## 12. 2026-09-25 — D2/D4 aplicados nos fluxos do n8n
+
+Decisões de 25/09: **D2 — só o nosso `payment.create` cria cobrança**; **D4 — URL singular
+`/api/webhook/n8n` → `/api/webhooks/n8n`**. Aplicadas via API do n8n, com backup do JSON antes
+de cada PUT (fora do git) e reversíveis. Relatório: `ops/negociacao-final/02-impl-A5.md`.
+
+### 12.1 O que mudou
+
+- **`1.7 Debt Collection (ASAAS)`** não cria mais cliente/cobrança no ASAAS nem insere em
+  `agreements`. Os nós ASAAS (`Get Customer`, `Create Customer`, `Generate Pay Installment`,
+  `Generate Paym. Cash`, `Get All Installments Generated`), `Customer Found?`,
+  `Format Paym. Method & Due Date`, `Prepare Data for Ingestion`, `Is it a installment payment?`
+  e `Update Agreements` estão **desconectados e desabilitados** (não apagados). No lugar, o bloco
+  `AlteaPay: *` chama o nosso webhook assinado (HMAC `sha256=`, credencial `Crypto account`,
+  mesmo padrão do `4. Send Msg & Update`):
+  1. `offer.list` — o servidor gera (ou reaproveita) as ofertas da matriz da sessão;
+  2. escolha da oferta com o mesmo nº de parcelas negociado
+     (`ongoing_agreement.selected_agreement.installments_count`; sem ele, à vista) — **o n8n só
+     escolhe entre ofertas geradas; nunca define desconto/valor** (D8/D11);
+  3. `payment.create { offer_id, billing_type }` → `invoice_url`/`asaas_payment_id` alimentam
+     `Parse Payment URL` → `Call 'Send Msg & Update'` (`already_charged` reenvia o link do
+     acordo vivo).
+  - 4xx/5xx, `processing`, resposta sem link ou parcela sem oferta → `AlteaPay: Error text` →
+    `7. Send Error Msg w/ Persistency`. **Nunca cobrança direta.**
+  - `chat_endpoint` passou a ser propagado às chamadas de `4. Send Msg & Update` (não era).
+- **`1.5`** (`MSG: Invalid Payment Method`) e **`1.6`** (`MSG: Ask for a valid payment method`):
+  URL corrigida. O `1. Main` antigo (inativo) está **arquivado** e a API recusa alteração — fica
+  com a URL singular, sem efeito.
+
+### 12.2 Por que `offer.list` e não `offer.propose`
+
+`offer.propose` exige `args.terms` com os 9 campos de `OfferTerms` **em reais** — o código passa
+`terms` direto a `validateProposedTerms`/`persistOffer`, sem converter centavos e sem conferir
+`original_value` contra a dívida — enquanto o contrato n8n (§11.3 e guia do time) diz "centavos
+em todas as interfaces". O banco que o n8n lê é uma **cópia separada** (a dívida de teste aparece
+lá com `amount=25000`). Um `offer.propose` montado pelo n8n poderia produzir cobrança 100× maior.
+**Pendência da plataforma:** `offer.propose` aceitar centavos na borda e validar `original_value`
+contra `debts.amount` (ou `payment.create` recusar oferta cujo `original_value` ≠ dívida).
+
+### 12.3 Prova (gate G3)
+
+Execução `7525` do `1.7` (Webhook de teste, sessão de teste): `offer.list` 200 (3 ofertas) →
+oferta 1x → `payment.create` 200 `{ok:true, status:'already_charged', idempotent:true}` (acordo
+cancelado com `asaas_status=PENDING`, gap N-D1-2) → `chat.send` 200. ASAAS do cliente de teste:
+**zero cobranças** antes e depois; cofre `A5-n8n-payment-create` = `nao_criada`. Zero caminho de
+`Input`/`Webhook` até qualquer nó ASAAS (verificado por alcance no JSON). **Limite:** a cadeia
+`Get Customer Interaction → … → Last Interaction` morre para sessões web (`notification_id` nulo,
+N-D2-4); a prova entrou direto no bloco por um nó temporário (removido); o caminho `created` não
+foi observado (bloqueado por N-D1-2).
+
+### 12.4 Pendências para o dev do n8n (não corrigidas nesta onda)
+
+- **Botões (N-D2-3):** `Send Message with buttons` (`4. Send Msg & Update`) manda o shape legado
+  `{sessionId, output, buttons}` → **422**. Shape correto:
+  `{action:'chat.send', session_id, event_id, args:{text, prompt:{kind, question, buttons:[{id:<int>, label}]}}}`
+  — `id` **inteiro** (2..97 para lista; 0/1/98/99 reservados) e `label` (não `text`). Idem
+  `Format Buttons` do `1.3` (ids string).
+- **Segredo hard-coded (N-D2-9):** `Input Normalization` do `1. Main` guarda o segredo num campo
+  `Set` e o repassa como `webhook_secret`. Mover para credencial/env do n8n; o bloco novo já não
+  depende dele (usa a credencial `Crypto account`). **Exposição e descarte (2026-09-25):** o valor
+  que circulou em exportações do workflow (nó `Set` do Main antigo e `pinData` do `Input` de
+  1.5/1.6/1.7) é o segredo de **teste/dev** (`webhook_secret_testing`, usado com o host de túnel) —
+  conferido por fingerprint: **não** é o `N8N_WEBHOOK_SECRET` de produção nem o valor da credencial
+  `Crypto account`, que nunca saíram em exportação. Portanto **não é preciso rotacionar**
+  `N8N_WEBHOOK_SECRET`/`Crypto account` (nada de janela combinada); ao mover para credencial,
+  **descartar** o valor de teste exposto (gerar outro só para o ambiente de teste,
+  `openssl rand -hex 32`) e não fixar nenhum segredo em `pinData` de novo.
+- **Router por `step` (D3):** o `1. Main` roteia por `Last Agent Interaction.step` e trata
+  `negotiation.start` como turno ("Teste"); `DB: Update Negotiation Status` exige
+  `notification_id` (nulo em sessões web) → sub-execuções morrem (N-D2-4). Fora de escopo.
+- Copy do `Call 'Send Msg & Update'` (emoji, "Um abraço") não segue a carta de voz D45 — só o
+  trecho do `already_charged` foi ajustado. `processing` não tem polling no fluxo (vai ao erro;
+  em produção `CHARGE_MODE=inline` devolve `created`).
+- `availableInMCP` de 1.5/1.6/1.7 foi resetado para `false` pelo PUT da API pública (chave fora do
+  schema); reativar na UI se for usado. Os nós `Webhook` de teste dos sub-fluxos são públicos e
+  sem autenticação (hoje inertes: corpo aninhado em `body`) — convém removê-los.
+
+## 13. 2026-09-25 — Regra de supersede do assistido (trilha A2, D1 híbrido)
+
+O assistido da plataforma (menu de 3 opções → parcelas da matriz → pós-link) é a **rede de
+segurança sempre presente**. O n8n **conduz** o diálogo **só por prompt acionável**. Vale para
+`chat.send` (com `args.prompt`), `prompt.ask` e `prompt.close` quando o prompt ATIVO da sessão é
+um menu do assistido criado pela plataforma (`kind ∈ {debt_three_options, offer_choice,
+post_payment_link}`, `created_by='platform'`):
+
+| Entrada do n8n | Efeito |
+|---|---|
+| `chat.send` só com `args.text` (sem botões) | bolha `engine='n8n'` gravada; **não supersede** (o menu continua ativo). Na tela vira nota discreta acima do menu; o fallback genérico do fluxo ("selecione uma das opções válidas", "canal de atendimento automático…") **não é exibido**; markdown é removido |
+| `chat.send`/`prompt.ask` com botões inválidos (`validateButtons`: ids não-inteiros, duplicados, `label` ausente, lista vazia) | **422** `{code:<erro de validação>}`; nada é gravado (nem o texto); o menu fica |
+| `chat.send`/`prompt.ask` com prompt válido mas **não mapeável** | **422** `{code:'prompt_not_actionable', error:'… (<motivo>)'}`; nada é gravado; o menu fica |
+| `chat.send`/`prompt.ask` com prompt **acionável** | supersede o menu (o ativo vira `superseded`; o novo é `created_by='n8n'`) |
+| `prompt.close` | **422** `{code:'platform_prompt_protected'}` — o menu só é substituído por prompt acionável (fechar sem substituir deixaria o devedor sem caminho). Prompts criados pelo n8n continuam fechando normalmente |
+
+**Acionável** (`lib/journey/chat-send.ts:assessPromptActionability`) = `validateButtons` OK **e**:
+- `offer_choice`: todo item de lista (2..97) leva `value` = `offer_id` de uma oferta `presented`
+  desta sessão (obtida por `offer.list`/`offer.propose` — a matriz é do servidor);
+- `payment_method_choice`: itens com `value` ∈ `PIX | BOLETO | CREDIT_CARD`;
+- kinds booleanos (`debt_acknowledgement`, `generic_yes_no`, `payment_confirmation`): catálogo
+  Sim/Não (`1`/`0`, `99` opcional);
+- kind desconhecido: só se **todo** botão for reservado (`0/1/98/99`) ou mapear um `offer_id`;
+- `debt_three_options`, `debt_consult`, `post_payment_link`: reservados à plataforma (nunca).
+
+Sem menu protegido ativo (ex.: já respondido, ou o ativo é do próprio n8n) vale o comportamento
+anterior (qualquer prompt válido supersede).
+
+Cliques em prompts criados pelo n8n com `NEGOTIATION_ENGINE=n8n`: o `chat.turn` ao fluxo tem
+timeout curto (`N8N_CLICK_TIMEOUT_MS`, default 4000 ms); estourado, o clique responde
+`{action:'engine_timeout', processing:true, prompt:<menu de 3 opções reaberto>}` e a resposta
+tardia do fluxo entra pelas regras acima (texto → nota; prompt acionável → substitui). O
+`negotiation.start` do "Negociar" é disparado em paralelo à apresentação das parcelas e aguardado
+só até `N8N_KICKOFF_DEADLINE_MS` (default 2500 ms; `kickoff: delivered|unavailable|pending` na
+resposta do clique). `engine_outbox` continua ausente em produção: a "entrega durável" é um no-op
+explícito (log único por processo) até a migration ser aplicada.

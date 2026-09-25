@@ -151,9 +151,8 @@ describe("R5 — handlePaymentClaim (registra claim, orienta comprovante, sem de
     const msg = db.chat_messages.find((m) => m.role === "assistant")
     expect(msg).toBeTruthy()
     const text = msg!.text as string
-    // orienta o comprovante e a conferência
-    expect(text).toMatch(/comprovante/i)
-    expect(text).toMatch(/conferir|confer[êe]ncia|equipe/i)
+    // A4/S18: "Vamos conferir o pagamento" (conferência), sem declarar pago.
+    expect(text).toMatch(/vamos conferir o pagamento/i)
     // NUNCA declara pago (D6/M15)
     expect(text).not.toMatch(/pagamento (confirmado|recebido)|quitad[oa]|est[aá] pago/i)
   })
@@ -167,14 +166,12 @@ describe("R5 — handlePaymentClaim (registra claim, orienta comprovante, sem de
     expect((db.contact_suppressions ?? []).length).toBe(0)
   })
 
-  it("copy do 'Já paguei' (T13/R-34): enxuta, sem 'Obrigado por avisar', não declara pago, sem ameaça", async () => {
+  it("copy do 'Já paguei' (A4/S18, Apêndice B): 'Obrigado por avisar. Vamos conferir o pagamento…', não declara pago, sem ameaça", async () => {
     const { handlePaymentClaim, paymentClaimReply } = await import("@/lib/journey/actions")
     await handlePaymentClaim(ctx, "customer")
     const text = db.chat_messages.find((m) => m.role === "assistant")!.text as string
-    // T13: a conferência é da equipe AlteaPay; a nova copy não cita mais o cedente.
-    expect(text).toMatch(/nossa equipe vai conferir/i)
-    // R-34/carta de voz: sem "Obrigado por avisar" (muleta).
-    expect(text).not.toMatch(/obrigado por avisar/i)
+    // Apêndice B "Já paguei": texto fixo (sem {contato} configurado → termina em "fale com o atendimento.").
+    expect(text).toBe("Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento.")
     // D6/M15: NÃO declara pago.
     expect(text).not.toMatch(/pagamento (confirmado|recebido)|quitad[oa]|est[aá] pago/i)
     // copy pura também sem ameaça (D36)

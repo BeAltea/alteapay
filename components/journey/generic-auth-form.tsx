@@ -4,6 +4,10 @@
 // Aceita CPF (11) ou CNPJ (14). Único fator = documento; consentimento LGPD
 // obrigatório antes do 1º turno. Erro SEMPRE genérico (resposta uniforme).
 // Nunca guarda PII em title/localStorage/query.
+// A4 r2 (B3-F3): as mesmas correções da porta pública (public-auth-form.tsx) —
+// o layout do /t/ aplica a marca do tenant ANTES do login, então o submit usa a
+// cor adaptativa --brand-secondary-fg (branco fixo sobre #EAB308 = 1,92:1) e o
+// "Quem somos" tem alvo >= 44 px. Só classe/estilo; nenhuma lógica alterada.
 import { useState } from "react"
 import { useRouter } from "next/navigation"
 import { entrySealText, entrySealWhoText, ENTRY_SEAL_WHO_LABEL } from "@/lib/journey/entry-seal"
@@ -91,7 +95,7 @@ export function JourneyGenericAuthForm({
           type="button"
           onClick={() => setShowWho((v) => !v)}
           aria-expanded={showWho}
-          className="mt-1 inline-flex items-center text-xs font-medium text-[var(--brand-secondary)] underline underline-offset-2"
+          className="mt-1 inline-flex min-h-[44px] items-center text-sm font-medium text-[var(--brand-secondary)] underline underline-offset-2"
         >
           {ENTRY_SEAL_WHO_LABEL}
         </button>
@@ -156,8 +160,8 @@ export function JourneyGenericAuthForm({
       <button
         type="submit"
         disabled={!canSubmit}
-        style={{ backgroundColor: "var(--brand-secondary)" }}
-        className="mt-auto h-11 rounded-md text-base font-semibold text-white transition-opacity disabled:opacity-40"
+        style={{ backgroundColor: "var(--brand-secondary)", color: "var(--brand-secondary-fg, #ffffff)" }}
+        className="mt-auto h-11 rounded-md text-base font-semibold transition-opacity disabled:opacity-40"
       >
         {submitting ? "Confirmando..." : "Continuar"}
       </button>

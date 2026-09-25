@@ -98,7 +98,7 @@ describe("histórico do fluxo assistido (sessão reaberta)", () => {
     expect(out.ok).toBe(true)
 
     // dados da dívida publicados como mensagem
-    expect(db.chat_messages.some((m) => m.role === "assistant" && /dados da sua pendência/.test(m.text))).toBe(true)
+    expect(db.chat_messages.some((m) => m.role === "assistant" && /^Vencimento original /.test(m.text))).toBe(true)
     // NÃO reconheceu ainda (Consultar não registra reconhecimento)
     expect(db.debt_acknowledgements.length).toBe(0)
     // menu pós-consulta ativo: Negociar [3] + Não reconheço [0]
@@ -174,13 +174,18 @@ describe("histórico do fluxo assistido (sessão reaberta)", () => {
     expect(ordered[0].text).toContain("O que você deseja fazer?")
     // clique do cliente
     expect(ordered[1].role).toBe("customer")
-    expect(ordered[1].text).toBe("Negociar Dívida")
+    expect(ordered[1].text).toBe("Negociar")
     expect(ordered[1].button_id).toBe(3)
     // dados da dívida (assistant)
     expect(ordered[2].role).toBe("assistant")
-    expect(ordered[2].text).toContain("dados da sua pendência")
-    // resposta do assistente
+    expect(ordered[2].text).toMatch(/^Vencimento original /)
+    // resposta do assistente. A4/S22 + r2 (B3-F2): esta seed NÃO tem faixa de matriz
+    // (4 mensagens, sem prompt de parcelas) → nada vem depois da frase, então ela é a
+    // completa, sem dois-pontos (NEGOTIATION_SEARCHING_TEXT); S7 ("…para você:") só
+    // quando as parcelas seguem (a2-legacy-negotiate / e2e-lab-reconhecimento).
+    const { NEGOTIATION_SEARCHING_TEXT } = await import("@/lib/journey/wait-machine")
     expect(ordered[3].role).toBe("assistant")
-    expect(ordered[3].text).toContain("vamos trabalhar juntos")
+    expect(ordered[3].text).toBe(NEGOTIATION_SEARCHING_TEXT)
+    expect(ordered[3].text).toBe("Certo. Vou buscar as condições de pagamento disponíveis para você.")
   })
 })

@@ -3,9 +3,11 @@
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createServiceClient } from "@/lib/supabase/service"
-import { recordEvent } from "@/lib/journey/events"
+import { isTerminalAgreement } from "@/lib/asaas-idempotency"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 export async function GET(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
@@ -26,17 +28,20 @@ export async function GET(req: NextRequest) {
   }
   const { data: ag } = await supabase
     .from("agreements")
-    .select("id, asaas_payment_id, asaas_billing_type, payment_status, asaas_status, asaas_payment_url, asaas_invoice_url, asaas_boleto_url, asaas_pix_qrcode_url, installments, installment_amount, agreed_amount, due_date")
+    .select("id, asaas_payment_id, asaas_billing_type, payment_status, asaas_status, status, asaas_payment_url, asaas_invoice_url, asaas_boleto_url, asaas_pix_qrcode_url, installments, installment_amount, agreed_amount, due_date")
     .eq("id", session.agreement_id)
     .single()
   if (!ag?.asaas_payment_id) {
     return NextResponse.json({ ok: true, status: "generating" })
   }
-  await recordEvent({
-    companyId: session.company_id, customerId: session.customer_id, debtId: session.debt_id,
-    sessionId: session.id, agreementId: ag.id, type: "payment.viewed", actor: "customer",
-    eventId: `payment-viewed-ui-${ag.id}`,
-  })
+  // A1 / N-D1-2: acordo TERMINAL (cancelado / cobrança deletada / reembolsada)
+  // NUNCA é 'ready' — devolver o link morto travava o devedor na "Fatura
+  // cancelada". Sem cobrança viva, o estado é o mesmo de "ainda não há link".
+  if (isTerminalAgreement(ag)) {
+    return NextResponse.json({ ok: true, status: "generating", reason: "no_live_charge" })
+  }
+  // N-D1-6: o poll NÃO grava payment.viewed (o devedor não abriu o link) — o
+  // sinal real é o webhook PAYMENT_CHECKOUT_VIEWED / a reconciliação.
   return NextResponse.json({
     ok: true, status: "ready",
     payment: {

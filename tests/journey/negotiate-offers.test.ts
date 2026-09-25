@@ -142,7 +142,8 @@ describe("R1 — apresentação das parcelas da matriz (fallback assistido)", ()
     expect(cashLabel).toMatch(/À vista R\$/)
     expect(cashLabel).toContain("(recomendado)")
     if (cash.terms.discount_value > 0) {
-      expect(cashLabel).toMatch(/você economiza R\$/)
+      expect(cashLabel).toMatch(/economia de R\$/) // A4/S9: sem travessão
+      expect(cashLabel).not.toContain("—")
     }
     // parcelado: "Nx de R$ … (total R$ …)"
     const inst = r.offers.find((o) => o.terms.installments > 1)
@@ -160,7 +161,8 @@ describe("R1 — apresentação das parcelas da matriz (fallback assistido)", ()
     const msg = db.chat_messages.find((m) => m.role === "assistant" && /condições disponíveis para você/i.test(m.text))
     expect(msg).toBeTruthy()
     expect(msg!.text).not.toContain("desconsiderar")
-    expect(msg!.text).toMatch(/gero o seu pagamento/i)
+    // A4/S8: a MESMA frase do eco do clique Negociar (S7) — uma bolha só na tela.
+    expect(msg!.text).toBe("Certo. Estas são as condições disponíveis para você:")
   })
 
   it("idempotente: com 'offer_choice' ativo NÃO recria (reload/clique duplo não empilha)", async () => {
@@ -248,7 +250,7 @@ describe("R1 — aceite de uma parcela gera o link canônico", () => {
     expect(withLink[0].text.toLowerCase()).not.toMatch(/pagamento (confirmado|recebido)|quitad/)
   })
 
-  it("G5/R7: aceite repetido NÃO duplica a bolha do link (idempotente por conteúdo)", async () => {
+  it("G5/R7 (A1): aceite repetido responde 'já tem cobrança' com o MESMO link; não empilha além disso", async () => {
     const { presentMatrixOffers } = await import("@/lib/journey/acknowledgement")
     const { acceptMatrixCondition } = await import("@/lib/journey/assisted")
     const pres = await presentMatrixOffers({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT })
@@ -257,10 +259,18 @@ describe("R1 — aceite de uma parcela gera o link canônico", () => {
     const offerId = pres.offers[0].id
     await acceptMatrixCondition(ctx, offerId)
     await acceptMatrixCondition(ctx, offerId)
+    await acceptMatrixCondition(ctx, offerId)
     const withLink = (db.chat_messages ?? []).filter(
       (m: any) => m.role === "assistant" && typeof m.text === "string" && m.text.includes("https://asaas/checkout/pay_r1"),
     )
-    expect(withLink.length).toBe(1)
+    // A1 (§2.3): o 1º aceite entrega o link; o repetido é idempotente e é
+    // respondido como already_charged ("Você já tem uma cobrança ativa…") com o
+    // MESMO link — 2 bolhas distintas, e o 3º aceite NÃO empilha (dedup 15min).
+    expect(withLink.length).toBe(2)
+    expect(withLink[0].text).toMatch(/Aqui está seu link/i)
+    expect(withLink[1].text).toMatch(/já tem uma cobrança ativa/i)
+    // ambas carregam a ação open_payment_link (fonte única do painel do client)
+    expect(withLink.every((m: any) => m.offers_snapshot?.message_action?.type === "open_payment_link")).toBe(true)
   })
 
   it("idempotência (D7): 2 aceites da MESMA oferta → 1 confirmAccept/1 acordo (nunca 2ª cobrança)", async () => {

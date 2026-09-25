@@ -23,6 +23,8 @@ import { reopenThreeOptions } from "@/lib/journey/acknowledgement"
 import { createServiceClient } from "@/lib/supabase/service"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 export const maxDuration = 60
 
 // A-02: ao re-publicar o menu, a espera acabou → limpa wait_state para o poll

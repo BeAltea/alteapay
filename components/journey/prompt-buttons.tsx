@@ -1,9 +1,10 @@
 "use client"
 
 // Componente de prompt com botões (onda R). Ordem por `order` (contratual) e id.
-// Desabilita após o clique. Trata 409 prompt_not_active devolvendo o controle ao
-// pai (que recarrega o estado). Sem termos técnicos ao cliente e sem badge de id
-// (o badge do button_id é só no painel admin).
+// Desabilita após o clique. Trata 409 prompt_stale/prompt_not_active devolvendo
+// o controle ao pai (que re-hidrata o estado) E avisando o devedor — nunca em
+// silêncio (A1 / N-D3-3). Sem termos técnicos ao cliente e sem badge de id (o
+// badge do button_id é só no painel admin).
 //
 // HIERARQUIA VISUAL (C11 / R-18, carta de voz §10.3): o peso do botão espelha o
 // peso da DECISÃO — PAGAR primário (grande, preenchido, destaque), NEGOCIAR
@@ -41,6 +42,17 @@ import {
 export type { ButtonTier }
 export { buttonTier, tierClass }
 
+/** A1 — aviso humano quando o prompt clicado já foi substituído (409). */
+export const PROMPT_STALE_NOTICE = "Esta opção já foi atualizada. Veja as opções abaixo."
+
+/** Aviso humano por código de falha do clique (puro/testável). null = sem aviso. */
+export function clickNotice(code: string | undefined): string | null {
+  if (!code) return null
+  if (code === "prompt_stale" || code === "prompt_not_active") return PROMPT_STALE_NOTICE
+  if (code === "timeout") return "A conexão está lenta. Toque no botão novamente."
+  return "Não foi possível processar agora. Toque no botão novamente."
+}
+
 export interface PromptButton {
   id: number
   label: string
@@ -68,15 +80,15 @@ export function PromptButtons({
   onClick,
 }: {
   prompt: ActivePrompt
-  /** Envia o clique; retorna ok/erro. 409 prompt_not_active volta pro pai recarregar.
+  /** Envia o clique; retorna ok/erro. 409 prompt_stale volta pro pai re-hidratar.
    *  O `buttonLabel` deixa o pai reconhecer o botão Negociar (pela label, já que a
    *  UI não tem o `kind`) para injetar o indicador optimistic "preparando negociação". */
   onClick: (promptId: string, buttonId: number, buttonLabel: string) => Promise<PromptClickResult>
 }) {
   const [pending, setPending] = useState<number | null>(null)
   const [answered, setAnswered] = useState(false)
-  // Aviso curto ao cliente quando o clique falha (rede/timeout/servidor). Sem
-  // termos técnicos e sem código de erro — só orienta a tentar de novo.
+  // Aviso curto ao cliente quando o clique falha (rede/timeout/servidor/prompt
+  // substituído). Sem termos técnicos e sem código de erro.
   const [notice, setNotice] = useState<string | null>(null)
 
   // Ordem contratual order-aware (M2/D.2): se algum botão traz `order`, ordena por
@@ -110,17 +122,13 @@ export function PromptButtons({
       const res = await onClick(prompt.id, buttonId, label)
       if (res.ok) {
         setAnswered(true)
-      } else if (res.code === "prompt_not_active") {
-        // O pai já recarrega o prompt ativo (este componente será remontado via
-        // key={prompt.id}); não mostramos aviso pois o estado será substituído.
       } else {
-        // 4xx/5xx/timeout/rede: reabilita os botões (answered continua false) e
-        // avisa o cliente em vez de deixar em silêncio.
-        setNotice(
-          res.code === "timeout"
-            ? "A conexão está lenta. Toque no botão novamente."
-            : "Não foi possível processar agora. Toque no botão novamente.",
-        )
+        // A1 (N-D3-3): 409 prompt_stale/prompt_not_active NUNCA é mudo — o pai já
+        // re-hidratou o prompt ativo (este componente pode ser remontado via
+        // key={prompt.id}); se o mesmo prompt continuar na tela, o devedor vê o
+        // aviso e os botões reabilitados. 4xx/5xx/timeout/rede: reabilita os
+        // botões (answered continua false) e avisa em vez de deixar em silêncio.
+        setNotice(clickNotice(res.code))
       }
     } finally {
       // SEMPRE para o loading — o botão nunca fica preso em "...". Como o pai
@@ -152,13 +160,19 @@ export function PromptButtons({
     )
   }
 
+  const question = (prompt.question ?? "").trim()
+
   return (
     <div className="space-y-3 rounded-lg border border-neutral-200 bg-white p-3">
       {/* R-43: a pergunta entra numa live region dedicada (anunciada 1x); os
-          rótulos dos botões NÃO são relidos em massa (ficam fora desta região). */}
-      <p className="text-sm text-neutral-800" role="status" aria-live="polite">
-        {prompt.question}
-      </p>
+          rótulos dos botões NÃO são relidos em massa (ficam fora desta região).
+          A1: o menu INICIAL vem sem pergunta (a saudação, no log, já pergunta) —
+          não renderiza parágrafo vazio. */}
+      {question ? (
+        <p className="text-sm text-neutral-800" role="status" aria-live="polite">
+          {question}
+        </p>
+      ) : null}
       {/* Grupo de RESOLUÇÃO (pagar/negociar/consultar/parcelas). gap-2.5 anti-erro.
           O primary ocupa a largura toda no mobile (1º botão acima da dobra, C12). */}
       <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">{resolution.map(renderButton)}</div>
@@ -171,7 +185,11 @@ export function PromptButtons({
           </div>
         </div>
       ) : null}
-      {notice ? <p className="text-xs text-red-600">{notice}</p> : null}
+      {notice ? (
+        <p className="text-xs text-red-600" role="status" aria-live="polite">
+          {notice}
+        </p>
+      ) : null}
     </div>
   )
 }

@@ -5,6 +5,8 @@ import { NextRequest, NextResponse } from "next/server"
 import { applyBlock, applyOptout, verifyActionCsrf } from "@/lib/journey/optout"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 export async function POST(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {

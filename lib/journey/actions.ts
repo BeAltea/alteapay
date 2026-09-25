@@ -51,16 +51,11 @@ export async function resolveCreditorName(input: {
 }): Promise<CreditorName> {
   try {
     const supabase = createServiceClient()
-    const { data: company } = await supabase
-      .from("companies")
-      .select("name")
-      .eq("id", input.companyId)
-      .maybeSingle()
-    const { data: cfg } = await supabase
-      .from("tenant_chat_config")
-      .select("branding")
-      .eq("company_id", input.companyId)
-      .maybeSingle()
+    // A2 (N-D2-2): as duas leituras são independentes → em paralelo.
+    const [{ data: company }, { data: cfg }] = await Promise.all([
+      supabase.from("companies").select("name").eq("id", input.companyId).maybeSingle(),
+      supabase.from("tenant_chat_config").select("branding").eq("company_id", input.companyId).maybeSingle(),
+    ])
     const branding = (cfg?.branding ?? {}) as Record<string, unknown>
     const brandName =
       typeof branding.brand_name === "string" && branding.brand_name.trim().length > 0
@@ -89,28 +84,35 @@ export interface DebtSummary {
 
 export async function debtSummary(ctx: SessionCtx): Promise<DebtSummary> {
   const supabase = createServiceClient()
-  const { data: debt } = await supabase
-    .from("debts")
-    .select("id, amount, due_date, description, company_id")
-    .eq("id", ctx.debtId)
-    .single()
+  // A2 (N-D2-2): dívida, cedente e documento são leituras INDEPENDENTES → em
+  // paralelo (antes: 5 round-trips sequenciais por chamada, e o Negociar chamava
+  // isto no caminho crítico do clique).
   // R15: nome do cedente pela precedência canônica (branding › companies.name ›
   // "Credor"). Nunca "" — cair em vazio deixava o resumo sem cedente identificado.
-  const creditor = await resolveCreditorName({ companyId: ctx.companyId })
-  const { data: customer } = await supabase
-    .from("customers").select("document").eq("id", ctx.customerId).single()
+  const [{ data: debt }, creditor, { data: customer }] = await Promise.all([
+    supabase
+      .from("debts")
+      .select("id, amount, due_date, description, company_id")
+      .eq("id", ctx.debtId)
+      .single(),
+    resolveCreditorName({ companyId: ctx.companyId }),
+    supabase.from("customers").select("document").eq("id", ctx.customerId).single(),
+  ])
   const doc = (customer?.document ?? "").replace(/\D/g, "")
-  const { data: invoices } = await supabase
-    .from("vmax_invoices")
-    .select("fatura, vencimento, saldo")
-    .eq("id_company", ctx.companyId)
-    .eq("doc", doc)
-    .order("vencimento", { ascending: true })
+  // faturas (depende do documento) em paralelo com o evento de auditoria.
+  const [{ data: invoices }] = await Promise.all([
+    supabase
+      .from("vmax_invoices")
+      .select("fatura, vencimento, saldo")
+      .eq("id_company", ctx.companyId)
+      .eq("doc", doc)
+      .order("vencimento", { ascending: true }),
+    recordEvent({
+      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+      sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
+    }),
+  ])
   const oldest = invoices?.[0]?.vencimento ?? debt?.due_date ?? null
-  await recordEvent({
-    companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-    sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
-  })
   return {
     debtId: ctx.debtId,
     creditorName: creditor.name,
@@ -126,56 +128,106 @@ export async function debtSummary(ctx: SessionCtx): Promise<DebtSummary> {
 // ---------- offer.list (gera se não houver; expiração lazy) ----------
 export interface ListedOffer { id: string; terms: OfferTerms; valid_until: string | null }
 
-export async function listOffers(ctx: SessionCtx): Promise<ListedOffer[]> {
+/** Ordem canônica de exibição das ofertas: à vista primeiro, depois parcelado em
+ *  N crescente (a mesma ordem em que generateOfferTerms as produz). Desempate
+ *  por created_at. Determinística — não depende da ordem de inserts paralelos. */
+function sortOffersCanonical<T extends { terms: OfferTerms; created_at?: string | null }>(list: T[]): T[] {
+  return [...list].sort((a, b) =>
+    (a.terms.installments ?? 0) - (b.terms.installments ?? 0) ||
+    String(a.created_at ?? "").localeCompare(String(b.created_at ?? "")),
+  )
+}
+
+/**
+ * offer.list — devolve as ofertas VÁLIDAS ('presented' e não vencidas) da sessão;
+ * sem nenhuma, gera da matriz (servidor decide, D8). A2 (N-D2-2): UMA leitura
+ * (a expiração lazy é decidida em memória e gravada em paralelo), persistência
+ * das ofertas e auditoria em LOTE — antes eram ~10 round-trips sequenciais no
+ * caminho crítico do "Quero negociar". `summary` (opcional) evita um 2º
+ * debtSummary quando o chamador já o tem.
+ */
+export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary }): Promise<ListedOffer[]> {
   const supabase = createServiceClient()
-  const now = new Date().toISOString()
-  // expiração lazy
-  const { data: expired } = await supabase
+  const nowMs = Date.now()
+  const now = new Date(nowMs).toISOString()
+  const { data: presentedRows } = await supabase
     .from("negotiation_offers")
-    .update({ status: "expired", responded_at: now })
-    .eq("session_id", ctx.sessionId)
-    .eq("status", "presented")
-    .lt("valid_until", now)
-    .select("id")
-  for (const e of expired ?? []) {
-    await recordEvent({
-      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-      sessionId: ctx.sessionId, type: "offer.expired", actor: "system",
-      payload: { offer_id: e.id },
-    })
-  }
-  const { data: current } = await supabase
-    .from("negotiation_offers")
-    .select("id, terms, valid_until")
+    .select("id, terms, valid_until, created_at")
     .eq("session_id", ctx.sessionId)
     .eq("status", "presented")
     .order("created_at", { ascending: true })
-  if (current && current.length > 0) {
-    return current.map((o) => ({ id: o.id, terms: o.terms as OfferTerms, valid_until: o.valid_until }))
+  const rows = (presentedRows ?? []) as Array<{ id: string; terms: OfferTerms; valid_until: string | null; created_at?: string | null }>
+  const isExpired = (o: { valid_until: string | null }) => {
+    if (!o.valid_until) return false
+    const t = Date.parse(o.valid_until)
+    return Number.isFinite(t) && t < nowMs
   }
+  const expired = rows.filter(isExpired)
+  const current = sortOffersCanonical(rows.filter((o) => !isExpired(o)))
+
+  // expiração lazy (escrita + auditoria) em PARALELO com o restante — nunca
+  // bloqueia a listagem; a auditoria leva o offer_id (N-D2-8).
+  const expireWrite: Promise<unknown> =
+    expired.length === 0
+      ? Promise.resolve()
+      : Promise.all([
+          supabase
+            .from("negotiation_offers")
+            .update({ status: "expired", responded_at: now })
+            .eq("session_id", ctx.sessionId)
+            .eq("status", "presented")
+            .in("id", expired.map((e) => e.id)),
+          ...expired.map((e) =>
+            recordEvent({
+              companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+              sessionId: ctx.sessionId, type: "offer.expired", actor: "system",
+              eventId: `offer.expired|${e.id}`,
+              payload: { offer_id: e.id },
+            }),
+          ),
+        ])
+
+  if (current.length > 0) {
+    await expireWrite
+    return current.map((o) => ({ id: o.id, terms: o.terms, valid_until: o.valid_until }))
+  }
+
   // gerar da matriz
-  const summary = await debtSummary(ctx)
+  const summary = opts?.summary ?? (await debtSummary(ctx))
   const row = await resolveMatrixRow({
     companyId: ctx.companyId, agingDays: summary.agingDays, debtValue: summary.originalValue,
   })
-  if (!row) return []
-  const firstDue = new Date(Date.now() + 7 * 86400_000).toISOString().slice(0, 10)
-  const validUntil = new Date(Date.now() + row.proposal_validity_days * 86400_000).toISOString()
-  const out: ListedOffer[] = []
-  for (const terms of generateOfferTerms(summary.originalValue, row, firstDue)) {
-    const id = await persistOffer({
-      companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-      debtId: ctx.debtId, matrixId: row.id, source: "system", status: "presented",
-      terms, validUntil,
-    })
-    await recordEvent({
-      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-      sessionId: ctx.sessionId, type: "offer.presented", actor: "system",
-      payload: { offer_id: id, installments: terms.installments, total: terms.total_value },
-    })
-    out.push({ id, terms, valid_until: validUntil })
+  if (!row) {
+    await expireWrite
+    return []
   }
-  return out
+  const firstDue = new Date(nowMs + 7 * 86400_000).toISOString().slice(0, 10)
+  const validUntil = new Date(nowMs + row.proposal_validity_days * 86400_000).toISOString()
+  const termsList = generateOfferTerms(summary.originalValue, row, firstDue)
+  // persistência em LOTE (ordem de `termsList` preservada pelo Promise.all)…
+  const ids = await Promise.all(
+    termsList.map((terms) =>
+      persistOffer({
+        companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+        debtId: ctx.debtId, matrixId: row.id, source: "system", status: "presented",
+        terms, validUntil,
+      }),
+    ),
+  )
+  // …e auditoria em lote, UMA linha por oferta (event_id explícito por offer_id —
+  // N-D2-8: 3 offer.presented no mesmo segundo não colapsam mais em 1).
+  await Promise.all([
+    expireWrite,
+    ...ids.map((id, i) =>
+      recordEvent({
+        companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+        sessionId: ctx.sessionId, type: "offer.presented", actor: "system",
+        eventId: `offer.presented|${id}`,
+        payload: { offer_id: id, installments: termsList[i].installments, total: termsList[i].total_value },
+      }),
+    ),
+  ])
+  return ids.map((id, i) => ({ id, terms: termsList[i], valid_until: validUntil }))
 }
 
 // ---------- offer.propose (sugestão de IA/cliente; validada) ----------
@@ -307,7 +359,7 @@ export async function transferToHuman(
     const creditor = await resolveCreditorName({ companyId: ctx.companyId })
     if (!creditor.hasRealName) {
       // Alerta de dado (sem PII): cedente sem companies.name/branding — usando genérico.
-      console.warn(`[journey] handoff: cedente sem nome real (company=${ctx.companyId}) — usando fallback "Credor"`)
+      console.warn(`[journey] handoff: cedente sem nome real (company=${ctx.companyId}); usando fallback "Credor"`)
     }
     const { persistAssistantMessage } = await import("./acknowledgement")
     await persistAssistantMessage({
@@ -364,7 +416,7 @@ export async function handlePaymentClaim(
 ): Promise<{ ok: true; caseId: string; reply: string }> {
   const caseId = await registerPaymentClaim(
     ctx,
-    { channel: "chat", note: "devedor informou que já pagou (Já paguei) — aguardando conferência" },
+    { channel: "chat", note: "devedor informou que já pagou (Já paguei); aguardando conferência" },
     actor,
     eventId,
   )
@@ -372,10 +424,14 @@ export async function handlePaymentClaim(
   const reply = paymentClaimReply(creditor.name)
   try {
     const { persistAssistantMessage } = await import("./acknowledgement")
+    // A1: resultado da ação como OUTCOME (stage 'payment_claim') — persistido
+    // ANTES de o menu ser reemitido pelo chamador.
     await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
       text: reply,
+      stage: "payment_claim",
+      snapshot: { case_id: caseId },
     })
   } catch (err) {
     console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)
@@ -385,20 +441,21 @@ export async function handlePaymentClaim(
 
 /**
  * R5 — copy do "Já paguei". Registramos a informação para conferência (NÃO declara
- * pago — D6/M15) e orientamos o devedor a guardar o comprovante. Sem ameaça (D36),
- * sem prometer baixa imediata. `creditorName` já resolvido (R15). Sem PII.
+ * pago — D6/M15). Sem ameaça (D36), sem prometer baixa imediata. Sem PII.
  */
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function paymentClaimReply(_creditorName?: string): string {
-  // T13 / R-34: enxuto, sem "Obrigado por avisar" (muleta). NÃO declara pago (D6/M15):
-  // "a nossa equipe vai conferir" + orienta guardar o comprovante. Sem PII. O
-  // `_creditorName` é mantido na assinatura por compatibilidade com os chamadores
-  // (a nova copy não cita o credor — a conferência é da equipe AlteaPay).
-  return (
-    "Registramos que você já pagou este valor. A nossa equipe vai conferir. " +
-    "Guarde o seu comprovante — ele pode ser pedido para dar baixa. " +
-    "Você não precisa fazer mais nada por aqui agora."
-  )
+  // A4/S18 (Apêndice B "Já paguei"): "Obrigado por avisar. Vamos conferir o
+  // pagamento. Se quiser adiantar, fale com o atendimento: {contato}." NÃO declara
+  // pago (D6/M15). A4 r2 (B3-F5): o tenant NÃO tem campo de contato de atendimento
+  // (official_channel_* é o canal do CREDOR, usado na contestação — não é o
+  // atendimento da negociação), então o segmento ": {contato}" fica fora e a
+  // frase termina em "fale com o atendimento." — texto fixo, sem parâmetro morto
+  // e sem promessa (o botão "Falar com atendimento" existe). Quando o campo
+  // existir (ex.: tenant_chat_config.support_contact), reintroduzir o segmento
+  // aqui e ligá-lo no chamador (handlePaymentClaim). `_creditorName` é a
+  // assinatura pré-A4 (chamador e testes intocados). Sem PII.
+  return "Obrigado por avisar. Vamos conferir o pagamento. Se quiser adiantar, fale com o atendimento."
 }
 
 // ---------- session.close ----------

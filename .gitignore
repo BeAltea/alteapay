@@ -42,3 +42,8 @@ supabase/.temp
 
 # Local Netlify folder
 .netlify
+
+# n8n workflow exports (backups/mods carry webhook paths, hosts and pinned test data) — never commit
+ops/n8n-fluxo/
+ops/**/backup-*.json
+ops/**/mod-*.json

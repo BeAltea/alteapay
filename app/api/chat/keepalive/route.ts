@@ -11,6 +11,8 @@ import { verifyChatJwt, signChatJwt, CHAT_COOKIE_NAME, CHAT_JWT_TTL_SECONDS } fr
 import { createServiceClient } from "@/lib/supabase/service"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 export async function POST(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {

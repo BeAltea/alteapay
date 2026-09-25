@@ -13,6 +13,8 @@ import { resolveCompanyBySlug } from "@/lib/journey/resolver"
 import { resolvePublicLink } from "@/lib/journey/public-link"
 
 export const dynamic = "force-dynamic"
+export const fetchCache = "force-no-store"
+export const revalidate = 0
 
 const MIN_RESPONSE_MS = 600
 

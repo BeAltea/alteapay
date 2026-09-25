@@ -17,12 +17,12 @@
 // pagamento.
 
 import { createServiceClient } from "@/lib/supabase/service"
-import { findBlockingAgreement, findBlockingPayment } from "@/lib/asaas-idempotency"
+import { findBlockingAgreement, findBlockingPayment, isTerminalAgreement } from "@/lib/asaas-idempotency"
 import { getAsaasPaymentsForCustomer } from "@/lib/asaas"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import { validateProposedTerms, type OfferTerms } from "@/lib/negotiation/offers"
 import { buildAcceptSummary, confirmAccept } from "./closing"
-import { debtSummary, registerPaymentClaim, rejectOffer, type SessionCtx } from "./actions"
+import { debtSummary, registerPaymentClaim, rejectOffer, type DebtSummary, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
 import { assertAcknowledgedForPayment } from "./acknowledgement"
 
@@ -120,6 +120,7 @@ export type MatrixCheck =
 async function assertOfferWithinMatrix(
   ctx: SessionCtx,
   offerId: string,
+  precomputedSummary?: DebtSummary,
 ): Promise<MatrixCheck> {
   const supabase = createServiceClient()
   const { data: offer } = await supabase
@@ -132,7 +133,8 @@ async function assertOfferWithinMatrix(
   // reportar; aqui só validamos a matriz para as ofertas ainda vivas.
   if (!offer?.terms) return { ok: true }
 
-  const summary = await debtSummary(ctx)
+  // A1 (N-D1-1): reusa o debtSummary já calculado pelo chamador (payService).
+  const summary = precomputedSummary ?? (await debtSummary(ctx))
   const row = await resolveMatrixRow({
     companyId: ctx.companyId,
     agingDays: summary.agingDays,
@@ -150,10 +152,16 @@ async function assertOfferWithinMatrix(
  * plataforma. O guard vive dentro de confirmAccept (nível local + ASAAS). Se a
  * cobrança ainda não voltou do worker, devolve status 'processing'.
  */
+export interface PaymentCreateOpts {
+  /** debtSummary já calculado (evita repetir 4 leituras + evento — N-D1-1). */
+  summary?: DebtSummary
+}
+
 export async function paymentCreate(
   ctx: SessionCtx,
   offerId: string,
   eventId?: string,
+  opts?: PaymentCreateOpts,
 ): Promise<PaymentCreateResult> {
   // Variante A é o ÚNICO caminho (D17/GATE R0). payment_origin != 'platform' →
   // 501 not_implemented (variante B fora do escopo desta onda).
@@ -197,7 +205,7 @@ export async function paymentCreate(
 
   // Revalida a oferta contra a matriz VIGENTE (§3): fora da matriz → 422.
   // O servidor decide — se a matriz mudou e a oferta não cabe mais, não cobra.
-  const matrix = await assertOfferWithinMatrix(ctx, offerId)
+  const matrix = await assertOfferWithinMatrix(ctx, offerId, opts?.summary)
   if (!matrix.ok) {
     await rejectOffer(ctx, offerId, "system", matrix.code, eventId)
     return {
@@ -218,7 +226,8 @@ export async function paymentCreate(
     return { ok: false, status: 409, code: pre.error, message: pre.error }
   }
 
-  const result = await confirmAccept({ ctx, offerId, termsHash: pre.summary.termsHash, eventId })
+  // `pre` já montado → confirmAccept NÃO refaz buildAcceptSummary (N-D1-1).
+  const result = await confirmAccept({ ctx, offerId, termsHash: pre.summary.termsHash, eventId, pre: pre.summary })
   if (!result.ok) {
     if (result.error === "ALREADY_CHARGED") {
       return { ok: false, status: 409, code: "already_charged", message: "dívida já possui cobrança viva" }
@@ -255,8 +264,9 @@ export async function paymentCreateOrExistingLink(
   ctx: SessionCtx,
   offerId: string,
   eventId?: string,
+  opts?: PaymentCreateOpts,
 ): Promise<PaymentCreateOrLink> {
-  const r = await paymentCreate(ctx, offerId, eventId)
+  const r = await paymentCreate(ctx, offerId, eventId, opts)
   if (r.ok) return r
   if (r.code === "already_charged") {
     // Nunca cria 2ª cobrança: reenvia o link do acordo vivo (paymentStatus §4).
@@ -371,7 +381,7 @@ async function isDebtAlreadyCharged(ctx: SessionCtx): Promise<boolean> {
   const supabase = createServiceClient()
   const { data: agreements } = await supabase
     .from("agreements")
-    .select("id, asaas_payment_id, payment_status, asaas_status")
+    .select("id, asaas_payment_id, payment_status, asaas_status, status")
     .eq("customer_id", ctx.customerId)
     .eq("company_id", ctx.companyId)
     .not("asaas_payment_id", "is", null)
@@ -522,29 +532,35 @@ export async function paymentStatus(ctx: SessionCtx): Promise<PaymentStatusResul
   if (agreementId) {
     const { data } = await supabase
       .from("agreements")
-      .select("payment_status, asaas_status")
+      .select("payment_status, asaas_status, status")
       .eq("id", agreementId)
       .eq("company_id", ctx.companyId)
       .maybeSingle()
-    const payment = await fetchPaymentDetails(agreementId, ctx.companyId)
-    return {
-      agreement_id: agreementId,
-      payment,
-      payment_status: data?.payment_status ?? null,
-      asaas_status: data?.asaas_status ?? null,
+    // A1 / N-D1-2: o acordo da sessão pode estar TERMINAL (cancelado no ASAAS,
+    // reembolsado). Nesse caso ele NÃO é "a cobrança viva": cai na busca do
+    // acordo vivo do cliente (abaixo) — nunca devolve link morto como 'ready'.
+    if (data && !isTerminalAgreement(data)) {
+      const payment = await fetchPaymentDetails(agreementId, ctx.companyId)
+      return {
+        agreement_id: agreementId,
+        payment,
+        payment_status: data?.payment_status ?? null,
+        asaas_status: data?.asaas_status ?? null,
+      }
     }
   }
 
-  // Sem acordo na sessão: procura o acordo VIVO do cliente (already_charged) e
-  // devolve suas URLs para reenvio (§4). Isola por customer_id + company_id.
+  // Sem acordo (vivo) na sessão: procura o acordo VIVO do cliente
+  // (already_charged) e devolve suas URLs para reenvio (§4). Isola por
+  // customer_id + company_id. Acordos terminais nunca são "vivos".
   const { data: agreements } = await supabase
     .from("agreements")
-    .select("id, asaas_payment_id, payment_status, asaas_status")
+    .select("id, asaas_payment_id, payment_status, asaas_status, status")
     .eq("customer_id", ctx.customerId)
     .eq("company_id", ctx.companyId)
     .not("asaas_payment_id", "is", null)
   const live = findBlockingAgreement(
-    (agreements ?? []) as Array<{ id: string; asaas_payment_id: string | null; payment_status: string | null; asaas_status: string | null }>,
+    (agreements ?? []) as Array<{ id: string; asaas_payment_id: string | null; payment_status: string | null; asaas_status: string | null; status?: string | null }>,
   ) as { id?: string; payment_status?: string | null; asaas_status?: string | null } | null
   if (!live?.id) {
     return { agreement_id: null, payment: null, payment_status: null, asaas_status: null }

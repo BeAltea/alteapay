@@ -56,7 +56,7 @@ export default async function GenericJourneyLayout({
           <div className="min-w-0">
             <p className="truncate text-base font-semibold">{branding.brandName}</p>
             <p className="truncate text-[11px] text-white/70">
-              AlteaPay · parceira oficial de cobrança de {branding.brandName}
+              AlteaPay · canal oficial de negociação da {branding.brandName}
             </p>
           </div>
         </div>
