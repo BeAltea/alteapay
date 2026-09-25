@@ -7,6 +7,7 @@ import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { buildPinnedDebt } from "@/lib/journey/pinned-debt"
 import { buildRecap } from "@/lib/journey/recap"
+import { annotateMessageGenerations, type GenerationPromptRow } from "@/lib/journey/display-class"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -68,7 +69,7 @@ export async function GET(req: NextRequest) {
   // estágio (offers_snapshot.stage: greeting | detail | payment_link |
   // not_recognized | payment_claim — A1) que a poda/retomada usa. A UI renderiza
   // a ação como <a> abaixo da bolha; offers_snapshot cru não vaza. Sem PII.
-  const messages = inCurrentThread.map((m) => {
+  const mapped = inCurrentThread.map((m) => {
     const snapshot = m.offers_snapshot as { message_action?: unknown; stage?: unknown } | null
     const action =
       snapshot && typeof snapshot === "object" && snapshot.message_action ? snapshot.message_action : null
@@ -76,6 +77,23 @@ export async function GET(req: NextRequest) {
     const { offers_snapshot: _drop, archived_at: _arch, ...rest } = m as Record<string, unknown>
     return { ...rest, ...(action ? { action } : {}), ...(stage ? { stage } : {}) }
   })
+
+  // A3 (§2.4 / G4 / N3): GERAÇÃO por mensagem — join EM MEMÓRIA com os
+  // chat_prompts da sessão (kind/status/created_at): cada mensagem ganha
+  // `prompt_kind` (o prompt que a governa: o seu prompt_id ou o último criado
+  // até ela) e `generation` (derivada do kind; prompt ativo = corrente). O client
+  // poda gerações anteriores (Sim/Não → Consultar/Negociar → 3 opções) sem
+  // migration nem arquivamento; painel/auditoria continuam lendo tudo. Sem PII.
+  const { data: promptRows } = await supabase
+    .from("chat_prompts")
+    .select("id, kind, status, created_at")
+    .eq("session_id", claims.sid)
+    .order("created_at", { ascending: true })
+    .limit(500)
+  const messages = annotateMessageGenerations(
+    mapped as Array<Record<string, unknown> & { prompt_id?: string | null; created_at?: string | null }>,
+    (promptRows ?? []) as GenerationPromptRow[],
+  )
 
   const { data: activePromptRaw } = await supabase
     .from("chat_prompts")

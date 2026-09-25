@@ -70,6 +70,10 @@ export interface ClassifiableMessage {
    *  'payment_link', 'not_recognized', 'payment_claim' são RESULTADOS de ação
    *  (outcome, ligados ao prompt respondido); 'greeting' é a saudação única. */
   stage?: string | null
+  /** A3 (§2.4) — GERAÇÃO do fluxo a que a linha pertence (anotada pelo servidor
+   *  via annotateMessageGenerations). Menor que a geração corrente → superseded
+   *  (salvo outcome). null/undefined = desconhecida (nunca podada por geração). */
+  generation?: number | null
 }
 
 /** Estágios que marcam o RESULTADO de uma ação do devedor (outcome, C8). */
@@ -88,6 +92,10 @@ export interface ClassifyContext {
   /** estado de espera corrente — decide se uma msg engine='n8n' é system (estado
    *  absorvente: link entregue/quitada/não reconhecida) ou guidance. */
   waitState?: WaitState | null
+  /** A3 (§2.4) — geração do MENU CORRENTE; mensagens de geração menor viram
+   *  superseded (Sim/Não reconheço, Consultar/Negociar e as respostas entre
+   *  elas). null/undefined = regra desligada (ex.: "Ver conversa completa"). */
+  currentGeneration?: number | null
 }
 
 /** Reconhece uma URL http(s) "crua" no texto — a bolha do link de pagamento é
@@ -97,12 +105,21 @@ function carriesPaymentLink(text: string | null | undefined): boolean {
   return typeof text === "string" && /https?:\/\/\S+/i.test(text)
 }
 
+/** Sinais de OUTCOME (resultado de ação): action anexada, link no texto ou stage
+ *  de resultado. Um outcome NUNCA é podado por geração (C8: o link não some). */
+function isOutcomeSignal(msg: ClassifiableMessage): boolean {
+  if (msg.hasAction === true) return true
+  if (carriesPaymentLink(msg.text)) return true
+  return !!msg.stage && OUTCOME_STAGES.has(msg.stage)
+}
+
 /**
  * Classe de exibição de UMA linha de chat_messages (§10.1). Determinística e sem
  * efeitos: mesma entrada → mesma classe. É a unidade sobre a qual todas as regras
  * de poda operam (R-10). Ordem das regras = precedência do domínio:
  *   1) role='system'            → system (nunca renderiza)
  *   2) engine='n8n' absorvente  → system (resposta tardia do motor, M12)
+ *   2b) geração anterior        → superseded (A3/§2.4; salvo outcome)
  *   3) role='customer'          → decision (a escolha; button_id opcional)
  *   4) assistant + action/link  → outcome (link de pagamento/acordo, contato)
  *   5) assistant pergunta de prompt NÃO-ativo → superseded (menu substituído)
@@ -126,6 +143,21 @@ export function classifyMessage(
   const isEngineMsg = role !== "customer" && msg.engine === "n8n"
   if (isEngineMsg && ctx.waitState && isAbsorbingForEngineMsg(ctx.waitState)) {
     return "system"
+  }
+
+  // 2b) GERAÇÃO ANTERIOR (A3 / §2.4 / G4): a linha pertence a uma geração do
+  //     fluxo anterior à do menu corrente (ex.: "Sim, reconheço" do
+  //     debt_acknowledgement, "Consultar Dívida" do debt_consult, as respostas e
+  //     mensagens do motor entre esses prompts). Não renderiza por padrão —
+  //     inclusive o eco do cliente (a "decision" de outra geração não é memória
+  //     útil). Um OUTCOME (link/acordo/desfecho) nunca é podado por geração.
+  if (
+    typeof msg.generation === "number" &&
+    typeof ctx.currentGeneration === "number" &&
+    msg.generation < ctx.currentGeneration &&
+    !isOutcomeSignal(msg)
+  ) {
+    return "superseded"
   }
 
   // 3) escolha do devedor: bolha role='customer'. É a DECISION (memória da
@@ -173,4 +205,100 @@ export function isProtectedClass(cls: DisplayClass): boolean {
  *  ephemeral também não vem do servidor, mas é tratado no client. */
 export function isNonRenderableClass(cls: DisplayClass): boolean {
   return cls === "system"
+}
+
+// ============================================================================
+// A3 (§2.4 / G4 / N3) — GERAÇÕES do fluxo. O formato do prompt inicial mudou ao
+// longo do tempo (Sim/Não reconheço → Consultar/Negociar → menu de 3 opções) e
+// as gerações anteriores continuam na MESMA época (o reset 24h não gira numa
+// sessão usada todo dia). Em vez de migration/arquivamento, a geração é DERIVADA
+// do kind do prompt que governa cada mensagem e anotada pelo servidor (join em
+// memória com chat_prompts da sessão): o client poda por geração; o painel do
+// atendente continua lendo tudo; journey_events intocado (D44).
+// ============================================================================
+
+/** kind do prompt → geração. Kinds ausentes (debt_three_options, offer_choice,
+ *  post_payment_link, kinds futuros) são a geração CORRENTE. */
+export const PROMPT_KIND_GENERATIONS: Readonly<Record<string, number>> = {
+  debt_acknowledgement: 0, // G0: Sim/Não reconheço
+  debt_consult: 1, // G1: Consultar/Negociar (+ menu pós-consulta)
+}
+
+/** Geração corrente do código (menu de 3 opções e o que vier depois). */
+export const CURRENT_GENERATION = 2
+
+/** Geração de um kind de prompt (desconhecido/null → corrente). */
+export function generationOfKind(kind: string | null | undefined): number {
+  if (!kind) return CURRENT_GENERATION
+  const g = PROMPT_KIND_GENERATIONS[kind]
+  return typeof g === "number" ? g : CURRENT_GENERATION
+}
+
+/** Linha mínima de chat_prompts usada na anotação (sem PII). */
+export interface GenerationPromptRow {
+  id: string
+  kind: string | null
+  status?: string | null
+  created_at: string
+}
+
+/** Anotação por mensagem: kind do prompt que a governa + geração derivada. */
+export interface GenerationAnnotation {
+  prompt_kind: string | null
+  generation: number
+}
+
+function parseTime(iso: string | null | undefined): number | null {
+  if (typeof iso !== "string" || !iso) return null
+  const n = Date.parse(iso)
+  return Number.isNaN(n) ? null : n
+}
+
+/** a <= b por instante (texto como fallback). */
+function notAfter(a: string, b: string): boolean {
+  const ta = parseTime(a)
+  const tb = parseTime(b)
+  if (ta !== null && tb !== null) return ta <= tb
+  return a <= b
+}
+
+/**
+ * Anota cada mensagem com o prompt que a GOVERNA e a geração derivada. Pura.
+ *   - com prompt_id conhecido → esse prompt;
+ *   - sem prompt_id (respostas, mensagens do motor) → o ÚLTIMO prompt criado até
+ *     o created_at da mensagem (a "janela entre prompts" pertence ao prompt que a
+ *     abriu);
+ *   - sem prompt algum antes dela (ex.: saudação persistida antes do 1º menu) →
+ *     geração corrente (nunca esconde por acidente);
+ *   - prompt governante ainda ATIVO → geração corrente, seja qual for o kind
+ *     (um tenant no fluxo legado continua vendo a sua conversa — D14).
+ * Nunca lança; nunca lê journey_events.
+ */
+export function annotateMessageGenerations<
+  T extends { prompt_id?: string | null; created_at?: string | null },
+>(messages: T[], prompts: GenerationPromptRow[]): Array<T & GenerationAnnotation> {
+  const byId = new Map<string, GenerationPromptRow>()
+  for (const p of prompts) if (p && typeof p.id === "string") byId.set(p.id, p)
+  const sorted = [...prompts]
+    .filter((p) => p && typeof p.created_at === "string")
+    .sort((a, b) => (notAfter(a.created_at, b.created_at) ? (notAfter(b.created_at, a.created_at) ? 0 : -1) : 1))
+  return messages.map((m) => {
+    let governing: GenerationPromptRow | null = null
+    if (m.prompt_id) governing = byId.get(m.prompt_id) ?? null
+    if (!governing && typeof m.created_at === "string" && m.created_at) {
+      for (let i = sorted.length - 1; i >= 0; i--) {
+        if (notAfter(sorted[i].created_at, m.created_at)) {
+          governing = sorted[i]
+          break
+        }
+      }
+    }
+    const prompt_kind = governing?.kind ?? null
+    const generation = !governing
+      ? CURRENT_GENERATION
+      : governing.status === "active"
+        ? CURRENT_GENERATION
+        : generationOfKind(governing.kind)
+    return { ...m, prompt_kind, generation }
+  })
 }

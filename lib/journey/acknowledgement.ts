@@ -50,8 +50,9 @@ export interface AckContext {
   oldestDueDate: string | null
 }
 
-/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver. */
-function firstNameOf(name: string | null | undefined): string {
+/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver.
+ *  Exportado (A3) para a saudação de retorno do recap usar a mesma regra. */
+export function firstNameOf(name: string | null | undefined): string {
   return (name ?? "").trim().split(/\s+/)[0] ?? ""
 }
 
@@ -198,15 +199,13 @@ export function postConsultQuestion(): string {
  * (nada de documento) — só os dados financeiros que o devedor pode ver.
  */
 export function debtInfoMessage(ctx: AckContext): string {
-  const invoiceLine =
-    ctx.invoiceCount > 0
-      ? ` em ${ctx.invoiceCount} fatura(s)`
-      : ""
+  // A3 (§2.4 / R-12): o VALOR mora só no card fixo e nos outcomes — nunca numa
+  // guidance. Aqui ficam só nº de faturas e vencimento.
+  const invoiceLine = ctx.invoiceCount > 0 ? `${ctx.invoiceCount} fatura(s), ` : ""
   // R14/D36: "pendência" (não "dívida").
   return (
     `Aqui estão os dados da sua pendência com a ${ctx.creditorName}: ` +
-    `valor atualizado ${BRL(ctx.updatedValue)}${invoiceLine}, ` +
-    `vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}.`
+    `${invoiceLine}vencimento mais antigo em ${formatDatePt(ctx.oldestDueDate)}.`
   )
 }
 

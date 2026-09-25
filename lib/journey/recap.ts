@@ -1,12 +1,14 @@
-// D2 — RECAPITULATIVO de retomada (§10.1 / C7 / R-17 / R-42). Montado no SERVIDOR
-// (sobrevive a reload) por função pura a partir de sinais PRESERVADOS em
-// chat_messages/chat_prompts — NÃO de journey_events (append-only, opaco, C2). Ao
-// retomar, o chat abre com UMA frase que resume o estado ("Você escolheu parcelar
-// em 3x. Seu link está aqui.") no lugar de repetir a sequência integral.
+// D2/A3 — RETOMADA (§2.2 / C7 / R-17 / R-42). Montado no SERVIDOR (sobrevive a
+// reload) por função pura a partir de sinais PRESERVADOS em chat_messages/
+// chat_prompts — NÃO de journey_events (append-only, opaco, C2/D44). Ao retomar,
+// o chat abre com card + UMA saudação de retorno + (último outcome) + menu; o
+// histórico anterior fica atrás de "Ver conversa completa" (client, chat-display).
 //
-// Depende da Decisão 4 (C3 PRESERVANDO): o reset deixa de deletar
-// chat_prompts/chat_messages, então o recap usa o LABEL REAL do botão clicado
-// (não um genérico) e a pergunta real — por isso recap e C3 são da mesma trilha.
+// A3: o texto do recap É a saudação de retorno (Apêndice B): "Olá de novo,
+// {primeiro_nome}. Você já viu os detalhes do valor em aberto. Como prefere
+// seguir?" — uma só saudação na tela (N4/N-D5-6): a saudação original (bolha
+// stage=greeting) fica recolhida na retomada. A copy final é da A4; a estrutura
+// (estado retomável + label real + primeiro nome) é daqui.
 //
 // O recap é entregue pelo GET /api/chat/messages num campo `recap` (só no 1º poll,
 // quando `since` está ausente = carregamento inicial/retomada). A UI renderiza um
@@ -14,6 +16,7 @@
 // chat funciona normalmente (degradação graciosa).
 
 import { createServiceClient } from "@/lib/supabase/service"
+import { firstNameOf } from "./acknowledgement"
 
 /** Estado retomável que escolhe o template do recap. */
 export type RecapState =
@@ -25,10 +28,18 @@ export type RecapState =
 
 export interface Recap {
   state: RecapState
-  /** frase única, carta de voz, para renderizar acima do log. Sem PII. */
+  /** saudação de retorno (Apêndice B), carta de voz, para renderizar acima do log. Sem PII além do primeiro nome. */
   text: string
   /** label real do último clique de decisão (R-42), quando houver. */
   lastDecisionLabel: string | null
+  /** primeiro nome do cliente (vazio → null); a copy cai no genérico "Olá de novo." */
+  firstName: string | null
+}
+
+/** Saudação de retorno (Apêndice B). Sem valor (o card já mostra), sem emoji. */
+export function returnGreeting(firstName: string | null | undefined): string {
+  const name = (firstName ?? "").trim()
+  return `Olá de novo${name ? `, ${name}` : ""}. Você já viu os detalhes do valor em aberto. Como prefere seguir?`
 }
 
 /** Reconhece uma URL http(s) crua (a bolha do link é persistida como texto). */
@@ -37,13 +48,13 @@ function hasPaymentLink(text: string | null | undefined): boolean {
 }
 
 /**
- * Reconhece a bolha PRESERVADA de "Já paguei" (paymentClaimReply em actions.ts:397
+ * Reconhece a bolha PRESERVADA de "Já paguei" (paymentClaimReply em actions.ts
  * — "Registramos que você já pagou este valor. A nossa equipe vai conferir…").
  * O payment_claim NÃO seta wait_state (handlePaymentClaim só registra o caso e
  * persiste esta bolha), então o recap detecta o desfecho pelo TEXTO preservado (a
  * mesma fonte canônica de C7/R-42: chat_messages), sem depender de uma coluna de
  * estado nem tocar journey_events. Casa a âncora estável da frase, não a copy
- * inteira (D3 pode refinar o final da frase sem quebrar a detecção).
+ * inteira (a A4 pode refinar o final da frase sem quebrar a detecção).
  */
 function hasPaymentClaim(text: string | null | undefined): boolean {
   return typeof text === "string" && /registramos que você já pagou/i.test(text)
@@ -54,7 +65,9 @@ function hasPaymentClaim(text: string | null | undefined): boolean {
  *   - última DECISION: bolha role='customer' com button_id (o label real clicado);
  *   - último OUTCOME: link de pagamento/acordo, "já paguei", "não reconheço",
  *     derivado do wait_state da sessão e das bolhas com link;
- *   - estado da sessão (wait_state) para escolher o template.
+ *   - estado da sessão (wait_state) para escolher o template;
+ *   - primeiro nome do cliente (A3): `opts.firstName` quando o chamador já o tem;
+ *     senão lê customers.name pela sessão (uma leitura, só na retomada).
  *
  * Retorna null quando NÃO há o que recapitular — pós-login SEM decisão ainda (a UI
  * mostra o menu normalmente, sem recap). NUNCA lança: erro → null (o poll segue).
@@ -65,19 +78,21 @@ function hasPaymentClaim(text: string | null | undefined): boolean {
 export async function buildRecap(
   sessionId: string,
   companyId: string,
+  opts: { firstName?: string | null } = {},
 ): Promise<Recap | null> {
   try {
     const supabase = createServiceClient()
 
-    // estado da sessão (wait_state) + época corrente.
+    // estado da sessão (wait_state) + época corrente + cliente (primeiro nome).
     const { data: session } = await supabase
       .from("negotiation_sessions")
-      .select("wait_state, thread_epoch")
+      .select("wait_state, thread_epoch, customer_id")
       .eq("id", sessionId)
       .eq("company_id", companyId)
       .maybeSingle()
-    const waitState = (session as { wait_state?: string | null } | null)?.wait_state ?? null
-    const epoch = Number((session as { thread_epoch?: number | null } | null)?.thread_epoch ?? 0)
+    const sess = session as { wait_state?: string | null; thread_epoch?: number | null; customer_id?: string | null } | null
+    const waitState = sess?.wait_state ?? null
+    const epoch = Number(sess?.thread_epoch ?? 0)
 
     // mensagens da THREAD CORRENTE (época atual OU null = época 0, compat). Ordena
     // DESCENDING e limita a 200 para que a fatia contenha as mais RECENTES (a
@@ -148,9 +163,21 @@ export async function buildRecap(
       return row.role !== "customer" && hasPaymentClaim(row.text)
     })
 
+    // primeiro nome (A3): do chamador ou de customers.name (só aqui, na retomada).
+    let firstName: string | null = opts.firstName ?? null
+    if (opts.firstName === undefined && sess?.customer_id) {
+      const { data: customer } = await supabase
+        .from("customers")
+        .select("name")
+        .eq("id", sess.customer_id)
+        .eq("company_id", companyId)
+        .maybeSingle()
+      firstName = firstNameOf((customer as { name?: string | null } | null)?.name) || null
+    }
+
     // escolhe o estado retomável a partir de wait_state + sinais das bolhas.
     const state = resolveRecapState(waitState, hasLink, claimed)
-    return { state, text: recapText(state, lastDecisionLabel), lastDecisionLabel }
+    return { state, text: recapText(state, lastDecisionLabel, firstName), lastDecisionLabel, firstName }
   } catch (err) {
     console.warn("[journey] buildRecap (não-fatal):", (err as Error).message)
     return null
@@ -176,24 +203,18 @@ export function resolveRecapState(
 }
 
 /**
- * Frase única do recap por estado retomável (carta de voz §10.2: adulto, curta,
- * uma ideia, sem muleta/valor repetido — o valor mora no card fixo, não aqui). O
- * label real do clique (R-42) dá a memória da escolha ("Você escolheu 3x de …").
- * D3 pode refinar a copy; a estrutura (1 frase, por estado) é de D2.
+ * Frase única da retomada (carta de voz: adulta, curta, uma ideia, sem valor —
+ * o valor mora no card e nos outcomes). A3/§2.2: é a SAUDAÇÃO DE RETORNO do
+ * Apêndice B para todo estado — o "recapitulativo da última escolha" é o último
+ * outcome que o client preserva acima do menu, não uma frase. `state` e o label
+ * real do clique ficam disponíveis para a A4 variar a copy por estado.
  */
-export function recapText(state: RecapState, decisionLabel: string | null): string {
-  const choice = decisionLabel ? decisionLabel : "uma opção"
-  switch (state) {
-    case "after_link":
-      return `Você retomou a conversa. Seu link de pagamento já está aqui embaixo, é só abrir.`
-    case "after_negotiate":
-      return `Você retomou a conversa. Estávamos vendo as condições de pagamento para você.`
-    case "after_payment_claim":
-      return `Você retomou a conversa. Você avisou que já pagou; nossa equipe está conferindo.`
-    case "after_not_recognized":
-      return `Você retomou a conversa. Você indicou que não reconhece esta cobrança.`
-    case "after_decision":
-    default:
-      return `Você retomou a conversa. Sua última escolha foi: ${choice}.`
-  }
+export function recapText(
+  state: RecapState,
+  decisionLabel: string | null,
+  firstName: string | null = null,
+): string {
+  void state
+  void decisionLabel
+  return returnGreeting(firstName)
 }

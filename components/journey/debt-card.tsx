@@ -4,7 +4,9 @@
 // renderizado FIXO no topo do chat, FORA do fluxo de mensagens (fora do div
 // role=log): NÃO é linha de chat_messages, aparece 1x. Alimentado pelo bloco
 // `pinned_debt` que o GET /api/chat/messages devolve (montado no servidor por
-// buildAckContext — mesma fonte canônica do resumo).
+// buildAckContext — mesma fonte canônica do resumo). A3 (G7/N2): fixo DE
+// VERDADE — position: sticky no topo do viewport enquanto a página rola (o
+// devedor nunca perde o valor/cedente de vista; o foco pós-login não o esconde).
 //
 // ESTRUTURA é de D2; o ESTILO (mobile 360, valor em destaque, hierarquia) é de D3
 // (className/tokens). Aqui deixo a marcação semântica e o layout mínimo; D3 refina.
@@ -46,7 +48,7 @@ export function DebtCard({ debt }: { debt: PinnedDebtData | null }) {
   return (
     <section
       aria-label="Resumo da dívida"
-      className="rounded-lg border border-neutral-200 bg-white px-4 py-3 shadow-sm"
+      className="sticky top-0 z-10 rounded-lg border border-neutral-200 bg-white px-4 py-3 shadow-sm"
     >
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-xs font-medium text-neutral-500">{debt.creditor_name}</span>
