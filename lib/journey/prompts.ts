@@ -16,6 +16,29 @@ import {
 } from "./buttons"
 import { recordEvent } from "./events"
 
+/**
+ * C3 (trilha D2): época (thread) corrente da sessão para carimbar nas inserts de
+ * chat_prompts/chat_messages. O reset 24h incrementa negotiation_sessions.
+ * thread_epoch; sem o carimbo, um prompt/clique novo cairia na época 0 (velha) e
+ * sumiria da tela nova. Best-effort: coluna ausente (20260935 pendente) → 0
+ * (comportamento de hoje). O caller só inclui o campo quando > 0 (época 0 = default
+ * = dispensa a coluna, para não quebrar em prod antes da migration). NUNCA lança.
+ */
+async function currentThreadEpoch(sessionId: string): Promise<number> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_sessions")
+      .select("thread_epoch")
+      .eq("id", sessionId)
+      .maybeSingle()
+    const raw = (data as { thread_epoch?: number | null } | null)?.thread_epoch
+    return typeof raw === "number" ? raw : 0
+  } catch {
+    return 0
+  }
+}
+
 export interface PromptRow {
   id: string
   company_id: string
@@ -70,20 +93,25 @@ export async function createPrompt(input: CreatePromptInput): Promise<CreateProm
     .eq("status", "active")
 
   const buttons = sortButtons(input.buttons)
+  // C3: carimba a época corrente (thread) — só quando > 0 (época 0 = default,
+  // dispensa a coluna e não quebra em prod antes da 20260935).
+  const epoch = await currentThreadEpoch(input.sessionId)
+  const promptRow: Record<string, unknown> = {
+    company_id: input.companyId,
+    session_id: input.sessionId,
+    kind: input.kind,
+    question: input.question,
+    buttons,
+    context: input.context ?? null,
+    status: "active",
+    created_by: input.createdBy ?? "platform",
+    n8n_execution_id: input.n8nExecutionId ?? null,
+    expires_at: input.expiresAt ?? null,
+  }
+  if (epoch > 0) promptRow.thread_epoch = epoch
   const { data, error } = await supabase
     .from("chat_prompts")
-    .insert({
-      company_id: input.companyId,
-      session_id: input.sessionId,
-      kind: input.kind,
-      question: input.question,
-      buttons,
-      context: input.context ?? null,
-      status: "active",
-      created_by: input.createdBy ?? "platform",
-      n8n_execution_id: input.n8nExecutionId ?? null,
-      expires_at: input.expiresAt ?? null,
-    })
+    .insert(promptRow)
     .select("*")
     .single()
   if (error || !data) return { ok: false, error: error?.message ?? "prompt_insert_failed" }
@@ -173,15 +201,19 @@ export async function answerPrompt(input: {
     return { ok: false, status: 409, code: "prompt_not_active" }
   }
 
-  // o clique também é uma mensagem do cliente (label + button_id + prompt_id)
-  await supabase.from("chat_messages").insert({
+  // o clique também é uma mensagem do cliente (label + button_id + prompt_id).
+  // C3: carimba a época corrente para a bolha do clique ficar na thread atual.
+  const clickEpoch = await currentThreadEpoch(input.sessionId)
+  const clickRow: Record<string, unknown> = {
     company_id: input.companyId,
     session_id: input.sessionId,
     role: "customer",
     text: button.label,
     button_id: button.id,
     prompt_id: prompt.id,
-  })
+  }
+  if (clickEpoch > 0) clickRow.thread_epoch = clickEpoch
+  await supabase.from("chat_messages").insert(clickRow)
 
   const answeredRow = Array.isArray(updated) ? (updated[0] as PromptRow) : (updated as PromptRow)
   return { ok: true, prompt: answeredRow, button }

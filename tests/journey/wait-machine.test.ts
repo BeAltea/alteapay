@@ -107,9 +107,15 @@ describe("copy narrada (03-copy.md §2/§4) — sem termos técnicos", () => {
     ].join(" ")
     expect(all).not.toMatch(/n8n|http|erro|exception|timeout|api|status/i)
   })
-  it("copy de degradação é POSITIVA (não 'falha'), oferece caminhos reais", () => {
-    expect(DEGRADED_MENU_COPY).toContain("não te impede de resolver hoje")
-    expect(DEGRADED_MENU_COPY).toContain("pagar o valor à vista")
+  it("copy de degradação (T10/R-31) é POSITIVA e oferece caminhos reais, sem tom vendedor", () => {
+    // T10: sem "não te impede de resolver hoje" (vendedor) e sem expor falha interna.
+    expect(DEGRADED_MENU_COPY).not.toContain("não te impede de resolver hoje")
+    // oferece os 3 caminhos: pagar à vista, tentar de novo, atendimento.
+    expect(DEGRADED_MENU_COPY).toContain("pague o valor à vista")
+    expect(DEGRADED_MENU_COPY).toMatch(/tente as opções de novo/i)
+    expect(DEGRADED_MENU_COPY).toMatch(/atendimento/i)
+    // enquadra positivo: "Você ainda pode resolver".
+    expect(DEGRADED_MENU_COPY).toContain("Você ainda pode resolver")
   })
 })
 

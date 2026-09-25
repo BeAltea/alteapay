@@ -1,15 +1,45 @@
 "use client"
 
-// Componente de prompt com botões (onda R). Ordem por id (1/0 aparecem como
-// Sim/Não; 98/99 ao final). Desabilita após o clique. Trata 409 prompt_not_active
-// devolvendo o controle ao pai (que recarrega o estado). Sem termos técnicos ao
-// cliente e sem badge de id (o badge do button_id é só no painel admin).
+// Componente de prompt com botões (onda R). Ordem por `order` (contratual) e id.
+// Desabilita após o clique. Trata 409 prompt_not_active devolvendo o controle ao
+// pai (que recarrega o estado). Sem termos técnicos ao cliente e sem badge de id
+// (o badge do button_id é só no painel admin).
 //
-// VIVACIDADE: o clique NUNCA fica preso em "..." — quando onClick resolve com
-// erro (rede/timeout/4xx/5xx), o `finally` para o loading, reabilita os botões
-// (answered continua false) e mostramos um aviso curto ao cliente em vez de
-// silêncio. O pai (chat.tsx) garante o resolve via AbortController no fetch.
+// HIERARQUIA VISUAL (C11 / R-18, carta de voz §10.3): o peso do botão espelha o
+// peso da DECISÃO — PAGAR primário (grande, preenchido, destaque), NEGOCIAR
+// secundário (preenchido leve/contorno de marca), CONSULTAR/NÃO-RECONHEÇO
+// terciários (discretos, contorno/ghost). Assim o devedor não trata "não pagar"
+// como equivalente a "pagar". A hierarquia é derivada por `buttonTier(kind,id)`
+// (pura/testável); o estilo por tier vem de `tierClass`.
+//
+// MOBILE 360px (C12): todo alvo de toque tem min-h-[44px] (R-19); há SEPARAÇÃO
+// anti-clique-errado (R-20) entre o grupo de resolução (pagar/negociar) e a
+// contestação (não reconheço) — a contestação vai para uma linha própria, abaixo,
+// com um divisor; nunca colada ao Negociar com o mesmo peso.
+//
+// CONTRASTE AA (R-23): botões de marca usam color: var(--brand-secondary-fg)
+// (preto/branco adaptativo por luminância — ver lib/journey/contrast.ts). Nunca
+// texto branco fixo sobre um secundário claro do tenant.
+//
+// A11Y (R-43): a pergunta do prompt é anunciada uma vez ao leitor de tela via uma
+// região aria-live=polite dedicada (os rótulos dos botões NÃO são relidos em massa
+// — o bloco de botões fica fora da live region, no group aria-label do pai).
+//
+// VIVACIDADE: o clique NUNCA fica preso em "..." — quando onClick resolve com erro
+// (rede/timeout/4xx/5xx), o `finally` para o loading, reabilita os botões e
+// mostramos um aviso curto. O pai (chat.tsx) garante o resolve via AbortController.
 import { useMemo, useState } from "react"
+// HIERARQUIA/ALVO/ESTILO derivados por lógica PURA num .ts irmão (button-tiers.ts)
+// — testável no node do vitest sem montar React (a decisão vive fora do .tsx).
+import {
+  buttonTier,
+  isContestation,
+  tierClass,
+  type ButtonTier,
+} from "./button-tiers"
+
+export type { ButtonTier }
+export { buttonTier, tierClass }
 
 export interface PromptButton {
   id: number
@@ -58,6 +88,19 @@ export function PromptButtons({
     return [...prompt.buttons].sort((a, b) => rank(a) - rank(b) || a.id - b.id)
   }, [prompt.buttons])
 
+  // Separa a CONTESTAÇÃO (Não reconheço no menu de 3 opções) do grupo de resolução
+  // (R-20): a contestação vai para uma linha própria, abaixo de um divisor, para
+  // não ficar colada ao Negociar nem com o mesmo peso.
+  const { resolution, contestation } = useMemo(() => {
+    const res: PromptButton[] = []
+    const con: PromptButton[] = []
+    for (const b of buttons) {
+      if (isContestation(prompt.kind, b.id)) con.push(b)
+      else res.push(b)
+    }
+    return { resolution: res, contestation: con }
+  }, [buttons, prompt.kind])
+
   async function handle(buttonId: number) {
     if (pending !== null || answered) return
     setNotice(null)
@@ -86,23 +129,48 @@ export function PromptButtons({
     }
   }
 
+  const renderButton = (b: PromptButton) => {
+    const tier = buttonTier(prompt.kind, b.id)
+    const isPrimary = tier === "primary"
+    return (
+      <button
+        key={b.id}
+        type="button"
+        onClick={() => handle(b.id)}
+        disabled={answered || pending !== null}
+        data-tier={tier}
+        // R-23: primary preenche com a marca e usa a cor de texto adaptativa (AA).
+        style={
+          isPrimary
+            ? { backgroundColor: "var(--brand-secondary)", color: "var(--brand-secondary-fg, #ffffff)" }
+            : undefined
+        }
+        className={tierClass(tier)}
+      >
+        {pending === b.id ? "…" : b.label}
+      </button>
+    )
+  }
+
   return (
-    <div className="space-y-2 rounded-lg border border-neutral-200 bg-white p-3">
-      <p className="text-sm text-neutral-800">{prompt.question}</p>
-      <div className="flex flex-wrap gap-2">
-        {buttons.map((b) => (
-          <button
-            key={b.id}
-            type="button"
-            onClick={() => handle(b.id)}
-            disabled={answered || pending !== null}
-            style={{ backgroundColor: "var(--brand-secondary)" }}
-            className="h-9 rounded-md px-4 text-sm font-semibold text-white disabled:opacity-40"
-          >
-            {pending === b.id ? "..." : b.label}
-          </button>
-        ))}
-      </div>
+    <div className="space-y-3 rounded-lg border border-neutral-200 bg-white p-3">
+      {/* R-43: a pergunta entra numa live region dedicada (anunciada 1x); os
+          rótulos dos botões NÃO são relidos em massa (ficam fora desta região). */}
+      <p className="text-sm text-neutral-800" role="status" aria-live="polite">
+        {prompt.question}
+      </p>
+      {/* Grupo de RESOLUÇÃO (pagar/negociar/consultar/parcelas). gap-2.5 anti-erro.
+          O primary ocupa a largura toda no mobile (1º botão acima da dobra, C12). */}
+      <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">{resolution.map(renderButton)}</div>
+      {/* R-20: CONTESTAÇÃO separada por um divisor, em linha própria, peso terciário —
+          nunca colada ao Negociar. */}
+      {contestation.length > 0 ? (
+        <div className="mt-1 border-t border-neutral-100 pt-2.5">
+          <div className="flex flex-col gap-2.5 sm:flex-row sm:flex-wrap">
+            {contestation.map(renderButton)}
+          </div>
+        </div>
+      ) : null}
       {notice ? <p className="text-xs text-red-600">{notice}</p> : null}
     </div>
   )

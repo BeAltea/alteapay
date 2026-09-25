@@ -83,18 +83,21 @@ export function payLinkMessageText(input: {
   const valorTxt = input.valor != null ? formatBRL(input.valor) : ""
   const venc = formatDueDatePt(input.vencimentoLink)
   if (input.alreadyCharged) {
+    // T8 / R-30: sem "se já pagou desconsidere" (é o botão "Já paguei" — C10).
     const head = valorTxt
-      ? `Você já tem uma cobrança ativa no valor de ${valorTxt}.`
+      ? `Você já tem uma cobrança ativa de ${valorTxt}.`
       : "Você já tem uma cobrança ativa."
     const linkLine = input.link ? `\n${input.link}` : ""
-    return `${head} Use o mesmo link abaixo — não precisa gerar outro. Se você já pagou, é só desconsiderar.${linkLine}`
+    return `${head} Use o mesmo link abaixo — não é preciso gerar outro.${linkLine}`
   }
+  // T7 / R-29: sem "Pronto!" e sem "se já pagou desconsidere"; reforço de segurança
+  // leve ("o link é pessoal e seguro") no ponto de maior conversão (link na tela).
   const head = valorTxt
-    ? `Pronto! Aqui está o seu link para pagar ${valorTxt}`
-    : "Pronto! Aqui está o seu link de pagamento"
+    ? `Aqui está o seu link para pagar ${valorTxt}`
+    : "Aqui está o seu link de pagamento"
   const vencPart = venc ? `, com vencimento em ${venc}` : ""
   const linkLine = input.link ? `\n${input.link}` : ""
-  return `${head}${vencPart}. É só abrir e escolher como prefere pagar (Pix, boleto ou cartão). Se você já pagou, pode desconsiderar.${linkLine}`
+  return `${head}${vencPart}. É só abrir e escolher entre Pix, boleto ou cartão. O link é pessoal e seguro.${linkLine}`
 }
 
 /**

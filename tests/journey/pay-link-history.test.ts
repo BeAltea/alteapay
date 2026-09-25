@@ -138,22 +138,29 @@ describe("payService — link no histórico (R7)", () => {
 })
 
 describe("payLinkMessageText — copy do link (R7, pura)", () => {
-  it("novo link: valor + vencimento + URL, com 'se já pagou, desconsidere'", () => {
+  it("novo link (T7/R-29): valor + vencimento + URL, SEM 'Pronto!' e SEM 'já pagou'; reforço de segurança", () => {
     const t = payLinkMessageText({
       link: "https://asaas/checkout/x", valor: 250, vencimentoLink: "2026-09-27", alreadyCharged: false,
     })
     expect(t).toMatch(/R\$\s?250,00/)
     expect(t).toContain("27/09/2026")
     expect(t).toContain("https://asaas/checkout/x")
-    expect(t.toLowerCase()).toContain("já pagou")
+    // R-29/C10: sem "Pronto!" e sem "se já pagou desconsidere" no ponto de maior conversão.
+    expect(t).not.toMatch(/^Pronto!/)
+    expect(t.toLowerCase()).not.toContain("já pagou")
+    expect(t.toLowerCase()).not.toContain("desconsider")
+    // reforço de segurança leve (link pessoal e seguro).
+    expect(t).toContain("O link é pessoal e seguro")
   })
 
-  it("already_charged: reforça 'não precisa gerar outro'", () => {
+  it("already_charged (T8/R-30): reforça 'não é preciso gerar outro', sem 'já pagou'", () => {
     const t = payLinkMessageText({
       link: "https://asaas/i/live", valor: 250, vencimentoLink: null, alreadyCharged: true,
     })
-    expect(t).toMatch(/não precisa gerar outro/i)
+    expect(t).toMatch(/não é preciso gerar outro/i)
     expect(t).toContain("https://asaas/i/live")
+    expect(t.toLowerCase()).not.toContain("já pagou")
+    expect(t.toLowerCase()).not.toContain("desconsider")
   })
 
   it("NUNCA declara pago (M15) e sem termos técnicos/ASAAS", () => {

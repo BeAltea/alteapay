@@ -117,11 +117,11 @@ export function waitStepCopy(step: WaitStep): string {
   }
 }
 
-/** Copy do menu de degradação (03-copy.md §4 / A.5, t=15s). Positiva, nunca
- *  "erro", nunca cita n8n/HTTP/sistema externo. */
+/** Copy do menu de degradação (T10 / R-31, t=15s). Frases curtas, uma ideia; sem
+ *  "não te impede de resolver hoje" (vendedor) e sem expor falha interna/n8n/HTTP. */
 export const DEGRADED_MENU_COPY =
-  "Não consegui carregar as opções de parcelamento agora — mas isso não te impede de resolver hoje. " +
-  "Você pode pagar o valor à vista na hora, tentar as opções de novo, ou falar com o nosso atendimento."
+  "As opções de parcelamento não carregaram agora. " +
+  "Você ainda pode resolver: pague o valor à vista, tente as opções de novo, ou fale com o nosso atendimento."
 
 // ---------------------------------------------------------------------------
 // Resposta tardia (M12) — renderiza-vs-descarta. Anteparo CLIENT (defensivo): o

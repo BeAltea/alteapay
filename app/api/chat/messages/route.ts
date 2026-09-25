@@ -5,6 +5,8 @@
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createServiceClient } from "@/lib/supabase/service"
+import { buildPinnedDebt } from "@/lib/journey/pinned-debt"
+import { buildRecap } from "@/lib/journey/recap"
 
 export const dynamic = "force-dynamic"
 
@@ -19,9 +21,28 @@ export async function GET(req: NextRequest) {
   const since = req.nextUrl.searchParams.get("since")
   const supabase = createServiceClient()
 
+  // C3: época (thread) CORRENTE da sessão — o reset 24h incrementa thread_epoch e
+  // ARQUIVA as linhas velhas (não deleta). Filtramos a época corrente aqui para a
+  // conversa nova começar limpa; painel/reconstrução/recap leem todas as épocas à
+  // parte. DEFENSIVO: se thread_epoch não existir (20260935 pendente em prod), a
+  // leitura cai em 0 e o filtro no client é no-op (compat total). Nunca PII.
+  let currentEpoch = 0
+  try {
+    const { data: sessRow } = await supabase
+      .from("negotiation_sessions")
+      .select("thread_epoch")
+      .eq("id", claims.sid)
+      .eq("company_id", claims.cid)
+      .maybeSingle()
+    const raw = (sessRow as { thread_epoch?: number | null } | null)?.thread_epoch
+    currentEpoch = typeof raw === "number" ? raw : 0
+  } catch {
+    currentEpoch = 0
+  }
+
   let q = supabase
     .from("chat_messages")
-    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, offers_snapshot, created_at")
+    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, offers_snapshot, thread_epoch, archived_at, created_at")
     .eq("session_id", claims.sid)
     .eq("company_id", claims.cid)
     .order("created_at", { ascending: true })
@@ -29,25 +50,52 @@ export async function GET(req: NextRequest) {
   if (since) q = q.gt("created_at", since)
   const { data: rawMessages } = await q
 
+  // Filtra a THREAD CORRENTE (C3): época corrente OU null (=época 0, compat) e
+  // NÃO-arquivada. As linhas de épocas anteriores ficam preservadas no banco (o
+  // painel/recap as leem), mas não voltam à tela da conversa nova. Best-effort: se
+  // as colunas não existirem, thread_epoch/archived_at vêm undefined → tudo passa.
+  const inCurrentThread = (rawMessages ?? []).filter((m) => {
+    const row = m as { thread_epoch?: number | null; archived_at?: string | null }
+    if (row.archived_at != null) return false
+    if (row.thread_epoch == null) return currentEpoch === 0
+    return Number(row.thread_epoch) === currentEpoch
+  })
+
   // Anexa o botão-link externo (ex.: quitação → #contato) quando a mensagem o
   // carrega em offers_snapshot.message_action. A UI renderiza como <a> abaixo da
   // bolha; offers_snapshot cru não vaza para o cliente. Sem PII.
-  const messages = (rawMessages ?? []).map((m) => {
+  const messages = inCurrentThread.map((m) => {
     const snapshot = m.offers_snapshot as { message_action?: unknown } | null
     const action =
       snapshot && typeof snapshot === "object" && snapshot.message_action ? snapshot.message_action : null
-    const { offers_snapshot: _drop, ...rest } = m as Record<string, unknown>
+    const { offers_snapshot: _drop, archived_at: _arch, ...rest } = m as Record<string, unknown>
     return action ? { ...rest, action } : rest
   })
 
-  const { data: activePrompt } = await supabase
+  const { data: activePromptRaw } = await supabase
     .from("chat_prompts")
-    .select("id, kind, question, buttons, status, created_at")
+    .select("id, kind, question, buttons, status, thread_epoch, archived_at, created_at")
     .eq("session_id", claims.sid)
     .eq("status", "active")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle()
+  // C3: um prompt 'active' de época anterior (não deveria existir — o reset o
+  // supersede) é ignorado para não vazar na thread nova. Best-effort: colunas
+  // ausentes → passa (compat). Devolve sem os campos internos de época.
+  let activePrompt: Record<string, unknown> | null = null
+  if (activePromptRaw) {
+    const ap = activePromptRaw as {
+      thread_epoch?: number | null
+      archived_at?: string | null
+    }
+    const sameThread =
+      ap.archived_at == null && (ap.thread_epoch == null ? currentEpoch === 0 : Number(ap.thread_epoch) === currentEpoch)
+    if (sameThread) {
+      const { thread_epoch: _e, archived_at: _a, ...rest } = activePromptRaw as Record<string, unknown>
+      activePrompt = rest
+    }
+  }
 
   // Estado de espera (M11 — onda "3 opções", trilha D2): o client reconstrói a
   // máquina de espera (degraus 1,2/4/10/15s) a partir destes dois campos + o
@@ -68,12 +116,26 @@ export async function GET(req: NextRequest) {
     waitStartedAt = (waitRow as { wait_started_at?: string | null }).wait_started_at ?? null
   }
 
+  // CARD FIXO do débito (C1 / R-11): bloco pinned montado no servidor a cada poll
+  // (imutável entre polls; sobrevive a reload). Reusa buildAckContext (mesma fonte
+  // canônica do resumo — D3 ALTO: valor do card = valor cobrado). Best-effort: se
+  // falhar, pinned_debt=null e o card não renderiza, mas o chat funciona (nunca
+  // derruba o poll). Só computa se houver dívida associada à sessão. Sem PII.
+  const pinnedDebt = await buildPinnedDebt(claims.sid, claims.cid)
+
+  // RECAPITULATIVO de retomada (C7 / R-17): só no 1º poll (since ausente =
+  // carregamento inicial/retomada). Nos polls incrementais não repetimos o recap.
+  // Montado no servidor a partir das bolhas PRESERVADAS (C3) → idêntico após F5.
+  const recap = since ? null : await buildRecap(claims.sid, claims.cid)
+
   return NextResponse.json({
     ok: true,
     messages: messages ?? [],
     active_prompt: activePrompt ?? null,
     wait_state: waitState,
     wait_started_at: waitStartedAt,
+    pinned_debt: pinnedDebt,
+    recap,
     server_time: new Date().toISOString(),
   })
 }

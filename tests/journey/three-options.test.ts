@@ -126,14 +126,22 @@ describe("bootstrap do menu de 3 opções (§6.1)", () => {
     expect(prompt.buttons[3].label).toBe("Não reconheço esta dívida")
   })
 
-  it("a mensagem-resumo traz valor atualizado e vencimento (sem clique); D36 'se já pagou'", async () => {
+  it("a mensagem-resumo (T1/R-24) identifica cedente+AlteaPay, SEM valor e SEM 'desconsiderar'", async () => {
     const { bootstrapThreeOptionsPrompt } = await import("@/lib/journey/acknowledgement")
     await bootstrapThreeOptionsPrompt({ companyId: CO, sessionId: SID, customerId: CUST, debtIds: [DEBT], primaryDebtId: DEBT })
     const msg = db.chat_messages.find((m) => m.role === "assistant")
     expect(msg).toBeTruthy()
     expect(msg!.text).toContain("VMAX")
-    expect(msg!.text).toContain("R$") // valor atualizado
-    expect(msg!.text).toContain("desconsiderar") // D36
+    // T1 (carta de voz §10.2): AlteaPay identificada como operadora do canal.
+    expect(msg!.text).toContain("AlteaPay")
+    // R-12: o VALOR sai da fala (mora no card fixo e no rótulo do botão PAGAR).
+    expect(msg!.text).not.toContain("R$")
+    // R-25/C10: NADA de "se já pagou desconsidere" na abertura (virou o botão "Já paguei").
+    expect(msg!.text).not.toContain("desconsiderar")
+    expect(msg!.text).not.toContain("desconsidere")
+    // R-24: sem alegria forçada (emoji / "Tudo bem?").
+    expect(msg!.text).not.toContain("🙂")
+    expect(msg!.text).not.toContain("Tudo bem?")
     // reconhecimento NÃO é gravado no bootstrap (só apresenta)
     expect((db.debt_acknowledgements ?? []).length).toBe(0)
   })
@@ -156,10 +164,12 @@ describe("bootstrap do menu de 3 opções (§6.1)", () => {
     expect(db.chat_prompts.length).toBe(0)
   })
 
-  it("firstName vazio → saudação genérica (nunca 'Oi, !'/'null')", async () => {
+  it("firstName vazio → saudação genérica (nunca 'Olá, .'/'null')", async () => {
     const { threeOptionsSummary } = await import("@/lib/journey/acknowledgement")
     const msg = threeOptionsSummary({ firstName: "", creditorName: "VMAX", updatedValue: 100, invoiceCount: 1, oldestDueDate: "2020-01-10" })
-    expect(msg.startsWith("Oi! Tudo bem?")).toBe(true)
+    // T1 (carta de voz §10.2): variante sem nome cai em "Olá." (nunca "Olá, ."/"null").
+    expect(msg.startsWith("Olá.")).toBe(true)
+    expect(msg).not.toContain("Olá, .")
     expect(msg).not.toContain("Oi, !")
     expect(msg).not.toContain("null")
   })
@@ -257,7 +267,11 @@ describe("encaminhamento ao cedente (§6.2/M6)", () => {
     expect(reply).toContain("informado na sua fatura")
     // nunca promete pagamento; AlteaPay não é responsável pela dívida
     expect(reply).toContain("não vamos gerar nenhum pagamento")
-    expect(reply).toContain("plataforma que opera o canal de negociação")
+    // R-46 (carta de voz): AlteaPay opera o canal; o dono do contrato é o credor.
+    expect(reply).toContain("A AlteaPay opera o canal de negociação")
+    // R-46/C10: sem "Obrigado por avisar" (muleta) nem "se já pagou desconsidere".
+    expect(reply).not.toContain("Obrigado por avisar")
+    expect(reply).not.toContain("desconsidere")
   })
 
   it("COM config: usa o canal oficial semeado (label + url)", async () => {
@@ -319,20 +333,27 @@ describe("buttons — ordenação do menu de 3 opções", () => {
 describe("resumo objetivo + Consultar + reset 24h", () => {
   beforeEach(() => seed())
 
-  it("threeOptionsSummary é OBJETIVO: exibe o VALOR e NÃO o vencimento", async () => {
+  it("threeOptionsSummary (T1/R-12): sem VALOR e sem vencimento na fala; convida a seguir", async () => {
     const { threeOptionsSummary, buildAckContext } = await import("@/lib/journey/acknowledgement")
     const s = threeOptionsSummary(await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
-    expect(s).toContain("250")
+    // R-12: o valor mora no card fixo e no rótulo do botão PAGAR, NÃO na fala.
+    expect(s).not.toContain("250")
+    expect(s).not.toContain("R$")
     expect(s).not.toContain("Vencimento original")
     expect(s).toMatch(/prefere seguir/i)
   })
 
-  it("debtConsultReply mostra vencimento original + serviço do cedente", async () => {
+  it("debtConsultReply (T4/R-27): vencimento + serviço do cedente + caminho de volta", async () => {
     const { debtConsultReply, buildAckContext } = await import("@/lib/journey/acknowledgement")
     const r = debtConsultReply(await buildAckContext({ companyId: CO, customerId: CUST, debtIds: [DEBT] }))
-    expect(r).toContain("Vencimento original")
-    expect(r).toMatch(/serviço oferecido pela/i)
+    // T4: "vencimento original em {venc}" e "refere-se a um serviço da {credor}".
+    expect(r).toMatch(/vencimento original em/i)
+    expect(r).toMatch(/serviço da/i)
     expect(r).toContain("VMAX")
+    // R-12: sem valor na fala (mora no card/rótulo).
+    expect(r).not.toContain("R$")
+    // a carta pede sempre oferecer caminho: a frase termina convidando a escolher.
+    expect(r).toMatch(/escolher abaixo/i)
   })
 
   it("Consultar [2]: sequência do clique gera a resposta + reabre o menu (não fica mudo)", async () => {
@@ -359,18 +380,79 @@ describe("resumo objetivo + Consultar + reset 24h", () => {
     expect(active!.buttons.map((b: any) => b.id)).toEqual([4, 1, 2, 0])
   })
 
-  it("reset 24h: histórico com >24h é apagado; recente é mantido", async () => {
+  // R-01 — GUARD DE REGRESSÃO do P1 (render síncrono do corpo do POST). Falha se:
+  //  (a) o consult deixar de vir no corpo do POST (action:'consult' + reply);
+  //  (b) não houver debt_three_options active após o clique;
+  //  (c) o reply não persistir em chat_messages (com prompt_id null — não filtrado
+  //      pelo render de prompt ativo, chat.tsx:942-944).
+  // Exercita a ROTA real (não só as libs) para travar o contrato que a UI consome.
+  it("R-01 guard: CONSULTAR devolve reply no corpo do POST + menu active + reply persistido (prompt_id null)", async () => {
+    const { bootstrapThreeOptionsPrompt } = await import("@/lib/journey/acknowledgement")
+    const { POST } = await import("@/app/api/chat/button/route")
+    const { signChatJwt } = await import("@/lib/negotiation/crypto")
+    process.env.NEGOTIATION_JWT_SECRET = "test-secret-3op-r01"
+    await bootstrapThreeOptionsPrompt({ companyId: CO, sessionId: SID, customerId: CUST, debtIds: [DEBT], primaryDebtId: DEBT })
+    const prompt = db.chat_prompts.find((p) => p.status === "active")!
+    const cookie = signChatJwt({ sid: SID, cid: CO }, 3600)
+    const req = {
+      cookies: { get: (n: string) => (n === "alteapay_chat_session" ? { value: cookie } : undefined) },
+      headers: { get: () => null },
+      json: async () => ({ prompt_id: prompt.id, button_id: 2 }),
+    } as any
+    const res = await POST(req)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    // (a) reply no corpo do POST
+    expect(body.action).toBe("consult")
+    expect(typeof body.reply).toBe("string")
+    expect(body.reply.length).toBeGreaterThan(0)
+    // (b) novo debt_three_options active após o clique
+    const active = db.chat_prompts.find((p) => p.status === "active")
+    expect(active!.kind).toBe("debt_three_options")
+    expect(active!.id).not.toBe(prompt.id)
+    // (c) reply persistido, com prompt_id null (não some no render de prompt ativo)
+    const replyMsg = db.chat_messages.find((m) => m.role === "assistant" && m.text === body.reply)
+    expect(replyMsg).toBeTruthy()
+    expect(replyMsg!.prompt_id == null).toBe(true)
+  })
+
+  // C3 — DECISÃO G3 D.3 (fim do DELETE): o reset de 24h PRESERVA as linhas.
+  // Substitui a antiga asserção de length===0 por asserção de PRESERVAÇÃO +
+  // thread_epoch+1 + arquivamento (archived_at). SELECT antes/depois = MESMAS
+  // linhas (agora arquivadas na época anterior).
+  it("reset 24h PRESERVA (não deleta): arquiva as linhas velhas e incrementa thread_epoch", async () => {
     const { resetStaleChatIfInactive } = await import("@/lib/journey/acknowledgement")
     const old = new Date(Date.now() - 25 * 3_600_000).toISOString()
     db.chat_messages = [{ id: "m1", session_id: SID, company_id: CO, role: "assistant", text: "velho", created_at: old }]
     db.chat_prompts = [{ id: "p1", session_id: SID, company_id: CO, kind: "debt_three_options", status: "active", buttons: [], created_at: old }]
-    expect(await resetStaleChatIfInactive(SID, CO)).toBe(true)
-    expect(db.chat_messages.length).toBe(0)
-    expect(db.chat_prompts.length).toBe(0)
+    // sessão começa na época 0 (default da migration 20260935).
+    db.negotiation_sessions[0].thread_epoch = 0
 
+    expect(await resetStaleChatIfInactive(SID, CO)).toBe(true)
+
+    // PRESERVAÇÃO: as linhas continuam no banco (NUNCA deletadas) — SELECT antes/
+    // depois retorna as mesmas linhas (mesma contagem, mesmo conteúdo).
+    expect(db.chat_messages.length).toBe(1)
+    expect(db.chat_prompts.length).toBe(1)
+    expect(db.chat_messages[0].id).toBe("m1")
+    expect(db.chat_prompts[0].id).toBe("p1")
+    // ARQUIVADAS (archived_at setado, UPDATE não DELETE) na época anterior.
+    expect(db.chat_messages[0].archived_at).toBeTruthy()
+    expect(db.chat_prompts[0].archived_at).toBeTruthy()
+    // prompt da época velha deixa de estar 'active' (não vive na thread nova).
+    expect(db.chat_prompts[0].status).toBe("superseded")
+    // thread_epoch da sessão foi incrementado (0 → 1): abre uma thread nova.
+    expect(db.negotiation_sessions[0].thread_epoch).toBe(1)
+  })
+
+  it("reset 24h: histórico recente (<24h) NÃO rotaciona (época e linhas intactas)", async () => {
+    const { resetStaleChatIfInactive } = await import("@/lib/journey/acknowledgement")
     const fresh = new Date(Date.now() - 60_000).toISOString()
     db.chat_messages = [{ id: "m2", session_id: SID, company_id: CO, role: "assistant", text: "novo", created_at: fresh }]
+    db.negotiation_sessions[0].thread_epoch = 0
     expect(await resetStaleChatIfInactive(SID, CO)).toBe(false)
     expect(db.chat_messages.length).toBe(1)
+    expect(db.chat_messages[0].archived_at == null).toBe(true)
+    expect(db.negotiation_sessions[0].thread_epoch).toBe(0)
   })
 })

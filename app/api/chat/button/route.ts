@@ -263,7 +263,10 @@ export async function POST(req: NextRequest) {
         })
         // Confirmação NOSSA imediata (A.2) — persistida para o histórico. Nada do
         // n8n é aguardado: a espera é client-side em D2.
-        const reply = "Perfeito. Vou buscar as condições disponíveis para o seu caso."
+        // T2 / R-26: mesma frase EXATA da bolha optimistic do client
+        // (NEGOTIATION_PENDING_TEXT em chat-display.ts) — 1 só bolha para o mesmo
+        // instante (M4). "Certo." (não "Perfeito."), "para você" (não "seu caso").
+        const reply = "Certo. Vou buscar as condições de pagamento disponíveis para você."
         await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
         // Dispara negotiation.start em BACKGROUND (best-effort/resiliente H8): se o
         // n8n um dia conduzir, ele assume os próximos turnos. NÃO aguardamos.
@@ -460,7 +463,10 @@ export async function POST(req: NextRequest) {
       } catch {
         /* fallback silencioso: mantém o texto genérico */
       }
-      const notRecognizedReply = `Obrigado pelo seu retorno. Para esclarecimentos sobre esta cobrança, entre em contato diretamente com a ${creditorName}.`
+      // R-46: mesma carta de voz do notRecognizedReply — adulto, sem "Obrigado
+      // pelo seu retorno" (muleta), sem "se já pagou desconsidere". Identifica a
+      // {credor} (dona da dívida) e a AlteaPay (operadora do canal). Sem ameaça.
+      const notRecognizedReply = `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName}. A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
       await persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: notRecognizedReply })
       return NextResponse.json({
         ok: true, button_id: buttonId, action: "not_recognized",
@@ -520,7 +526,10 @@ export async function POST(req: NextRequest) {
       } catch {
         /* fallback silencioso: mantém o texto genérico */
       }
-      const notRecognizedReply = `Obrigado pelo seu retorno. Para esclarecimentos sobre esta cobrança, entre em contato diretamente com a ${creditorName}.`
+      // R-46: mesma carta de voz do notRecognizedReply — adulto, sem "Obrigado
+      // pelo seu retorno" (muleta), sem "se já pagou desconsidere". Identifica a
+      // {credor} (dona da dívida) e a AlteaPay (operadora do canal). Sem ameaça.
+      const notRecognizedReply = `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName}. A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
       // Persiste a resposta do assistente no histórico (o clique do cliente já foi
       // gravado por answerPrompt dentro de recordAcknowledgement). Assim a sessão
       // reaberta reconstrói [pergunta+resumo] → [clique] → [resposta].

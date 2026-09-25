@@ -5,6 +5,7 @@
 import type React from "react"
 import type { Metadata } from "next"
 import { notFound } from "next/navigation"
+import { adaptiveTextColor } from "@/lib/journey/contrast"
 import { loadGenericTenant } from "./_lib/tenant"
 
 export const dynamic = "force-dynamic"
@@ -27,9 +28,11 @@ export default async function GenericJourneyLayout({
   if (!result.ok) notFound()
 
   const { branding, privacyPolicyUrl, dpoContact } = result.tenant
+  // R-23 (contraste AA): cor de TEXTO adaptativa sobre o secundário do tenant.
   const cssVars = {
     "--brand-primary": branding.brandPrimaryColor,
     "--brand-secondary": branding.brandSecondaryColor,
+    "--brand-secondary-fg": adaptiveTextColor(branding.brandSecondaryColor),
   } as React.CSSProperties
 
   return (

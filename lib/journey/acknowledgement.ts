@@ -242,33 +242,36 @@ export function backToOptionsButtons(): Button[] {
 }
 
 /**
- * Mensagem-resumo do menu de 3 opções (§6.1, copy 03-copy.md §1). Uma bolha:
- * saudação + credor + valor atualizado + vencimento original (+ N faturas se >1) +
- * convite. "Se já pagou, é só desconsiderar" cobre D36. Sem PII (nada de documento).
- * Variação sem nome cai em "Olá!" (nunca "Olá, !"/"null").
+ * Mensagem-resumo/abertura do menu de 3 opções (T1 / R-24 — carta de voz §10.2).
+ * Adulto-para-adulto: SEM alegria forçada ("Tudo bem?"/emoji), SEM "se já pagou
+ * desconsidere" (isso virou o botão "Já paguei" — C10) e SEM o VALOR na fala (o
+ * número mora no CARD fixo e no rótulo do botão PAGAR — R-11/R-12). Identifica a
+ * AlteaPay como operadora do canal e a {credor} como dona da dívida (transparência
+ * LGPD — R-24). Variação sem nome cai em "Olá." (nunca "Olá, ."/"null"). Sem PII.
  */
 export function threeOptionsSummary(ctx: AckContext): string {
-  const greeting = ctx.firstName ? `Oi, ${ctx.firstName}! Tudo bem?` : "Oi! Tudo bem?"
-  // Tom AMIGÁVEL + objetivo (pedido do Fabio 2026-09-24): acolhe, já exibe o VALOR
-  // e se coloca à disposição. O vencimento original e a natureza (serviço do
-  // cedente) ficam sob demanda no "Consultar dívida". Linguagem D36 (sem ameaça).
+  const greeting = ctx.firstName ? `Olá, ${ctx.firstName}.` : "Olá."
   return (
-    `${greeting} Estou aqui para te ajudar a resolver um valor em aberto de ` +
-    `${BRL(ctx.updatedValue)} com a ${ctx.creditorName}, da forma mais simples possível. ` +
-    `Como você prefere seguir? Se já tiver pago, pode desconsiderar esta mensagem. 🙂`
+    `${greeting} Encontramos um valor em aberto em seu nome com a ${ctx.creditorName}. ` +
+    `Dá para resolver agora mesmo por aqui. ` +
+    `A AlteaPay opera este canal de negociação; a dívida é da ${ctx.creditorName}. ` +
+    `Como você prefere seguir?`
   )
 }
 
 /**
- * Resposta do "Consultar dívida" [2] (informativo — NÃO reconhece a dívida): o
- * detalhe que saiu do resumo objetivo — vencimento original (e nº de faturas) e
- * que se trata de um serviço oferecido pelo cedente. Linguagem D36.
+ * Resposta do "Consultar dívida" [2] (T4 / R-27 — carta de voz §10.2). Informativo,
+ * NÃO reconhece a dívida. Frase única, adulto, que TERMINA oferecendo caminho de
+ * volta ("é só escolher abaixo como prefere seguir") — a carta pede sempre oferecer
+ * caminho. Condicional de plural: só cita "reúne N faturas" quando N>1. Sem valor
+ * na fala (mora no card/rótulo — R-12). Sem PII (nada de documento).
  */
 export function debtConsultReply(ctx: AckContext): string {
-  const faturas = ctx.invoiceCount > 1 ? ` (${ctx.invoiceCount} faturas)` : ""
+  const faturas = ctx.invoiceCount > 1 ? ` e reúne ${ctx.invoiceCount} faturas` : ""
   return (
-    `Vencimento original: ${formatDatePt(ctx.oldestDueDate)}${faturas}. ` +
-    `Trata-se de um serviço oferecido pela ${ctx.creditorName}.`
+    `Este valor tem vencimento original em ${formatDatePt(ctx.oldestDueDate)}${faturas} ` +
+    `e refere-se a um serviço da ${ctx.creditorName}. ` +
+    `Se quiser, é só escolher abaixo como prefere seguir.`
   )
 }
 
@@ -332,14 +335,15 @@ export async function resolveCreditorChannel(input: {
 export function notRecognizedReply(channel: CreditorChannel): string {
   const { creditorName } = channel
   const channelSentence = channel.hasConfig
-    ? `Para entender a origem do débito e contestar, fale diretamente com a ${creditorName} pelo canal oficial: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}.`
-    : `Para entender a origem do débito e contestar, fale diretamente com a ${creditorName} pelo canal informado na sua fatura ou no site oficial da ${creditorName}.`
+    ? `Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName} pelo canal oficial: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}.`
+    : `Para entender a origem da dívida e contestar, fale diretamente com a ${creditorName} pelo canal informado na sua fatura ou no site oficial da ${creditorName}.`
+  // R-46 (carta de voz): adulto, sem "Obrigado por avisar" (muleta), sem "se já
+  // pagou desconsidere". Preserva o conteúdo jurídico (não gera pagamento;
+  // contestação segue disponível) e identifica VMAX (dona) e AlteaPay (operadora).
   return (
-    `Obrigado por avisar. Registramos que você não reconhece esta cobrança e não vamos ` +
-    `gerar nenhum pagamento agora. ${channelSentence} ` +
-    `A AlteaPay é a plataforma que opera o canal de negociação; quem tem os detalhes do ` +
-    `contrato é a ${creditorName}. Se você já pagou este valor, informe isso ao credor ` +
-    `para que ele atualize o cadastro.`
+    `Registramos que você não reconhece esta cobrança e não vamos gerar nenhum pagamento agora. ` +
+    `${channelSentence} ` +
+    `A AlteaPay opera o canal de negociação; quem tem os detalhes do contrato é a ${creditorName}.`
   )
 }
 
@@ -420,16 +424,49 @@ export async function bootstrapThreeOptionsPrompt(input: {
   return { ok: true, created: true, prompt: created.prompt }
 }
 
-// 24h sem interação → o histórico é apagado e a jornada recomeça como um chat novo.
+// 24h sem interação → a thread atual é ENCERRADA e outra é aberta; o histórico é
+// PRESERVADO (arquivado), não apagado.
 const CHAT_HISTORY_TTL_MS = 24 * 60 * 60 * 1000
 
 /**
- * Pedido do Fabio (2026-09-24): passadas 24h da ÚLTIMA interação, o histórico do
- * chat é apagado e a jornada volta como um chat novo. Baseia-se na última
- * `chat_messages` da sessão (a última interação REAL) — não no `last_activity_at`,
- * que a própria auth acabou de bumpar ao reabrir a sessão. Best-effort e NÃO-fatal:
- * uma falha aqui não derruba a auth (no pior caso o histórico antigo permanece).
- * Retorna true se apagou. Ordem: mensagens antes dos prompts (FK prompt_id).
+ * Época (thread) CORRENTE da sessão (int monotônico, default 0). É o filtro que
+ * separa a conversa nova das velhas dentro da MESMA sessão reusada (C3). Best-
+ * effort: se a coluna thread_epoch ainda não existir (migration 20260935 pendente
+ * em prod), degrada para 0 = comportamento de hoje. NUNCA lança.
+ */
+export async function getCurrentThreadEpoch(sessionId: string): Promise<number> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_sessions")
+      .select("thread_epoch")
+      .eq("id", sessionId)
+      .maybeSingle()
+    const raw = (data as { thread_epoch?: number | null } | null)?.thread_epoch
+    return typeof raw === "number" ? raw : 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Decisão G3 D.3 (aprovada pelo Fabio): passadas 24h da ÚLTIMA interação, o reset
+ * DEIXA de ser DELETE físico. Passa a ENCERRAR A THREAD ATUAL E ABRIR OUTRA:
+ *   - incrementa negotiation_sessions.thread_epoch (int monotônico) — a conversa
+ *     nova começa numa época nova;
+ *   - ARQUIVA (UPDATE archived_at=now(), NÃO DELETE) as linhas de chat_messages e
+ *     chat_prompts da época ANTERIOR — auditoria e itens C8 (link, escolha, "já
+ *     paguei", reconhecimento) permanecem consultáveis;
+ *   - supersede os prompts 'active' da época velha (não ficam vivos na tela nova).
+ * O GET /api/chat/messages passa a filtrar a época corrente → a tela começa limpa,
+ * mas o banco preserva tudo. journey_events INTACTO (C2/R-09: não é referenciado).
+ *
+ * Baseia-se na última `chat_messages` da sessão (a última interação REAL) — não no
+ * `last_activity_at`, que a própria auth acabou de bumpar ao reabrir a sessão.
+ * Best-effort/NÃO-fatal: uma falha aqui não derruba a auth. Retorna true se
+ * encerrou/rotacionou a thread (o SELECT antes/depois vê as MESMAS linhas — agora
+ * arquivadas). DEFENSIVO: se as colunas 20260935 ainda não existirem em prod, o
+ * incremento/arquivamento é no-op silencioso e a tela apenas não "recomeça".
  */
 export async function resetStaleChatIfInactive(sessionId: string, _companyId: string): Promise<boolean> {
   try {
@@ -441,19 +478,39 @@ export async function resetStaleChatIfInactive(sessionId: string, _companyId: st
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
-    if (!last?.created_at) return false // sem histórico → nada a apagar
+    if (!last?.created_at) return false // sem histórico → nada a rotacionar
     if (Date.now() - new Date(last.created_at).getTime() < CHAT_HISTORY_TTL_MS) return false // ainda fresco
-    await supabase.from("chat_messages").delete().eq("session_id", sessionId)
-    await supabase.from("chat_prompts").delete().eq("session_id", sessionId)
-    // limpa a espera (defensivo — coluna wait_state pode não estar aplicada).
+
+    const nowIso = new Date().toISOString()
+    const prevEpoch = await getCurrentThreadEpoch(sessionId)
+    const nextEpoch = prevEpoch + 1
+
+    // 1) ARQUIVA (UPDATE, nunca DELETE) as linhas ainda-não-arquivadas da sessão:
+    //    a partir de agora elas pertencem à thread anterior. archived_at marca o
+    //    encerramento; o filtro de época no GET as tira da tela nova sem removê-las.
+    await supabase
+      .from("chat_messages")
+      .update({ archived_at: nowIso })
+      .eq("session_id", sessionId)
+      .is("archived_at", null)
+      .then(() => {}, () => {})
+    // 2) supersede + arquiva os prompts da época velha (não ficam 'active' na nova).
+    await supabase
+      .from("chat_prompts")
+      .update({ archived_at: nowIso, status: "superseded" })
+      .eq("session_id", sessionId)
+      .is("archived_at", null)
+      .then(() => {}, () => {})
+    // 3) incrementa a época da sessão + limpa a espera. A partir daqui, as inserts
+    //    gravam thread_epoch=nextEpoch (ver currentEpochForInsert nos bootstraps).
     await supabase
       .from("negotiation_sessions")
-      .update({ wait_state: null, wait_started_at: null })
+      .update({ thread_epoch: nextEpoch, wait_state: null, wait_started_at: null })
       .eq("id", sessionId)
       .then(() => {}, () => {})
     return true
   } catch (err) {
-    console.warn("[journey] reset 24h (não-fatal):", (err as Error).message)
+    console.warn("[journey] reset 24h — rotação de thread (não-fatal):", (err as Error).message)
     return false
   }
 }
@@ -527,18 +584,20 @@ export async function reopenThreeOptions(input: {
 const OFFER_FIRST_BUTTON_ID = 2
 
 /**
- * Rótulo curto e claro de uma oferta de parcelamento (§ copy, sem PII):
- *   - à vista (1 parcela): "À vista R$ 175,00" (+ "(30% de desconto)" se houver);
+ * Rótulo de uma oferta de parcelamento (T6 / R-45 — âncora de economia). Sem PII.
+ *   - à vista (1 parcela) COM desconto: "À vista R$ 175,00 — você economiza R$ 75,00
+ *     (recomendado)" (âncora de economia em REAIS + destaque "recomendado", que
+ *     orienta a escolha à quitação — A4/N1); sem desconto: "À vista R$ 175,00
+ *     (recomendado)" (recomenda, mas NUNCA insinua economia que não existe);
  *   - parcelado (N>1): "3x de R$ 78,33 (total R$ 235,00)".
- * Valores da OFERTA (total/parcela) — a mesma matriz que gerou a oferta. Nunca
- * insinua desconto quando não há (discount_value 0).
+ * Valores da OFERTA (total/parcela/economia) — a mesma matriz que gerou a oferta.
  */
 export function offerButtonLabel(terms: OfferTerms): string {
   if (terms.installments <= 1) {
     const base = `À vista ${BRL(terms.total_value)}`
     return terms.discount_value > 0
-      ? `${base} (${Math.round(terms.discount_pct)}% de desconto)`
-      : base
+      ? `${base} — você economiza ${BRL(terms.discount_value)} (recomendado)`
+      : `${base} (recomendado)`
   }
   return `${terms.installments}x de ${BRL(terms.installment_value)} (total ${BRL(terms.total_value)})`
 }
@@ -559,12 +618,13 @@ export function offerChoiceButtons(offers: ListedOffer[]): Button[] {
   return buttons
 }
 
-/** Pergunta que acompanha os botões de parcelamento (D36: "se já pagou,
- *  desconsidere"). Sem PII; sem ameaça/negativação. */
+/** Pergunta que acompanha os botões de parcelamento (T5 / R-28 — carta de voz).
+ *  Uma ideia, sem "se já pagou desconsidere" (isso é o botão "Já paguei" — C10).
+ *  Sem PII; sem ameaça/negativação; sem valor na fala (mora no card/rótulo — R-12). */
 export function offerChoiceQuestion(): string {
   return (
-    "Aqui estão as opções de pagamento disponíveis para você. " +
-    "Escolha a que preferir para gerar o seu pagamento. Se já pagou, é só desconsiderar."
+    "Estas são as condições disponíveis para você. " +
+    "Escolha a que preferir e eu gero o seu pagamento."
   )
 }
 
@@ -998,16 +1058,25 @@ export async function persistAssistantMessage(input: {
       .maybeSingle()
     if (dup) return (dup as { id: string }).id
 
+    // C3: carimba a ÉPOCA corrente na bolha nova, para o GET filtrar a thread atual
+    // (o reset 24h incrementa thread_epoch; sem o carimbo, uma bolha nova cairia na
+    // época 0/velha). Best-effort: se a coluna não existir (20260935 pendente em
+    // prod), o insert com thread_epoch é ignorado pelo PostgREST? Não — colunas
+    // desconhecidas causam erro. Por isso lemos a época e só incluímos o campo
+    // quando > 0 (época 0 = default = comportamento de hoje, dispensa a coluna).
+    const epoch = await getCurrentThreadEpoch(input.sessionId)
+    const insertRow: Record<string, unknown> = {
+      company_id: input.companyId,
+      session_id: input.sessionId,
+      role: "assistant",
+      text,
+      engine: "platform",
+      prompt_id: input.promptId ?? null,
+    }
+    if (epoch > 0) insertRow.thread_epoch = epoch
     const { data } = await supabase
       .from("chat_messages")
-      .insert({
-        company_id: input.companyId,
-        session_id: input.sessionId,
-        role: "assistant",
-        text,
-        engine: "platform",
-        prompt_id: input.promptId ?? null,
-      })
+      .insert(insertRow)
       .select("id")
       .single()
     return (data as { id: string } | null)?.id ?? null

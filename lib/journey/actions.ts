@@ -283,11 +283,12 @@ export async function registerPaymentClaim(
  * `creditorName` já vem resolvido pela precedência canônica (R15). Sem PII.
  */
 export function humanHandoffReply(creditorName: string): string {
+  // T12 / R-33: remove "em breve" (promessa de prazo sem SLA) e o "se já pagou
+  // desconsidere" deslocado. Nomeia o canal (WhatsApp AlteaPay) sem número em claro.
   return (
     "Certo. Vou encaminhar você ao nosso atendimento. " +
-    "Em breve a nossa equipe entra em contato com você pelo WhatsApp da AlteaPay. " +
-    `Dúvidas sobre a origem do débito são com a ${creditorName}. ` +
-    "Se você já pagou, é só desconsiderar esta mensagem."
+    "A nossa equipe vai falar com você pelo WhatsApp da AlteaPay. " +
+    `Dúvidas sobre a origem da dívida são com a ${creditorName}.`
   )
 }
 
@@ -387,12 +388,16 @@ export async function handlePaymentClaim(
  * pago — D6/M15) e orientamos o devedor a guardar o comprovante. Sem ameaça (D36),
  * sem prometer baixa imediata. `creditorName` já resolvido (R15). Sem PII.
  */
-export function paymentClaimReply(creditorName: string): string {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function paymentClaimReply(_creditorName?: string): string {
+  // T13 / R-34: enxuto, sem "Obrigado por avisar" (muleta). NÃO declara pago (D6/M15):
+  // "a nossa equipe vai conferir" + orienta guardar o comprovante. Sem PII. O
+  // `_creditorName` é mantido na assinatura por compatibilidade com os chamadores
+  // (a nova copy não cita o credor — a conferência é da equipe AlteaPay).
   return (
-    "Obrigado por avisar. Registramos que você informou já ter pago este valor e a nossa " +
-    "equipe vai conferir. Enquanto isso, guarde o seu comprovante de pagamento — ele pode ser " +
-    `pedido para a baixa. Se o pagamento foi feito com a ${creditorName}, informe também o credor ` +
-    "para que ele atualize o cadastro. Você não precisa fazer mais nada por aqui agora."
+    "Registramos que você já pagou este valor. A nossa equipe vai conferir. " +
+    "Guarde o seu comprovante — ele pode ser pedido para dar baixa. " +
+    "Você não precisa fazer mais nada por aqui agora."
   )
 }
 

@@ -167,11 +167,16 @@ describe("R5 — handlePaymentClaim (registra claim, orienta comprovante, sem de
     expect((db.contact_suppressions ?? []).length).toBe(0)
   })
 
-  it("usa o cedente REAL (VMAX) na orientação (R15)", async () => {
+  it("copy do 'Já paguei' (T13/R-34): enxuta, sem 'Obrigado por avisar', não declara pago, sem ameaça", async () => {
     const { handlePaymentClaim, paymentClaimReply } = await import("@/lib/journey/actions")
     await handlePaymentClaim(ctx, "customer")
     const text = db.chat_messages.find((m) => m.role === "assistant")!.text as string
-    expect(text).toContain("VMAX")
+    // T13: a conferência é da equipe AlteaPay; a nova copy não cita mais o cedente.
+    expect(text).toMatch(/nossa equipe vai conferir/i)
+    // R-34/carta de voz: sem "Obrigado por avisar" (muleta).
+    expect(text).not.toMatch(/obrigado por avisar/i)
+    // D6/M15: NÃO declara pago.
+    expect(text).not.toMatch(/pagamento (confirmado|recebido)|quitad[oa]|est[aá] pago/i)
     // copy pura também sem ameaça (D36)
     expect(paymentClaimReply("VMAX")).not.toMatch(/negativa|protesto|judicial|SPC|Serasa/i)
   })

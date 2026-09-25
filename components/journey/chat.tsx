@@ -15,12 +15,15 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { PromptButtons, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 import {
+  capHistory,
   dedupAssistantByContent,
   isNegotiateLabel,
   NEGOTIATION_PENDING_TEXT,
+  prunePresentation,
   type ChatMsg,
   type MsgAction,
 } from "./chat-display"
+import { DebtCard, type PinnedDebtData } from "./debt-card"
 import {
   DEGRADED_MENU_COPY,
   deriveWaitStep,
@@ -28,7 +31,6 @@ import {
   hydrateWaitState,
   resolveWaitView,
   shouldRenderEngineMsg,
-  shouldShowSlowExits,
   shouldShowTypingIndicator,
   waitStepCopy,
   type WaitState,
@@ -141,6 +143,13 @@ export function JourneyChat() {
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [ended, setEnded] = useState(false)
   const [activePrompt, setActivePrompt] = useState<ActivePrompt | null>(null)
+  // D2 — CARD FIXO (C1) e RECAP de retomada (C7): montados no servidor e entregues
+  // no poll. O card vem a cada poll (imutável entre polls, sobrevive a reload); o
+  // recap vem só no 1º poll (retomada). "Ver conversa completa" (R-41) expande o
+  // histórico recolhido pela poda/teto.
+  const [pinnedDebt, setPinnedDebt] = useState<PinnedDebtData | null>(null)
+  const [recap, setRecap] = useState<{ text: string } | null>(null)
+  const [historyExpanded, setHistoryExpanded] = useState(false)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const sinceRef = useRef<string | null>(null)
   const seenIds = useRef<Set<string>>(new Set())
@@ -328,6 +337,19 @@ export function JourneyChat() {
       // M11: reidrata a máquina de espera a partir do estado do servidor (vem no
       // 1º poll e nos seguintes). Um reload durante a espera restaura o degrau.
       rehydrateWait(data?.wait_state ?? null, data?.wait_started_at ?? null)
+      // D2 — CARD FIXO (C1): vem a cada poll (imutável entre polls). Best-effort: se
+      // o servidor não montou (null), o card some e o chat segue. Não é linha de
+      // chat_messages — mora fora do log.
+      if (data?.pinned_debt && typeof data.pinned_debt === "object") {
+        setPinnedDebt(data.pinned_debt as PinnedDebtData)
+      } else if (data?.pinned_debt === null) {
+        setPinnedDebt(null)
+      }
+      // D2 — RECAP (C7): só o 1º poll (retomada) traz recap != null. Guardamos para
+      // renderizar o bloco acima do log no lugar da repetição integral.
+      if (data?.recap && typeof data.recap === "object" && typeof data.recap.text === "string") {
+        setRecap({ text: data.recap.text })
+      }
       const pushed: Array<{
         id: string
         role: string
@@ -379,6 +401,10 @@ export function JourneyChat() {
               text: m.text,
               action: safeExternalAction(m.action),
               promptId: m.prompt_id ?? null,
+              // sinais p/ a poda por classe (§10.1): engine distingue system;
+              // button_id distingue decision (eco do clique).
+              engine: m.engine ?? null,
+              buttonId: m.button_id ?? null,
             },
           ]
         })
@@ -673,15 +699,26 @@ export function JourneyChat() {
           }
           // senão: mantém aguardando_motor; o poll trará wait_started_at do servidor.
         }
-        // CONSULTAR — informativo: renderiza a resposta (vencimento + cedente) NA
-        // HORA, sem depender do timing do poll; o menu reabre em seguida via
-        // pollMessages. O dedup por conteúdo colapsa a bolha local com a persistida
-        // que o poll trouxer (mesmo texto) — nunca duplica.
-        if (data?.action === "consult" && typeof data?.reply === "string" && data.reply) {
-          const consultText = data.reply as string
+        // FEEDBACK IMEDIATO <1s (R-01/R-02, C13): renderiza a resposta do servidor
+        // NA HORA (do corpo do POST), sem depender do timing do poll de 2,5s. Cobre
+        // os cliques cujo desfecho é uma bolha de texto do assistente:
+        //   - consult  (CONSULTAR): vencimento + cedente;
+        //   - not_recognized (NAO_RECONHECO): copy do cedente + volta;
+        //   - back_to_options (VOLTAR): resumo do menu reaberto.
+        // O dedup por conteúdo (chat-display) colapsa esta bolha local com a
+        // persistida que o poll trouxer (mesmo texto) — nunca duplica, nunca some.
+        // Sem esta injeção, sob rede ruim o clique ficava mudo até o poll voltar.
+        const immediateReplyActions = new Set(["consult", "not_recognized", "back_to_options"])
+        if (
+          typeof data?.action === "string" &&
+          immediateReplyActions.has(data.action) &&
+          typeof data?.reply === "string" &&
+          data.reply
+        ) {
+          const replyText = data.reply as string
           setMessages((prev) => [
             ...prev,
-            { id: `consult-${Date.now()}`, from: "assistant", text: consultText, action: null, promptId: null },
+            { id: `${data.action}-${Date.now()}`, from: "assistant", text: replyText, action: null, promptId: null },
           ])
         }
         // O prompt clicado já foi respondido (answered) no servidor. Limpamos o
@@ -889,6 +926,14 @@ export function JourneyChat() {
     setPayResult(null)
     await onWaitPayNow()
   }
+  // R-06 — "Voltar às opções" no erro de cobrança: limpa o painel de erro e reabre
+  // o menu payável completo (Pagar/Negociar/Consultar/Não reconheço). Dá saída às
+  // demais decisões básicas por 1 clique — não prende o devedor no par tentar/
+  // atendimento. reopenOptions() re-emite o menu no servidor (nunca beco sem saída).
+  async function onPayBackToOptions() {
+    setPayResult(null)
+    await reopenOptions()
+  }
   // Copiar o link de pagamento (§5.2). Best-effort; sem quebrar se o clipboard
   // não estiver disponível.
   async function onCopyLink(link: string) {
@@ -900,6 +945,21 @@ export function JourneyChat() {
       /* silencioso: o link continua visível/clicável na tela */
     }
   }
+
+  // D2 — PIPELINE DE APRESENTAÇÃO (§10.1), na ordem:
+  //  1) filtra a bolha do prompt ATIVO (sua pergunta aparece no bloco de botões);
+  //  2) PODA por classe (prunePresentation): system fora (R-16), superseded colapsa
+  //     (menus antigos não empilham, R-13);
+  //  3) dedup por conteúdo (só a última guidance idêntica);
+  //  4) TETO de 20 (capHistory): guidance velho recolhe atrás de "ver conversa
+  //     completa"; decision/outcome NUNCA recolhem (C8/R-15/R-41).
+  const activePromptId = activePrompt && !ended ? activePrompt.id : null
+  const visibleMessages = messages.filter(
+    (m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id),
+  )
+  const prunedMessages = prunePresentation(visibleMessages, activePromptId, waitState)
+  const dedupedMessages = dedupAssistantByContent(prunedMessages)
+  const capped = capHistory(dedupedMessages, activePromptId, waitState, { expanded: historyExpanded })
 
   return (
     <div className="flex flex-1 flex-col gap-3">
@@ -914,6 +974,21 @@ export function JourneyChat() {
           Sair
         </button>
       </div>
+      {/* D2 — CARD FIXO do débito (C1/R-11): FORA do log (não é linha de chat),
+          aparece 1x no topo, imutável entre polls, sobrevive a reload. O valor mora
+          aqui (e nos outcomes), não nas guidance/perguntas (R-12). D3 estiliza. */}
+      <DebtCard debt={pinnedDebt} />
+      {/* D2 — RECAP de retomada (C7/R-17): ACIMA do log, no lugar da repetição
+          integral. Só aparece na retomada (recap != null vindo do 1º poll). */}
+      {recap && !ended ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-lg border border-neutral-200 bg-neutral-50 px-3.5 py-2 text-sm text-neutral-700"
+        >
+          {recap.text}
+        </div>
+      ) : null}
       {/* R8 — a região de mensagens é um log acessível: o resumo pós-login e as
           respostas do assistente são anunciados ao leitor de tela (aria-live
           polite, só adições), e a região recebe FOCO uma vez após o login (M18).
@@ -933,16 +1008,21 @@ export function JourneyChat() {
         className="flex-1 space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-secondary)]/40"
         style={{ minHeight: 320 }}
       >
-        {dedupAssistantByContent(
-          // 1º filtra a bolha do prompt ATIVO (sua pergunta já aparece no bloco de
-          // botões abaixo — omitida aqui para não duplicar; respondido o prompt,
-          // sem active_prompt, ela reaparece). 2º deduplica por conteúdo, mantendo
-          // a ÚLTIMA ocorrência de cada texto assistant idêntico ("Aqui estão os
-          // dados...", saudação re-bootstrapada) → "só a última resposta".
-          messages.filter(
-            (m) => !(activePrompt && !ended && m.promptId && m.promptId === activePrompt.id),
-          ),
-        ).map((m) => (
+        {/* R-41 — "ver conversa completa": quando o teto (20) recolheu guidance
+            velho, o controle expande o histórico. decision/outcome NUNCA são
+            recolhidos (C8), então nunca ficam atrás deste botão. */}
+        {capped.hasMore ? (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={() => setHistoryExpanded(true)}
+              className="rounded-md px-3 py-1 text-xs font-medium text-neutral-500 underline underline-offset-2 hover:text-neutral-800"
+            >
+              Ver conversa completa
+            </button>
+          </div>
+        ) : null}
+        {capped.visible.map((m) => (
           <div
             key={m.id}
             className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}
@@ -1001,26 +1081,32 @@ export function JourneyChat() {
                 <span className="h-2 w-2 animate-bounce rounded-full bg-neutral-400" />
               </div>
             ) : null}
-            {/* Saídas aos 10s (d3) — SEM cancelar a espera (o tick e o poll seguem). */}
-            {shouldShowSlowExits(waitStep) ? (
-              <div className="flex flex-wrap gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={onWaitPayNow}
-                  style={{ backgroundColor: "var(--brand-secondary)" }}
-                  className="h-9 rounded-md px-4 text-sm font-semibold text-white"
-                >
-                  Pagar agora
-                </button>
-                <button
-                  type="button"
-                  onClick={onWaitHandoff}
-                  className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
-                >
-                  Falar com atendimento
-                </button>
-              </div>
-            ) : null}
+            {/* R-03 (C13) — NUNCA um beco de 0-10s: durante TODA a espera
+                (aguardando_motor, d0..d3) há ≥1 caminho de ação clicável, não só o
+                indicador. Antes, os atalhos só apareciam aos 10s (d3) e entre 0-10s
+                o menu de 3 opções tinha sumido (answered) → tela sem NENHUM botão de
+                ação no ponto de maior intenção. Agora "Pagar agora" e "Falar com
+                atendimento" ficam disponíveis desde o início da espera. As saídas
+                NÃO cancelam a espera: o tick e o poll seguem (a resposta tardia do
+                motor ainda resolve). Aos 10s (d3) a copy narrada acima muda para
+                "está demorando", mas os botões já estavam lá. */}
+            <div className="flex flex-wrap gap-2 pt-1">
+              <button
+                type="button"
+                onClick={onWaitPayNow}
+                style={{ backgroundColor: "var(--brand-secondary)" }}
+                className="h-9 rounded-md px-4 text-sm font-semibold text-white"
+              >
+                Pagar agora
+              </button>
+              <button
+                type="button"
+                onClick={onWaitHandoff}
+                className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+              >
+                Falar com atendimento
+              </button>
+            </div>
           </div>
         ) : null}
 
@@ -1061,7 +1147,7 @@ export function JourneyChat() {
         {!ended && waitState === "gerando_cobranca" && !payResult ? (
           <div role="status" aria-live="polite" className="flex flex-col items-start">
             <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-              Certo. Estou gerando o seu link de pagamento. Um instante.
+              Certo. Estou gerando o seu link de pagamento. Só um instante.
             </div>
           </div>
         ) : null}
@@ -1072,9 +1158,13 @@ export function JourneyChat() {
             {payResult.status === "link" ? (
               <>
                 <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+                  {/* T7/T8 (R-29/R-30): sem "Pronto!" e sem "se já pagou
+                      desconsidere" (isso é o botão "Já paguei" — C10). Reforço de
+                      segurança leve ("o link é pessoal e seguro"); espelha
+                      pay.ts:payLinkMessageText (a bolha persistida no histórico). */}
                   {payResult.already_charged
-                    ? `Você já tem uma cobrança ativa${payResult.valor ? ` no valor de ${formatBRL(payResult.valor)}` : ""}. Use o mesmo link abaixo — não precisa gerar outro. Se você já pagou, é só desconsiderar.`
-                    : `Pronto! Aqui está o seu link para pagar${payResult.valor ? ` ${formatBRL(payResult.valor)}` : ""}${payResult.vencimento_link ? `, com vencimento em ${formatDueDate(payResult.vencimento_link)}` : ""}. É só abrir e escolher como prefere pagar (Pix, boleto ou cartão). Se você já pagou, pode desconsiderar.`}
+                    ? `Você já tem uma cobrança ativa${payResult.valor ? ` de ${formatBRL(payResult.valor)}` : ""}. Use o mesmo link abaixo — não é preciso gerar outro.`
+                    : `Aqui está o seu link para pagar${payResult.valor ? ` ${formatBRL(payResult.valor)}` : ""}${payResult.vencimento_link ? `, com vencimento em ${formatDueDate(payResult.vencimento_link)}` : ""}. É só abrir e escolher entre Pix, boleto ou cartão. O link é pessoal e seguro.`}
                 </div>
                 {payResult.link ? (
                   <div className="flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
@@ -1096,6 +1186,39 @@ export function JourneyChat() {
                     </button>
                   </div>
                 ) : null}
+                {/* R-05 (C13) — link_entregue NÃO é beco absorvente: além de abrir/
+                    copiar, o devedor tem caminhos de RETORNO. Antes, entregue o link,
+                    o painel só mostrava Abrir/Copiar — quem quisesse trocar de opção,
+                    avisar que já pagou ou falar com humano ficava preso e abandonava.
+                    "Voltar às opções" re-emite o menu payável no servidor (reopen);
+                    "Já paguei" registra o claim (sem declarar pago); "Falar com
+                    atendimento" transfere. NÃO cancela nem recobra: a idempotência é
+                    do servidor (nunca 2ª cobrança). */}
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={onWaitRetryOptions}
+                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                  >
+                    Voltar às opções
+                  </button>
+                  {!claimSent ? (
+                    <button
+                      type="button"
+                      onClick={requestPaymentClaim}
+                      className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    >
+                      Já paguei este valor
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={onWaitHandoff}
+                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                  >
+                    Falar com atendimento
+                  </button>
+                </div>
               </>
             ) : payResult.status === "processing" ? (
               <>
@@ -1131,8 +1254,17 @@ export function JourneyChat() {
             ) : (
               <>
                 <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-                  Não consegui gerar o seu link de pagamento agora. Isso costuma se resolver em uma nova tentativa. Você pode tentar de novo ou falar com o nosso atendimento — não se preocupe, nenhuma cobrança foi criada.
+                  {/* T11 / R-32: tranquilização de duplicidade ("Nenhuma cobrança
+                      foi criada.") ANTES das ações; frases curtas, sem código/erro
+                      técnico exposto. */}
+                  Não consegui gerar o seu link de pagamento agora. Nenhuma cobrança foi criada. Você pode tentar de novo ou falar com o nosso atendimento.
                 </div>
+                {/* R-06 (C13) — erro_cobranca NÃO prende o devedor entre "tentar de
+                    novo" (que pode falhar de novo) e um atendimento: além de Tentar
+                    novamente e Atendimento, "Voltar às opções" reabre o menu payável
+                    completo (Pagar/Negociar/Consultar/Não reconheço) por 1 clique. A
+                    copy "nenhuma cobrança foi criada" (acima) tranquiliza sobre
+                    duplicidade; onWaitRetryOptions limpa o painel de erro via reopen. */}
                 <div className="flex flex-wrap gap-2 pt-1">
                   <button
                     type="button"
@@ -1141,6 +1273,13 @@ export function JourneyChat() {
                     className="h-9 rounded-md px-4 text-sm font-semibold text-white"
                   >
                     Tentar novamente
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onPayBackToOptions}
+                    className="h-9 rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                  >
+                    Voltar às opções
                   </button>
                   <button
                     type="button"
@@ -1167,8 +1306,16 @@ export function JourneyChat() {
             {/* R5 — afordância "Já paguei": secundária/discreta, disponível no menu de
                 3 opções (payável). Registra o payment_claim (conferência da equipe),
                 sem declarar pago; o servidor reabre o menu em seguida. Some após o
-                clique (claimSent) para não empilhar. Só no menu de 3 opções. */}
-            {activePrompt.kind === "debt_three_options" && !claimSent ? (
+                clique (claimSent) para não empilhar.
+                R-36 — COERÊNCIA em nao_reconhecida: o prompt de VOLTA do "Não
+                reconheço" também é kind 'debt_three_options', mas traz só o botão
+                [98] (sem PAGAR). Oferecer "Já paguei" a quem acabou de dizer que NÃO
+                reconhece o débito é incoerente (C13/C14). Por isso só mostramos a
+                afordância quando o menu é o MENU PAYÁVEL de fato — tem o botão PAGAR
+                (id 4) —, não o menu-volta de contestação. */}
+            {activePrompt.kind === "debt_three_options" &&
+            activePrompt.buttons.some((b) => b.id === 4) &&
+            !claimSent ? (
               <button
                 type="button"
                 onClick={requestPaymentClaim}

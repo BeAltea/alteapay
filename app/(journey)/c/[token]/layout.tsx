@@ -6,6 +6,7 @@ import type React from "react"
 import type { Metadata } from "next"
 import { cookies } from "next/headers"
 import { CHAT_COOKIE_NAME, verifyChatJwt } from "@/lib/negotiation/crypto"
+import { adaptiveTextColor } from "@/lib/journey/contrast"
 import { loadJourneyTenant } from "./_lib/tenant"
 
 export const dynamic = "force-dynamic"
@@ -93,9 +94,13 @@ export default async function JourneyLayout({
         dpoContact: null as string | null,
       }
 
+  // R-23 (contraste AA): cor de TEXTO adaptativa sobre o secundário do tenant
+  // (#000/#fff pelo maior contraste). Os botões de marca usam color: var(...) — um
+  // secundário claro deixa de renderizar texto branco ilegível (<4.5:1).
   const cssVars = {
     "--brand-primary": view.primary,
     "--brand-secondary": view.secondary,
+    "--brand-secondary-fg": adaptiveTextColor(view.secondary),
   } as React.CSSProperties
 
   return (

@@ -10,6 +10,7 @@ import type { Metadata } from "next"
 import { unstable_noStore as noStore } from "next/cache"
 import { cookies } from "next/headers"
 import { CHAT_COOKIE_NAME, verifyChatJwt } from "@/lib/negotiation/crypto"
+import { adaptiveTextColor } from "@/lib/journey/contrast"
 import { loadPublicLinkTenant } from "./_lib/tenant"
 
 export const dynamic = "force-dynamic"
@@ -101,9 +102,12 @@ export default async function PublicLinkLayout({
         dpoContact: null as string | null,
       }
 
+  // R-23 (contraste AA): cor de TEXTO adaptativa sobre o secundário do tenant
+  // (#000/#fff pelo maior contraste). Botões de marca usam color: var(...).
   const cssVars = {
     "--brand-primary": view.primary,
     "--brand-secondary": view.secondary,
+    "--brand-secondary-fg": adaptiveTextColor(view.secondary),
   } as React.CSSProperties
 
   return (

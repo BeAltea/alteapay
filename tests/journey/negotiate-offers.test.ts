@@ -131,14 +131,19 @@ describe("R1 — apresentação das parcelas da matriz (fallback assistido)", ()
     expect(prompt!.context.offer_ids).toEqual(r.offers.map((o) => o.id))
   })
 
-  it("os rótulos das parcelas trazem valor/nº de parcelas (À vista … / 3x de …)", async () => {
+  it("os rótulos das parcelas (T6/R-45): à vista com âncora de economia + '(recomendado)'; parcelado com total", async () => {
     const { presentMatrixOffers, offerButtonLabel } = await import("@/lib/journey/acknowledgement")
     const r = await presentMatrixOffers({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT })
     if (!(r.ok && r.presented)) throw new Error("esperava apresentar")
-    // à vista: rótulo com R$ e "% de desconto" (max_discount_pct 30%)
+    // à vista (T6): "À vista R$ … — você economiza R$ … (recomendado)" (com desconto);
+    // âncora de economia em REAIS + destaque "(recomendado)". Sem a palavra "desconto".
     const cash = r.offers.find((o) => o.terms.installments === 1)!
-    expect(offerButtonLabel(cash.terms)).toMatch(/À vista R\$/)
-    expect(offerButtonLabel(cash.terms)).toContain("desconto")
+    const cashLabel = offerButtonLabel(cash.terms)
+    expect(cashLabel).toMatch(/À vista R\$/)
+    expect(cashLabel).toContain("(recomendado)")
+    if (cash.terms.discount_value > 0) {
+      expect(cashLabel).toMatch(/você economiza R\$/)
+    }
     // parcelado: "Nx de R$ … (total R$ …)"
     const inst = r.offers.find((o) => o.terms.installments > 1)
     if (inst) {
@@ -148,12 +153,14 @@ describe("R1 — apresentação das parcelas da matriz (fallback assistido)", ()
     }
   })
 
-  it("a mensagem-pergunta é persistida (histórico da re-entrada) com D36 'se já pagou'", async () => {
+  it("a mensagem-pergunta (T5/R-28) é persistida SEM 'se já pagou desconsidere'", async () => {
     const { presentMatrixOffers } = await import("@/lib/journey/acknowledgement")
     await presentMatrixOffers({ companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT })
-    const msg = db.chat_messages.find((m) => m.role === "assistant" && /opções de pagamento/i.test(m.text))
+    // T5: "Estas são as condições disponíveis para você. Escolha a que preferir e eu gero o seu pagamento."
+    const msg = db.chat_messages.find((m) => m.role === "assistant" && /condições disponíveis para você/i.test(m.text))
     expect(msg).toBeTruthy()
-    expect(msg!.text).toContain("desconsiderar") // D36
+    expect(msg!.text).not.toContain("desconsiderar")
+    expect(msg!.text).toMatch(/gero o seu pagamento/i)
   })
 
   it("idempotente: com 'offer_choice' ativo NÃO recria (reload/clique duplo não empilha)", async () => {
