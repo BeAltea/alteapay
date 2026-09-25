@@ -111,3 +111,81 @@ export function payLinkMessageText(input: {
   const vencPart = venc ? `, válido até ${venc}` : ""
   return `${head}${vencPart}.${linkLine}`
 }
+
+// ---------------------------------------------------------------------------
+// QA round 2 (QAB1-H1, ALTO) — RELOAD DURANTE O PAGAR. O servidor agora persiste
+// wait_state='gerando_cobranca' na sessão ANTES de chamar o payService (Pagar e
+// aceite de parcela) e, ao final, limpa (link entregue → o prompt pós-link já
+// existe) ou grava 'erro_cobranca'. O client, ao reidratar um desses estados
+// pelo GET /api/chat/messages, precisa mostrar um caminho: a copy progressiva +
+// poll de GET /api/chat/payment até o link/prompt aparecer, ou a saída humana no
+// teto (~60 s). Regra PURA abaixo; chat.tsx só consome.
+// ---------------------------------------------------------------------------
+
+/** Estados de PAGAR persistíveis no servidor (a espera de negociação é outra). */
+export const PAY_WAIT_STATES: ReadonlySet<string> = new Set(["gerando_cobranca", "erro_cobranca", "link_entregue"])
+
+/** true quando o wait_state do servidor pertence ao PAGAR (reconciliado por
+ *  decidePayResume, não pela reidratação da espera de negociação). */
+export function isPayWaitState(state: string | null | undefined): boolean {
+  return typeof state === "string" && PAY_WAIT_STATES.has(state)
+}
+
+/** Copy da espera RETOMADA (reload durante o Pagar): a mesma frase progressiva do
+ *  clique longo (A1), porque o devedor já esperava antes de recarregar. */
+export const PAY_RESUME_GENERATING_TEXT = "Ainda estou gerando o seu link de pagamento."
+
+/** Copy do processing nascido nesta aba (worker gerando; A1/R3). */
+export const PAY_PROCESSING_TEXT = "Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui."
+
+/** Copy do teto do poll (~60 s) antes das saídas humanas. */
+export const PAY_PROCESSING_SLOW_TEXT =
+  "Está demorando um pouco mais que o normal para gerar o link. Você pode continuar aguardando, voltar às opções ou falar com o nosso atendimento."
+
+export type PayResumeDecision = "resume_generating" | "show_error" | "settle_idle" | "none"
+
+export interface PayResumeInput {
+  /** wait_state devolvido pelo GET /api/chat/messages (null = sem espera). */
+  serverWaitState: string | null | undefined
+  /** estado local da máquina de espera nesta aba. */
+  localWaitState: string
+  /** true enquanto o POST do Pagar desta aba está em voo (o clique governa). */
+  payInFlight: boolean
+  /** true quando o estado local de PAGAR nasceu de reidratação/recuperação (não
+   *  de um clique com resposta nesta aba) — aí o servidor é a autoridade. */
+  resumed: boolean
+  /** há um prompt ativo na tela depois de aplicar este poll. */
+  hasActivePrompt: boolean
+  /** este poll trouxe uma bolha de link VIVO (o resultado já está na tela). */
+  linkDelivered: boolean
+}
+
+/**
+ * Decide como o client reconcilia o estado de PAGAR do servidor a cada poll:
+ *  - POST em voo nesta aba, ou link já entregue → 'none' (nada a repor);
+ *  - servidor 'gerando_cobranca' e o client fora dessa espera → 'resume_generating'
+ *    (copy progressiva + poll do link + saídas no teto); já nessa espera → 'none';
+ *  - servidor 'erro_cobranca' → 'show_error' (painel de erro com saídas), salvo
+ *    quando o client já mostra um erro/espera de um clique próprio;
+ *  - servidor sem espera de pagamento e o client numa espera RETOMADA com um
+ *    prompt ativo na tela → 'settle_idle' (o servidor já concluiu: outcome +
+ *    menu vieram no poll; o menu conduz). Sem prompt ainda → espera (o teto dá
+ *    a saída). Pura.
+ */
+export function decidePayResume(i: PayResumeInput): PayResumeDecision {
+  if (i.payInFlight) return "none"
+  if (i.localWaitState === "link_entregue" || i.linkDelivered) return "none"
+  const localPay = i.localWaitState === "gerando_cobranca" || i.localWaitState === "erro_cobranca"
+  if (i.serverWaitState === "gerando_cobranca") {
+    if (i.localWaitState === "gerando_cobranca") return "none"
+    if (i.localWaitState === "erro_cobranca" && !i.resumed) return "none"
+    return "resume_generating"
+  }
+  if (i.serverWaitState === "erro_cobranca") {
+    if (i.localWaitState === "erro_cobranca") return "none"
+    if (localPay && !i.resumed) return "none"
+    return "show_error"
+  }
+  if (localPay && i.resumed && i.hasActivePrompt) return "settle_idle"
+  return "none"
+}

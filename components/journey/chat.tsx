@@ -24,12 +24,21 @@ import {
   latestLivePaymentLinkId,
   NEGOTIATION_PENDING_TEXT,
   paymentLinkActionOf,
+  placeAfterCustomerEcho,
   prunePresentation,
   resolvePromptForRender,
   splitResumeHistory,
   type ChatMsg,
   type MsgAction,
 } from "./chat-display"
+import { OUTCOME_STAGES } from "@/lib/journey/display-class"
+import {
+  createInFlightGuard,
+  PROCESSING_CHOICE_NOTICE,
+  staleClickFeedback,
+  toRenderablePrompt,
+} from "@/lib/journey/click-feedback"
+import { isStalePoll, type PollStamp } from "@/lib/journey/poll-order"
 import { DebtCard, type PinnedDebtData } from "./debt-card"
 import {
   DEGRADED_MENU_COPY,
@@ -47,7 +56,16 @@ import {
   type WaitState,
   type WaitStep,
 } from "@/lib/journey/wait-machine"
-import { interpretPaymentPoll, payLinkMessageText, shouldOfferProcessingExit } from "@/lib/journey/pay-poll"
+import {
+  decidePayResume,
+  interpretPaymentPoll,
+  isPayWaitState,
+  PAY_PROCESSING_SLOW_TEXT,
+  PAY_PROCESSING_TEXT,
+  PAY_RESUME_GENERATING_TEXT,
+  payLinkMessageText,
+  shouldOfferProcessingExit,
+} from "@/lib/journey/pay-poll"
 
 // D2 — ESPERA CONFIÁVEL: a máquina de espera (§6.3) é client-side sobre o polling
 // atual. A lógica PURA (degraus, copy, absorventes, reidratação) vive em
@@ -70,6 +88,10 @@ interface PayResult {
    *  única situação em que "Nenhuma cobrança foi criada" é verdade. Timeout/rede
    *  NUNCA afirmam isso (a cobrança pode ter sido criada). */
   confirmedNotCreated?: boolean
+  /** QA round 2 (QAB1-H1): o estado nasceu de REIDRATAÇÃO (reload durante o
+   *  Pagar) ou de recuperação de transporte — copy "Ainda estou gerando…" e o
+   *  servidor é a autoridade (decidePayResume). */
+  resumed?: boolean
 }
 
 const TICK_MS = 250 // granularidade da troca de copy (menor que o poll de 2500ms)
@@ -126,16 +148,9 @@ function textWithoutUrl(text: string, href: string): string {
 /** A2 — prompt devolvido no CORPO do POST do clique (mesmo shape do GET
  *  active_prompt). Só aceita o que o PromptButtons consegue renderizar. */
 function asActivePrompt(raw: unknown): ActivePrompt | null {
-  if (!raw || typeof raw !== "object") return null
-  const p = raw as Record<string, unknown>
-  if (typeof p.id !== "string" || !p.id || typeof p.kind !== "string") return null
-  if (!Array.isArray(p.buttons) || p.buttons.length === 0) return null
-  const buttons = p.buttons.filter(
-    (b): b is ActivePrompt["buttons"][number] =>
-      !!b && typeof b === "object" && typeof (b as { id?: unknown }).id === "number" && typeof (b as { label?: unknown }).label === "string",
-  )
-  if (buttons.length === 0) return null
-  return { id: p.id, kind: p.kind, question: typeof p.question === "string" ? p.question : "", buttons }
+  // QA round 2: regra pura em lib/journey/click-feedback.ts (mesma usada pelo
+  // feedback do 409/duplicate — staleClickFeedback).
+  return toRenderablePrompt(raw) as ActivePrompt | null
 }
 
 /** Só http(s) — nunca javascript:/data:. Usado para auto-linkar URLs no histórico. */
@@ -186,7 +201,18 @@ export function JourneyChat() {
   // reconhecimento, empurrado via /api/chat/messages (active_prompt).
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [ended, setEnded] = useState(false)
-  const [activePrompt, setActivePrompt] = useState<ActivePrompt | null>(null)
+  const [activePrompt, setActivePromptRaw] = useState<ActivePrompt | null>(null)
+  // Espelho do prompt ativo para os callbacks assíncronos (poll/reconciliação).
+  const activePromptRef = useRef<ActivePrompt | null>(null)
+  const setActivePrompt = useCallback((p: ActivePrompt | null) => {
+    activePromptRef.current = p
+    setActivePromptRaw(p)
+  }, [])
+  // QA round 2 (QAB1-H2): aviso "Já estou processando a sua escolha." — um clique
+  // tardio (409 sem active_prompt / duplicate sem prompt) enquanto o vencedor
+  // ainda processa. Fica FORA do bloco de botões (que some) e sai quando o
+  // próximo prompt/outcome chega pelo poll. Nunca reabilita o mesmo menu.
+  const [processingNotice, setProcessingNotice] = useState<string | null>(null)
   // D2 — CARD FIXO (C1) e RECAP de retomada (C7): montados no servidor e entregues
   // no poll. O card vem a cada poll (imutável entre polls, sobrevive a reload); o
   // recap vem só no 1º poll (retomada). "Ver conversa completa" (R-41) expande o
@@ -230,6 +256,21 @@ export function JourneyChat() {
   // do n8n chegar via poll. Guardamos o id sintético para removê-la quando a
   // primeira mensagem assistant real da negociação chegar (ou em erro).
   const pendingNegotiationRef = useRef<string | null>(null)
+  // QA round 2 (QAA2-01): id da bolha otimista do Negociar que ainda espera o
+  // ECO "Negociar" persistido — ao chegar o eco, a otimista é recolocada logo
+  // depois dele (ordem do banco: eco → confirmação → parcelas).
+  const optimisticAwaitingEchoRef = useRef<string | null>(null)
+  // QA round 2 (QAB1-H1): o POST do Pagar desta aba está em voo (o clique
+  // governa o estado; o poll não o repõe) / o estado de PAGAR local nasceu de
+  // reidratação ou recuperação (o servidor é a autoridade).
+  const payInFlightRef = useRef(false)
+  const payResumedRef = useRef(false)
+  // QA round 2 (QAA2-06 / QAB1-H4): sequência de disparo dos polls e carimbo da
+  // última resposta APLICADA — uma resposta mais antiga é ignorada por inteiro.
+  const pollSeqRef = useRef(0)
+  const lastAppliedPollRef = useRef<PollStamp | null>(null)
+  // QA round 2 (QAB1-H5): guarda de clique duplo dos atalhos do painel de pagamento.
+  const shortcutGuardRef = useRef(createInFlightGuard())
 
   // --- Máquina de espera (D2, §6.3) ----------------------------------------
   // waitState: estado DECIDIDO (idle/aguardando_motor/menu_degradado/…). O degrau
@@ -325,6 +366,10 @@ export function JourneyChat() {
       // Estados do PAGAR e desfechos são governados localmente pelo clique/poll de
       // pagamento — o poll de mensagens não os altera.
       if (local === "gerando_cobranca" || local === "link_entregue" || local === "erro_cobranca") return
+      // QA round 2 (QAB1-H1): um estado de PAGAR persistido pelo servidor
+      // (gerando_cobranca/erro_cobranca) é reconciliado por reconcilePayWait,
+      // DEPOIS de aplicar mensagens/prompt do mesmo poll — não aqui.
+      if (isPayWaitState(serverWaitState)) return
       if (serverWaitState) {
         const view = resolveWaitView(
           hydrateWaitState({ wait_state: serverWaitState, wait_started_at: serverWaitStartedAt }),
@@ -405,6 +450,8 @@ export function JourneyChat() {
     if (modalRef.current) return // pausado enquanto o modal (inatividade/expiração) está aberto
     if (opts?.skipIfInFlight && pollInFlightRef.current) return
     pollInFlightRef.current = true
+    // QA round 2 (QAA2-06 / QAB1-H4): carimbo de disparo deste poll.
+    const seq = ++pollSeqRef.current
     try {
       const url = sinceRef.current
         ? `/api/chat/messages?since=${encodeURIComponent(sinceRef.current)}`
@@ -420,6 +467,14 @@ export function JourneyChat() {
       }
       if (!res.ok) return
       const data = await res.json()
+      // QA round 2 (QAA2-06 / QAB1-H4): POLLS FORA DE ORDEM — uma resposta mais
+      // antiga que a última aplicada (server_time; empate/ausência → sequência
+      // local) é ignorada por inteiro: mensagens, prompt, espera e links mortos.
+      // Nada se perde (as linhas vêm ascendentes e `since` só avança com a
+      // resposta aplicada); o prompt na tela nunca regride ao obsoleto.
+      const stamp: PollStamp = { seq, serverTime: typeof data?.server_time === "string" ? data.server_time : null }
+      if (isStalePoll(stamp, lastAppliedPollRef.current)) return
+      lastAppliedPollRef.current = stamp
       // M11: reidrata a máquina de espera a partir do estado do servidor (vem no
       // 1º poll e nos seguintes). Um reload durante a espera restaura o degrau.
       rehydrateWait(data?.wait_state ?? null, data?.wait_started_at ?? null)
@@ -469,6 +524,8 @@ export function JourneyChat() {
         stage?: string | null
         generation?: number | null
       }> = Array.isArray(data?.messages) ? data.messages : []
+      // QA round 2 (QAB1-H1): este poll trouxe uma bolha de link VIVO?
+      let liveLinkSeen = false
       for (const m of pushed) {
         if (seenIds.current.has(m.id)) continue
         const isAssistant = m.role !== "customer"
@@ -514,36 +571,46 @@ export function JourneyChat() {
         // A1-R1: uma bolha de link MORTO (live:false — acordo cancelado) é só
         // histórico: nunca resolve a espera nem vira "link entregue".
         if (isAssistant && action && isLivePaymentLink(action, deadHrefs)) {
+          liveLinkSeen = true
           const local = waitStateRef.current
           if (local === "gerando_cobranca" || payResultRef.current?.status === "processing") {
             stopTick()
             waitStartedAtRef.current = null
+            payResumedRef.current = false
             setPayResult({ status: "link", link: action.href, valor: null, vencimento_link: null, already_charged: false })
             setWaitState("link_entregue")
           }
         }
+        // QA round 2 (QAB1-H2): chegou um OUTCOME ligado a um clique (ação/stage
+        // de resultado) → o "Já estou processando a sua escolha." já foi atendido.
+        if (isAssistant && (action || (typeof m.stage === "string" && OUTCOME_STAGES.has(m.stage)))) {
+          setProcessingNotice(null)
+        }
+        if (dropOptimistic && optimisticAwaitingEchoRef.current === optimisticId) optimisticAwaitingEchoRef.current = null
+        // QA round 2 (QAA2-01): o ECO do clique (customer + button_id) recoloca a
+        // bolha otimista do Negociar logo DEPOIS dele — a ordem do banco.
+        const echoReorderId = !isAssistant && typeof m.button_id === "number" ? optimisticAwaitingEchoRef.current : null
+        if (echoReorderId) optimisticAwaitingEchoRef.current = null
+        const incoming: ChatMsg = {
+          id: m.id,
+          from: isAssistant ? "assistant" : "customer",
+          text: m.text,
+          action,
+          promptId: m.prompt_id ?? null,
+          // sinais p/ a poda por classe (§10.1): engine distingue system;
+          // button_id distingue decision (eco do clique); stage marca
+          // outcome/greeting (A1).
+          engine: m.engine ?? null,
+          buttonId: m.button_id ?? null,
+          stage: m.stage ?? null,
+          // A3: geração anotada pelo servidor (poda §2.4) e instante da
+          // linha (a retomada recolhe o que veio antes do menu corrente).
+          generation: typeof m.generation === "number" ? m.generation : null,
+          createdAt: typeof m.created_at === "string" ? m.created_at : null,
+        }
         setMessages((prev) => {
           const base = dropOptimistic ? prev.filter((x) => x.id !== optimisticId) : prev
-          return [
-            ...base,
-            {
-              id: m.id,
-              from: isAssistant ? "assistant" : "customer",
-              text: m.text,
-              action,
-              promptId: m.prompt_id ?? null,
-              // sinais p/ a poda por classe (§10.1): engine distingue system;
-              // button_id distingue decision (eco do clique); stage marca
-              // outcome/greeting (A1).
-              engine: m.engine ?? null,
-              buttonId: m.button_id ?? null,
-              stage: m.stage ?? null,
-              // A3: geração anotada pelo servidor (poda §2.4) e instante da
-              // linha (a retomada recolhe o que veio antes do menu corrente).
-              generation: typeof m.generation === "number" ? m.generation : null,
-              createdAt: typeof m.created_at === "string" ? m.created_at : null,
-            },
-          ]
+          return echoReorderId ? placeAfterCustomerEcho(base, echoReorderId, incoming) : [...base, incoming]
         })
       }
       // Nunca sobrescreve o prompt depois de encerrado (preserva o histórico).
@@ -553,11 +620,56 @@ export function JourneyChat() {
         const ap = data?.active_prompt ?? null
         const apId = ap && typeof ap === "object" ? (ap as { id?: unknown }).id : null
         if (!(typeof apId === "string" && consumedPromptIds.current.has(apId))) setActivePrompt(ap)
+        // QA round 2 (QAB1-H2): chegou o prompt seguinte → o aviso de
+        // processamento já foi atendido.
+        if (ap) setProcessingNotice(null)
       }
+      // QA round 2 (QAB1-H1): reconcilia o estado de PAGAR persistido pelo
+      // servidor (reload durante a cobrança) DEPOIS de aplicar mensagens/prompt.
+      reconcilePayWait(data?.wait_state ?? null, liveLinkSeen)
     } catch {
       /* silencioso */
     } finally {
       pollInFlightRef.current = false
+    }
+  }
+
+  // QA round 2 (QAB1-H1) — RELOAD DURANTE O PAGAR: o servidor persiste
+  // wait_state='gerando_cobranca' antes da cobrança e limpa/'erro_cobranca' ao
+  // final. A cada poll, a regra pura decidePayResume (pay-poll.ts) decide:
+  //  - resume_generating → copy "Ainda estou gerando o seu link de pagamento." +
+  //    poll de GET /api/chat/payment (o efeito do 'processing') até o link/prompt
+  //    ou o teto (~60 s) com [Voltar às opções] [Falar com atendimento];
+  //  - show_error → painel de erro com saídas (sem afirmar "nenhuma cobrança");
+  //  - settle_idle → o servidor concluiu (outcome + menu vieram): o menu conduz.
+  // Um POST do Pagar em voo nesta aba nunca é sobreposto (payInFlightRef).
+  function reconcilePayWait(serverWaitState: string | null, liveLinkSeen: boolean) {
+    const decision = decidePayResume({
+      serverWaitState,
+      localWaitState: waitStateRef.current,
+      payInFlight: payInFlightRef.current,
+      resumed: payResumedRef.current,
+      hasActivePrompt: !!activePromptRef.current,
+      linkDelivered: liveLinkSeen,
+    })
+    if (decision === "resume_generating") {
+      stopTick()
+      waitStartedAtRef.current = null
+      payResumedRef.current = true
+      setPayPollAttempts(0)
+      setCopied(false)
+      setPayResult({ status: "processing", link: null, valor: null, vencimento_link: null, already_charged: false, resumed: true })
+      setWaitState("gerando_cobranca")
+    } else if (decision === "show_error") {
+      stopTick()
+      waitStartedAtRef.current = null
+      payResumedRef.current = true
+      setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false, confirmedNotCreated: false, resumed: true })
+      setWaitState("erro_cobranca")
+    } else if (decision === "settle_idle") {
+      payResumedRef.current = false
+      setPayResult(null)
+      setWaitState("idle")
     }
   }
 
@@ -686,11 +798,15 @@ export function JourneyChat() {
   // (espera/degradação/erro de cobrança/processing) entra em cena, as suas ações
   // ficam inertes por WAIT_EXITS_ARM_MS (disabled + pointer-events:none). Um
   // 2º toque de um toque duplo (100–300 ms) nunca acerta uma ação recém-nascida.
+  // QA round 2 (B6 M-1): a saída de handoff que NASCE em d3 ganha o próprio
+  // arming (dep = visibilidade dessa saída, não o degrau — senão "Pagar agora"
+  // ficaria inerte a cada troca d1/d2/d3).
+  const waitHandoffExitVisible = waitState === "aguardando_motor" && shouldShowWaitHandoffExit(waitStep)
   useEffect(() => {
     setWaitExitsArmed(false)
     const t = setTimeout(() => setWaitExitsArmed(true), WAIT_EXITS_ARM_MS)
     return () => clearTimeout(t)
-  }, [waitState, payResult?.status])
+  }, [waitState, payResult?.status, waitHandoffExitVisible])
 
   // R8 — ao aparecer o resumo pós-login + menu de 3 opções, move o foco para a
   // região do resumo UMA vez, para o leitor de tela anunciá-la (M18). Só quando
@@ -724,6 +840,7 @@ export function JourneyChat() {
     const id = pendingNegotiationRef.current
     if (!id) return
     pendingNegotiationRef.current = null
+    if (optimisticAwaitingEchoRef.current === id) optimisticAwaitingEchoRef.current = null
     setMessages((prev) => prev.filter((m) => m.id !== id))
   }
 
@@ -773,6 +890,9 @@ export function JourneyChat() {
       setPayResult(null)
       setCopied(false)
       setPayPollAttempts(0) // R3 — zera o contador do poll de 'processing'
+      // QA round 2 (QAB1-H1): o clique governa o estado até o POST resolver.
+      payInFlightRef.current = true
+      payResumedRef.current = false
     }
     // OPTIMISTIC: ao Negociar, injeta já uma bolha "preparando sua negociação"
     // (antes do await). Feedback imediato de que o sistema está trabalhando
@@ -790,6 +910,7 @@ export function JourneyChat() {
       negotiateClickedAtRef.current = Date.now()
       const optimisticId = `optimistic-neg-${Date.now()}`
       pendingNegotiationRef.current = optimisticId
+      optimisticAwaitingEchoRef.current = optimisticId // QAA2-01: reordena ao chegar o eco
       setMessages((prev) => [
         ...prev,
         { id: optimisticId, from: "assistant", text: NEGOTIATION_PENDING_TEXT, action: null, promptId: null },
@@ -808,6 +929,7 @@ export function JourneyChat() {
     const timeoutId = setTimeout(() => controller.abort(), isPay ? PAY_ABORT_MS : CLICK_ABORT_MS)
     if (isPay) startPayLongWait()
     setPromptNotice(null)
+    setProcessingNotice(null)
     try {
       const res = await fetch("/api/chat/button", {
         method: "POST",
@@ -850,6 +972,12 @@ export function JourneyChat() {
         }
         const dupPrompt = asActivePrompt(data?.prompt)
         if (dupPrompt && !endedRef.current) setActivePrompt(dupPrompt)
+        else if (staleClickFeedback(data) === "processing") {
+          // QA round 2 (QAB1-H2): o 1º clique ainda não reabriu o menu — aviso
+          // humano + poll até o próximo prompt/outcome (nunca mudo).
+          setActivePrompt(null)
+          setProcessingNotice(PROCESSING_CHOICE_NOTICE)
+        }
         await pollMessages()
         return { ok: true }
       }
@@ -965,10 +1093,20 @@ export function JourneyChat() {
         clearPendingNegotiation()
         if (isPay) resetWaitToIdle() // prompt já consumido: não trava em gerando_cobranca
         else if (isNegotiate) resetWaitToIdle()
-        setPromptNotice(PROMPT_STALE_NOTICE)
-        if (data?.active_prompt && typeof data.active_prompt === "object" && !endedRef.current) {
-          setActivePrompt(data.active_prompt as ActivePrompt)
+        // QA round 2 (QAB1-H2): 409 SEM active_prompt = o vencedor (outra aba/POST
+        // concorrente) ainda processa e não criou o prompt seguinte. Nunca mudo,
+        // nunca o mesmo menu reabilitado: "Já estou processando a sua escolha." +
+        // poll até o próximo prompt/outcome. O bloco de botões some (consumido).
+        if (staleClickFeedback(data) === "processing") {
+          setPromptNotice(null)
+          setActivePrompt(null)
+          setProcessingNotice(PROCESSING_CHOICE_NOTICE)
+          await pollMessages()
+          return { ok: true }
         }
+        setPromptNotice(PROMPT_STALE_NOTICE)
+        const stalePrompt = asActivePrompt(data?.active_prompt)
+        if (stalePrompt && !endedRef.current) setActivePrompt(stalePrompt)
         await pollMessages()
         return { ok: false, code: "prompt_stale" }
       }
@@ -1006,6 +1144,7 @@ export function JourneyChat() {
     } finally {
       clearTimeout(timeoutId)
       stopPayLongWait()
+      if (isPay) payInFlightRef.current = false
     }
   }
 
@@ -1045,7 +1184,10 @@ export function JourneyChat() {
       /* silencioso: cai no processing/poll abaixo */
     }
     if (!ready) {
-      setPayResult({ status: "processing", link: null, valor: null, vencimento_link: null, already_charged: false })
+      // QA round 2 (QAB1-H1): o servidor é a autoridade daqui em diante (o
+      // wait_state persistido decide: link/erro/menu pelo poll).
+      payResumedRef.current = true
+      setPayResult({ status: "processing", link: null, valor: null, vencimento_link: null, already_charged: false, resumed: true })
       setWaitState("gerando_cobranca")
     }
     setActivePrompt(null)
@@ -1072,6 +1214,7 @@ export function JourneyChat() {
   function applyPayResult(data: Record<string, unknown>) {
     stopTick()
     waitStartedAtRef.current = null
+    payResumedRef.current = false
     if (data.ok === true) {
       // QA round 1 (QAA1-02): cobrança já existente SEM link resolvível — o
       // servidor persistiu o outcome humano + menu curto (vêm no poll/corpo).
@@ -1207,7 +1350,11 @@ export function JourneyChat() {
     const b = activePrompt?.buttons?.find((x) => x.id === 4)
     return b ? b.id : null
   }
-  async function onWaitPayNow() {
+  // QA round 2 (QAB1-H5): TODOS os atalhos do painel (espera/degradação/erro/
+  // link/processing) passam pela mesma guarda de clique duplo — um 2º toque com
+  // um atalho em voo é ignorado (nunca 2 POST /api/chat/reopen). O núcleo de
+  // cada ação fica sem guarda para poder ser composto (onPayRetry → payNow).
+  async function payNowCore() {
     const pid = payActiveButtonId()
     if (activePrompt && pid != null) {
       await clickButton(activePrompt.id, pid, "Pagar")
@@ -1217,34 +1364,43 @@ export function JourneyChat() {
     // apenas poll (que não repõe prompt respondido). O devedor reabre e paga.
     await reopenOptions()
   }
+  async function onWaitPayNow() {
+    await shortcutGuardRef.current.run(payNowCore)
+  }
   // "Tentar as opções de novo" (A.5): re-emite o menu de 3 opções no servidor.
   async function onWaitRetryOptions() {
-    await reopenOptions()
+    await shortcutGuardRef.current.run(reopenOptions)
   }
   // "Falar com atendimento": reusa o botão de handoff (99) do prompt ativo se
   // houver; senão transfere direto ao atendimento no servidor (nunca beco sem
   // saída). Sem termos técnicos ao devedor.
   async function onWaitHandoff() {
-    const h = activePrompt?.buttons?.find((x) => x.id === 99)
-    if (activePrompt && h) {
-      await clickButton(activePrompt.id, 99, h.label)
-      return
-    }
-    await requestHandoffNoPrompt()
+    await shortcutGuardRef.current.run(async () => {
+      const h = activePrompt?.buttons?.find((x) => x.id === 99)
+      if (activePrompt && h) {
+        await clickButton(activePrompt.id, 99, h.label)
+        return
+      }
+      await requestHandoffNoPrompt()
+    })
   }
   // "Tentar novamente" (§5.4, erro de cobrança): reusa o PAGAR ativo, senão repõe
   // o menu. Limpa o painel de erro antes.
   async function onPayRetry() {
-    setPayResult(null)
-    await onWaitPayNow()
+    await shortcutGuardRef.current.run(async () => {
+      setPayResult(null)
+      await payNowCore()
+    })
   }
   // R-06 — "Voltar às opções" no erro de cobrança: limpa o painel de erro e reabre
   // o menu payável completo (Pagar/Negociar/Consultar/Não reconheço). Dá saída às
   // demais decisões básicas por 1 clique — não prende o devedor no par tentar/
   // atendimento. reopenOptions() re-emite o menu no servidor (nunca beco sem saída).
   async function onPayBackToOptions() {
-    setPayResult(null)
-    await reopenOptions()
+    await shortcutGuardRef.current.run(async () => {
+      setPayResult(null)
+      await reopenOptions()
+    })
   }
   // Copiar o link de pagamento (§5.2). Best-effort; sem quebrar se o clipboard
   // não estiver disponível.
@@ -1644,7 +1800,9 @@ export function JourneyChat() {
             ) : payResult.status === "processing" ? (
               <>
                 <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-                  Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui.
+                  {/* QA round 2 (QAB1-H1): espera RETOMADA (reload durante o Pagar /
+                      recuperação) usa a copy progressiva; a nascida aqui, a do R3. */}
+                  {payResult.resumed ? PAY_RESUME_GENERATING_TEXT : PAY_PROCESSING_TEXT}
                 </div>
                 {/* R3 — inline "digitando" para o processing não parecer travado. */}
                 <div
@@ -1660,17 +1818,30 @@ export function JourneyChat() {
                 {shouldOfferProcessingExit(payPollAttempts) ? (
                   <div className="flex flex-col items-start gap-2 pt-1">
                     <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
-                      Está demorando um pouco mais que o normal para gerar o link. Você pode continuar aguardando ou falar com o nosso atendimento.
+                      {PAY_PROCESSING_SLOW_TEXT}
                     </div>
-                    <button
-                      type="button"
-                      onClick={onWaitHandoff}
-                      disabled={!waitExitsArmed}
-                      aria-disabled={!waitExitsArmed}
-                      className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
-                    >
-                      Falar com atendimento
-                    </button>
+                    {/* QA round 2 (QAB1-H1): teto do poll → saída humana com DOIS
+                        caminhos: voltar às opções (reabre o menu) ou atendimento. */}
+                    <div className="flex flex-wrap gap-2" data-wait-exits={waitExitsArmed ? "armed" : "arming"}>
+                      <button
+                        type="button"
+                        onClick={onPayBackToOptions}
+                        disabled={!waitExitsArmed}
+                        aria-disabled={!waitExitsArmed}
+                        className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                      >
+                        Voltar às opções
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onWaitHandoff}
+                        disabled={!waitExitsArmed}
+                        aria-disabled={!waitExitsArmed}
+                        className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                      >
+                        Falar com atendimento
+                      </button>
+                    </div>
                   </div>
                 ) : null}
               </>
@@ -1727,6 +1898,15 @@ export function JourneyChat() {
         ) : null}
 
       </div>
+
+      {/* QA round 2 (QAB1-H2) — aviso de processamento FORA do bloco de botões:
+          o clique tardio consumiu o menu e o vencedor ainda processa; o poll
+          traz o próximo prompt/outcome e o aviso some. Nunca uma tela muda. */}
+      {processingNotice && !ended ? (
+        <p className="px-1 text-sm text-neutral-600" role="status" aria-live="polite">
+          {processingNotice}
+        </p>
+      ) : null}
 
       {activePrompt && !ended ? (
         // R8 — aria-live=off: os BOTÕES não entram no anúncio do log (evita

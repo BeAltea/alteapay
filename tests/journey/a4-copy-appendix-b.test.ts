@@ -204,8 +204,12 @@ describe("S13/S16/S17 — Pagar (client, chat.tsx)", () => {
     expect(chat).not.toMatch(/\n\s+Tentar novamente\n/)
     expect(chat).toMatch(/\n\s+Falar com atendimento\n/)
   })
-  it("S17 processing: 'Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui.'", () => {
-    expect(chat).toContain("Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui.")
+  it("S17 processing: 'Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui.'", async () => {
+    // QA round 2 (QAB1-H1): a copy vive em pay-poll.ts (PAY_PROCESSING_TEXT) e o
+    // chat.tsx a referencia — a espera RETOMADA usa PAY_RESUME_GENERATING_TEXT.
+    const { PAY_PROCESSING_TEXT } = await import("@/lib/journey/pay-poll")
+    expect(PAY_PROCESSING_TEXT).toBe("Estou gerando seu link de pagamento. Assim que estiver pronto, ele aparece aqui.")
+    expect(chat).toContain("{payResult.resumed ? PAY_RESUME_GENERATING_TEXT : PAY_PROCESSING_TEXT}")
     expect(chat).not.toContain("pode aguardar um instante")
   })
   it("o painel-fallback usa payLinkMessageText (N-D5-8) — nenhuma copy do link duplicada no client", () => {

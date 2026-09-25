@@ -109,8 +109,11 @@ export function shouldShowSlowExits(step: WaitStep): boolean {
 //    em diante (shouldShowWaitHandoffExit) — antes disso, só "Pagar agora".
 // ---------------------------------------------------------------------------
 
-/** Tempo mínimo entre o bloco de saídas aparecer e as suas ações responderem. */
-export const WAIT_EXITS_ARM_MS = 1500
+/** Tempo mínimo entre o bloco de saídas aparecer e as suas ações responderem.
+ *  QA round 2 (B6 M-1): ≥ janela do toque duplo do servidor (DOUBLE_TAP_WINDOW_MS
+ *  = 2000, double-tap.ts) + folga de relógio DB×função — um clique legítimo numa
+ *  saída armada nunca cai na janela em que o servidor o ignoraria. */
+export const WAIT_EXITS_ARM_MS = 2500
 
 /** true quando as saídas já podem responder a um toque (≥ WAIT_EXITS_ARM_MS
  *  desde que o bloco apareceu). Sem instante conhecido → inerte. */

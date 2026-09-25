@@ -1957,8 +1957,10 @@ export async function handleDebtNegotiate(input: {
 
   // Kickoff: aguarda só o que resta do deadline curto (Promise.race). Se entregou,
   // engine_owner devolvido = o gravado no banco ('n8n'); senão platform/pending.
+  // QA round 2 (QAA2-02): com as parcelas prontas a resposta NÃO espera o
+  // disparo (`settle(0)`), como no ramo de 3 opções — o kickoff segue em curso.
   const deadlineMs = input.dispatchDeadlineMs ?? kickoffDeadlineMs()
-  const kick = await kickoff.settle(Math.max(0, deadlineMs - (Date.now() - t0)))
+  const kick = await kickoff.settle(offersPresented ? 0 : Math.max(0, deadlineMs - (Date.now() - t0)))
   return { ok: true, engineOwner: kick.owner, reply, kickoff: kick.status, offersPresented, prompt }
 }
 

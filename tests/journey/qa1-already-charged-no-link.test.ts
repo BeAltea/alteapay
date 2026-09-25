@@ -152,21 +152,30 @@ describe("QAA1-02 — already_charged com o link resolvido pelo ASAAS (acordo pa
     expect(confirmCalls).toBe(1)
   })
 
-  it("R3 — guard nível-ASAAS sem acordo vivo local: link da cobrança viva do cliente no ASAAS; bolha + prompt pós-link", async () => {
+  it("R3 — guard nível-ASAAS sem acordo vivo local: a cobrança viva do cliente no ASAAS só é exibida se MAPEÁVEL a um acordo desta empresa (QA round 2 / B6 M-2); nunca o link morto", async () => {
     db.agreements = [{ ...DEAD }]
     asaasForCustomer = [
       { id: "pay_dead", status: "PENDING", deleted: true, invoiceUrl: "https://asaas/i/dead" },
       { id: "pay_other", status: "PENDING", deleted: false, invoiceUrl: "https://asaas/i/other", dueDate: "2026-10-05", value: 250 },
     ]
-    const { payService } = await import("@/lib/journey/pay")
+    const { payService, ALREADY_CHARGED_NO_LINK_TEXT } = await import("@/lib/journey/pay")
     const r = await payService(ctx)
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect(r.already_charged).toBe(true)
-    expect(r.link).toBe("https://asaas/i/other") // nunca o link morto
-    expect(r.prompt?.kind).toBe("post_payment_link")
-    expect(linkBubbles().length).toBe(1)
-    expect(linkBubbles()[0].offers_snapshot.message_action.href).toBe("https://asaas/i/other")
+    // pay_other não é de nenhum acordo desta empresa (outro cedente/legada) → sem link,
+    // outcome humano + menu curto (nunca o link morto, nunca uma cobrança alheia)
+    expect(r.link).toBeNull()
+    expect(r.prompt?.kind).toBe("debt_three_options")
+    expect(linkBubbles().length).toBe(0)
+    expect(chargeActiveBubbles().length).toBe(1)
+    expect(chargeActiveBubbles()[0].text).toBe(ALREADY_CHARGED_NO_LINK_TEXT)
+    // …e a mesma cobrança viva, quando é a de um acordo desta empresa, é entregue
+    seed()
+    db.agreements = [{ ...DEAD, asaas_payment_id: "pay_other" }]
+    asaasForCustomer = [{ id: "pay_other", status: "PENDING", deleted: false, invoiceUrl: "https://asaas/i/other", dueDate: "2026-10-05", value: 250 }]
+    const r2 = await payService(ctx)
+    expect(r2.ok && r2.link).toBe("https://asaas/i/other")
   })
 })
 

@@ -70,6 +70,14 @@ export function isDuplicateClick(
  * Nunca lança (falha de leitura → null → o handoff segue).
  */
 export async function lastCustomerClickAt(sessionId: string, promptId?: string | null): Promise<string | null> {
+  return (await lastCustomerClick(sessionId, promptId)).at
+}
+
+/** Último clique válido da sessão/prompt: instante + botão. Nunca lança. */
+export async function lastCustomerClick(
+  sessionId: string,
+  promptId?: string | null,
+): Promise<{ at: string | null; buttonId: number | null }> {
   try {
     const supabase = createServiceClient()
     let q = supabase
@@ -82,11 +90,27 @@ export async function lastCustomerClickAt(sessionId: string, promptId?: string |
       .limit(1)
     if (promptId) q = q.eq("prompt_id", promptId)
     const { data } = await q.maybeSingle()
-    const at = (data as { created_at?: string | null } | null)?.created_at
-    return typeof at === "string" ? at : null
+    const row = data as { created_at?: string | null; button_id?: number | null } | null
+    return {
+      at: typeof row?.created_at === "string" ? row.created_at : null,
+      buttonId: typeof row?.button_id === "number" ? row.button_id : null,
+    }
   } catch {
-    return null
+    return { at: null, buttonId: null }
   }
+}
+
+/**
+ * QA round 2 (B6 M-1) — o guard do `reopen {handoff}` (sem prompt) só vale quando
+ * o último clique foi o próprio NEGOCIAR (o único vetor observado: o bloco de
+ * espera nascia sob o ponteiro). Um handoff < 2 s depois de outro clique (ex.:
+ * Pagar → erro rápido → "Falar com atendimento") é legítimo e transfere.
+ * Botões: 1 = Negociar (menu de 3 opções), 3 = Negociar (legado debt_consult).
+ */
+export const NEGOTIATE_BUTTON_IDS: ReadonlySet<number> = new Set([1, 3])
+
+export function reopenHandoffGuardApplies(lastButtonId: number | null | undefined): boolean {
+  return typeof lastButtonId === "number" && NEGOTIATE_BUTTON_IDS.has(lastButtonId)
 }
 
 export interface DoubleTapCheck {
@@ -110,8 +134,11 @@ export async function isDoubleTapHandoff(input: {
   nowMs?: number
 }): Promise<DoubleTapCheck> {
   const nowMs = input.nowMs ?? Date.now()
-  const lastClickAt = await lastCustomerClickAt(input.sessionId, input.promptId)
-  const doubleTap = isWithinWindow(lastClickAt, nowMs, DOUBLE_TAP_WINDOW_MS)
+  const last = await lastCustomerClick(input.sessionId, input.promptId)
+  const lastClickAt = last.at
+  // M-1: no reopen (sem prompt), só um clique em NEGOCIAR arma o guard.
+  const applies = input.source === "button" || reopenHandoffGuardApplies(last.buttonId)
+  const doubleTap = applies && isWithinWindow(lastClickAt, nowMs, DOUBLE_TAP_WINDOW_MS)
   if (doubleTap) {
     await recordEvent({
       companyId: input.companyId,

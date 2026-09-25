@@ -111,6 +111,22 @@ export function dedupAssistantByContent(list: ChatMsg[]): ChatMsg[] {
   })
 }
 
+/**
+ * QA round 2 (QAA2-01) — ORDEM DA TRANSCRIÇÃO: a bolha OTIMISTA do Negociar
+ * ("Certo. Estas são as condições…") nasce no clique, ANTES do eco "Negociar"
+ * persistido chegar pelo poll. Na 1ª apresentação a confirmação persistida (T2)
+ * chega depois do eco e o dedup fica com ela; nas seguintes (T2 deduplicada no
+ * servidor por 15 min) a otimista ficava ACIMA do eco — assistente respondendo
+ * antes da pergunta. Ao chegar o eco do clique, a otimista é RECOLOCADA logo
+ * depois dele (a ordem do banco: eco → confirmação → parcelas). Se a otimista já
+ * não está na lista, só o eco entra. Pura; preserva o resto da ordem.
+ */
+export function placeAfterCustomerEcho(list: ChatMsg[], optimisticId: string | null, echo: ChatMsg): ChatMsg[] {
+  const opt = optimisticId ? list.find((m) => m.id === optimisticId) : undefined
+  if (!opt) return [...list, echo]
+  return [...list.filter((m) => m.id !== optimisticId), echo, opt]
+}
+
 /** Ação `open_payment_link` de uma bolha do LINK: a anexada pelo servidor ou,
  *  para uma bolha persistida com stage 'payment_link' que chegou sem a ação
  *  (shape malformado), derivada da URL http(s) do próprio texto — o painel

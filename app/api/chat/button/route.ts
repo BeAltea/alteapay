@@ -18,7 +18,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
-import { createServiceClient } from "@/lib/supabase/service"
 import {
   answerPrompt,
   getActivePrompt,
@@ -49,6 +48,7 @@ import {
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { isDoubleTapHandoff, isDuplicateClick } from "@/lib/journey/double-tap"
 import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
+import { setSessionWaitState } from "@/lib/journey/session-wait"
 import { engineName } from "@/lib/negotiation/engine"
 import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"
 import {
@@ -74,26 +74,45 @@ function clientIp(req: NextRequest): string | null {
 
 /**
  * Grava wait_state='aguardando_motor' + wait_started_at=now() na sessão (M11,
- * contrato G1). A coluna é da migration M-4 do D2, que roda DEPOIS desta trilha —
- * então a escrita é DEFENSIVA: se a coluna ainda não existir (ou o update falhar
- * por qualquer motivo), NÃO derruba o clique. A espera é reconstruída client-side
- * pelo D2 a partir de wait_started_at; sem a coluna, a UI apenas não restaura o
- * degrau no reload (degradação graciosa). NUNCA lança.
+ * contrato G1). DEFENSIVO (setSessionWaitState): se a coluna M-4 não existir ou o
+ * update falhar, NÃO derruba o clique — a UI só não restaura o degrau no reload.
  */
 async function markWaitingForEngine(sessionId: string): Promise<void> {
+  await setSessionWaitState(sessionId, "aguardando_motor")
+}
+
+/**
+ * QA round 2 (QAB1-H1, ALTO) — a COBRANÇA persiste o seu estado na sessão: grava
+ * 'gerando_cobranca' ANTES de chamar o serviço de pagamento e, ao final, limpa
+ * (link entregue → o prompt pós-link já existe; já-cobrado sem link → o menu
+ * curto já foi reaberto) ou grava 'erro_cobranca' (erro de negócio ou exceção).
+ * 'processing' (worker gerando o link) mantém 'gerando_cobranca'. Assim um F5
+ * durante os 11–16 s do ASAAS em produção reidrata a espera (copy progressiva +
+ * poll do link + saídas no teto) em vez de uma tela sem caminho. As escritas
+ * são defensivas (nunca derrubam o clique); a exceção do serviço segue para o
+ * catch da branch (500 com JSON), já com 'erro_cobranca' gravado.
+ */
+async function withChargeWaitState<T extends { ok: boolean }>(
+  sessionId: string,
+  run: () => Promise<T>,
+): Promise<{ result: T; wait_state: "gerando_cobranca" | "erro_cobranca" | null }> {
+  await setSessionWaitState(sessionId, "gerando_cobranca")
+  let result: T
   try {
-    const supabase = createServiceClient()
-    const { error } = await supabase
-      .from("negotiation_sessions")
-      .update({ wait_state: "aguardando_motor", wait_started_at: new Date().toISOString() })
-      .eq("id", sessionId)
-    if (error) {
-      // Coluna ausente (M-4 do D2 ainda não aplicada) ou outro erro não-fatal.
-      console.warn("[chat:button] wait_state write não aplicado (coluna M-4 pendente?):", error.message)
-    }
+    result = await run()
   } catch (err) {
-    console.warn("[chat:button] wait_state write falhou (defensivo):", (err as Error).message)
+    await setSessionWaitState(sessionId, "erro_cobranca")
+    throw err
   }
+  const r = result as { ok: boolean; processing?: boolean; status?: string }
+  const processing = r.ok === true && (r.processing === true || r.status === "processing")
+  const next: "gerando_cobranca" | "erro_cobranca" | null = !r.ok
+    ? "erro_cobranca"
+    : processing
+      ? "gerando_cobranca"
+      : null
+  if (next !== "gerando_cobranca") await setSessionWaitState(sessionId, next)
+  return { result, wait_state: next }
 }
 
 /**
@@ -324,13 +343,17 @@ export async function POST(req: NextRequest) {
       // apresentou estas ofertas; o guard D18 já está destravado. acceptMatrixCondition
       // reusa paymentCreateOrExistingLink (guard duplo D7 + revalidação de matriz)
       // e persiste o link (outcome) + o prompt pós-link.
-      const accepted = await acceptMatrixCondition(ctx, offerId)
+      // QA round 2 (QAB1-H1): 'gerando_cobranca' persistido ANTES do serviço;
+      // limpo/'erro_cobranca' ao final (reload durante o aceite nunca fica mudo).
+      const { result: accepted, wait_state: acceptWait } = await withChargeWaitState(ctx.sessionId, () =>
+        acceptMatrixCondition(ctx, offerId),
+      )
       if (!accepted.ok) {
         // Rótulo de negócio (não erro de transporte): o D2 mostra a copy humana
         // §5.4. HTTP 200 para o front tratar como resultado do pagamento, não como
         // falha de rede. NUNCA a mensagem crua/HTTP/"n8n" ao devedor.
         return NextResponse.json(
-          { ok: false, button_id: buttonId, action: "pay", error: accepted.code },
+          { ok: false, button_id: buttonId, action: "pay", error: accepted.code, wait_state: acceptWait },
           { status: 200 },
         )
       }
@@ -346,6 +369,7 @@ export async function POST(req: NextRequest) {
           already_charged: true, processing: false,
           agreement_id: accepted.payment?.agreement_id ?? null,
           post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt,
+          wait_state: acceptWait,
         })
       }
       if (accepted.status === "processing") {
@@ -356,6 +380,7 @@ export async function POST(req: NextRequest) {
           link: null, valor: null, vencimento_link: null,
           already_charged: false, processing: true,
           agreement_id: accepted.agreementId,
+          wait_state: acceptWait,
         })
       }
       // status: 'created' — link pronto (inline).
@@ -367,6 +392,7 @@ export async function POST(req: NextRequest) {
         already_charged: false, processing: false,
         agreement_id: accepted.payment.agreement_id ?? null,
         post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt,
+        wait_state: acceptWait,
       })
     } catch (err) {
       console.error("[chat:button] offer_choice falhou:", (err as Error).message)
@@ -448,10 +474,14 @@ export async function POST(req: NextRequest) {
         // prompt pós-link ANTES de responder. Passamos os MESMOS debtIds que
         // geraram o rótulo do botão (prompt.context.debt_ids) para o valor cobrado
         // bater com o valor exibido (D3 ALTO).
-        const pay = await payService(ctx, { debtIds, primaryDebtId })
+        // QA round 2 (QAB1-H1): wait_state='gerando_cobranca' ANTES do payService
+        // (reload durante a cobrança reidrata a espera); limpo/'erro_cobranca' ao final.
+        const { result: pay, wait_state: payWait } = await withChargeWaitState(ctx.sessionId, () =>
+          payService(ctx, { debtIds, primaryDebtId }),
+        )
         if (!pay.ok) {
           return NextResponse.json(
-            { ok: false, button_id: buttonId, action: "pay", error: pay.error },
+            { ok: false, button_id: buttonId, action: "pay", error: pay.error, wait_state: payWait },
             { status: 200 }, // rótulo de negócio, não erro de transporte: o D2 mostra a copy §5.4
           )
         }
@@ -463,6 +493,7 @@ export async function POST(req: NextRequest) {
           // QA round 1 (QAA1-02): prompt ATIVO no corpo (pós-link, ou o menu curto
           // quando não há link resolvível) — o client renderiza na hora.
           prompt: pay.prompt ?? null,
+          wait_state: payWait,
         })
       }
 
@@ -522,8 +553,16 @@ export async function POST(req: NextRequest) {
         await ackWrite
         const presentedOffers = !!presented && presented.ok && presented.presented === true
 
-        // Kickoff: aguarda só o que resta do deadline (default 2,5 s desde o clique).
-        const kick = await kickoff.settle(Math.max(0, kickoffDeadlineMs() - (Date.now() - t0)))
+        // Kickoff: com as PARCELAS prontas a resposta NÃO espera o disparo — QA
+        // round 2 (QAA2-02): o Promise.race de 2,5 s era consumido inteiro em 7/8
+        // cliques (n8n respondendo 5–9 s depois) e as parcelas só apareciam em
+        // 3,1–5,5 s. `settle(0)` devolve o desfecho se o disparo já resolveu e
+        // `pending` senão; o disparo segue em curso (bounded pelo timeout do
+        // próprio POST ao n8n, N8N_KICKOFF_TIMEOUT_MS). Sem parcelas (espera D2) a
+        // resposta continua aguardando o que resta do deadline, como antes.
+        const kick = await kickoff.settle(
+          presentedOffers ? 0 : Math.max(0, kickoffDeadlineMs() - (Date.now() - t0)),
+        )
 
         // Só armamos a espera instrumentada (M11/D2) quando NÃO conseguimos
         // apresentar as parcelas agora (sem faixa de matriz vigente / falha): aí o

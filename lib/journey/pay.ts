@@ -55,7 +55,8 @@ import {
 import { createPrompt, getActivePrompt, promptView, type PromptRow, type PromptView } from "./prompts"
 import { payLinkMessageText } from "./pay-poll"
 import { createServiceClient } from "@/lib/supabase/service"
-import { findBlockingPayment, isBlockingAgreement } from "@/lib/asaas-idempotency"
+import { isBlockingAgreement, isBlockingPayment } from "@/lib/asaas-idempotency"
+import { PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import {
   persistOffer,
@@ -216,11 +217,86 @@ function asaasPaymentLink(p: { invoiceUrl?: string | null; bankSlipUrl?: string 
 }
 
 /**
+ * QA round 2 (B6 B-2) — cobrança PAGÁVEL: viva no ASAAS (isBlockingPayment — nunca
+ * deletada/estornada) E ainda não paga (RECEIVED/CONFIRMED/RECEIVED_IN_CASH). Uma
+ * cobrança já recebida com o local defasado não vira "cobrança ativa, use o
+ * link"; cai no outcome humano (sem link) — e nunca declara pago (D6; quem
+ * fecha é o webhook).
+ */
+export function isPayableCharge(p: { status?: string | null; deleted?: boolean } | null | undefined): boolean {
+  if (!p || !isBlockingPayment(p)) return false
+  return !(PAID_ASAAS_STATUSES as readonly string[]).includes(p.status ?? "")
+}
+
+/** Shape mínimo de uma cobrança ASAAS para o mapeamento (sem PII). */
+export interface AsaasChargeLike {
+  id?: string
+  status?: string | null
+  deleted?: boolean
+  value?: number
+  dueDate?: string | null
+  invoiceUrl?: string | null
+  bankSlipUrl?: string | null
+  pixQrCodeUrl?: string | null
+  externalReference?: string | null
+  /** id do plano de parcelamento (presente em cada parcela de um parcelado). */
+  installment?: string | null
+}
+
+/** Acordo local mínimo para o mapeamento (sempre lido por customer_id + company_id). */
+export interface AgreementChargeRef {
+  id: string
+  asaas_payment_id: string | null
+  agreed_amount?: number | null
+  due_date?: string | null
+}
+
+/**
+ * QA round 2 (B6 M-2) — passo 2 do `resolveLiveChargeLink`: entre as cobranças
+ * VIVAS do cliente no ASAAS, só é exibida a que é MAPEÁVEL a esta empresa/dívida:
+ *  - `id` = `asaas_payment_id` de um acordo desta `company_id` (qualquer status
+ *    local — o ASAAS diz se está viva), com o TOTAL do acordo (B-3); ou
+ *  - `externalReference` = `journey_<esta sessão>_…` (cobrança desta sessão cujo
+ *    acordo não ficou gravado): total = `value` só numa cobrança única (numa
+ *    parcela o total é desconhecido → copy sem valor).
+ * Uma cobrança viva de OUTRO cedente/legada (mesmo CPF, mesma conta ASAAS) nunca
+ * é exibida como "a sua cobrança ativa": sem mapeamento → null → outcome
+ * `charge_active` sem link (caminho humano). Pura.
+ */
+export function matchLiveChargeToAgreement(
+  payments: AsaasChargeLike[] | null | undefined,
+  agreements: AgreementChargeRef[] | null | undefined,
+  sessionId: string,
+): { payment: AsaasChargeLike; link: string; total: number | null; agreementId: string | null } | null {
+  const byPaymentId = new Map<string, AgreementChargeRef>()
+  for (const ag of agreements ?? []) if (ag.asaas_payment_id) byPaymentId.set(ag.asaas_payment_id, ag)
+  const sessionRef = `journey_${sessionId}_`
+  for (const p of payments ?? []) {
+    if (!isPayableCharge(p)) continue
+    const link = asaasPaymentLink(p)
+    if (!link) continue
+    const ag = p.id ? byPaymentId.get(p.id) : undefined
+    if (ag) {
+      const total = typeof ag.agreed_amount === "number" ? ag.agreed_amount : typeof p.value === "number" ? p.value : null
+      return { payment: p, link, total, agreementId: ag.id }
+    }
+    if (typeof p.externalReference === "string" && p.externalReference.startsWith(sessionRef)) {
+      const total = !p.installment && typeof p.value === "number" ? p.value : null
+      return { payment: p, link, total, agreementId: null }
+    }
+  }
+  return null
+}
+
+/**
  * Resolve o LINK VIVO de uma cobrança existente. Ordem: URLs do acordo local →
- * ASAAS pela `asaas_payment_id` do acordo → cobrança viva do cliente no ASAAS
- * (guard nível-ASAAS sem acordo local). Best-effort: nunca lança; sem link →
- * null (o chamador persiste o outcome humano). Quando resolve pelo ASAAS e há
- * acordo local, grava as URLs de volta (não-fatal) para os próximos polls.
+ * ASAAS pela `asaas_payment_id` do acordo (só se a cobrança continua PAGÁVEL —
+ * isPayableCharge, B-2) → cobrança viva do cliente no ASAAS MAPEÁVEL a um
+ * acordo desta empresa/sessão (matchLiveChargeToAgreement, M-2). Best-effort:
+ * nunca lança; sem link → null (o chamador persiste o outcome humano). Quando
+ * resolve pelo ASAAS e há acordo local, grava as URLs de volta (não-fatal).
+ * O `total` é o TOTAL do acordo (`agreed_amount`): numa cobrança parcelada o
+ * `value` do ASAAS é a PARCELA e não entra na copy "cobrança ativa de R$ X" (B-3).
  */
 export async function resolveLiveChargeLink(
   ctx: SessionCtx,
@@ -232,40 +308,42 @@ export async function resolveLiveChargeLink(
     const asaas = await import("@/lib/asaas")
     const supabase = createServiceClient()
     // 1) pela cobrança do acordo (asaas_payment_id) — o caso do acordo parcelado
-    //    sem URL local (QAA1-02).
+    //    sem URL local (QAA1-02). Só uma cobrança PAGÁVEL (nunca deletada/
+    //    estornada/já recebida com o local defasado — B-2).
     if (payment?.payment_id) {
-      const p = await asaas.getAsaasPayment(payment.payment_id).catch(() => null)
+      const p = (await asaas.getAsaasPayment(payment.payment_id).catch(() => null)) as AsaasChargeLike | null
       const link = asaasPaymentLink(p)
-      if (link && !(p as { deleted?: boolean } | null)?.deleted) {
+      if (p && link && isPayableCharge(p)) {
         if (payment.agreement_id) {
           await supabase
             .from("agreements")
             .update({
-              asaas_invoice_url: p?.invoiceUrl ?? null,
-              asaas_payment_url: p?.invoiceUrl ?? null,
-              asaas_boleto_url: p?.bankSlipUrl ?? null,
-              asaas_pix_qrcode_url: p?.pixQrCodeUrl ?? null,
+              asaas_invoice_url: p.invoiceUrl ?? null,
+              asaas_payment_url: p.invoiceUrl ?? null,
+              asaas_boleto_url: p.bankSlipUrl ?? null,
+              asaas_pix_qrcode_url: p.pixQrCodeUrl ?? null,
             })
             .eq("id", payment.agreement_id)
             .eq("company_id", ctx.companyId)
             .then(() => {}, () => {})
         }
-        return { link, dueDate: p?.dueDate ?? payment.due_date ?? null, total: typeof p?.value === "number" ? p.value : payment.total_value }
+        const total = payment.total_value ?? (typeof p.value === "number" ? p.value : null)
+        return { link, dueDate: p.dueDate ?? payment.due_date ?? null, total }
       }
     }
-    // 2) cobrança viva do cliente no ASAAS (guard nível-ASAAS sem acordo local — R3).
+    // 2) cobrança viva do cliente no ASAAS MAPEÁVEL a esta empresa (M-2). Acordos
+    //    lidos por customer_id + company_id (B-1); o asaas_customer_id vem deles.
     const { data: known } = await supabase
       .from("agreements")
-      .select("asaas_customer_id")
+      .select("id, asaas_payment_id, asaas_customer_id, agreed_amount, due_date")
       .eq("customer_id", ctx.customerId)
-      .not("asaas_customer_id", "is", null)
-      .limit(1)
-    const asaasCustomerId = (known?.[0] as { asaas_customer_id?: string | null } | undefined)?.asaas_customer_id
+      .eq("company_id", ctx.companyId)
+    const rows = (known ?? []) as Array<AgreementChargeRef & { asaas_customer_id?: string | null }>
+    const asaasCustomerId = rows.find((r) => typeof r.asaas_customer_id === "string" && r.asaas_customer_id)?.asaas_customer_id
     if (asaasCustomerId) {
-      const payments = await asaas.getAsaasPaymentsForCustomer(asaasCustomerId)
-      const live = findBlockingPayment(payments) as { invoiceUrl?: string; bankSlipUrl?: string; pixQrCodeUrl?: string; dueDate?: string; value?: number } | null
-      const link = asaasPaymentLink(live)
-      if (link) return { link, dueDate: live?.dueDate ?? null, total: typeof live?.value === "number" ? live.value : null }
+      const payments = (await asaas.getAsaasPaymentsForCustomer(asaasCustomerId)) as AsaasChargeLike[]
+      const mapped = matchLiveChargeToAgreement(payments, rows, ctx.sessionId)
+      if (mapped) return { link: mapped.link, dueDate: mapped.payment.dueDate ?? null, total: mapped.total }
     }
   } catch (err) {
     console.warn("[journey] resolveLiveChargeLink falhou (não fatal):", (err as Error).message)
