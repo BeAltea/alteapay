@@ -421,7 +421,12 @@ foi observado (bloqueado por N-D1-2).
   `Format Buttons` do `1.3` (ids string).
 - **Segredo hard-coded (N-D2-9):** `Input Normalization` do `1. Main` guarda o segredo num campo
   `Set` e o repassa como `webhook_secret`. Mover para credencial/env do n8n; o bloco novo já não
-  depende dele (usa a credencial `Crypto account`).
+  depende dele (usa a credencial `Crypto account`). **Rotacionar (pedido em 2026-09-25):** o valor
+  circulou em exportações do workflow (nó `Set` do Main antigo e `pinData` do `Input` de
+  1.5/1.6/1.7) — tratar como exposto. Ao mover para credencial, gerar segredo novo
+  (`openssl rand -hex 32`) e trocar em conjunto com `N8N_WEBHOOK_SECRET` da AlteaPay (janela
+  combinada: as chamadas nos dois sentidos só validam quando os dois lados baterem). Não fixar o
+  valor em `pinData` de novo.
 - **Router por `step` (D3):** o `1. Main` roteia por `Last Agent Interaction.step` e trata
   `negotiation.start` como turno ("Teste"); `DB: Update Negotiation Status` exige
   `notification_id` (nulo em sessões web) → sub-execuções morrem (N-D2-4). Fora de escopo.
