@@ -252,3 +252,90 @@ describe("auditoria de clique (N-D3-2)", () => {
     expect(turn!.payload?.retargeted_from).toBeUndefined()
   })
 })
+
+describe("re-alvejamento exige o MESMO botão: id + rótulo + value iguais (A1-R2 / D3)", () => {
+  beforeEach(seed)
+
+  it("mesmo kind e mesmo id, rótulo DIFERENTE (saldo mudou entre os menus) → 409 prompt_stale, 0 cobrança, ativo intacto", async () => {
+    const { POST } = await import("@/app/api/chat/button/route")
+    const p1 = await bootstrap()
+    // Detalhes reabre o menu (p2, mesmo kind); a aba antiga ainda mostra p1
+    await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 2 }))
+    const p2 = active()!
+    expect(p2.kind).toBe(p1.kind)
+    const staleLabel = p1.buttons.find((b: any) => b.id === 4)!.label
+    // VMAX atualizou o saldo: o menu ATIVO cobra outro valor
+    p2.buttons = p2.buttons.map((b: any) => (b.id === 4 ? { ...b, label: "Pagar R$ 260,00" } : b))
+    expect(staleLabel).not.toBe("Pagar R$ 260,00")
+
+    const r = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 4 }))
+    const b = await r.json()
+    expect(r.status).toBe(409)
+    expect(b.ok).toBe(false)
+    expect(b.code).toBe("prompt_stale")
+    expect(b.active_prompt.id).toBe(p2.id)
+    expect(b.active_prompt.buttons.find((x: any) => x.id === 4).label).toBe("Pagar R$ 260,00")
+    // D3: o valor do menu ativo NUNCA é cobrado por um clique no menu antigo
+    expect(confirmCalls).toBe(0)
+    expect(active()!.id).toBe(p2.id)
+    expect(db.chat_prompts.find((p) => p.id === p2.id)!.status).toBe("active")
+    // nenhum eco novo (só o Detalhes)
+    expect(db.chat_messages.filter((m) => m.role === "customer").length).toBe(1)
+    expect(events.filter((e) => e.type === "chat.turn.customer").length).toBe(1)
+  })
+
+  it("offer_choice: mesmo id posicional com value (offer_id) DIFERENTE → 409 prompt_stale; a oferta do outro prompt nunca é aceita", async () => {
+    const { POST } = await import("@/app/api/chat/button/route")
+    const base = {
+      company_id: CO, session_id: SID, kind: "offer_choice", question: "Qual opção prefere?",
+      created_by: "platform", n8n_execution_id: null, expires_at: null, thread_epoch: 0, archived_at: null,
+    }
+    db.chat_prompts = [
+      {
+        ...base, id: "oc-old", status: "answered", created_at: "2026-09-25T10:00:00Z",
+        buttons: [{ id: 2, label: "3x de R$ 81,25", value: "off-a" }, { id: 98, label: "Voltar às opções" }],
+        context: { offer_ids: ["off-a"] },
+      },
+      {
+        ...base, id: "oc-new", status: "active", created_at: "2026-09-25T10:05:00Z",
+        buttons: [{ id: 2, label: "3x de R$ 81,25", value: "off-b" }, { id: 98, label: "Voltar às opções" }],
+        context: { offer_ids: ["off-b"] },
+      },
+    ]
+    const r = await POST(buttonReq(await signed(), { prompt_id: "oc-old", button_id: 2 }))
+    const b = await r.json()
+    expect(r.status).toBe(409)
+    expect(b.code).toBe("prompt_stale")
+    expect(b.active_prompt.id).toBe("oc-new")
+    expect(confirmCalls).toBe(0)
+    expect(db.chat_prompts.find((p) => p.id === "oc-new")!.status).toBe("active")
+    expect(db.chat_messages.filter((m) => m.role === "customer").length).toBe(0)
+  })
+
+  it("offer_choice: botão sem value e rótulo igual ([98] Voltar) → continua re-alvejado (mesma intenção)", async () => {
+    const { POST } = await import("@/app/api/chat/button/route")
+    const base = {
+      company_id: CO, session_id: SID, kind: "offer_choice", question: "Qual opção prefere?",
+      created_by: "platform", n8n_execution_id: null, expires_at: null, thread_epoch: 0, archived_at: null,
+    }
+    db.chat_prompts = [
+      {
+        ...base, id: "oc-old", status: "answered", created_at: "2026-09-25T10:00:00Z",
+        buttons: [{ id: 2, label: "3x de R$ 81,25", value: "off-a" }, { id: 98, label: "Voltar às opções" }],
+        context: { offer_ids: ["off-a"], debt_ids: [DEBT], primary_debt_id: DEBT },
+      },
+      {
+        ...base, id: "oc-new", status: "active", created_at: "2026-09-25T10:05:00Z",
+        buttons: [{ id: 2, label: "3x de R$ 81,25", value: "off-b" }, { id: 98, label: "Voltar às opções" }],
+        context: { offer_ids: ["off-b"], debt_ids: [DEBT], primary_debt_id: DEBT },
+      },
+    ]
+    const r = await POST(buttonReq(await signed(), { prompt_id: "oc-old", button_id: 98 }))
+    const b = await r.json()
+    expect(r.status).toBe(200)
+    expect(b.ok).toBe(true)
+    expect(b.action).toBe("back_to_options")
+    expect(db.chat_prompts.find((p) => p.id === "oc-new")!.status).toBe("answered")
+    expect(confirmCalls).toBe(0)
+  })
+})

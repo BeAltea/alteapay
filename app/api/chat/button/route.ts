@@ -59,6 +59,7 @@ import {
   BTN_PAY,
   BTN_YES,
   findButton,
+  type Button,
 } from "@/lib/journey/buttons"
 
 export const dynamic = "force-dynamic"
@@ -104,6 +105,17 @@ async function staleResponse(sessionId: string) {
     { ok: false, error: "prompt_stale", code: "prompt_stale", active_prompt: promptView(active) },
     { status: 409 },
   )
+}
+
+/**
+ * A1-R2 — o MESMO botão para fins de re-alvejamento: mesmo id E mesmo rótulo E
+ * mesmo value. O rótulo carrega o valor ("Pagar R$ 250,00", "3x de R$ 81,25") e
+ * o value carrega o offer_id (offer_choice) — ids são posicionais. D3: o valor
+ * cobrado é o que o devedor VIU; um menu novo com outro valor/oferta NUNCA
+ * recebe o clique do menu antigo (vira 409 prompt_stale e o client re-hidrata).
+ */
+function sameButton(a: Button, b: Button): boolean {
+  return a.id === b.id && a.label === b.label && (a.value ?? null) === (b.value ?? null)
 }
 
 /**
@@ -191,12 +203,16 @@ export async function POST(req: NextRequest) {
 
   // A1 — RE-ALVEJAMENTO (N-D3-3): prompt clicado já não está ativo (respondido/
   // substituído: 2ª aba, poll atrasado, clique duplo tardio). Se o prompt ATIVO
-  // tem o MESMO kind e contém o MESMO button_id, a intenção é a mesma → o clique
-  // vale para o ativo. Senão, 409 prompt_stale com o ativo no corpo (nunca mudo).
+  // tem o MESMO kind e o MESMO botão (id + rótulo + value — sameButton, A1-R2),
+  // a intenção é a mesma → o clique vale para o ativo. Senão (outro kind, botão
+  // ausente, rótulo/valor/oferta diferentes), 409 prompt_stale com o ativo no
+  // corpo (nunca mudo).
   let retargetedFrom: string | null = null
   if (prompt.status !== "active") {
     const active = await getActivePrompt(ctx.sessionId)
-    if (active && active.kind === prompt.kind && findButton(active.buttons ?? [], buttonId)) {
+    const staleBtn = findButton(prompt.buttons ?? [], buttonId)
+    const liveBtn = active && active.kind === prompt.kind ? findButton(active.buttons ?? [], buttonId) : null
+    if (active && staleBtn && liveBtn && sameButton(staleBtn, liveBtn)) {
       retargetedFrom = prompt.id
       prompt = active
       promptId = active.id

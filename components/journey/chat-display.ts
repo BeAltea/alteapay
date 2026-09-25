@@ -25,6 +25,10 @@ export interface MsgAction {
   type: string
   label: string
   href: string
+  /** A1-R1 — `false` quando o servidor sabe que a cobrança daquele link já não
+   *  está viva (acordo terminal): a bolha fica como histórico (outcome), sem
+   *  painel Abrir/Copiar e sem contar como "link entregue". Ausente = viva. */
+  live?: boolean
 }
 
 export interface ChatMsg {

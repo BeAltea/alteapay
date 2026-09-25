@@ -8,6 +8,7 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { buildPinnedDebt } from "@/lib/journey/pinned-debt"
 import { buildRecap } from "@/lib/journey/recap"
 import { annotateMessageGenerations, type GenerationPromptRow } from "@/lib/journey/display-class"
+import { isTerminalAgreement, type AgreementLike } from "@/lib/asaas-idempotency"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -69,10 +70,20 @@ export async function GET(req: NextRequest) {
   // estágio (offers_snapshot.stage: greeting | detail | payment_link |
   // not_recognized | payment_claim — A1) que a poda/retomada usa. A UI renderiza
   // a ação como <a> abaixo da bolha; offers_snapshot cru não vaza. Sem PII.
+  //
+  // A1-R1 — LINK MORTO na retomada: a bolha do link de pagamento carrega
+  // offers_snapshot.agreement_id. Se esse acordo já é TERMINAL (cancelado no
+  // ASAAS / estornado — isTerminalAgreement, a MESMA regra do guard e do
+  // GET /api/chat/payment), a ação sai com `live:false`: o texto fica como
+  // histórico (outcome), mas o client NÃO renderiza Abrir/Copiar nem trata a
+  // bolha como "link entregue" — o devedor nunca cai em "Fatura cancelada" pela
+  // retomada. 1 `in()` por request; best-effort (falha → nada muda, compat).
+  const deadAgreementIds = await terminalAgreementIds(supabase, claims.cid, inCurrentThread)
   const mapped = inCurrentThread.map((m) => {
-    const snapshot = m.offers_snapshot as { message_action?: unknown; stage?: unknown } | null
-    const action =
+    const snapshot = m.offers_snapshot as { message_action?: unknown; stage?: unknown; agreement_id?: unknown } | null
+    const rawAction =
       snapshot && typeof snapshot === "object" && snapshot.message_action ? snapshot.message_action : null
+    const action = withLiveness(rawAction, snapshot?.agreement_id, deadAgreementIds)
     const stage = snapshot && typeof snapshot === "object" && typeof snapshot.stage === "string" ? snapshot.stage : null
     const { offers_snapshot: _drop, archived_at: _arch, ...rest } = m as Record<string, unknown>
     return { ...rest, ...(action ? { action } : {}), ...(stage ? { stage } : {}) }
@@ -161,4 +172,54 @@ export async function GET(req: NextRequest) {
     recap,
     server_time: new Date().toISOString(),
   })
+}
+
+/** offers_snapshot.agreement_id das bolhas com ação `open_payment_link`. */
+function linkAgreementIds(rows: Array<{ offers_snapshot?: unknown }>): string[] {
+  const ids = new Set<string>()
+  for (const m of rows) {
+    const snapshot = m.offers_snapshot as { message_action?: unknown; agreement_id?: unknown } | null
+    if (!snapshot || typeof snapshot !== "object") continue
+    const type = (snapshot.message_action as { type?: unknown } | null | undefined)?.type
+    if (type !== "open_payment_link" || typeof snapshot.agreement_id !== "string" || !snapshot.agreement_id) continue
+    ids.add(snapshot.agreement_id)
+  }
+  return [...ids]
+}
+
+/**
+ * A1-R1 — ids dos acordos (das bolhas de link da thread) que já são TERMINAIS
+ * (isTerminalAgreement: payment_status deleted/refunded/cancelled ou
+ * status cancelled). Filtrado por company_id (nunca cruza tenant). Best-effort:
+ * qualquer falha → conjunto vazio (a ação segue como está; compat).
+ */
+async function terminalAgreementIds(
+  supabase: ReturnType<typeof createServiceClient>,
+  companyId: string,
+  rows: Array<{ offers_snapshot?: unknown }>,
+): Promise<ReadonlySet<string>> {
+  const ids = linkAgreementIds(rows)
+  if (ids.length === 0) return new Set()
+  try {
+    const { data } = await supabase
+      .from("agreements")
+      .select("id, status, payment_status")
+      .eq("company_id", companyId)
+      .in("id", ids)
+    const dead = new Set<string>()
+    for (const ag of (data ?? []) as Array<AgreementLike & { id: string }>) {
+      if (isTerminalAgreement(ag)) dead.add(ag.id)
+    }
+    return dead
+  } catch {
+    return new Set()
+  }
+}
+
+/** Ação `open_payment_link` cujo acordo é terminal → `{...action, live:false}`; demais: como está. */
+function withLiveness(action: unknown, agreementId: unknown, dead: ReadonlySet<string>): unknown {
+  if (!action || typeof action !== "object") return action
+  if ((action as { type?: unknown }).type !== "open_payment_link") return action
+  if (typeof agreementId !== "string" || !dead.has(agreementId)) return action
+  return { ...(action as Record<string, unknown>), live: false }
 }

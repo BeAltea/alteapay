@@ -272,3 +272,93 @@ describe("guard duplo do confirmAccept: cancelada localmente não bloqueia; ASAA
     expect(closeCalls).toBe(1)
   })
 })
+
+describe("GET /api/chat/messages — bolha de link cujo acordo é TERMINAL não expõe ação viva (A1-R1)", () => {
+  beforeEach(seed)
+
+  const HREF_DEAD = "https://asaas/i/dead"
+  const HREF_LIVE = "https://asaas/i/live"
+  function linkBubble(id: string, agreementId: string | null, href: string, createdAt: string) {
+    return {
+      id, company_id: CO, session_id: SID, role: "assistant", prompt_id: null,
+      text: `Aqui está o seu link para pagar R$ 250,00.\n${href}`,
+      offers_snapshot: {
+        stage: "payment_link", agreement_id: agreementId, already_charged: false, valor: 250, vencimento_link: "2026-09-28",
+        message_action: { type: "open_payment_link", label: "Abrir link de pagamento", href },
+      },
+      created_at: createdAt,
+    }
+  }
+
+  async function getMessages() {
+    const { GET } = await import("@/app/api/chat/messages/route")
+    const { signChatJwt } = await import("@/lib/negotiation/crypto")
+    const cookie = signChatJwt({ sid: SID, cid: CO }, 3600)
+    const res = await GET({
+      cookies: { get: (n: string) => (n === "alteapay_chat_session" ? { value: cookie } : undefined) },
+      nextUrl: { searchParams: new URLSearchParams("") },
+    } as any)
+    return res.json()
+  }
+
+  it("acordo cancelado (webhook antigo: asaas_status PENDING) → action.live === false; texto e stage continuam (histórico)", async () => {
+    db.agreements = [DEAD]
+    db.negotiation_sessions[0].agreement_id = DEAD.id
+    db.chat_messages = [linkBubble("m-dead", DEAD.id, HREF_DEAD, "2026-09-25T10:01:00Z")]
+    const body = await getMessages()
+    expect(body.ok).toBe(true)
+    const m = body.messages.find((x: any) => x.id === "m-dead")
+    expect(m).toBeTruthy()
+    expect(m.action).toMatchObject({ type: "open_payment_link", href: HREF_DEAD, live: false })
+    expect(m.stage).toBe("payment_link")
+    expect(m.text).toContain("Aqui está o seu link")
+    // offers_snapshot cru nunca vaza
+    expect(m.offers_snapshot).toBeUndefined()
+  })
+
+  it("acordo vivo → action sem `live:false` (sem regressão)", async () => {
+    db.agreements = [LIVE]
+    db.negotiation_sessions[0].agreement_id = LIVE.id
+    db.chat_messages = [linkBubble("m-live", LIVE.id, HREF_LIVE, "2026-09-25T10:01:00Z")]
+    const body = await getMessages()
+    const m = body.messages.find((x: any) => x.id === "m-live")
+    expect(m.action).toEqual({ type: "open_payment_link", label: "Abrir link de pagamento", href: HREF_LIVE })
+    expect(m.action.live).toBeUndefined()
+  })
+
+  it("cancelada e recriada: só a bolha do acordo vivo mantém a ação viva; a do cancelado vem live:false", async () => {
+    db.agreements = [DEAD, LIVE]
+    db.negotiation_sessions[0].agreement_id = LIVE.id
+    db.chat_messages = [
+      linkBubble("m-dead", DEAD.id, HREF_DEAD, "2026-09-25T10:01:00Z"),
+      linkBubble("m-live", LIVE.id, HREF_LIVE, "2026-09-25T10:05:00Z"),
+    ]
+    const body = await getMessages()
+    const dead = body.messages.find((x: any) => x.id === "m-dead")
+    const live = body.messages.find((x: any) => x.id === "m-live")
+    expect(dead.action.live).toBe(false)
+    expect(live.action.live).toBeUndefined()
+  })
+
+  it("bolha sem agreement_id (legado) ou de acordo desconhecido → ação inalterada (compat; nunca inventa 'morto')", async () => {
+    db.agreements = [DEAD]
+    db.chat_messages = [
+      linkBubble("m-legacy", null, HREF_LIVE, "2026-09-25T10:01:00Z"),
+      linkBubble("m-unknown", "ag-nao-existe", HREF_LIVE, "2026-09-25T10:02:00Z"),
+    ]
+    const body = await getMessages()
+    for (const id of ["m-legacy", "m-unknown"]) {
+      const m = body.messages.find((x: any) => x.id === id)
+      expect(m.action.type).toBe("open_payment_link")
+      expect(m.action.live).toBeUndefined()
+    }
+  })
+
+  it("acordo terminal de OUTRA empresa com o mesmo id nunca é cruzado (filtro por company_id)", async () => {
+    db.agreements = [{ ...DEAD, company_id: "outra-empresa" }]
+    db.chat_messages = [linkBubble("m-x", DEAD.id, HREF_DEAD, "2026-09-25T10:01:00Z")]
+    const body = await getMessages()
+    const m = body.messages.find((x: any) => x.id === "m-x")
+    expect(m.action.live).toBeUndefined()
+  })
+})

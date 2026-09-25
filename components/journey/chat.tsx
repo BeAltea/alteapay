@@ -101,7 +101,9 @@ function safeMessageAction(raw: unknown): MsgAction | null {
   const label = typeof a.label === "string" ? a.label : ""
   const href = typeof a.href === "string" ? a.href : ""
   if (!label || !/^https?:\/\//i.test(href)) return null
-  return { type: a.type, label, href }
+  // A1-R1: `live:false` = o servidor cruzou o acordo da bolha e a cobrança já
+  // não está viva (cancelada/estornada). Só propagamos o sinal negativo.
+  return { type: a.type, label, href, ...(a.live === false ? { live: false } : {}) }
 }
 
 /** A1 (N-D1-8): a bolha do link persistida traz a URL crua numa linha própria
@@ -478,7 +480,9 @@ export function JourneyChat() {
         // em "gerando" (POST em voo/abortado) ou em 'processing', o link resolve
         // a espera aqui mesmo: link_entregue (absorvente, M12), sem painel
         // duplicado (o client só renderiza o painel próprio quando NÃO há bolha).
-        if (isAssistant && action?.type === "open_payment_link") {
+        // A1-R1: uma bolha de link MORTO (live:false — acordo cancelado) é só
+        // histórico: nunca resolve a espera nem vira "link entregue".
+        if (isAssistant && action?.type === "open_payment_link" && action.live !== false) {
           const local = waitStateRef.current
           if (local === "gerando_cobranca" || payResultRef.current?.status === "processing") {
             stopTick()
@@ -1204,20 +1208,22 @@ export function JourneyChat() {
   // botões. Composição pura em chat-display.resolvePromptForRender.
   const promptForRender =
     activePrompt && !ended ? resolvePromptForRender(activePrompt, capped.visible, recap?.text) : activePrompt
-  // A1: há bolha persistida do link (ação open_payment_link) para o link corrente?
+  // A1: há bolha persistida do link (ação open_payment_link VIVA) para o link corrente?
   const hasPersistedLink = messages.some(
     (m) =>
       m.from === "assistant" &&
       m.action?.type === "open_payment_link" &&
+      m.action.live !== false &&
       (!payResult?.link || m.action.href === payResult.link),
   )
-  // A1: só a ÚLTIMA bolha de link ganha o painel (Abrir/Copiar). Bolhas de links
-  // anteriores (ex.: cobrança cancelada e recriada) ficam só como texto, sem
-  // botão para um link que pode estar morto — o link vivo é sempre o mais recente.
+  // A1: só a ÚLTIMA bolha de link VIVO ganha o painel (Abrir/Copiar). Bolhas de
+  // links anteriores (cobrança cancelada e recriada) e bolhas cujo acordo o
+  // servidor marcou como terminal (action.live === false — A1-R1) ficam só como
+  // texto: nenhum botão para um link morto, nem na retomada após cancelamento.
   let latestPaymentLinkId: string | null = null
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
-    if (m.from === "assistant" && m.action?.type === "open_payment_link") {
+    if (m.from === "assistant" && m.action?.type === "open_payment_link" && m.action.live !== false) {
       latestPaymentLinkId = m.id
       break
     }
@@ -1313,7 +1319,10 @@ export function JourneyChat() {
                 pagamento" + "Copiar link". As ações seguintes (Voltar às opções /
                 Falar com atendimento) vêm do prompt pós-link do servidor; "Já
                 paguei" é a afordância sob esse prompt. */}
-            {m.from === "assistant" && m.action?.type === "open_payment_link" && m.id === latestPaymentLinkId ? (
+            {m.from === "assistant" &&
+            m.action?.type === "open_payment_link" &&
+            m.action.live !== false &&
+            m.id === latestPaymentLinkId ? (
               <div className="mt-2 flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
                 <a
                   href={m.action.href}
