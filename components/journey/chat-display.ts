@@ -344,3 +344,31 @@ export function stripDuplicateQuestion<T extends { question: string }>(
   const norm = (s: string) => s.replace(/\s+/g, " ").toLowerCase()
   return norm(g).endsWith(norm(q)) ? { ...prompt, question: "" } : prompt
 }
+
+/** Texto da bolha do ASSISTENTE que fica imediatamente acima do bloco de botões:
+ *  a última entrada do log visível, quando é do assistente. null quando o log
+ *  está vazio ou termina numa bolha do cliente (aí nada "encosta" no bloco). */
+export function lastAssistantVisibleText(visible: ChatMsg[]): string | null {
+  const last = visible[visible.length - 1]
+  return last && last.from === "assistant" ? last.text : null
+}
+
+/**
+ * A4 (correção r1 / B3-F1) — a pergunta do prompt ativo aparece UMA vez na tela.
+ * O prompt renderiza `question` num bloco próprio, acima dos botões; se essa
+ * frase já é a última bolha visível do assistente (ex.: T2 = S7 persistida antes
+ * do prompt de parcelas, cuja pergunta S8 = S7) ou já fecha a saudação de
+ * retorno (A3: "… Como prefere seguir?"), o bloco vem só com os botões.
+ * Composição pura do que chat.tsx monta como `promptForRender`; as duas fontes
+ * são independentes (qualquer uma basta) e o prompt volta intacto quando não há
+ * duplicidade.
+ */
+export function resolvePromptForRender<T extends { question: string }>(
+  prompt: T | null,
+  visible: ChatMsg[],
+  recapText: string | null | undefined,
+): T | null {
+  if (!prompt) return null
+  const againstLog = stripDuplicateQuestion(prompt, lastAssistantVisibleText(visible))
+  return stripDuplicateQuestion(againstLog, recapText)
+}

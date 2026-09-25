@@ -787,7 +787,10 @@ export function offerChoiceButtons(offers: ListedOffer[]): Button[] {
  *  Uma ideia, sem "se já pagou desconsidere" (isso é o botão "Já paguei" — C10).
  *  Sem PII; sem ameaça/negativação; sem valor na fala (mora no card/rótulo — R-12). */
 export function offerChoiceQuestion(): string {
-  // A4/S8: a MESMA frase do eco do clique Negociar (S7) — uma bolha só na tela.
+  // A4/S8: a MESMA frase do eco do clique Negociar (S7). T2 (S7) é persistida
+  // antes deste prompt; na tela, o client (chat-display.resolvePromptForRender)
+  // omite a pergunta do bloco de botões quando ela já é a última bolha visível —
+  // S7 aparece uma vez. Aqui a pergunta segue gravada (histórico/retomada).
   return NEGOTIATION_PENDING_TEXT
 }
 

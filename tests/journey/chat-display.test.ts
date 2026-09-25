@@ -5,7 +5,9 @@ import { describe, expect, it } from "vitest"
 import {
   dedupAssistantByContent,
   isNegotiateLabel,
+  lastAssistantVisibleText,
   NEGOTIATION_PENDING_TEXT,
+  resolvePromptForRender,
   type ChatMsg,
 } from "@/components/journey/chat-display"
 
@@ -130,5 +132,85 @@ describe("isNegotiateLabel", () => {
     expect(isNegotiateLabel("Não reconheço a dívida")).toBe(false)
     expect(isNegotiateLabel("Falar com atendente")).toBe(false)
     expect(isNegotiateLabel("")).toBe(false)
+  })
+})
+
+// A4 (correção r1 / B3-F1) — composição na TELA: log + bloco do prompt. A pergunta
+// do prompt ativo aparece UMA vez: se já é a última bolha visível do assistente
+// (T2 = S7 persistida antes do prompt de parcelas, cuja pergunta S8 = S7) ou já
+// fecha a saudação de retorno (A3), o bloco vem só com os botões.
+describe("resolvePromptForRender / lastAssistantVisibleText — S7 uma vez na tela (B3-F1)", () => {
+  const offerChoice = {
+    id: "p-offer",
+    kind: "offer_choice",
+    question: NEGOTIATION_PENDING_TEXT,
+    buttons: [
+      { id: 1, label: "À vista R$ 175,00, economia de R$ 75,00 (recomendado)", order: 0 },
+      { id: 2, label: "3x de R$ 78,33 (total R$ 235,00)", order: 1 },
+      { id: 0, label: "Voltar às opções", order: 2 },
+    ],
+  }
+  // o log do Negociar após o dedup: eco do clique + T2 (S7) como última bolha
+  const negotiateLog: ChatMsg[] = [
+    assistant("g1", "Olá, Ana. Este é o canal oficial de negociação da VMAX, operado pela AlteaPay. Como você prefere seguir?"),
+    customer("c1", "Negociar"),
+    assistant("t2", NEGOTIATION_PENDING_TEXT),
+  ]
+
+  it("offer_choice com question === NEGOTIATION_PENDING_TEXT e última bolha igual → question vazia (botões intactos)", () => {
+    const out = resolvePromptForRender(offerChoice, negotiateLog, null)
+    expect(out).not.toBeNull()
+    expect(out!.question).toBe("")
+    expect(out!.id).toBe("p-offer")
+    expect(out!.buttons).toBe(offerChoice.buttons)
+    // o log continua com T2 (a frase mora numa bolha só, acima das parcelas)
+    expect(negotiateLog.filter((m) => m.text === NEGOTIATION_PENDING_TEXT)).toHaveLength(1)
+  })
+
+  it("pergunta DIFERENTE da última bolha → prompt intacto (mesma referência)", () => {
+    const back = { ...offerChoice, id: "p-back", kind: "debt_three_options", question: "Como prefere seguir?" }
+    const out = resolvePromptForRender(back, negotiateLog, null)
+    expect(out).toBe(back)
+    expect(out!.question).toBe("Como prefere seguir?")
+  })
+
+  it("normaliza espaços e caixa entre a bolha e a pergunta (T2 gravada com espaços à volta)", () => {
+    const log: ChatMsg[] = [customer("c1", "Negociar"), assistant("t2", `  ${NEGOTIATION_PENDING_TEXT.toUpperCase()}  `)]
+    expect(resolvePromptForRender(offerChoice, log, null)!.question).toBe("")
+  })
+
+  it("só a bolha que ENCOSTA no bloco conta: log terminando no cliente → pergunta mantida", () => {
+    const log: ChatMsg[] = [assistant("t2", NEGOTIATION_PENDING_TEXT), customer("c2", "Voltar às opções")]
+    expect(lastAssistantVisibleText(log)).toBeNull()
+    expect(resolvePromptForRender(offerChoice, log, null)!.question).toBe(NEGOTIATION_PENDING_TEXT)
+  })
+
+  it("retomada: T2 recolhida atrás de 'Ver conversa completa' (log = último outcome) → pergunta mantida (S7 uma vez, no bloco)", () => {
+    const log: ChatMsg[] = [
+      assistant("m46", "Aqui está seu link para pagar R$ 250,00, válido até 27/09/2026.", {
+        type: "open_payment_link",
+        label: "Abrir link de pagamento",
+        href: "https://x.test/i/abc",
+      }),
+    ]
+    const recap = "Olá de novo, Ana. Você já viu os detalhes do valor em aberto. Como prefere seguir?"
+    expect(resolvePromptForRender(offerChoice, log, recap)!.question).toBe(NEGOTIATION_PENDING_TEXT)
+  })
+
+  it("saudação de retorno continua como 2ª fonte (A3): recap termina com a pergunta do menu → vazia", () => {
+    const menu = { ...offerChoice, id: "p-menu", kind: "debt_three_options", question: "Como prefere seguir?" }
+    const recap = "Olá de novo, Ana. Você já viu os detalhes do valor em aberto. Como prefere seguir?"
+    const log: ChatMsg[] = [assistant("d1", "Vencimento original 15/08/2026 · 1 fatura · serviço da VMAX.")]
+    expect(resolvePromptForRender(menu, log, recap)!.question).toBe("")
+    // sem recap e sem bolha igual → intacto
+    expect(resolvePromptForRender(menu, log, null)).toBe(menu)
+  })
+
+  it("log vazio / prompt nulo / pergunta vazia (menu inicial da A1) → sem efeito", () => {
+    expect(lastAssistantVisibleText([])).toBeNull()
+    expect(resolvePromptForRender(null, negotiateLog, null)).toBeNull()
+    const initial = { ...offerChoice, id: "p-initial", kind: "debt_three_options", question: "" }
+    expect(resolvePromptForRender(initial, negotiateLog, null)).toBe(initial)
+    expect(resolvePromptForRender(offerChoice, [], null)).toBe(offerChoice)
   })
 })

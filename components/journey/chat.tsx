@@ -22,8 +22,8 @@ import {
   isNegotiateLabel,
   NEGOTIATION_PENDING_TEXT,
   prunePresentation,
+  resolvePromptForRender,
   splitResumeHistory,
-  stripDuplicateQuestion,
   type ChatMsg,
   type MsgAction,
 } from "./chat-display"
@@ -1198,10 +1198,12 @@ export function JourneyChat() {
     currentGeneration,
   })
   const hiddenCount = resume.collapsed.length + capped.collapsed.length
-  // A3 (§2.2): uma só pergunta na tela — se a saudação de retorno já pergunta
-  // "Como prefere seguir?", o bloco de botões não a repete.
+  // A3 (§2.2) + A4 (B3-F1): uma só pergunta na tela — se a frase do prompt já é
+  // a última bolha visível do assistente (T2 = S7 acima das parcelas) ou já fecha
+  // a saudação de retorno ("… Como prefere seguir?"), o bloco vem só com os
+  // botões. Composição pura em chat-display.resolvePromptForRender.
   const promptForRender =
-    activePrompt && recap && !ended ? stripDuplicateQuestion(activePrompt, recap.text) : activePrompt
+    activePrompt && !ended ? resolvePromptForRender(activePrompt, capped.visible, recap?.text) : activePrompt
   // A1: há bolha persistida do link (ação open_payment_link) para o link corrente?
   const hasPersistedLink = messages.some(
     (m) =>
