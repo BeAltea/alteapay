@@ -34,7 +34,6 @@ import {
   handleDebtNotRecognized,
   kickoffDeadlineMs,
   kickoffNegotiationStart,
-  NEGOTIATE_ACK_TEXT,
   notRecognizedReply,
   persistAssistantMessage,
   presentMatrixOffers,
@@ -425,10 +424,11 @@ export async function POST(req: NextRequest) {
           companyId: ctx.companyId, sessionId: ctx.sessionId,
           customerId: ctx.customerId, debtId: ctx.debtId,
         })
-        // Confirmação NOSSA imediata (T2 / R-26 — a MESMA frase da bolha otimista
+        // Confirmação NOSSA imediata (T2 / R-26 — a MESMA constante da bolha otimista
         // do client e da pergunta das parcelas: A4/S7, NEGOTIATION_PENDING_TEXT em
-        // lib/journey/wait-machine.ts, via NEGOTIATE_ACK_TEXT) — escrita já em curso.
-        const reply = NEGOTIATE_ACK_TEXT
+        // lib/journey/wait-machine.ts; o alias em acknowledgement.ts tem o mesmo
+        // valor) — escrita já em curso.
+        const reply = NEGOTIATION_PENDING_TEXT
         const ackWrite = persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
         let presented: PresentMatrixOffersResult | null = null
         const [, pres] = await Promise.all([

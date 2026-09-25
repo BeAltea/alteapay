@@ -107,8 +107,12 @@ describe("A2 — legado debt_consult / 'Negociar Dívida' [3] apresenta a matriz
     const assistant = db.chat_messages.filter((m) => m.role === "assistant").map((m) => m.text)
     // A4/S24: dados da dívida na linha compacta (sem valor).
     expect(assistant.some((t) => t.startsWith("Vencimento original"))).toBe(true)
-    const iAck = assistant.indexOf(NEGOTIATE_ACK_TEXT)
-    const iQ = assistant.findIndex((t) => /condições disponíveis/i.test(t))
+    // A4/S8 = S7: T2 e a pergunta das parcelas têm o MESMO texto; a ordem é
+    // verificada pelo vínculo ao prompt (T2 sem prompt_id, pergunta ligada ao
+    // offer_choice ativo), não pelo texto.
+    const rows = db.chat_messages.filter((m) => m.role === "assistant")
+    const iAck = rows.findIndex((m) => m.text === NEGOTIATE_ACK_TEXT && !m.prompt_id)
+    const iQ = rows.findIndex((m) => m.prompt_id === active()!.id)
     expect(iAck).toBeGreaterThanOrEqual(0)
     expect(iQ).toBeGreaterThan(iAck)
     // o reply legado "Perfeito!… preparando…" NÃO é gravado quando há parcelas
