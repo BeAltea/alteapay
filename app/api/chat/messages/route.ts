@@ -160,7 +160,15 @@ export async function GET(req: NextRequest) {
   // RECAPITULATIVO de retomada (C7 / R-17): só no 1º poll (since ausente =
   // carregamento inicial/retomada). Nos polls incrementais não repetimos o recap.
   // Montado no servidor a partir das bolhas PRESERVADAS (C3) → idêntico após F5.
-  const recap = since ? null : await buildRecap(claims.sid, claims.cid)
+  // QA round 1 (QAA1-07 / B2 / A1-R10): links MORTOS também no poll incremental —
+  // a bolha do link já renderizada não volta no `since`, então a liveness por
+  // mensagem (acima) não a alcança; `dead_payment_links` traz os hrefs das
+  // cobranças TERMINAIS do cliente nesta empresa a cada poll, e o client desliga
+  // Abrir/Copiar da bolha correspondente no próximo ciclo (2,5 s), sem F5.
+  const [recap, deadPaymentLinks] = await Promise.all([
+    since ? Promise.resolve(null) : buildRecap(claims.sid, claims.cid),
+    deadPaymentLinkHrefs(supabase, claims.sid, claims.cid),
+  ])
 
   return NextResponse.json({
     ok: true,
@@ -170,8 +178,48 @@ export async function GET(req: NextRequest) {
     wait_started_at: waitStartedAt,
     pinned_debt: pinnedDebt,
     recap,
+    dead_payment_links: deadPaymentLinks,
     server_time: new Date().toISOString(),
   })
+}
+
+/**
+ * QA round 1 (QAA1-07) — hrefs das cobranças TERMINAIS (cancelada/estornada) do
+ * cliente da sessão nesta empresa: invoice/payment/boleto/PIX. Isola por
+ * customer_id + company_id (nunca cruza tenant). Best-effort: falha → [].
+ */
+async function deadPaymentLinkHrefs(
+  supabase: ReturnType<typeof createServiceClient>,
+  sessionId: string,
+  companyId: string,
+): Promise<string[]> {
+  try {
+    const { data: sess } = await supabase
+      .from("negotiation_sessions")
+      .select("customer_id")
+      .eq("id", sessionId)
+      .eq("company_id", companyId)
+      .maybeSingle()
+    const customerId = (sess as { customer_id?: string | null } | null)?.customer_id
+    if (!customerId) return []
+    const { data } = await supabase
+      .from("agreements")
+      .select("id, status, payment_status, asaas_payment_id, asaas_invoice_url, asaas_payment_url, asaas_boleto_url, asaas_pix_qrcode_url")
+      .eq("customer_id", customerId)
+      .eq("company_id", companyId)
+      .not("asaas_payment_id", "is", null)
+    const hrefs = new Set<string>()
+    for (const ag of (data ?? []) as Array<AgreementLike & Record<string, unknown>>) {
+      if (!isTerminalAgreement(ag)) continue
+      for (const k of ["asaas_invoice_url", "asaas_payment_url", "asaas_boleto_url", "asaas_pix_qrcode_url"]) {
+        const v = ag[k]
+        if (typeof v === "string" && /^https?:\/\//i.test(v)) hrefs.add(v)
+      }
+    }
+    return [...hrefs]
+  } catch {
+    return []
+  }
 }
 
 /** offers_snapshot.agreement_id das bolhas com ação `open_payment_link`. */

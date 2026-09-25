@@ -872,9 +872,21 @@ export async function presentMatrixOffers(input: {
     listOffers(ctx),
     getCurrentThreadEpoch(input.sessionId),
   ])
+  // QA round 1 (M2): o 'offer_choice' ativo só é reusado quando os seus botões
+  // ainda apontam para o CONJUNTO vigente — se listOffers regenerou (conjunto
+  // parcialmente consumido), um prompt novo com as ofertas novas substitui o
+  // antigo (cujos offer_ids já não são aceitáveis).
   if (existing) {
     const row = existing as PromptRow
-    return { ok: true, presented: true, offers, promptId: row.id, prompt: promptView(row)!, reused: true }
+    const existingIds = Array.isArray((row.context as { offer_ids?: unknown } | null)?.offer_ids)
+      ? ((row.context as { offer_ids: string[] }).offer_ids)
+      : (row.buttons ?? []).map((b) => b.value).filter((v): v is string => typeof v === "string")
+    const currentIds = offers.map((o) => o.id)
+    const sameSet =
+      existingIds.length === currentIds.length && currentIds.every((id) => existingIds.includes(id))
+    if (sameSet || offers.length === 0) {
+      return { ok: true, presented: true, offers, promptId: row.id, prompt: promptView(row)!, reused: true }
+    }
   }
   if (offers.length === 0) return { ok: true, presented: false, reason: "no_offers" }
 

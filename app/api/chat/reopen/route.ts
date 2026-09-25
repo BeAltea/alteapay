@@ -20,6 +20,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { handlePaymentClaim, loadSessionCtx, transferToHuman } from "@/lib/journey/actions"
 import { reopenThreeOptions } from "@/lib/journey/acknowledgement"
+import { isDoubleTapHandoff } from "@/lib/journey/double-tap"
 import { createServiceClient } from "@/lib/supabase/service"
 
 export const dynamic = "force-dynamic"
@@ -85,6 +86,17 @@ export async function POST(req: NextRequest) {
 
   try {
     if (action === "handoff") {
+      // QA round 1 (QAA1-01): um handoff < 2 s depois de um clique válido na
+      // sessão é o 2º toque de um toque duplo (o bloco de espera nascia sob o
+      // ponteiro). Ignorado: nunca transfere/suprime/encerra por um toque que o
+      // devedor não quis dar. O client só faz poll (não reabre o menu).
+      const dt = await isDoubleTapHandoff({
+        sessionId: ctx.sessionId, companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+        source: "reopen",
+      })
+      if (dt.doubleTap) {
+        return NextResponse.json({ ok: true, action: "handoff", transferred: false, ignored: "double_tap" })
+      }
       await transferToHuman(ctx, "wait_degraded_handoff", "customer")
       return NextResponse.json({ ok: true, action: "handoff", transferred: true })
     }

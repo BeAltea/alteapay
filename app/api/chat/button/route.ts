@@ -47,6 +47,7 @@ import {
   type PresentMatrixOffersResult,
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
+import { isDoubleTapHandoff, isDuplicateClick } from "@/lib/journey/double-tap"
 import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { engineName } from "@/lib/negotiation/engine"
 import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"
@@ -105,6 +106,29 @@ async function staleResponse(sessionId: string) {
     { ok: false, error: "prompt_stale", code: "prompt_stale", active_prompt: promptView(active) },
     { status: 409 },
   )
+}
+
+/**
+ * QA round 1 (QAA1-06) — CLIQUE DUPLICADO: o prompt já foi respondido com o
+ * MESMO botão há menos de DUPLICATE_CLICK_WINDOW_MS (POSTs concorrentes, retry).
+ * É o mesmo clique chegando de novo: 200 { ok:true, duplicate:true, prompt } com
+ * o prompt ATIVO no corpo (shape do GET) e NENHUM efeito novo — nem eco, nem
+ * outcome, nem menu, nem re-alvejamento em cascata.
+ */
+async function duplicateResponse(sessionId: string, buttonId: number) {
+  const active = await getActivePrompt(sessionId).catch(() => null)
+  return NextResponse.json({ ok: true, duplicate: true, button_id: buttonId, prompt: promptView(active) })
+}
+
+/**
+ * Recusa de `answerPrompt` por prompt não-ativo (corrida): relê o prompt — se
+ * ele acabou de ser respondido com o MESMO botão, é duplicado (200); senão, 409
+ * prompt_stale com o ativo no corpo (nunca mudo).
+ */
+async function staleOrDuplicate(sessionId: string, promptId: string, buttonId: number) {
+  const fresh = await getPrompt(promptId, sessionId).catch(() => null)
+  if (isDuplicateClick(fresh, buttonId)) return duplicateResponse(sessionId, buttonId)
+  return staleResponse(sessionId)
 }
 
 /**
@@ -207,8 +231,28 @@ export async function POST(req: NextRequest) {
   // a intenção é a mesma → o clique vale para o ativo. Senão (outro kind, botão
   // ausente, rótulo/valor/oferta diferentes), 409 prompt_stale com o ativo no
   // corpo (nunca mudo).
+  // QA round 1 (QAA1-01) — TOQUE DUPLO no handoff: [99] recebido < 2 s depois de
+  // um clique válido neste prompt é o 2º toque de um toque duplo (o bloco de
+  // espera nascia sob o ponteiro). Ignorado com 200: nunca transfere, nunca
+  // suprime, nunca encerra. Decisão auditada (chat.click_ignored). Checado ANTES
+  // do re-alvejamento: o prompt tocado costuma já estar respondido pelo 1º toque.
+  if (buttonId === BTN_HANDOFF) {
+    const dt = await isDoubleTapHandoff({
+      sessionId: ctx.sessionId, companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+      promptId: prompt.id, source: "button",
+    })
+    if (dt.doubleTap) {
+      const active = await getActivePrompt(ctx.sessionId).catch(() => null)
+      return NextResponse.json({ ok: true, button_id: buttonId, ignored: "double_tap", prompt: promptView(active) })
+    }
+  }
+
   let retargetedFrom: string | null = null
   if (prompt.status !== "active") {
+    // QA round 1 (QAA1-06) — o MESMO botão já respondeu este prompt há < 3 s:
+    // clique duplicado (POSTs concorrentes) → 200 duplicate, sem re-alvejar em
+    // cascata. Um 2º clique genuinamente tardio (2ª aba) segue re-alvejado (A1).
+    if (isDuplicateClick(prompt, buttonId)) return duplicateResponse(ctx.sessionId, buttonId)
     const active = await getActivePrompt(ctx.sessionId)
     const staleBtn = findButton(prompt.buttons ?? [], buttonId)
     const liveBtn = active && active.kind === prompt.kind ? findButton(active.buttons ?? [], buttonId) : null
@@ -243,7 +287,7 @@ export async function POST(req: NextRequest) {
       // 1) integridade do clique (ativo/botão existe) + grava a mensagem do cliente.
       const answered = await answerPrompt(answerInput)
       if (!answered.ok) {
-        if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+        if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
         return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
       }
 
@@ -291,14 +335,17 @@ export async function POST(req: NextRequest) {
         )
       }
       if (accepted.status === "already_charged") {
-        // D23/M14: devolve o LINK EXISTENTE, nunca cria 2ª cobrança.
+        // D23/M14: devolve o LINK EXISTENTE, nunca cria 2ª cobrança. QA round 1
+        // (QAA1-02): o link vem resolvido pelo acordo/ASAAS; sem link, o servidor
+        // já persistiu o outcome humano + menu curto e devolve o `prompt` ativo.
         return NextResponse.json({
           ok: true, button_id: buttonId, action: "pay", acknowledged: true,
-          link: accepted.payment?.invoice_url ?? accepted.payment?.boleto_url ?? accepted.payment?.pix_copy_paste ?? null,
+          link: accepted.link,
           valor: accepted.payment?.total_value ?? null,
-          vencimento_link: accepted.payment?.due_date ?? null,
+          vencimento_link: accepted.vencimento_link,
           already_charged: true, processing: false,
           agreement_id: accepted.payment?.agreement_id ?? null,
+          post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt,
         })
       }
       if (accepted.status === "processing") {
@@ -314,11 +361,12 @@ export async function POST(req: NextRequest) {
       // status: 'created' — link pronto (inline).
       return NextResponse.json({
         ok: true, button_id: buttonId, action: "pay", acknowledged: true,
-        link: accepted.payment.invoice_url ?? accepted.payment.boleto_url ?? accepted.payment.pix_copy_paste ?? null,
+        link: accepted.link,
         valor: accepted.payment.total_value ?? null,
-        vencimento_link: accepted.payment.due_date ?? null,
+        vencimento_link: accepted.vencimento_link,
         already_charged: false, processing: false,
         agreement_id: accepted.payment.agreement_id ?? null,
+        post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt,
       })
     } catch (err) {
       console.error("[chat:button] offer_choice falhou:", (err as Error).message)
@@ -337,7 +385,7 @@ export async function POST(req: NextRequest) {
     try {
       const answered = await answerPrompt(answerInput)
       if (!answered.ok) {
-        if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+        if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
         return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
       }
       const { debtIds, primaryDebtId } = debtIdsOf(prompt, ctx.debtId)
@@ -386,7 +434,7 @@ export async function POST(req: NextRequest) {
         // 1) integridade do clique + eco + evento.
         const answered = await answerPrompt(answerInput)
         if (!answered.ok) {
-          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
         // Reconhecimento IMPLÍCITO ANTES do payService (M4): destrava o guard D18.
@@ -412,6 +460,9 @@ export async function POST(req: NextRequest) {
           link: pay.link, valor: pay.valor, vencimento_link: pay.vencimento_link,
           already_charged: pay.already_charged, processing: pay.processing,
           agreement_id: pay.agreement_id, post_prompt_id: pay.post_prompt_id,
+          // QA round 1 (QAA1-02): prompt ATIVO no corpo (pós-link, ou o menu curto
+          // quando não há link resolvível) — o client renderiza na hora.
+          prompt: pay.prompt ?? null,
         })
       }
 
@@ -433,7 +484,7 @@ export async function POST(req: NextRequest) {
         const t0 = Date.now()
         const answered = await answerPrompt(answerInput)
         if (!answered.ok) {
-          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
         const kickoff = kickoffNegotiationStart({
@@ -505,7 +556,7 @@ export async function POST(req: NextRequest) {
           buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds }),
         ])
         if (!answered.ok) {
-          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
         const reply = debtConsultReply(ackCtx)
@@ -528,7 +579,7 @@ export async function POST(req: NextRequest) {
       if (buttonId === BTN_NO) {
         const answered = await answerPrompt(answerInput)
         if (!answered.ok) {
-          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
         const out = await handleDebtNotRecognized({
@@ -577,7 +628,7 @@ export async function POST(req: NextRequest) {
       if (buttonId === BTN_BACK) {
         const answered = await answerPrompt(answerInput)
         if (!answered.ok) {
-          if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+          if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
         const back = await reopenThreeOptions({
@@ -594,7 +645,7 @@ export async function POST(req: NextRequest) {
       // (e qualquer botão fora do catálogo esperado: responde, sem efeito.)
       const answered = await answerPrompt(answerInput)
       if (!answered.ok) {
-        if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+        if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
         return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
       }
       if (buttonId === BTN_HANDOFF) {
@@ -627,7 +678,7 @@ export async function POST(req: NextRequest) {
     //    A integridade do clique (ativo/botão existe) é validada aqui.
     const answered = await answerPrompt(answerInput)
     if (!answered.ok) {
-      if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+      if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
       return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
     }
 
@@ -717,7 +768,7 @@ export async function POST(req: NextRequest) {
       userAgent,
     })
     if (!res.ok) {
-      if (res.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+      if (res.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
       return NextResponse.json({ error: res.code, code: res.code }, { status: res.status })
     }
 
@@ -805,7 +856,7 @@ export async function POST(req: NextRequest) {
   if (buttonId === BTN_HANDOFF) {
     const answered = await answerPrompt(answerInput)
     if (!answered.ok) {
-      if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+      if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
       return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
     }
     await transferToHuman(ctx, "handoff_button", "customer")
@@ -816,7 +867,7 @@ export async function POST(req: NextRequest) {
   // do cliente).
   const answered = await answerPrompt(answerInput)
   if (!answered.ok) {
-    if (answered.code === "prompt_not_active") return staleResponse(ctx.sessionId)
+    if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
     return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
   }
 

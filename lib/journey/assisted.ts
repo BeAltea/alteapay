@@ -16,8 +16,10 @@
 //
 // A1: o link é persistido como OUTCOME (bolha com ação open_payment_link +
 // stage 'payment_link') e, logo após, o servidor persiste o prompt pós-link —
-// a MESMA peça do PAGAR à vista (persistPaymentLinkMessage /
-// publishPostPaymentLinkPrompt em pay.ts), para o reload restaurar link + ações.
+// a MESMA peça do PAGAR à vista (deliverPaymentOutcome em pay.ts), para o
+// reload restaurar link + ações. QA round 1 (QAA1-02): sem link resolvível
+// (acordo parcelado sem URL, guard nível-ASAAS), a MESMA peça persiste o
+// outcome humano + menu curto — nunca `ok:true` sem outcome e sem prompt.
 
 import {
   paymentCreateOrExistingLink,
@@ -25,40 +27,26 @@ import {
   type PaymentDetails,
 } from "./payment-actions"
 import type { SessionCtx } from "./actions"
-import { linkOf, persistPaymentLinkMessage, publishPostPaymentLinkPrompt } from "./pay"
+import { deliverPaymentOutcome, type DeliveredPaymentOutcome } from "./pay"
+import type { PromptView } from "./prompts"
+
+/** Campos entregues junto do resultado (link resolvido + prompt ativo). */
+interface DeliveredFields {
+  link: string | null
+  vencimento_link: string | null
+  post_prompt_id: string | null
+  prompt: PromptView | null
+}
 
 export type AssistedAcceptResult =
-  | { ok: true; status: "created"; agreementId: string; payment: PaymentDetails }
+  | ({ ok: true; status: "created"; agreementId: string; payment: PaymentDetails } & DeliveredFields)
   | { ok: true; status: "processing"; agreementId: string; pollAfterMs: number }
   // já cobrada: reenvia o LINK EXISTENTE (nunca recria a cobrança).
-  | { ok: true; status: "already_charged"; payment: PaymentDetails | null; paymentStatus: string | null }
+  | ({ ok: true; status: "already_charged"; payment: PaymentDetails | null; paymentStatus: string | null } & DeliveredFields)
   | { ok: false; status: number; code: string; message: string }
 
-/** Bolha do link (outcome) + prompt pós-link, best-effort (nunca lança). */
-async function persistOfferLinkOutcome(
-  ctx: SessionCtx,
-  payment: PaymentDetails | null,
-  alreadyCharged: boolean,
-): Promise<void> {
-  const link = linkOf(payment)
-  if (!link) return
-  try {
-    await persistPaymentLinkMessage(ctx, {
-      link,
-      valor: payment?.total_value ?? null,
-      vencimentoLink: payment?.due_date ?? null,
-      alreadyCharged,
-      agreementId: payment?.agreement_id ?? null,
-    })
-    await publishPostPaymentLinkPrompt(ctx, {
-      link,
-      agreementId: payment?.agreement_id ?? null,
-      debtIds: [ctx.debtId],
-      primaryDebtId: ctx.debtId,
-    })
-  } catch (err) {
-    console.warn("[journey] persistOfferLinkOutcome falhou (não fatal):", (err as Error).message)
-  }
+function fields(d: DeliveredPaymentOutcome): DeliveredFields {
+  return { link: d.link, vencimento_link: d.vencimentoLink, post_prompt_id: d.postPromptId, prompt: d.prompt }
 }
 
 /**
@@ -78,12 +66,18 @@ export async function acceptMatrixCondition(
     // Sem link ainda (worker gerando): não persiste nada — nasce depois no poll.
     return { ok: true, status: "processing", agreementId: r.agreement_id, pollAfterMs: r.poll_after_ms }
   }
+  const alreadyCharged = r.status === "already_charged" || r.idempotent === true
+  // G5/R7 — grava o link (existente ou recém-gerado) no histórico (idempotente):
+  // reload restaura. QAA1-02: sem link, outcome humano + menu curto.
+  const delivered = await deliverPaymentOutcome(ctx, {
+    payment: r.payment,
+    alreadyCharged,
+    valor: r.payment?.total_value ?? null,
+    debtIds: [ctx.debtId],
+    primaryDebtId: ctx.debtId,
+  })
   if (r.status === "already_charged") {
-    // G5/R7 — grava o link existente no histórico (idempotente): reload restaura.
-    await persistOfferLinkOutcome(ctx, r.payment, true)
-    return { ok: true, status: "already_charged", payment: r.payment, paymentStatus: r.payment_status }
+    return { ok: true, status: "already_charged", payment: r.payment, paymentStatus: r.payment_status, ...fields(delivered) }
   }
-  // G5/R7 — grava o link recém-gerado no histórico (idempotente): reload restaura.
-  await persistOfferLinkOutcome(ctx, r.payment, r.idempotent === true)
-  return { ok: true, status: "created", agreementId: r.payment.agreement_id, payment: r.payment }
+  return { ok: true, status: "created", agreementId: r.payment.agreement_id, payment: r.payment, ...fields(delivered) }
 }

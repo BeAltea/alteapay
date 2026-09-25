@@ -254,7 +254,17 @@ describe("R-38 — CONSULTAR 2x: 1 reply, 2º clique re-alvejado (nunca mudo)", 
     const b1 = await r1.json()
     expect(b1.action).toBe("consult")
     const menu2 = db.chat_prompts.find((p) => p.status === "active")!
-    // 2º clique no MESMO prompt (agora answered) → re-alvejado ao menu ativo
+    // QA round 1 (QAA1-06): o MESMO botão instantes depois é o mesmo clique
+    // chegando de novo → 200 duplicate (sem eco/outcome/menu novo, nunca mudo).
+    const rDup = await POST(buttonReq(await signed(), { prompt_id: prompt.id, button_id: 2 }))
+    const bDup = await rDup.json()
+    expect(rDup.status).toBe(200)
+    expect(bDup).toMatchObject({ ok: true, duplicate: true })
+    expect(bDup.prompt?.id).toBe(menu2.id)
+    expect(db.chat_prompts.find((p) => p.status === "active")!.id).toBe(menu2.id)
+    // 2º clique GENUINAMENTE tardio (2ª aba, fora da janela) no MESMO prompt
+    // (agora answered) → re-alvejado ao menu ativo (A1 preservada)
+    db.chat_prompts.find((p) => p.id === prompt.id)!.answered_at = new Date(Date.now() - 60_000).toISOString()
     const r2 = await POST(buttonReq(await signed(), { prompt_id: prompt.id, button_id: 2 }))
     const b2 = await r2.json()
     expect(r2.status).toBe(200)
@@ -290,11 +300,11 @@ describe("R-39 — PAGAR duplo concorrente: idempotente (1 cobrança, 409 tratad
       POST(buttonReq(jwt, { prompt_id: prompt.id, button_id: 4 })),
     ])
     const [b1, b2] = [await r1.json(), await r2.json()]
-    // exatamente UM converteu o prompt; o outro pega 409 prompt_stale (A1: o
-    // ativo agora é o prompt pós-link, de OUTRO kind → sem re-alvejamento) —
-    // NUNCA silêncio: ambos devolvem JSON com status/código.
-    const codes = [b1, b2].map((b) => b.code ?? (b.action === "pay" ? "pay" : "ok"))
-    expect(codes).toContain("prompt_stale")
+    // exatamente UM converteu o prompt; o outro é o MESMO clique chegando de novo
+    // (QA round 1 / QAA1-06: 200 duplicate — nunca 409 mudo, nunca re-alvejado em
+    // cascata). NUNCA silêncio: ambos devolvem JSON com status/código.
+    const codes = [b1, b2].map((b) => b.code ?? (b.duplicate ? "duplicate" : b.action === "pay" ? "pay" : "ok"))
+    expect(codes).toContain("duplicate")
     expect(codes).toContain("pay")
     // NUNCA 2 cobranças: confirmAccept (payment.create canônico) roda no máximo 1x.
     expect(confirmCalls).toBeLessThanOrEqual(1)

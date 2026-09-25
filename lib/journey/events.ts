@@ -17,6 +17,9 @@ export type JourneyEventType =
   | "auth.attempt" | "auth.failed" | "auth.locked" | "auth.success"
   | "consent.given" | "session.started"
   | "chat.turn.customer" | "chat.turn.assistant" | "chat.engine_error" | "chat.engine_invalid_action"
+  // QA round 1 (QAA1-01): clique/toque ignorado pelo servidor (toque duplo em
+  // handoff). Auditoria da decisão; payload sem PII (ids, janela, instante).
+  | "chat.click_ignored"
   | "debt.viewed"
   | "debt.acknowledged" | "debt.not_recognized"
   | "offer.presented" | "offer.invalid" | "offer.accepted" | "offer.rejected" | "offer.expired"

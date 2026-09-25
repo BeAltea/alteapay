@@ -17,6 +17,7 @@ import {
   CURRENT_GENERATION,
   generationOfKind,
   isProtectedClass,
+  OUTCOME_STAGES,
   type DisplayClass,
 } from "@/lib/journey/display-class"
 import type { WaitState } from "@/lib/journey/wait-machine"
@@ -74,27 +75,77 @@ export function isNegotiateLabel(label: string): boolean {
   return /\bnegociar\b/i.test(label)
 }
 
+/** QA round 1 (F-QAA3-1 / QAA1-06): bolha do assistente que é o RESULTADO de um
+ *  clique (ação anexada ou stage de outcome) — cada eco tem a sua resposta, o
+ *  dedup por conteúdo nunca a apaga (senão o clique parece "não ter feito nada"). */
+function isClickBoundOutcome(m: ChatMsg): boolean {
+  if (m.from !== "assistant") return false
+  if (m.action) return true
+  return !!m.stage && OUTCOME_STAGES.has(m.stage)
+}
+
 // Colapsa bolhas do ASSISTENTE com texto idêntico, mantendo apenas a ÚLTIMA
 // ocorrência (na posição original da última). O servidor pode re-persistir a
 // mesma resposta ("Aqui estão os dados...", saudação re-bootstrapada) — aqui
 // garantimos "só a última resposta" na EXIBIÇÃO, sem tocar no buffer bruto nem
-// no backend. Bolhas do cliente e bolhas com <a> de ação nunca são colapsadas.
+// no backend. Bolhas do cliente, bolhas com <a> de ação e OUTCOMES ligados a um
+// clique (stage detail/payment_link/…) nunca são colapsadas aqui — a repetição
+// de um par "clique → mesmo resultado" é tratada por collapseConsecutiveDecisions
+// (QA round 1: antes, o dedup apagava a resposta dos ecos anteriores e o colapso,
+// que já tinha rodado, deixava os ecos órfãos e consecutivos).
 export function dedupAssistantByContent(list: ChatMsg[]): ChatMsg[] {
   // 1º passo: para cada texto assistant "colapsável", achar o índice da ÚLTIMA
   // ocorrência.
   const lastIdxByText = new Map<string, number>()
   list.forEach((m, i) => {
     if (m.from !== "assistant") return
-    if (m.action) return // ação anexada: preserva sempre
+    if (isClickBoundOutcome(m)) return // resultado de um clique: preserva sempre
     lastIdxByText.set(m.text.trim(), i)
   })
   // 2º passo: manter cliente sempre; manter assistant só na última ocorrência
   // do seu texto (ou se não for colapsável).
   return list.filter((m, i) => {
     if (m.from !== "assistant") return true
-    if (m.action) return true
+    if (isClickBoundOutcome(m)) return true
     return lastIdxByText.get(m.text.trim()) === i
   })
+}
+
+/** Ação `open_payment_link` de uma bolha do LINK: a anexada pelo servidor ou,
+ *  para uma bolha persistida com stage 'payment_link' que chegou sem a ação
+ *  (shape malformado), derivada da URL http(s) do próprio texto — o painel
+ *  Abrir/Copiar sempre deriva da bolha, em qualquer viewport (QAA1-08). */
+export function paymentLinkActionOf(m: ChatMsg): MsgAction | null {
+  if (m.from !== "assistant") return null
+  if (m.action?.type === "open_payment_link") return m.action
+  if (m.action) return null // outra ação (external_link): não é link de pagamento
+  if (m.stage !== "payment_link") return null
+  const url = /https?:\/\/\S+/i.exec(m.text ?? "")?.[0] ?? null
+  return url ? { type: "open_payment_link", label: "Abrir link de pagamento", href: url } : null
+}
+
+/** QA round 1 (QAA1-07): um link está VIVO quando o servidor não o marcou morto
+ *  na mensagem (`live:false`) NEM listou o href entre as cobranças terminais do
+ *  cliente (`dead_payment_links`, atualizado a cada poll — inclusive incremental). */
+export function isLivePaymentLink(
+  action: MsgAction | null | undefined,
+  deadHrefs: ReadonlySet<string> | null | undefined,
+): boolean {
+  if (!action || action.type !== "open_payment_link") return false
+  if (action.live === false) return false
+  return !(deadHrefs && deadHrefs.has(action.href))
+}
+
+/** id da ÚLTIMA bolha de link VIVO (a única que ganha o painel Abrir/Copiar). */
+export function latestLivePaymentLinkId(
+  list: ChatMsg[],
+  deadHrefs: ReadonlySet<string> | null | undefined,
+): string | null {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]
+    if (isLivePaymentLink(paymentLinkActionOf(m), deadHrefs)) return m.id
+  }
+  return null
 }
 
 // ============================================================================
@@ -178,14 +229,31 @@ function decisionKey(m: ChatMsg): string {
   return `${m.buttonId ?? "-"}|${label}`
 }
 
+/** Um TURNO = uma decision + o que o assistente respondeu até a próxima decision.
+ *  `outcomes` = textos (normalizados) dos resultados do turno — a "assinatura" do
+ *  que aquele clique produziu. */
+interface DecisionTurn {
+  decision: ChatMsg
+  outcomes: ChatMsg[]
+}
+
+const normText = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase()
+
+function outcomeSignature(t: DecisionTurn): string {
+  return t.outcomes.map((o) => normText(o.text)).sort().join("\u0000")
+}
+
 /**
  * A3 (§2.4) — COLAPSO DE DECISÕES CONSECUTIVAS IGUAIS: cliques repetidos no
- * mesmo botão (mesmo button_id + mesmo rótulo) SEM um outcome entre eles viram
- * UM — fica a ÚLTIMA ocorrência, na posição dela. Guidance entre os cliques não
- * separa (a pilha "Consultar › Consultar" é ruído); um OUTCOME separa (cada clique
- * que produziu resultado é memória legítima: "Pagar › link › Pagar › já tem"). Só
- * decisions da geração corrente contam (as anteriores já são superseded).
- * Pura, determinística; preserva a ordem.
+ * mesmo botão (mesmo button_id + mesmo rótulo) viram UM — fica a ÚLTIMA
+ * ocorrência, na posição dela. Guidance entre os cliques não separa (a pilha
+ * "Consultar › Consultar" é ruído). Um OUTCOME DIFERENTE separa (cada clique que
+ * produziu um resultado distinto é memória legítima: "Pagar › link › Pagar › já
+ * tem"). QA round 1 (QAA1-06 / F-QAA3-1): dois turnos consecutivos com a MESMA
+ * decisão e o MESMO resultado ("Detalhes › vencimento… › Detalhes › vencimento…")
+ * também colapsam — ficam o último eco e o seu resultado, nunca um eco órfão
+ * sem resposta. Só decisions da geração corrente contam (as anteriores já são
+ * superseded). Pura, determinística; preserva a ordem.
  */
 export function collapseConsecutiveDecisions(
   list: ChatMsg[],
@@ -193,17 +261,29 @@ export function collapseConsecutiveDecisions(
   waitState: WaitState | null,
   currentGeneration: number | null = null,
 ): ChatMsg[] {
-  const drop = new Set<string>()
-  let prev: ChatMsg | null = null
+  // 1) agrupa em turnos (o que vem antes da 1ª decision não é turno).
+  const turns: DecisionTurn[] = []
   for (const m of list) {
     const cls = classOf(m, activePromptId, waitState, currentGeneration)
-    if (cls === "outcome") {
-      prev = null // um resultado entre cliques fecha a sequência
+    if (cls === "decision") {
+      turns.push({ decision: m, outcomes: [] })
       continue
     }
-    if (cls !== "decision") continue
-    if (prev && decisionKey(prev) === decisionKey(m)) drop.add(prev.id)
-    prev = m
+    if (cls === "outcome" && turns.length > 0) turns[turns.length - 1].outcomes.push(m)
+  }
+  // 2) turno anterior colapsa no seguinte quando a decisão é a mesma e
+  //    (a) o anterior não produziu resultado (clique repetido, ruído), ou
+  //    (b) produziu EXATAMENTE o mesmo resultado (par clique→resposta repetido).
+  const drop = new Set<string>()
+  for (let i = 1; i < turns.length; i++) {
+    const prev = turns[i - 1]
+    const cur = turns[i]
+    if (decisionKey(prev.decision) !== decisionKey(cur.decision)) continue
+    const sameOutcome = prev.outcomes.length > 0 && outcomeSignature(prev) === outcomeSignature(cur)
+    if (prev.outcomes.length === 0 || sameOutcome) {
+      drop.add(prev.decision.id)
+      for (const o of prev.outcomes) drop.add(o.id)
+    }
   }
   return drop.size === 0 ? list : list.filter((m) => !drop.has(m.id))
 }
