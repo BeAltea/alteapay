@@ -97,6 +97,60 @@ export function shouldShowSlowExits(step: WaitStep): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// QA round 1 (QAA1-01, BLOQUEANTE em produção) — o bloco de espera nascia no
+// instante do clique em "Negociar", sob o ponteiro, com [Falar com atendimento]
+// habilitado: um toque duplo transferia ao atendimento, suprimia o devedor e
+// encerrava a conversa. Regras PURAS (o chat.tsx só as consome):
+//  - o clique NÃO arma a espera: ela só arma quando o servidor responde SEM
+//    parcelas (wait_state) ou quando o poll reidrata (negotiateWaitOnResponse);
+//  - as saídas de um bloco de espera/degradação/erro ficam INERTES por
+//    WAIT_EXITS_ARM_MS depois de o bloco aparecer (areWaitExitsArmed);
+//  - "Falar com atendimento" a partir da espera só existe do degrau d3 (10 s)
+//    em diante (shouldShowWaitHandoffExit) — antes disso, só "Pagar agora".
+// ---------------------------------------------------------------------------
+
+/** Tempo mínimo entre o bloco de saídas aparecer e as suas ações responderem.
+ *  QA round 2 (B6 M-1): ≥ janela do toque duplo do servidor (DOUBLE_TAP_WINDOW_MS
+ *  = 2000, double-tap.ts) + folga de relógio DB×função — um clique legítimo numa
+ *  saída armada nunca cai na janela em que o servidor o ignoraria. */
+export const WAIT_EXITS_ARM_MS = 2500
+
+/** true quando as saídas já podem responder a um toque (≥ WAIT_EXITS_ARM_MS
+ *  desde que o bloco apareceu). Sem instante conhecido → inerte. */
+export function areWaitExitsArmed(shownAtMs: number | null | undefined, nowMs: number): boolean {
+  if (typeof shownAtMs !== "number" || !Number.isFinite(shownAtMs)) return false
+  return nowMs - shownAtMs >= WAIT_EXITS_ARM_MS
+}
+
+/** "Falar com atendimento" a partir da ESPERA (aguardando_motor): só de d3 em
+ *  diante. Na degradação (d4) e nos painéis de erro/processing a saída existe
+ *  desde o início (com o arming acima). */
+export function shouldShowWaitHandoffExit(step: WaitStep): boolean {
+  return shouldShowSlowExits(step)
+}
+
+/** Shape mínimo da resposta do POST do clique Negociar. */
+export interface NegotiateResponseLike {
+  ok?: boolean
+  action?: string | null
+  offers_presented?: boolean
+  wait_state?: string | null
+}
+
+/**
+ * Decide se a resposta do Negociar ARMA a espera: só quando o servidor não
+ * apresentou parcelas e sinalizou `wait_state:'aguardando_motor'`. Com parcelas
+ * no corpo (A2) ou qualquer outro desfecho, nada de espera (nem bloco, nem
+ * saídas) — o menu de parcelas é a ação imediatamente disponível.
+ */
+export function negotiateWaitOnResponse(data: NegotiateResponseLike | null | undefined): boolean {
+  if (!data || data.ok !== true) return false
+  if (data.action !== "negotiate") return false
+  if (data.offers_presented === true) return false
+  return data.wait_state === "aguardando_motor"
+}
+
+// ---------------------------------------------------------------------------
 // Copy dos degraus (03-copy.md §2). D1 não tem texto próprio (só o indicador).
 // A copy do D0 (eco A.2) é gravada no servidor pelo clique NEGOCIAR (D1) e vem
 // no histórico — aqui só as trocas narradas que a máquina reescreve na bolha de

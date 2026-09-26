@@ -129,7 +129,20 @@ describe("re-alvejamento: prompt obsoleto + ativo do MESMO kind com o MESMO bot�
     const p2 = active()!
     expect(p2.id).not.toBe(p1.id)
 
-    // client atrasado / 2ª aba: clica de novo em p1 (answered) com o mesmo botão
+    // QA round 1 (QAA1-06): o MESMO botão no MESMO prompt logo em seguida é o
+    // mesmo clique chegando de novo → 200 duplicate, sem efeito novo (o menu
+    // ativo p2 continua ativo; nenhum eco/outcome novo; nada re-alvejado).
+    const rDup = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 2 }))
+    const bDup = await rDup.json()
+    expect(rDup.status).toBe(200)
+    expect(bDup).toMatchObject({ ok: true, duplicate: true })
+    expect(bDup.prompt?.id).toBe(p2.id)
+    expect(active()!.id).toBe(p2.id)
+    expect(db.chat_messages.filter((m) => m.role === "customer" && m.button_id === 2).length).toBe(1)
+
+    // client atrasado / 2ª aba, GENUINAMENTE tardio (fora da janela de duplicidade):
+    // clica de novo em p1 (answered) com o mesmo botão → re-alvejado (A1).
+    db.chat_prompts.find((p) => p.id === p1.id)!.answered_at = new Date(Date.now() - 60_000).toISOString()
     const r2 = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 2 }))
     const b2 = await r2.json()
     expect(r2.status).toBe(200)
@@ -222,7 +235,7 @@ describe("409 prompt_stale: ativo de OUTRO kind ou sem o botão → aviso + acti
     expect(b.active_prompt).toBeNull()
   })
 
-  it("corrida: 2 cliques concorrentes no MESMO Pagar → 1 'pay' + 1 prompt_stale (nunca prompt_not_active mudo, nunca 2 cobranças)", async () => {
+  it("corrida: 2 cliques concorrentes no MESMO Pagar → 1 'pay' + 1 duplicate (nunca prompt_not_active mudo, nunca 2 cobranças)", async () => {
     const { POST } = await import("@/app/api/chat/button/route")
     const p1 = await bootstrap()
     const jwt = await signed()
@@ -231,9 +244,11 @@ describe("409 prompt_stale: ativo de OUTRO kind ou sem o botão → aviso + acti
       POST(buttonReq(jwt, { prompt_id: p1.id, button_id: 4 })),
     ])
     const bodies = [await r1.json(), await r2.json()]
-    const codes = bodies.map((b) => b.code ?? b.action)
+    // QA round 1 (QAA1-06): o perdedor é o MESMO clique (mesmo prompt + mesmo
+    // botão, instantes depois) → 200 duplicate, nunca 409 mudo, nunca 2ª cobrança.
+    const codes = bodies.map((b) => b.code ?? (b.duplicate ? "duplicate" : b.action))
     expect(codes).toContain("pay")
-    expect(codes).toContain("prompt_stale")
+    expect(codes).toContain("duplicate")
     expect(codes).not.toContain("prompt_not_active")
     expect(confirmCalls).toBe(1)
   })

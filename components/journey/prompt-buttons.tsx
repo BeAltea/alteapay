@@ -154,6 +154,10 @@ export function PromptButtons({
             : undefined
         }
         className={tierClass(tier)}
+        // QA round 3 (QAB3-05): enquanto pendente o VISUAL mostra "…", mas o
+        // nome acessível continua o rótulo (aria-label) e o estado é aria-busy.
+        aria-busy={pending === b.id || undefined}
+        aria-label={pending === b.id ? b.label : undefined}
       >
         {pending === b.id ? "…" : b.label}
       </button>

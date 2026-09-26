@@ -16,7 +16,7 @@
 // chat funciona normalmente (degradação graciosa).
 
 import { createServiceClient } from "@/lib/supabase/service"
-import { firstNameOf } from "./acknowledgement"
+import { firstNameOf } from "./first-name"
 
 /** Estado retomável que escolhe o template do recap. */
 export type RecapState =
@@ -172,11 +172,13 @@ export async function buildRecap(
     if (opts.firstName === undefined && sess?.customer_id) {
       const { data: customer } = await supabase
         .from("customers")
-        .select("name")
+        .select("name, document")
         .eq("id", sess.customer_id)
         .eq("company_id", companyId)
         .maybeSingle()
-      firstName = firstNameOf((customer as { name?: string | null } | null)?.name) || null
+      const row = customer as { name?: string | null; document?: string | null } | null
+      // QAB3-03: razão social/CNPJ → null → "Olá de novo." (sem nome).
+      firstName = firstNameOf(row?.name, row?.document)
     }
 
     // escolhe o estado retomável a partir de wait_state + sinais das bolhas.

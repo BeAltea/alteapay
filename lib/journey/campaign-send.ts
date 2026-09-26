@@ -9,6 +9,7 @@ import { getWhatsAppProvider, resolveDispatchMode } from "@/lib/whatsapp"
 import { loadVoxuyApiConfig, coerceFlowId } from "@/lib/whatsapp/voxuy/config"
 import { whatsappQueue } from "@/lib/queue/queues"
 import { recordEvent } from "./events"
+import { firstNameOf } from "./first-name"
 import { isSuppressed } from "./suppressions"
 import { issueActionTokens } from "./tokens"
 import { dispatchEmailInvite, dispatchRenderedEmail } from "./email-dispatch"
@@ -132,7 +133,8 @@ export async function processCampaignMessage(
   ])
   const branding = (cfg?.branding ?? {}) as { brand_name?: string; creditor_name?: string }
   const voxuyEvents = (cfg?.voxuy_events ?? {}) as { approach?: number | null; stop?: number | null; receipt?: number | null }
-  const firstName = (customer?.name ?? "").trim().split(/\s+/)[0] ?? ""
+  // QAB3-03: fonte única do primeiro nome (razão social/CNPJ → sem nome).
+  const firstName = firstNameOf(customer?.name, customer?.document) ?? ""
   const brandName = branding.brand_name ?? "AlteaPay"
   const creditorName = branding.creditor_name ?? company?.name ?? brandName
 
@@ -424,11 +426,6 @@ async function sendWhatsAppDecision(
     },
     paused: outcome === "paused",
   }
-}
-
-/** Primeiro nome do destinatário (para a variável {{primeiro_nome}}). Sem PII no log. */
-function firstNameOf(name: string | null | undefined): string {
-  return (name ?? "").trim().split(/\s+/)[0] ?? ""
 }
 
 /**
@@ -726,11 +723,11 @@ export async function runHubSend(input: {
     if (emailIds.length > 0) {
       const { data: names } = await supabase
         .from("customers")
-        .select("id, name")
+        .select("id, name, document")
         .eq("company_id", input.companyId)
         .in("id", emailIds)
-      for (const c of (names ?? []) as { id: string; name: string | null }[]) {
-        emailFirstNames.set(c.id, firstNameOf(c.name))
+      for (const c of (names ?? []) as { id: string; name: string | null; document?: string | null }[]) {
+        emailFirstNames.set(c.id, firstNameOf(c.name, c.document) ?? "")
       }
     }
   }

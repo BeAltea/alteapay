@@ -42,6 +42,7 @@ import {
   buildAckContext,
   persistAssistantMessage,
   REOPEN_MENU_QUESTION,
+  reopenThreeOptions,
   type MessageAction,
 } from "./acknowledgement"
 import { debtSummary, type DebtSummary, type SessionCtx } from "./actions"
@@ -51,10 +52,11 @@ import {
   paymentCreateOrExistingLink,
   type PaymentDetails,
 } from "./payment-actions"
-import { createPrompt, getActivePrompt, type PromptRow } from "./prompts"
+import { createPrompt, getActivePrompt, promptView, type PromptRow, type PromptView } from "./prompts"
 import { payLinkMessageText } from "./pay-poll"
 import { createServiceClient } from "@/lib/supabase/service"
-import { isBlockingAgreement } from "@/lib/asaas-idempotency"
+import { isBlockingAgreement, isBlockingPayment } from "@/lib/asaas-idempotency"
+import { PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import {
   persistOffer,
@@ -189,6 +191,243 @@ export async function publishPostPaymentLinkPrompt(
   }
 }
 
+// ---------------------------------------------------------------------------
+// QA round 1 (QAA1-02 / A1-R3) — `already_charged` NUNCA é beco.
+// Em produção, Pagar com uma cobrança viva de OFERTA ACEITA (acordo 3x) devolvia
+// `already_charged:true, link:null` sem bolha nem prompt: menu consumido, tela
+// sem botões (também após F5). Agora o servidor: (1) resolve o link vivo pelo
+// acordo (paymentStatus) e, faltando URL local, pelo ASAAS (`asaas_payment_id`
+// ou a cobrança viva do cliente — guard nível-ASAAS sem acordo local, R3);
+// (2) com link, persiste a bolha + prompt pós-link como no caminho normal;
+// (3) sem link, persiste um OUTCOME humano (stage 'charge_active') + reabre o
+// menu curto. Nunca `ok:true` sem outcome e sem prompt.
+// ---------------------------------------------------------------------------
+
+/** Marcador de estágio do outcome "cobrança ativa sem link" (OUTCOME_STAGES). */
+export const CHARGE_ACTIVE_STAGE = "charge_active"
+
+/** Copy humana do outcome sem link (Apêndice B: frases curtas, sem sistema). */
+export const ALREADY_CHARGED_NO_LINK_TEXT =
+  "Você já tem uma cobrança ativa. Se o link não aparecer, fale com o atendimento."
+
+/** Melhor URL de uma cobrança ASAAS: checkout (invoiceUrl) › boleto › PIX. */
+function asaasPaymentLink(p: { invoiceUrl?: string | null; bankSlipUrl?: string | null; pixQrCodeUrl?: string | null } | null | undefined): string | null {
+  if (!p) return null
+  return p.invoiceUrl ?? p.bankSlipUrl ?? p.pixQrCodeUrl ?? null
+}
+
+/**
+ * QA round 2 (B6 B-2) — cobrança PAGÁVEL: viva no ASAAS (isBlockingPayment — nunca
+ * deletada/estornada) E ainda não paga (RECEIVED/CONFIRMED/RECEIVED_IN_CASH). Uma
+ * cobrança já recebida com o local defasado não vira "cobrança ativa, use o
+ * link"; cai no outcome humano (sem link) — e nunca declara pago (D6; quem
+ * fecha é o webhook).
+ */
+export function isPayableCharge(p: { status?: string | null; deleted?: boolean } | null | undefined): boolean {
+  if (!p || !isBlockingPayment(p)) return false
+  return !(PAID_ASAAS_STATUSES as readonly string[]).includes(p.status ?? "")
+}
+
+/** Shape mínimo de uma cobrança ASAAS para o mapeamento (sem PII). */
+export interface AsaasChargeLike {
+  id?: string
+  status?: string | null
+  deleted?: boolean
+  value?: number
+  dueDate?: string | null
+  invoiceUrl?: string | null
+  bankSlipUrl?: string | null
+  pixQrCodeUrl?: string | null
+  externalReference?: string | null
+  /** id do plano de parcelamento (presente em cada parcela de um parcelado). */
+  installment?: string | null
+}
+
+/** Acordo local mínimo para o mapeamento (sempre lido por customer_id + company_id). */
+export interface AgreementChargeRef {
+  id: string
+  asaas_payment_id: string | null
+  agreed_amount?: number | null
+  due_date?: string | null
+}
+
+/**
+ * QA round 2 (B6 M-2) — passo 2 do `resolveLiveChargeLink`: entre as cobranças
+ * VIVAS do cliente no ASAAS, só é exibida a que é MAPEÁVEL a esta empresa/dívida:
+ *  - `id` = `asaas_payment_id` de um acordo desta `company_id` (qualquer status
+ *    local — o ASAAS diz se está viva), com o TOTAL do acordo (B-3); ou
+ *  - `externalReference` = `journey_<esta sessão>_…` (cobrança desta sessão cujo
+ *    acordo não ficou gravado): total = `value` só numa cobrança única (numa
+ *    parcela o total é desconhecido → copy sem valor).
+ * Uma cobrança viva de OUTRO cedente/legada (mesmo CPF, mesma conta ASAAS) nunca
+ * é exibida como "a sua cobrança ativa": sem mapeamento → null → outcome
+ * `charge_active` sem link (caminho humano). Pura.
+ */
+export function matchLiveChargeToAgreement(
+  payments: AsaasChargeLike[] | null | undefined,
+  agreements: AgreementChargeRef[] | null | undefined,
+  sessionId: string,
+): { payment: AsaasChargeLike; link: string; total: number | null; agreementId: string | null } | null {
+  const byPaymentId = new Map<string, AgreementChargeRef>()
+  for (const ag of agreements ?? []) if (ag.asaas_payment_id) byPaymentId.set(ag.asaas_payment_id, ag)
+  const sessionRef = `journey_${sessionId}_`
+  for (const p of payments ?? []) {
+    if (!isPayableCharge(p)) continue
+    const link = asaasPaymentLink(p)
+    if (!link) continue
+    const ag = p.id ? byPaymentId.get(p.id) : undefined
+    if (ag) {
+      const total = typeof ag.agreed_amount === "number" ? ag.agreed_amount : typeof p.value === "number" ? p.value : null
+      return { payment: p, link, total, agreementId: ag.id }
+    }
+    if (typeof p.externalReference === "string" && p.externalReference.startsWith(sessionRef)) {
+      const total = !p.installment && typeof p.value === "number" ? p.value : null
+      return { payment: p, link, total, agreementId: null }
+    }
+  }
+  return null
+}
+
+/**
+ * Resolve o LINK VIVO de uma cobrança existente. Ordem: URLs do acordo local →
+ * ASAAS pela `asaas_payment_id` do acordo (só se a cobrança continua PAGÁVEL —
+ * isPayableCharge, B-2) → cobrança viva do cliente no ASAAS MAPEÁVEL a um
+ * acordo desta empresa/sessão (matchLiveChargeToAgreement, M-2). Best-effort:
+ * nunca lança; sem link → null (o chamador persiste o outcome humano). Quando
+ * resolve pelo ASAAS e há acordo local, grava as URLs de volta (não-fatal).
+ * O `total` é o TOTAL do acordo (`agreed_amount`): numa cobrança parcelada o
+ * `value` do ASAAS é a PARCELA e não entra na copy "cobrança ativa de R$ X" (B-3).
+ */
+export async function resolveLiveChargeLink(
+  ctx: SessionCtx,
+  payment: PaymentDetails | null,
+): Promise<{ link: string | null; dueDate: string | null; total: number | null }> {
+  const local = linkOf(payment)
+  if (local) return { link: local, dueDate: payment?.due_date ?? null, total: payment?.total_value ?? null }
+  try {
+    const asaas = await import("@/lib/asaas")
+    const supabase = createServiceClient()
+    // 1) pela cobrança do acordo (asaas_payment_id) — o caso do acordo parcelado
+    //    sem URL local (QAA1-02). Só uma cobrança PAGÁVEL (nunca deletada/
+    //    estornada/já recebida com o local defasado — B-2).
+    if (payment?.payment_id) {
+      const p = (await asaas.getAsaasPayment(payment.payment_id).catch(() => null)) as AsaasChargeLike | null
+      const link = asaasPaymentLink(p)
+      if (p && link && isPayableCharge(p)) {
+        if (payment.agreement_id) {
+          await supabase
+            .from("agreements")
+            .update({
+              asaas_invoice_url: p.invoiceUrl ?? null,
+              asaas_payment_url: p.invoiceUrl ?? null,
+              asaas_boleto_url: p.bankSlipUrl ?? null,
+              asaas_pix_qrcode_url: p.pixQrCodeUrl ?? null,
+            })
+            .eq("id", payment.agreement_id)
+            .eq("company_id", ctx.companyId)
+            .then(() => {}, () => {})
+        }
+        const total = payment.total_value ?? (typeof p.value === "number" ? p.value : null)
+        return { link, dueDate: p.dueDate ?? payment.due_date ?? null, total }
+      }
+    }
+    // 2) cobrança viva do cliente no ASAAS MAPEÁVEL a esta empresa (M-2). Acordos
+    //    lidos por customer_id + company_id (B-1); o asaas_customer_id vem deles.
+    const { data: known } = await supabase
+      .from("agreements")
+      .select("id, asaas_payment_id, asaas_customer_id, agreed_amount, due_date")
+      .eq("customer_id", ctx.customerId)
+      .eq("company_id", ctx.companyId)
+    const rows = (known ?? []) as Array<AgreementChargeRef & { asaas_customer_id?: string | null }>
+    const asaasCustomerId = rows.find((r) => typeof r.asaas_customer_id === "string" && r.asaas_customer_id)?.asaas_customer_id
+    if (asaasCustomerId) {
+      const payments = (await asaas.getAsaasPaymentsForCustomer(asaasCustomerId)) as AsaasChargeLike[]
+      const mapped = matchLiveChargeToAgreement(payments, rows, ctx.sessionId)
+      if (mapped) return { link: mapped.link, dueDate: mapped.payment.dueDate ?? null, total: mapped.total }
+    }
+  } catch (err) {
+    console.warn("[journey] resolveLiveChargeLink falhou (não fatal):", (err as Error).message)
+  }
+  return { link: null, dueDate: payment?.due_date ?? null, total: payment?.total_value ?? null }
+}
+
+export interface DeliveredPaymentOutcome {
+  link: string | null
+  vencimentoLink: string | null
+  agreementId: string | null
+  postPromptId: string | null
+  /** prompt ATIVO após a entrega (pós-link, ou o menu curto sem link). */
+  prompt: PromptView | null
+}
+
+/**
+ * Entrega o RESULTADO do pagamento ao devedor, sempre com outcome + prompt:
+ *  - link resolvido → bolha do link (outcome) + prompt pós-link (caminho normal);
+ *  - sem link → outcome humano 'charge_active' + menu curto reaberto.
+ * Best-effort em cada escrita (o resultado já é conhecido); nunca lança.
+ */
+export async function deliverPaymentOutcome(
+  ctx: SessionCtx,
+  input: {
+    payment: PaymentDetails | null
+    alreadyCharged: boolean
+    /** valor exibido na copy quando a cobrança não informa o total. */
+    valor: number | null
+    debtIds: string[]
+    primaryDebtId?: string | null
+  },
+): Promise<DeliveredPaymentOutcome> {
+  const resolved = await resolveLiveChargeLink(ctx, input.payment)
+  const agreementId = input.payment?.agreement_id ?? null
+  if (resolved.link) {
+    await persistPaymentLinkMessage(ctx, {
+      link: resolved.link,
+      valor: resolved.total ?? input.valor,
+      vencimentoLink: resolved.dueDate,
+      alreadyCharged: input.alreadyCharged,
+      agreementId,
+    })
+    const post = await publishPostPaymentLinkPrompt(ctx, {
+      link: resolved.link,
+      agreementId,
+      debtIds: input.debtIds,
+      primaryDebtId: input.primaryDebtId ?? ctx.debtId,
+    })
+    return {
+      link: resolved.link,
+      vencimentoLink: resolved.dueDate,
+      agreementId,
+      postPromptId: post?.id ?? null,
+      prompt: promptView(post),
+    }
+  }
+  // Sem link resolvível: outcome humano ligado a este resultado (fora do dedup de
+  // conteúdo — cada Pagar tem a sua resposta) + menu curto (nunca tela sem botão).
+  try {
+    await persistAssistantMessage({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      text: ALREADY_CHARGED_NO_LINK_TEXT,
+      stage: CHARGE_ACTIVE_STAGE,
+      snapshot: { agreement_id: agreementId, already_charged: input.alreadyCharged },
+      skipContentDedup: true,
+    })
+  } catch (err) {
+    console.warn("[journey] outcome charge_active falhou (não fatal):", (err as Error).message)
+  }
+  let prompt: PromptView | null = null
+  try {
+    const back = await reopenThreeOptions({
+      companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+      debtIds: input.debtIds, primaryDebtId: input.primaryDebtId ?? ctx.debtId,
+    })
+    if (back.ok) prompt = promptView(await getActivePrompt(ctx.sessionId))
+  } catch (err) {
+    console.warn("[journey] reabertura do menu após charge_active falhou (não fatal):", (err as Error).message)
+  }
+  return { link: null, vencimentoLink: null, agreementId, postPromptId: null, prompt }
+}
+
 /** Escolhe o billing à vista da matriz: PIX › BOLETO › CREDIT_CARD (mesma
  *  precedência de generateOfferTerms para a condição "à vista"). */
 function cashBillingType(allowed: string[]): BillingType {
@@ -213,6 +452,9 @@ export interface PayServiceOk {
   agreement_id: string | null
   /** id do prompt pós-link persistido pelo servidor (null se sem link). */
   post_prompt_id: string | null
+  /** QA round 1 (QAA1-02): prompt ATIVO após a entrega (pós-link ou menu curto),
+   *  no shape do GET — o client renderiza na hora. null só em 'processing'. */
+  prompt?: PromptView | null
 }
 
 export interface PayServiceErr {
@@ -434,38 +676,33 @@ export async function payService(
   // casos o devedor JÁ tem esta cobrança — copy "você já tem uma cobrança ativa".
   const alreadyCharged = r.status === "already_charged" || (r.status === "created" && r.idempotent === true)
   const payment = r.payment
-  const link = linkOf(payment)
-  const vencimento = payment?.due_date ?? null
-  const agreementId = payment?.agreement_id ?? null
 
-  // Resultado da ação como OUTCOME, ANTES de qualquer menu: bolha do link
-  // (com ação/stage) + telemetria em paralelo; depois o prompt pós-link.
-  await Promise.all([
+  // Resultado da ação como OUTCOME, ANTES de qualquer menu: bolha do link (com
+  // ação/stage) + prompt pós-link; sem link resolvível (QAA1-02), outcome humano
+  // + menu curto. Telemetria em paralelo. Na cobrança já existente, o valor da
+  // copy é o da COBRANÇA (um acordo 3x cobra o total com desconto, não o rótulo
+  // "Pagar R$ X" do menu).
+  const [, delivered] = await Promise.all([
     emitPayLinkReady(ctx, payment, { already_charged: alreadyCharged }),
-    persistPaymentLinkMessage(ctx, {
-      link,
-      valor: offer.valor,
-      vencimentoLink: vencimento,
+    deliverPaymentOutcome(ctx, {
+      payment,
       alreadyCharged,
-      agreementId,
+      valor: alreadyCharged ? (payment?.total_value ?? offer.valor) : offer.valor,
+      debtIds,
+      primaryDebtId: opts?.primaryDebtId ?? ctx.debtId,
     }),
   ])
-  const post = await publishPostPaymentLinkPrompt(ctx, {
-    link,
-    agreementId,
-    debtIds,
-    primaryDebtId: opts?.primaryDebtId ?? ctx.debtId,
-  })
 
   return {
     ok: true,
-    link,
-    valor: offer.valor,
-    vencimento_link: vencimento,
+    link: delivered.link,
+    valor: alreadyCharged ? (payment?.total_value ?? offer.valor) : offer.valor,
+    vencimento_link: delivered.vencimentoLink,
     already_charged: alreadyCharged,
     processing: false,
-    agreement_id: agreementId,
-    post_prompt_id: post?.id ?? null,
+    agreement_id: delivered.agreementId,
+    post_prompt_id: delivered.postPromptId,
+    prompt: delivered.prompt,
   }
 }
 

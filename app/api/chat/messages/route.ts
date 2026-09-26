@@ -44,15 +44,22 @@ export async function GET(req: NextRequest) {
     currentEpoch = 0
   }
 
-  let q = supabase
+  // QA round 3 (QAB3-02b): SEM `since` (1ª pintura/retomada) a fatia de 200 é a
+  // das linhas MAIS RECENTES (order desc + limit, re-ordenada ascendente em
+  // memória) — antes eram as 200 mais ANTIGAS, e numa sessão longa (> 200
+  // linhas) a retomada elegia um outcome velho e o trocava quando o delta
+  // chegava. COM `since` (poll incremental) segue ascendente + limit (contíguo a
+  // partir do `since`; o excedente vem no poll seguinte).
+  const base = supabase
     .from("chat_messages")
     .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, offers_snapshot, thread_epoch, archived_at, created_at")
     .eq("session_id", claims.sid)
     .eq("company_id", claims.cid)
-    .order("created_at", { ascending: true })
-    .limit(200)
-  if (since) q = q.gt("created_at", since)
-  const { data: rawMessages } = await q
+  const q = since
+    ? base.gt("created_at", since).order("created_at", { ascending: true }).limit(200)
+    : base.order("created_at", { ascending: false }).limit(200)
+  const { data: rawFetched } = await q
+  const rawMessages = since ? rawFetched : [...(rawFetched ?? [])].reverse()
 
   // Filtra a THREAD CORRENTE (C3): época corrente OU null (=época 0, compat) e
   // NÃO-arquivada. As linhas de épocas anteriores ficam preservadas no banco (o
@@ -160,7 +167,15 @@ export async function GET(req: NextRequest) {
   // RECAPITULATIVO de retomada (C7 / R-17): só no 1º poll (since ausente =
   // carregamento inicial/retomada). Nos polls incrementais não repetimos o recap.
   // Montado no servidor a partir das bolhas PRESERVADAS (C3) → idêntico após F5.
-  const recap = since ? null : await buildRecap(claims.sid, claims.cid)
+  // QA round 1 (QAA1-07 / B2 / A1-R10): links MORTOS também no poll incremental —
+  // a bolha do link já renderizada não volta no `since`, então a liveness por
+  // mensagem (acima) não a alcança; `dead_payment_links` traz os hrefs das
+  // cobranças TERMINAIS do cliente nesta empresa a cada poll, e o client desliga
+  // Abrir/Copiar da bolha correspondente no próximo ciclo (2,5 s), sem F5.
+  const [recap, deadPaymentLinks] = await Promise.all([
+    since ? Promise.resolve(null) : buildRecap(claims.sid, claims.cid),
+    deadPaymentLinkHrefs(supabase, claims.sid, claims.cid),
+  ])
 
   return NextResponse.json({
     ok: true,
@@ -170,8 +185,48 @@ export async function GET(req: NextRequest) {
     wait_started_at: waitStartedAt,
     pinned_debt: pinnedDebt,
     recap,
+    dead_payment_links: deadPaymentLinks,
     server_time: new Date().toISOString(),
   })
+}
+
+/**
+ * QA round 1 (QAA1-07) — hrefs das cobranças TERMINAIS (cancelada/estornada) do
+ * cliente da sessão nesta empresa: invoice/payment/boleto/PIX. Isola por
+ * customer_id + company_id (nunca cruza tenant). Best-effort: falha → [].
+ */
+async function deadPaymentLinkHrefs(
+  supabase: ReturnType<typeof createServiceClient>,
+  sessionId: string,
+  companyId: string,
+): Promise<string[]> {
+  try {
+    const { data: sess } = await supabase
+      .from("negotiation_sessions")
+      .select("customer_id")
+      .eq("id", sessionId)
+      .eq("company_id", companyId)
+      .maybeSingle()
+    const customerId = (sess as { customer_id?: string | null } | null)?.customer_id
+    if (!customerId) return []
+    const { data } = await supabase
+      .from("agreements")
+      .select("id, status, payment_status, asaas_payment_id, asaas_invoice_url, asaas_payment_url, asaas_boleto_url, asaas_pix_qrcode_url")
+      .eq("customer_id", customerId)
+      .eq("company_id", companyId)
+      .not("asaas_payment_id", "is", null)
+    const hrefs = new Set<string>()
+    for (const ag of (data ?? []) as Array<AgreementLike & Record<string, unknown>>) {
+      if (!isTerminalAgreement(ag)) continue
+      for (const k of ["asaas_invoice_url", "asaas_payment_url", "asaas_boleto_url", "asaas_pix_qrcode_url"]) {
+        const v = ag[k]
+        if (typeof v === "string" && /^https?:\/\//i.test(v)) hrefs.add(v)
+      }
+    }
+    return [...hrefs]
+  } catch {
+    return []
+  }
 }
 
 /** offers_snapshot.agreement_id das bolhas com ação `open_payment_link`. */

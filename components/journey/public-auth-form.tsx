@@ -187,7 +187,7 @@ export function PublicAuthForm({
           type="button"
           onClick={() => setShowWho((v) => !v)}
           aria-expanded={showWho}
-          className="mt-1 inline-flex min-h-[44px] items-center text-sm font-medium text-[var(--brand-secondary)] underline underline-offset-2"
+          className="mt-1 inline-flex min-h-[44px] items-center text-sm font-medium text-[var(--brand-secondary)] underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
         >
           {ENTRY_SEAL_WHO_LABEL}
         </button>
@@ -214,7 +214,7 @@ export function PublicAuthForm({
           placeholder="000.000.000-00"
           value={maskDoc(doc)}
           onChange={(e) => setDoc(e.target.value)}
-          className="h-11 rounded-md border border-neutral-300 bg-white px-3 text-base outline-none focus:border-[var(--brand-secondary)] focus:ring-2 focus:ring-[var(--brand-secondary)]/30"
+          className="h-11 rounded-md border border-neutral-300 bg-white px-3 text-base outline-none focus:border-neutral-900 focus:ring-2 focus:ring-neutral-900"
         />
       </label>
 
@@ -248,7 +248,7 @@ export function PublicAuthForm({
         type="submit"
         disabled={!canSubmit}
         style={{ backgroundColor: "var(--brand-secondary)", color: "var(--brand-secondary-fg, #ffffff)" }}
-        className="mt-auto h-11 rounded-md text-base font-semibold transition-opacity disabled:opacity-40"
+        className="mt-auto h-11 rounded-md text-base font-semibold transition-opacity disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
       >
         {submitting ? "Confirmando..." : "Continuar"}
       </button>

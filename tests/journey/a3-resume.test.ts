@@ -155,9 +155,13 @@ describe("RETOMADA (A3 / §2.2) — pipeline do client sobre a sessão de teste"
     const ids = r.deduped.map((m) => m.id)
     expect(ids).not.toContain("m44")
     expect(ids).toContain("m45")
-    // Detalhes › detalhe(outcome) › Detalhes: o outcome separa → os dois cliques ficam
-    expect(ids).toContain("m28")
+    // QA round 1 (F-QAA3-1 / QAA1-06): Detalhes › detalhe › Detalhes › MESMO detalhe
+    // é o MESMO par clique→resposta repetido → fica o último par (m31 + m32), nunca
+    // um eco órfão sem resposta (antes: o dedup apagava m29 e m28 ficava "mudo").
+    expect(ids).not.toContain("m28")
+    expect(ids).not.toContain("m29")
     expect(ids).toContain("m31")
+    expect(ids).toContain("m32")
   })
 
   it("uma só pergunta na tela: menu em modo reopen ('Como prefere seguir?') sob a saudação de retorno vem sem pergunta", () => {

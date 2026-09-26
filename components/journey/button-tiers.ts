@@ -65,13 +65,30 @@ export function isContestation(kind: string, id: number): boolean {
 // da marca sobre branco cai a 1,92:1 num secundário claro como o da VMAX); o
 // tertiary é discreto (contorno neutro/ghost). foco visível (focus-visible ring).
 //
+// QA round 3 (QAB3-01): o anel de foco NÃO é da cor da marca. Com a marca VMAX
+// (#EAB308) o anel `ring-[var(--brand-secondary)]` dava 1,92:1 sobre a caixa
+// branca e 1,0:1 sobre o próprio botão primário (WCAG 2.4.11/1.4.11 pedem ≥ 3:1):
+// quem navega por teclado não sabia em qual dos 4 botões estava. O anel passa a
+// ser NEUTRO ESCURO (neutral-900 = #171717) com offset branco de 2 px — ≥ 3:1
+// contra a página (#fafafa/#fff), contra #EAB308 (9,3:1) e contra o default
+// #2563eb (3,5:1); o offset separa o anel do preenchimento do primário. A mesma
+// classe (FOCUS_RING) vale para todos os alvos da jornada: menu, parcelas,
+// Voltar, atalhos dos painéis, modal, log, card.
+//
 // A4/N-D5-4: o tamanho da fonte NÃO fica no BASE (text-sm × text-base no mesmo
 // elemento deixava o primary em 14px); cada tier declara o seu — o primary é
 // maior de verdade (text-base + py-3 ≈ 48px) que os demais (text-sm + py-2.5 → 44px).
+/** Cor do anel de foco (neutral-900). Exportada para o teste de contraste. */
+export const FOCUS_RING_HEX = "#171717"
+
+/** Indicador de foco por teclado, independente da marca (QAB3-01). */
+export const FOCUS_RING =
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 " +
+  "focus-visible:ring-offset-2"
+
 export const BASE_BTN =
   "inline-flex min-h-[44px] items-center justify-center rounded-md font-semibold " +
-  "transition-colors disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 " +
-  "focus-visible:ring-offset-1 focus-visible:ring-[var(--brand-secondary)]"
+  `transition-colors disabled:opacity-40 ${FOCUS_RING}`
 
 /** className por tier. O primary recebe estilo inline (cor de marca) no render. */
 export function tierClass(tier: ButtonTier): string {

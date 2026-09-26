@@ -82,6 +82,9 @@ export const OUTCOME_STAGES: ReadonlySet<string> = new Set([
   "payment_link",
   "not_recognized",
   "payment_claim",
+  // QA round 1 (QAA1-02): "já tem cobrança ativa" SEM link resolvível — o
+  // resultado humano do Pagar quando o link não aparece (nunca beco).
+  "charge_active",
 ])
 
 /** Contexto opcional da classificação (sem ele, cai em heurística por sinais). */

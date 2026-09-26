@@ -17,6 +17,7 @@ import {
   CURRENT_GENERATION,
   generationOfKind,
   isProtectedClass,
+  OUTCOME_STAGES,
   type DisplayClass,
 } from "@/lib/journey/display-class"
 import type { WaitState } from "@/lib/journey/wait-machine"
@@ -74,27 +75,103 @@ export function isNegotiateLabel(label: string): boolean {
   return /\bnegociar\b/i.test(label)
 }
 
+/** QA round 3 (QAB3-05) — prefixo SÓ para tecnologia assistiva (`sr-only`) que
+ *  identifica quem fala em cada bolha: o leitor de tela ouvia "Detalhes da
+ *  dívida" "Vencimento original…" "Negociar" "Certo…" sem saber o que foi escolha
+ *  e o que foi resposta. Sem mudança visual. */
+export const SR_SPEAKER_CUSTOMER = "Você: "
+export const SR_SPEAKER_ASSISTANT = "AlteaPay: "
+export function srSpeakerPrefix(from: ChatMsg["from"]): string {
+  return from === "customer" ? SR_SPEAKER_CUSTOMER : SR_SPEAKER_ASSISTANT
+}
+
+/** QA round 1 (F-QAA3-1 / QAA1-06): bolha do assistente que é o RESULTADO de um
+ *  clique (ação anexada ou stage de outcome) — cada eco tem a sua resposta, o
+ *  dedup por conteúdo nunca a apaga (senão o clique parece "não ter feito nada"). */
+function isClickBoundOutcome(m: ChatMsg): boolean {
+  if (m.from !== "assistant") return false
+  if (m.action) return true
+  return !!m.stage && OUTCOME_STAGES.has(m.stage)
+}
+
 // Colapsa bolhas do ASSISTENTE com texto idêntico, mantendo apenas a ÚLTIMA
 // ocorrência (na posição original da última). O servidor pode re-persistir a
 // mesma resposta ("Aqui estão os dados...", saudação re-bootstrapada) — aqui
 // garantimos "só a última resposta" na EXIBIÇÃO, sem tocar no buffer bruto nem
-// no backend. Bolhas do cliente e bolhas com <a> de ação nunca são colapsadas.
+// no backend. Bolhas do cliente, bolhas com <a> de ação e OUTCOMES ligados a um
+// clique (stage detail/payment_link/…) nunca são colapsadas aqui — a repetição
+// de um par "clique → mesmo resultado" é tratada por collapseConsecutiveDecisions
+// (QA round 1: antes, o dedup apagava a resposta dos ecos anteriores e o colapso,
+// que já tinha rodado, deixava os ecos órfãos e consecutivos).
 export function dedupAssistantByContent(list: ChatMsg[]): ChatMsg[] {
   // 1º passo: para cada texto assistant "colapsável", achar o índice da ÚLTIMA
   // ocorrência.
   const lastIdxByText = new Map<string, number>()
   list.forEach((m, i) => {
     if (m.from !== "assistant") return
-    if (m.action) return // ação anexada: preserva sempre
+    if (isClickBoundOutcome(m)) return // resultado de um clique: preserva sempre
     lastIdxByText.set(m.text.trim(), i)
   })
   // 2º passo: manter cliente sempre; manter assistant só na última ocorrência
   // do seu texto (ou se não for colapsável).
   return list.filter((m, i) => {
     if (m.from !== "assistant") return true
-    if (m.action) return true
+    if (isClickBoundOutcome(m)) return true
     return lastIdxByText.get(m.text.trim()) === i
   })
+}
+
+/**
+ * QA round 2 (QAA2-01) — ORDEM DA TRANSCRIÇÃO: a bolha OTIMISTA do Negociar
+ * ("Certo. Estas são as condições…") nasce no clique, ANTES do eco "Negociar"
+ * persistido chegar pelo poll. Na 1ª apresentação a confirmação persistida (T2)
+ * chega depois do eco e o dedup fica com ela; nas seguintes (T2 deduplicada no
+ * servidor por 15 min) a otimista ficava ACIMA do eco — assistente respondendo
+ * antes da pergunta. Ao chegar o eco do clique, a otimista é RECOLOCADA logo
+ * depois dele (a ordem do banco: eco → confirmação → parcelas). Se a otimista já
+ * não está na lista, só o eco entra. Pura; preserva o resto da ordem.
+ */
+export function placeAfterCustomerEcho(list: ChatMsg[], optimisticId: string | null, echo: ChatMsg): ChatMsg[] {
+  const opt = optimisticId ? list.find((m) => m.id === optimisticId) : undefined
+  if (!opt) return [...list, echo]
+  return [...list.filter((m) => m.id !== optimisticId), echo, opt]
+}
+
+/** Ação `open_payment_link` de uma bolha do LINK: a anexada pelo servidor ou,
+ *  para uma bolha persistida com stage 'payment_link' que chegou sem a ação
+ *  (shape malformado), derivada da URL http(s) do próprio texto — o painel
+ *  Abrir/Copiar sempre deriva da bolha, em qualquer viewport (QAA1-08). */
+export function paymentLinkActionOf(m: ChatMsg): MsgAction | null {
+  if (m.from !== "assistant") return null
+  if (m.action?.type === "open_payment_link") return m.action
+  if (m.action) return null // outra ação (external_link): não é link de pagamento
+  if (m.stage !== "payment_link") return null
+  const url = /https?:\/\/\S+/i.exec(m.text ?? "")?.[0] ?? null
+  return url ? { type: "open_payment_link", label: "Abrir link de pagamento", href: url } : null
+}
+
+/** QA round 1 (QAA1-07): um link está VIVO quando o servidor não o marcou morto
+ *  na mensagem (`live:false`) NEM listou o href entre as cobranças terminais do
+ *  cliente (`dead_payment_links`, atualizado a cada poll — inclusive incremental). */
+export function isLivePaymentLink(
+  action: MsgAction | null | undefined,
+  deadHrefs: ReadonlySet<string> | null | undefined,
+): boolean {
+  if (!action || action.type !== "open_payment_link") return false
+  if (action.live === false) return false
+  return !(deadHrefs && deadHrefs.has(action.href))
+}
+
+/** id da ÚLTIMA bolha de link VIVO (a única que ganha o painel Abrir/Copiar). */
+export function latestLivePaymentLinkId(
+  list: ChatMsg[],
+  deadHrefs: ReadonlySet<string> | null | undefined,
+): string | null {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]
+    if (isLivePaymentLink(paymentLinkActionOf(m), deadHrefs)) return m.id
+  }
+  return null
 }
 
 // ============================================================================
@@ -178,14 +255,31 @@ function decisionKey(m: ChatMsg): string {
   return `${m.buttonId ?? "-"}|${label}`
 }
 
+/** Um TURNO = uma decision + o que o assistente respondeu até a próxima decision.
+ *  `outcomes` = textos (normalizados) dos resultados do turno — a "assinatura" do
+ *  que aquele clique produziu. */
+interface DecisionTurn {
+  decision: ChatMsg
+  outcomes: ChatMsg[]
+}
+
+const normText = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase()
+
+function outcomeSignature(t: DecisionTurn): string {
+  return t.outcomes.map((o) => normText(o.text)).sort().join("\u0000")
+}
+
 /**
  * A3 (§2.4) — COLAPSO DE DECISÕES CONSECUTIVAS IGUAIS: cliques repetidos no
- * mesmo botão (mesmo button_id + mesmo rótulo) SEM um outcome entre eles viram
- * UM — fica a ÚLTIMA ocorrência, na posição dela. Guidance entre os cliques não
- * separa (a pilha "Consultar › Consultar" é ruído); um OUTCOME separa (cada clique
- * que produziu resultado é memória legítima: "Pagar › link › Pagar › já tem"). Só
- * decisions da geração corrente contam (as anteriores já são superseded).
- * Pura, determinística; preserva a ordem.
+ * mesmo botão (mesmo button_id + mesmo rótulo) viram UM — fica a ÚLTIMA
+ * ocorrência, na posição dela. Guidance entre os cliques não separa (a pilha
+ * "Consultar › Consultar" é ruído). Um OUTCOME DIFERENTE separa (cada clique que
+ * produziu um resultado distinto é memória legítima: "Pagar › link › Pagar › já
+ * tem"). QA round 1 (QAA1-06 / F-QAA3-1): dois turnos consecutivos com a MESMA
+ * decisão e o MESMO resultado ("Detalhes › vencimento… › Detalhes › vencimento…")
+ * também colapsam — ficam o último eco e o seu resultado, nunca um eco órfão
+ * sem resposta. Só decisions da geração corrente contam (as anteriores já são
+ * superseded). Pura, determinística; preserva a ordem.
  */
 export function collapseConsecutiveDecisions(
   list: ChatMsg[],
@@ -193,17 +287,29 @@ export function collapseConsecutiveDecisions(
   waitState: WaitState | null,
   currentGeneration: number | null = null,
 ): ChatMsg[] {
-  const drop = new Set<string>()
-  let prev: ChatMsg | null = null
+  // 1) agrupa em turnos (o que vem antes da 1ª decision não é turno).
+  const turns: DecisionTurn[] = []
   for (const m of list) {
     const cls = classOf(m, activePromptId, waitState, currentGeneration)
-    if (cls === "outcome") {
-      prev = null // um resultado entre cliques fecha a sequência
+    if (cls === "decision") {
+      turns.push({ decision: m, outcomes: [] })
       continue
     }
-    if (cls !== "decision") continue
-    if (prev && decisionKey(prev) === decisionKey(m)) drop.add(prev.id)
-    prev = m
+    if (cls === "outcome" && turns.length > 0) turns[turns.length - 1].outcomes.push(m)
+  }
+  // 2) turno anterior colapsa no seguinte quando a decisão é a mesma e
+  //    (a) o anterior não produziu resultado (clique repetido, ruído), ou
+  //    (b) produziu EXATAMENTE o mesmo resultado (par clique→resposta repetido).
+  const drop = new Set<string>()
+  for (let i = 1; i < turns.length; i++) {
+    const prev = turns[i - 1]
+    const cur = turns[i]
+    if (decisionKey(prev.decision) !== decisionKey(cur.decision)) continue
+    const sameOutcome = prev.outcomes.length > 0 && outcomeSignature(prev) === outcomeSignature(cur)
+    if (prev.outcomes.length === 0 || sameOutcome) {
+      drop.add(prev.decision.id)
+      for (const o of prev.outcomes) drop.add(o.id)
+    }
   }
   return drop.size === 0 ? list : list.filter((m) => !drop.has(m.id))
 }
@@ -229,6 +335,21 @@ export interface ResumeSplit {
   collapsed: ChatMsg[]
   /** id do último outcome (link/acordo/desfecho) preservado acima do menu, se houver. */
   lastOutcomeId: string | null
+  /** QA round 3 (QAB3-02): bolha NEUTRA de status a renderizar no lugar do
+   *  outcome elevado quando o último resultado é um link MORTO e não há outcome
+   *  vivo para elevar. Sem botão. null = nada a mostrar. */
+  notice: string | null
+}
+
+/** QA round 3 (QAB3-02) — copy da bolha neutra da retomada (carta de voz: sem
+ *  promessa, sem "aqui está seu link" para um link que já não existe). */
+export const RESUME_DEAD_LINK_NOTICE = "Sua cobrança anterior foi cancelada."
+
+/** Link de pagamento MORTO: ação `open_payment_link` com `live:false` ou href
+ *  entre as cobranças terminais do poll (`dead_payment_links`). */
+function isDeadPaymentLink(m: ChatMsg, deadHrefs: ReadonlySet<string> | null | undefined): boolean {
+  const a = paymentLinkActionOf(m)
+  return !!a && !isLivePaymentLink(a, deadHrefs)
 }
 
 /**
@@ -239,6 +360,21 @@ export interface ResumeSplit {
  * (link/acordo, "não reconheço", "já paguei"): "Se a última escolha produziu um
  * resultado, o resultado vem acima do menu". Bolhas locais (sem createdAt) e as
  * que chegam depois do corte ficam visíveis. `expanded` devolve tudo.
+ *
+ * QA round 3 (QAB3-02):
+ *  (a) NUNCA eleva um link MORTO (`action.live === false` ou href em
+ *      `deadHrefs`): a retomada mostrava "Aqui está seu link para pagar R$ …"
+ *      sem link, sem "Abrir" e sem dizer que a cobrança fora cancelada. Um link
+ *      morto no fim da lista é pulado; eleva-se o outcome anterior VIVO só se
+ *      for um LINK vivo (um resultado que ainda vale) — um outcome não-link mais
+ *      antigo que o Pagar cancelado (ex.: "não reconheço" de dias antes) não é
+ *      "o resultado da última escolha" e não é elevado; na falta, `notice` =
+ *      RESUME_DEAD_LINK_NOTICE (bolha neutra, sem botão) e nada é elevado.
+ *  (b) ESTABILIDADE: `pinnedOutcomeId` (o id eleito na 1ª pintura da retomada,
+ *      guardado pelo client) continua eleito enquanto for elegível (existe, é
+ *      outcome e, se link, está vivo) — um poll posterior nunca troca o texto do
+ *      resultado destacado sob os olhos do devedor. Só se o pino deixar de ser
+ *      elegível (a cobrança foi cancelada) a eleição roda de novo.
  */
 export function splitResumeHistory(
   list: ChatMsg[],
@@ -248,19 +384,41 @@ export function splitResumeHistory(
     activePromptId: string | null
     waitState: WaitState | null
     currentGeneration?: number | null
+    /** hrefs das cobranças terminais do poll (QAA1-07); null = só `live:false`. */
+    deadHrefs?: ReadonlySet<string> | null
+    /** id eleito na 1ª pintura da retomada (QAB3-02b); null = eleger. */
+    pinnedOutcomeId?: string | null
   },
 ): ResumeSplit {
   const cutoff = opts.cutoffAt
-  if (!cutoff || opts.expanded) return { visible: list, collapsed: [], lastOutcomeId: null }
+  if (!cutoff || opts.expanded) return { visible: list, collapsed: [], lastOutcomeId: null, notice: null }
   const gen = opts.currentGeneration ?? null
+  const deadHrefs = opts.deadHrefs ?? null
+  const isOutcome = (m: ChatMsg) =>
+    m.stage !== "detail" && classOf(m, opts.activePromptId, opts.waitState, gen) === "outcome"
+  const isEligible = (m: ChatMsg) => isOutcome(m) && !isDeadPaymentLink(m, deadHrefs)
+
   let lastOutcomeId: string | null = null
-  for (let i = list.length - 1; i >= 0; i--) {
-    const m = list[i]
-    if (m.stage === "detail") continue // detalhes já estão resumidos na saudação de retorno
-    if (classOf(m, opts.activePromptId, opts.waitState, gen) === "outcome") {
+  let notice: string | null = null
+  const pinned = opts.pinnedOutcomeId ? list.find((m) => m.id === opts.pinnedOutcomeId) : undefined
+  if (pinned && isEligible(pinned)) {
+    lastOutcomeId = pinned.id
+  } else {
+    let deadSkipped = false
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m = list[i]
+      if (!isOutcome(m)) continue // detalhes já estão resumidos na saudação de retorno
+      if (isDeadPaymentLink(m, deadHrefs)) {
+        deadSkipped = true
+        continue
+      }
+      // depois de um link morto só um LINK vivo ainda descreve "o resultado da
+      // última escolha"; outro outcome mais antigo não é elevado.
+      if (deadSkipped && !paymentLinkActionOf(m)) break
       lastOutcomeId = m.id
       break
     }
+    if (!lastOutcomeId && deadSkipped) notice = RESUME_DEAD_LINK_NOTICE
   }
   const visible: ChatMsg[] = []
   const collapsed: ChatMsg[] = []
@@ -269,7 +427,7 @@ export function splitResumeHistory(
     if (before && m.id !== lastOutcomeId) collapsed.push(m)
     else visible.push(m)
   }
-  return { visible, collapsed, lastOutcomeId }
+  return { visible, collapsed, lastOutcomeId, notice }
 }
 
 export interface CappedHistory {

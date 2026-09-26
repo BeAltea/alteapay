@@ -88,7 +88,7 @@ describe("R15 — resolveCreditorName (cedente identificado, nunca genérico à 
 describe("R2 — transferToHuman persiste mensagem ao devedor (N-01)", () => {
   beforeEach(() => seed())
 
-  it("persiste UMA mensagem de assistente com o próximo passo + canal (nunca 'Sessão encerrada' seca)", async () => {
+  it("persiste UMA mensagem de assistente com o próximo passo (nunca 'Sessão encerrada' seca)", async () => {
     const { transferToHuman } = await import("@/lib/journey/actions")
     const caseId = await transferToHuman(ctx, "handoff_button", "customer")
     expect(typeof caseId).toBe("string")
@@ -96,9 +96,9 @@ describe("R2 — transferToHuman persiste mensagem ao devedor (N-01)", () => {
     const msgs = db.chat_messages.filter((m) => m.role === "assistant")
     expect(msgs.length).toBe(1)
     const text = msgs[0].text as string
-    // comunica a transferência + nomeia o canal (WhatsApp AlteaPay)
+    // comunica o registro do pedido; QAB3-07: sem canal/contato prometido
     expect(text).toMatch(/atendimento/i)
-    expect(text).toMatch(/WhatsApp/i)
+    expect(text).not.toMatch(/WhatsApp|vai falar com você/i)
     // NÃO cai em silêncio nem em copy de sessão encerrada
     expect(text).not.toMatch(/Sess[aã]o encerrada/i)
     expect(text.trim().length).toBeGreaterThan(0)

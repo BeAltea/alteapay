@@ -96,11 +96,12 @@ export interface AckContext {
   oldestDueDate: string | null
 }
 
-/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver.
- *  Exportado (A3) para a saudação de retorno do recap usar a mesma regra. */
-export function firstNameOf(name: string | null | undefined): string {
-  return (name ?? "").trim().split(/\s+/)[0] ?? ""
-}
+/** Primeiro nome de PESSOA FÍSICA (ex.: "Fabio Mendes" → "Fabio"); null para
+ *  vazio, CNPJ, razão social ou 1º token inválido (QA round 3 / QAB3-03). Fonte
+ *  única em lib/journey/first-name.ts; re-exportado aqui (A3: o recap e o
+ *  campaign-send usam a MESMA regra). */
+export { firstNameOf } from "./first-name"
+import { firstNameOf } from "./first-name"
 
 /** Resumo objetivo da dívida (cliente, credor, valor atualizado, vencimento). */
 export async function buildAckContext(input: {
@@ -138,7 +139,7 @@ export async function buildAckContext(input: {
     .select("name, document")
     .eq("id", input.customerId)
     .maybeSingle()
-  const firstName = firstNameOf(customer?.name)
+  const firstName = firstNameOf(customer?.name, customer?.document) ?? ""
   const doc = (customer?.document ?? "").replace(/\D/g, "")
   const { data: invoices } = await supabase
     .from("vmax_invoices")
@@ -872,9 +873,21 @@ export async function presentMatrixOffers(input: {
     listOffers(ctx),
     getCurrentThreadEpoch(input.sessionId),
   ])
+  // QA round 1 (M2): o 'offer_choice' ativo só é reusado quando os seus botões
+  // ainda apontam para o CONJUNTO vigente — se listOffers regenerou (conjunto
+  // parcialmente consumido), um prompt novo com as ofertas novas substitui o
+  // antigo (cujos offer_ids já não são aceitáveis).
   if (existing) {
     const row = existing as PromptRow
-    return { ok: true, presented: true, offers, promptId: row.id, prompt: promptView(row)!, reused: true }
+    const existingIds = Array.isArray((row.context as { offer_ids?: unknown } | null)?.offer_ids)
+      ? ((row.context as { offer_ids: string[] }).offer_ids)
+      : (row.buttons ?? []).map((b) => b.value).filter((v): v is string => typeof v === "string")
+    const currentIds = offers.map((o) => o.id)
+    const sameSet =
+      existingIds.length === currentIds.length && currentIds.every((id) => existingIds.includes(id))
+    if (sameSet || offers.length === 0) {
+      return { ok: true, presented: true, offers, promptId: row.id, prompt: promptView(row)!, reused: true }
+    }
   }
   if (offers.length === 0) return { ok: true, presented: false, reason: "no_offers" }
 
@@ -1050,11 +1063,11 @@ export async function buildSettledContext(input: {
     (typeof branding.brand_name === "string" && branding.brand_name) || company?.name || "Credor"
   const { data: customer } = await supabase
     .from("customers")
-    .select("name")
+    .select("name, document")
     .eq("id", input.customerId)
     .maybeSingle()
   return {
-    firstName: firstNameOf(customer?.name),
+    firstName: firstNameOf(customer?.name, customer?.document) ?? "",
     creditorName,
     totalPaid: input.totalPaid,
     oldestDueDate: input.oldestDueDate,
@@ -1945,8 +1958,10 @@ export async function handleDebtNegotiate(input: {
 
   // Kickoff: aguarda só o que resta do deadline curto (Promise.race). Se entregou,
   // engine_owner devolvido = o gravado no banco ('n8n'); senão platform/pending.
+  // QA round 2 (QAA2-02): com as parcelas prontas a resposta NÃO espera o
+  // disparo (`settle(0)`), como no ramo de 3 opções — o kickoff segue em curso.
   const deadlineMs = input.dispatchDeadlineMs ?? kickoffDeadlineMs()
-  const kick = await kickoff.settle(Math.max(0, deadlineMs - (Date.now() - t0)))
+  const kick = await kickoff.settle(offersPresented ? 0 : Math.max(0, deadlineMs - (Date.now() - t0)))
   return { ok: true, engineOwner: kick.owner, reply, kickoff: kick.status, offersPresented, prompt }
 }
 

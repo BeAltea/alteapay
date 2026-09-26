@@ -138,6 +138,36 @@ function sortOffersCanonical<T extends { terms: OfferTerms; created_at?: string 
   )
 }
 
+/** Linha mínima de negotiation_offers para a regra do conjunto (sem PII). */
+export interface OfferSetRow {
+  id: string
+  status: string
+  valid_until: string | null
+  source?: string | null
+}
+
+/**
+ * QA round 1 (QAA1-04 / M2) — CONJUNTO PARCIALMENTE CONSUMIDO. As ofertas de uma
+ * apresentação nascem juntas com o MESMO `valid_until` (é a chave do conjunto —
+ * sem coluna nova). Se alguma irmã do conjunto vigente já não está 'presented'
+ * (rejeitada pelo guard already_charged do n8n, aceita, expirada, superseded), o
+ * conjunto está incompleto — "Negociar" mostrava só 2x/3x, sem a opção à vista
+ * recomendada. Regra pura: o conjunto vigente (as 'presented' não vencidas de
+ * origem 'system') é reaproveitado SÓ quando TODAS as irmãs continuam
+ * 'presented'; senão regenera o conjunto completo. Ofertas integrais do PAGAR
+ * (mesmo `source:'system'`) têm `valid_until` próprio → não contam como irmãs.
+ */
+export function isOfferSetIntact(rows: OfferSetRow[], presentedIds: ReadonlySet<string>): boolean {
+  const keys = new Set<string>()
+  for (const r of rows) if (presentedIds.has(r.id)) keys.add(r.valid_until ?? "")
+  if (keys.size === 0) return true
+  for (const r of rows) {
+    if (!keys.has(r.valid_until ?? "")) continue
+    if (r.status !== "presented") return false
+  }
+  return true
+}
+
 /**
  * offer.list — devolve as ofertas VÁLIDAS ('presented' e não vencidas) da sessão;
  * sem nenhuma, gera da matriz (servidor decide, D8). A2 (N-D2-2): UMA leitura
@@ -145,18 +175,23 @@ function sortOffersCanonical<T extends { terms: OfferTerms; created_at?: string 
  * das ofertas e auditoria em LOTE — antes eram ~10 round-trips sequenciais no
  * caminho crítico do "Quero negociar". `summary` (opcional) evita um 2º
  * debtSummary quando o chamador já o tem.
+ * QA round 1 (M2): a leitura traz TODAS as ofertas da sessão (mesma 1 leitura);
+ * um conjunto vigente com alguma irmã consumida é REGENERADO por inteiro (as
+ * 'presented' restantes viram 'superseded') — o menu sempre traz à vista + parcelas.
  */
 export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary }): Promise<ListedOffer[]> {
   const supabase = createServiceClient()
   const nowMs = Date.now()
   const now = new Date(nowMs).toISOString()
-  const { data: presentedRows } = await supabase
+  const { data: allRows } = await supabase
     .from("negotiation_offers")
-    .select("id, terms, valid_until, created_at")
+    .select("id, terms, valid_until, created_at, status, source")
     .eq("session_id", ctx.sessionId)
-    .eq("status", "presented")
     .order("created_at", { ascending: true })
-  const rows = (presentedRows ?? []) as Array<{ id: string; terms: OfferTerms; valid_until: string | null; created_at?: string | null }>
+  const sessionRows = (allRows ?? []) as Array<{
+    id: string; terms: OfferTerms; valid_until: string | null; created_at?: string | null; status: string; source?: string | null
+  }>
+  const rows = sessionRows.filter((r) => r.status === "presented")
   const isExpired = (o: { valid_until: string | null }) => {
     if (!o.valid_until) return false
     const t = Date.parse(o.valid_until)
@@ -187,33 +222,58 @@ export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary
           ),
         ])
 
-  if (current.length > 0) {
+  // conjunto vigente = 'presented' não vencidas geradas da matriz (source
+  // 'system'); intacto → reusa. Ofertas de IA/cliente ('ai'/'customer') não
+  // formam conjunto e continuam listadas como antes.
+  const setIntact = isOfferSetIntact(
+    sessionRows.filter((r) => (r.source ?? "system") === "system"),
+    new Set(current.map((o) => o.id)),
+  )
+  if (current.length > 0 && setIntact) {
     await expireWrite
     return current.map((o) => ({ id: o.id, terms: o.terms, valid_until: o.valid_until }))
   }
 
-  // gerar da matriz
+  // gerar da matriz (conjunto novo ou regeneração de conjunto incompleto)
   const summary = opts?.summary ?? (await debtSummary(ctx))
   const row = await resolveMatrixRow({
     companyId: ctx.companyId, agingDays: summary.agingDays, debtValue: summary.originalValue,
   })
   if (!row) {
     await expireWrite
-    return []
+    // sem faixa vigente não há como regenerar: devolve o que resta (nunca some
+    // uma opção válida por falta de matriz).
+    return current.map((o) => ({ id: o.id, terms: o.terms, valid_until: o.valid_until }))
   }
+  // as restantes do conjunto incompleto saem de cena (superseded) — nunca duas
+  // apresentações vivas ao mesmo tempo.
+  const supersedeWrite: Promise<unknown> =
+    current.length === 0
+      ? Promise.resolve()
+      : Promise.all([
+          supabase
+            .from("negotiation_offers")
+            .update({ status: "superseded", responded_at: now })
+            .eq("session_id", ctx.sessionId)
+            .eq("status", "presented")
+            .in("id", current.map((o) => o.id)),
+        ])
   const firstDue = new Date(nowMs + 7 * 86400_000).toISOString().slice(0, 10)
   const validUntil = new Date(nowMs + row.proposal_validity_days * 86400_000).toISOString()
   const termsList = generateOfferTerms(summary.originalValue, row, firstDue)
   // persistência em LOTE (ordem de `termsList` preservada pelo Promise.all)…
-  const ids = await Promise.all(
-    termsList.map((terms) =>
-      persistOffer({
-        companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-        debtId: ctx.debtId, matrixId: row.id, source: "system", status: "presented",
-        terms, validUntil,
-      }),
+  const [ids] = await Promise.all([
+    Promise.all(
+      termsList.map((terms) =>
+        persistOffer({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
+          debtId: ctx.debtId, matrixId: row.id, source: "system", status: "presented",
+          terms, validUntil,
+        }),
+      ),
     ),
-  )
+    supersedeWrite,
+  ])
   // …e auditoria em lote, UMA linha por oferta (event_id explícito por offer_id —
   // N-D2-8: 3 offer.presented no mesmo segundo não colapsam mais em 1).
   await Promise.all([
@@ -312,34 +372,138 @@ export async function registerDispute(
   return caseId
 }
 
+/**
+ * QA round 1 (QAA1-05 / M1) — no máximo UM caso `payment_claim` ABERTO por
+ * sessão: um "Já paguei" repetido reusa o caso aberto (a equipe concilia um
+ * caso, não N). Nunca lança; falha de leitura → null (abre um novo).
+ */
+async function findOpenPaymentClaimCase(ctx: SessionCtx): Promise<string | null> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_cases")
+      .select("id, status, created_at")
+      .eq("company_id", ctx.companyId)
+      .eq("session_id", ctx.sessionId)
+      .eq("type", "payment_claim")
+      .order("created_at", { ascending: false })
+      .limit(20)
+    const open = ((data ?? []) as Array<{ id: string; status?: string | null }>).find(
+      (c) => c.status == null || c.status === "open",
+    )
+    return open?.id ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * QA round 3 (QAB2-02) — convergência sob CORRIDA entre instâncias: dois "Já
+ * paguei" concorrentes podem ambos não achar caso aberto e ambos inserir. Depois
+ * do insert, relê os casos `payment_claim` abertos da sessão; o CANÔNICO é o mais
+ * antigo (created_at, desempate por id — todas as instâncias elegem o mesmo). Se
+ * o nosso não é o canônico, ele é removido (fallback: marcado `rejected` com
+ * resolution `duplicate_concurrent`, fora da fila de abertos) e devolvemos o
+ * canônico. Nunca lança; falha de leitura → mantém o nosso.
+ */
+export async function reconcilePaymentClaimCase(ctx: SessionCtx, ownId: string): Promise<string> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_cases")
+      .select("id, status, created_at")
+      .eq("company_id", ctx.companyId)
+      .eq("session_id", ctx.sessionId)
+      .eq("type", "payment_claim")
+      .limit(50)
+    const open = ((data ?? []) as Array<{ id: string; status?: string | null; created_at?: string | null }>)
+      .filter((c) => c.status == null || c.status === "open")
+      .sort((a, b) => {
+        const ta = a.created_at ?? ""
+        const tb = b.created_at ?? ""
+        if (ta !== tb) return ta < tb ? -1 : 1
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+      })
+    const canonical = open[0]?.id
+    if (!canonical || canonical === ownId) return ownId
+    const { error } = await supabase
+      .from("negotiation_cases")
+      .delete()
+      .eq("id", ownId)
+      .eq("company_id", ctx.companyId)
+    if (error) {
+      await supabase
+        .from("negotiation_cases")
+        .update({ status: "rejected", resolution: "duplicate_concurrent", updated_at: new Date().toISOString() })
+        .eq("id", ownId)
+        .eq("company_id", ctx.companyId)
+    }
+    return canonical
+  } catch {
+    return ownId
+  }
+}
+
+/** QAB2-02 — single-flight por sessão NA MESMA instância: "Já paguei"
+ *  concorrentes da mesma sessão compartilham o mesmo registro (1 leitura, no
+ *  máximo 1 insert). Entre instâncias, `reconcilePaymentClaimCase` converge. */
+const inflightPaymentClaims = new Map<string, Promise<{ caseId: string; reused: boolean }>>()
+
+async function resolvePaymentClaimCase(
+  ctx: SessionCtx,
+  details: Record<string, unknown>,
+): Promise<{ caseId: string; reused: boolean }> {
+  const key = `${ctx.companyId}:${ctx.sessionId}`
+  const pending = inflightPaymentClaims.get(key)
+  if (pending) {
+    const r = await pending
+    return { caseId: r.caseId, reused: true }
+  }
+  const p = (async () => {
+    const existing = await findOpenPaymentClaimCase(ctx)
+    if (existing) return { caseId: existing, reused: true }
+    const inserted = await openCase(ctx, "payment_claim", details)
+    const canonical = await reconcilePaymentClaimCase(ctx, inserted)
+    return { caseId: canonical, reused: canonical !== inserted }
+  })()
+  inflightPaymentClaims.set(key, p)
+  try {
+    return await p
+  } finally {
+    if (inflightPaymentClaims.get(key) === p) inflightPaymentClaims.delete(key)
+  }
+}
+
 export async function registerPaymentClaim(
   ctx: SessionCtx,
   details: { paidAt?: string; amount?: number; channel?: string; note?: string },
   actor: JourneyActor, eventId?: string,
 ): Promise<string> {
-  const caseId = await openCase(ctx, "payment_claim", details)
+  const { caseId, reused } = await resolvePaymentClaimCase(ctx, details)
+  const existing = reused ? caseId : null
   await recordEvent({
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
     sessionId: ctx.sessionId, eventId, type: "payment_claim.registered", actor,
-    payload: { case_id: caseId },
+    payload: { case_id: caseId, ...(existing ? { reused_open_case: true } : {}) },
   })
   return caseId
 }
 
 /**
  * R2 — copy de confirmação da transferência ao atendimento (nunca silêncio/"Sessão
- * encerrada" seca). NOMEIA o canal (WhatsApp AlteaPay) e a expectativa de contato,
- * SEM prometer prazo que não podemos cumprir e SEM expor número em claro (o número
- * real do WhatsApp AlteaPay não foi fornecido — mensagem de fallback segura).
+ * encerrada" seca). QA round 3 (QAB3-07, carta de voz D45/Apêndice B — sem
+ * promessa): a frase anterior ("A nossa equipe vai falar com você pelo WhatsApp da
+ * AlteaPay.") prometia canal e contato que o tenant pode não ter (VMAX sem plano
+ * Voxuy; o próprio handoff grava contact_suppressions channel=all). Agora só
+ * REGISTRA o pedido e orienta sem prazo nem canal prometido; SEM número em claro.
  * D36: sem ameaça; dúvidas sobre a origem do débito ficam com o cedente ({credor}).
  * `creditorName` já vem resolvido pela precedência canônica (R15). Sem PII.
  */
 export function humanHandoffReply(creditorName: string): string {
-  // T12 / R-33: remove "em breve" (promessa de prazo sem SLA) e o "se já pagou
-  // desconsidere" deslocado. Nomeia o canal (WhatsApp AlteaPay) sem número em claro.
+  // T12 / R-33 / QAB3-07: sem "em breve", sem "vai falar com você", sem canal.
   return (
-    "Certo. Vou encaminhar você ao nosso atendimento. " +
-    "A nossa equipe vai falar com você pelo WhatsApp da AlteaPay. " +
+    "Certo. Registramos o seu pedido de atendimento. " +
+    "Se precisar, volte a este link para consultar o valor em aberto. " +
     `Dúvidas sobre a origem da dívida são com a ${creditorName}.`
   )
 }
@@ -425,13 +589,16 @@ export async function handlePaymentClaim(
   try {
     const { persistAssistantMessage } = await import("./acknowledgement")
     // A1: resultado da ação como OUTCOME (stage 'payment_claim') — persistido
-    // ANTES de o menu ser reemitido pelo chamador.
+    // ANTES de o menu ser reemitido pelo chamador. QA round 1 (M1): é a resposta
+    // a ESTE clique — fora do dedup de conteúdo de 15 min (um 2º "Já paguei" na
+    // janela ficava sem resposta visível).
     await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
       text: reply,
       stage: "payment_claim",
       snapshot: { case_id: caseId },
+      skipContentDedup: true,
     })
   } catch (err) {
     console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)

@@ -357,9 +357,10 @@ describe("T10 / R-31 — degradação (15s)", () => {
 })
 
 describe("T12 / R-33 — handoff", () => {
-  it("nomeia o canal (WhatsApp AlteaPay) sem prometer prazo ('em breve') nem número em claro", () => {
+  it("registra o pedido sem prometer canal nem prazo ('em breve') nem número em claro (QAB3-07)", () => {
     const t = humanHandoffReply("VMAX")
-    expect(t).toMatch(/WhatsApp da AlteaPay/i)
+    expect(t).toMatch(/Registramos o seu pedido de atendimento\./)
+    expect(t).not.toMatch(/WhatsApp|vai falar com você/i)
     expect(t).toContain("VMAX")
     expect(t).not.toMatch(/em breve/i)
     // sem número de telefone em claro (fallback seguro).

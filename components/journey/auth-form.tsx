@@ -88,7 +88,7 @@ export function JourneyAuthForm({
           placeholder="000.000.000-00"
           value={maskCpf(cpf)}
           onChange={(e) => setCpf(e.target.value)}
-          className="h-11 rounded-md border border-neutral-300 bg-white px-3 text-base outline-none focus:border-[var(--brand-secondary)] focus:ring-2 focus:ring-[var(--brand-secondary)]/30"
+          className="h-11 rounded-md border border-neutral-300 bg-white px-3 text-base outline-none focus:border-neutral-900 focus:ring-2 focus:ring-neutral-900"
         />
       </label>
 
@@ -99,7 +99,7 @@ export function JourneyAuthForm({
             type="date"
             value={birthDate}
             onChange={(e) => setBirthDate(e.target.value)}
-            className="h-11 rounded-md border border-neutral-300 bg-white px-3 text-base outline-none focus:border-[var(--brand-secondary)] focus:ring-2 focus:ring-[var(--brand-secondary)]/30"
+            className="h-11 rounded-md border border-neutral-300 bg-white px-3 text-base outline-none focus:border-neutral-900 focus:ring-2 focus:ring-neutral-900"
           />
         </label>
       ) : null}
@@ -127,7 +127,7 @@ export function JourneyAuthForm({
         type="submit"
         disabled={!canSubmit}
         style={{ backgroundColor: "var(--brand-secondary)" }}
-        className="mt-auto h-11 rounded-md text-base font-semibold text-white transition-opacity disabled:opacity-40"
+        className="mt-auto h-11 rounded-md text-base font-semibold text-white transition-opacity disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
       >
         {submitting ? "Confirmando..." : "Confirmar"}
       </button>

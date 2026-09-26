@@ -10,6 +10,14 @@
 //
 // ESTRUTURA é de D2; o ESTILO (mobile 360, valor em destaque, hierarquia) é de D3
 // (className/tokens). Aqui deixo a marcação semântica e o layout mínimo; D3 refina.
+//
+// QA round 3 (QAB3-04): o card é o PONTO DE PARTIDA do leitor de tela após o
+// login — recebe o foco inicial (tabIndex=-1 + `focusRef`, chat.tsx foca com
+// preventScroll) para que quem cobra, quanto e a saudação sejam lidos ANTES do
+// log. QAB3-10c: "vencimento" por extenso (o leitor de tela lia "venc ponto").
+
+import type React from "react"
+import { FOCUS_RING } from "./button-tiers"
 
 /** Shape espelhado de lib/journey/pinned-debt.ts:PinnedDebt (valores em reais). */
 export interface PinnedDebtData {
@@ -41,19 +49,28 @@ function formatDue(iso: string | null): string {
  * de resumo (não um alerta/erro); o valor é o dado em destaque; o cedente é
  * identificado. Sem PII.
  */
-export function DebtCard({ debt }: { debt: PinnedDebtData | null }) {
+export function DebtCard({
+  debt,
+  focusRef,
+}: {
+  debt: PinnedDebtData | null
+  /** QAB3-04: alvo do foco inicial pós-login (o card, não o meio do log). */
+  focusRef?: React.Ref<HTMLElement>
+}) {
   if (!debt) return null
   const due = formatDue(debt.oldest_due_date)
   const multi = debt.invoice_count > 1
   return (
     <section
+      ref={focusRef}
+      tabIndex={-1}
       aria-label="Resumo da dívida"
-      className="sticky top-0 z-10 rounded-lg border border-neutral-200 bg-white px-4 py-3 shadow-sm"
+      className={`sticky top-0 z-10 rounded-lg border border-neutral-200 bg-white px-4 py-3 shadow-sm ${FOCUS_RING}`}
     >
       <div className="flex items-baseline justify-between gap-2">
         <span className="truncate text-xs font-medium text-neutral-500">{debt.creditor_name}</span>
         {due ? (
-          <span className="shrink-0 text-xs text-neutral-500">venc. {due}</span>
+          <span className="shrink-0 text-xs text-neutral-500">vencimento {due}</span>
         ) : null}
       </div>
       <div className="mt-0.5 text-2xl font-bold text-neutral-900">{formatBRL(debt.updated_value)}</div>

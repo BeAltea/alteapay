@@ -58,7 +58,7 @@ export function ActionConfirm({
                 href={officialChannelUrl}
                 target="_blank"
                 rel="noreferrer noopener"
-                className="underline underline-offset-2"
+                className="underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
               >
                 {officialChannelLabel ?? "pelo canal oficial"}
               </a>
@@ -85,11 +85,11 @@ export function ActionConfirm({
         type="button"
         onClick={confirm}
         disabled={state === "busy"}
-        className="mt-auto h-11 rounded-md bg-neutral-900 text-base font-semibold text-white disabled:opacity-40"
+        className="mt-auto h-11 rounded-md bg-neutral-900 text-base font-semibold text-white disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
       >
         {state === "busy" ? "Confirmando..." : "Confirmar"}
       </button>
-      <a href={`/c/${token}`} className="text-center text-sm text-neutral-500 underline underline-offset-2">
+      <a href={`/c/${token}`} className="text-center text-sm text-neutral-500 underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2">
         Voltar
       </a>
     </div>
