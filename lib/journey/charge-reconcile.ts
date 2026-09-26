@@ -75,6 +75,7 @@ interface AsaasPaymentLike {
   pixQrCodeUrl?: string | null
   dueDate?: string | null
   customer?: string | null
+  installment?: string | null
 }
 
 const inlineMode = () => (process.env.CHARGE_MODE || "queue").toLowerCase() === "inline"
@@ -119,6 +120,8 @@ export async function reconcilePendingCharge(
         asaas_boleto_url: found.bankSlipUrl ?? null,
         asaas_pix_qrcode_url: found.pixQrCodeUrl ?? null,
         ...(found.dueDate ? { due_date: found.dueDate } : {}),
+        // QA rodada 6 (Q4r2-03): id do parcelamento (webhook das parcelas 2..N).
+        ...(found.installment ? { asaas_subscription_id: found.installment } : {}),
       })
       .eq("id", ag.id)
       .is("asaas_payment_id", null)

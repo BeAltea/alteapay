@@ -49,6 +49,8 @@ export interface AsaasPayment {
   externalReference?: string
   installmentCount?: number
   installmentValue?: number
+  /** id do parcelamento (presente em cada parcela de uma cobrança parcelada). */
+  installment?: string | null
   invoiceUrl?: string
   bankSlipUrl?: string
   transactionReceiptUrl?: string

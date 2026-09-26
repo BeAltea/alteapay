@@ -25,6 +25,8 @@ export type JourneyEventType =
   | "offer.presented" | "offer.invalid" | "offer.accepted" | "offer.rejected" | "offer.expired"
   | "agreement.created"
   | "payment.generated" | "payment.viewed" | "payment.paid" | "payment.overdue" | "payment.cancelled"
+  // QA rodada 6 (Q4r2-03): parcela intermediária paga (o acordo segue em aberto).
+  | "payment.installment_paid"
   | "receipt.issued" | "creditor.notified" | "payment.sync_error"
   | "dispute.registered" | "payment_claim.registered" | "human.transfer"
   | "optout.received" | "block.received"

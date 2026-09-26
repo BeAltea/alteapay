@@ -2,6 +2,13 @@ import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
 import { effectiveAsaasStatusFromWebhook } from "@/lib/asaas-idempotency"
+import {
+  isFinalInstallmentPaid,
+  isFirstInstallmentOf,
+  isInstallmentCharge,
+  PAID_ASAAS_EVENTS,
+  parseJourneyExternalReference,
+} from "@/lib/asaas-installments"
 
 /**
  * ASAAS Payment Webhook Endpoint
@@ -70,6 +77,18 @@ const DEBT_STATUS_MAP: Record<string, string | null> = {
   PAYMENT_REFUNDED: "pending", // Revert to open
   PAYMENT_DELETED: "pending", // Revert to open
 }
+
+// QA rodada 6 (Q4r2-03): eventos que, numa parcela 2..N, só informam (não mudam
+// o espelho da parcela 1 exibida no acordo).
+const INFORMATIVE_EVENTS: ReadonlySet<string> = new Set([
+  "PAYMENT_CREATED",
+  "PAYMENT_AWAITING_RISK_ANALYSIS",
+  "PAYMENT_PENDING",
+  "PAYMENT_UPDATED",
+  "PAYMENT_CHECKOUT_VIEWED",
+  "PAYMENT_VIEWED",
+  "PAYMENT_RESTORED",
+])
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
@@ -170,6 +189,44 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // Strategy 2b (QA rodada 6, Q4r2-03): PARCELAMENTO — as parcelas 2..N de um
+    // acordo parcelado compartilham `payment.installment` (id do parcelamento),
+    // gravado no acordo em `asaas_subscription_id` (coluna existente).
+    if (!agreement && payment.installment) {
+      const { data: agreementByInstallment } = await supabase
+        .from("agreements")
+        .select("*")
+        .eq("asaas_subscription_id", payment.installment)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (agreementByInstallment) {
+        agreement = agreementByInstallment
+        searchMethod = "installment_id"
+      }
+    }
+
+    // Strategy 2c (QA rodada 6, Q4r2-03): externalReference da JORNADA
+    // (`journey_{sessão}_{oferta}`), compartilhada por todas as parcelas — cobre
+    // os acordos criados antes de o id do parcelamento ser gravado.
+    const journeyRef = parseJourneyExternalReference(payment.externalReference)
+    if (!agreement && journeyRef) {
+      const { data: agreementByJourneyRef } = await supabase
+        .from("agreements")
+        .select("*")
+        .eq("negotiation_session_id", journeyRef.sessionId)
+        .eq("offer_id", journeyRef.offerId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (agreementByJourneyRef) {
+        agreement = agreementByJourneyRef
+        searchMethod = "journey_external_reference"
+      }
+    }
+
     // Strategy 3: External reference with "agreement_" prefix
     if (!agreement && payment.externalReference?.startsWith("agreement_")) {
       const vmaxId = payment.externalReference.replace("agreement_", "")
@@ -256,10 +313,42 @@ export async function POST(request: NextRequest) {
 
     console.log("[ASAAS Webhook] Found agreement:", agreement.id, "via:", searchMethod)
 
+    // 6b. PARCELAMENTO (QA rodada 6, Q4r2-03): grava o id do parcelamento no
+    // acordo (casamento direto das próximas parcelas) e decide se um PAGO é o da
+    // ÚLTIMA parcela. Antes disso, NADA é declarado pago (acordo, dívida, VMAX).
+    const installmentCharge = isInstallmentCharge(payment, agreement)
+    const firstInstallment = !installmentCharge || isFirstInstallmentOf(payment, agreement)
+    let partialInstallmentPaid = false
+    if (installmentCharge) {
+      if (!agreement.asaas_subscription_id) {
+        await supabase
+          .from("agreements")
+          .update({ asaas_subscription_id: payment.installment })
+          .eq("id", agreement.id)
+          .is("asaas_subscription_id", null)
+      }
+      if (PAID_ASAAS_EVENTS.has(event)) {
+        const { data: priorPaid } = await supabase
+          .from("asaas_webhook_events")
+          .select("payment_id, event_type")
+          .eq("agreement_id", agreement.id)
+          .in("event_type", [...PAID_ASAAS_EVENTS])
+        partialInstallmentPaid = !isFinalInstallmentPaid({
+          installments: Number(agreement.installments),
+          priorPaidPaymentIds: ((priorPaid ?? []) as Array<{ payment_id?: string | null }>).map((r) => r.payment_id),
+          currentPaymentId: payment.id,
+        })
+      }
+    }
+
     // 7. Determine new statuses based on event type
-    const newPaymentStatus = PAYMENT_STATUS_MAP[event] ?? agreement.payment_status
-    const newAgreementStatus = AGREEMENT_STATUS_MAP[event] ?? agreement.status
-    const newDebtStatus = DEBT_STATUS_MAP[event]
+    const newPaymentStatus = partialInstallmentPaid
+      ? agreement.payment_status
+      : PAYMENT_STATUS_MAP[event] ?? agreement.payment_status
+    const newAgreementStatus = partialInstallmentPaid
+      ? agreement.status
+      : AGREEMENT_STATUS_MAP[event] ?? agreement.status
+    const newDebtStatus = partialInstallmentPaid ? null : DEBT_STATUS_MAP[event]
 
     // 8. Build the update object for agreement
     // N-D1-2: o ASAAS mantém status=PENDING numa cobrança deletada (só liga
@@ -267,12 +356,19 @@ export async function POST(request: NextRequest) {
     // e o guard local (isBlockingAgreement) travava o devedor em already_charged
     // com link morto. DELETED/REFUNDED passam a ser persistidos explicitamente.
     const agreementUpdate: Record<string, any> = {
-      asaas_status: effectiveAsaasStatusFromWebhook(event, payment),
       asaas_last_webhook_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }
+    // Parcela paga que NÃO é a última: o espelho continua "em aberto" (nunca
+    // RECEIVED/CONFIRMED no acordo antes da última parcela). Eventos informativos
+    // de outras parcelas (CREATED/UPDATED/VIEWED) não mexem no status da parcela 1.
+    const informativeOtherInstallment =
+      installmentCharge && !firstInstallment && INFORMATIVE_EVENTS.has(event)
+    if (!partialInstallmentPaid && !informativeOtherInstallment) {
+      agreementUpdate.asaas_status = effectiveAsaasStatusFromWebhook(event, payment)
+    }
 
-    if (newPaymentStatus) {
+    if (newPaymentStatus && !informativeOtherInstallment) {
       agreementUpdate.payment_status = newPaymentStatus
     }
 
@@ -287,24 +383,22 @@ export async function POST(request: NextRequest) {
     if (payment.netValue) {
       agreementUpdate.asaas_net_value = payment.netValue
     }
-    if (payment.invoiceUrl) {
+    // Link e vencimento exibidos são os da PARCELA 1 (outras parcelas não os
+    // sobrescrevem).
+    if (payment.invoiceUrl && firstInstallment) {
       agreementUpdate.asaas_invoice_url = payment.invoiceUrl
     }
-    if (payment.paymentDate || payment.clientPaymentDate) {
+    if ((payment.paymentDate || payment.clientPaymentDate) && !partialInstallmentPaid) {
       agreementUpdate.asaas_payment_date = payment.paymentDate || payment.clientPaymentDate
     }
     // Sync due date from ASAAS (in case it was changed)
-    if (payment.dueDate) {
+    if (payment.dueDate && firstInstallment) {
       agreementUpdate.due_date = payment.dueDate
     }
 
-    // Set payment_received_at for received/confirmed events (todos os pagos)
-    if (
-      event === "PAYMENT_RECEIVED" ||
-      event === "PAYMENT_CONFIRMED" ||
-      event === "PAYMENT_RECEIVED_IN_CASH" ||
-      event === "PAYMENT_DUNNING_RECEIVED"
-    ) {
+    // Set payment_received_at for received/confirmed events (todos os pagos) —
+    // no parcelado, só na ÚLTIMA parcela.
+    if (PAID_ASAAS_EVENTS.has(event) && !partialInstallmentPaid) {
       agreementUpdate.payment_received_at = new Date().toISOString()
     }
 
@@ -418,6 +512,9 @@ export async function POST(request: NextRequest) {
           eventType: event,
           paymentId: payment.id,
           agreementId: agreement.id,
+          installmentIndex: typeof payment.installmentNumber === "number" ? payment.installmentNumber : null,
+          // QA rodada 6 (Q4r2-03): parcela paga que não quita o acordo.
+          partialInstallmentPaid,
         })
       } catch (journeyErr) {
         console.error("[ASAAS Webhook] journey hook error (isolado):", (journeyErr as Error).message)
@@ -428,6 +525,8 @@ export async function POST(request: NextRequest) {
     console.log("[ASAAS Webhook] Processed successfully in", duration, "ms:", {
       event,
       agreementId: agreement.id,
+      searchMethod,
+      partialInstallmentPaid,
       paymentStatus: newPaymentStatus,
       agreementStatus: newAgreementStatus,
     })

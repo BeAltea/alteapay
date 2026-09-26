@@ -178,6 +178,9 @@ export async function createAsaasChargeInline(
         asaas_boleto_url: asaasPayment.bankSlipUrl ?? null,
         asaas_pix_qrcode_url: asaasPayment.pixQrCodeUrl ?? null,
         due_date: asaasPayment.dueDate ?? payment.dueDate,
+        // QA rodada 6 (Q4r2-03): id do PARCELAMENTO (coluna existente) — o webhook
+        // das parcelas 2..N casa por ele com este acordo.
+        ...(asaasPayment.installment ? { asaas_subscription_id: asaasPayment.installment } : {}),
       })
       .eq("id", agreementId)
       .eq("company_id", metadata.companyId)
