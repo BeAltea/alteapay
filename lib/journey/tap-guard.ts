@@ -56,3 +56,30 @@ export function shouldRearm(prev: ActionBlockPosition | null, next: ActionBlockP
   if (prev.promptId !== next.promptId) return true
   return Math.abs(next.top - prev.top) > LAYOUT_SHIFT_PX
 }
+
+// ---------------------------------------------------------------------------
+// Correção B8 (A-2) — a inércia de nascimento/deslocamento conta a partir do
+// ÚLTIMO TOQUE (nunca do instante em que o menu nasceu ou se moveu): um menu que
+// aparece ≥ ACTIONS_ARM_MS depois do último toque já nasce clicável; o 2º/3º
+// toque de um toque múltiplo (até ~500 ms depois do 1º) continua protegido.
+// Correção B8 (A-1/M-1) — nenhum toque é mudo: o toque ignorado (bloco inerte no
+// client, ou `ignored:'double_tap'` do servidor) ganha um aviso curto.
+
+/**
+ * Instante-limite da inércia de um bloco que nasceu/se deslocou: último toque +
+ * ACTIONS_ARM_MS, ou null quando esse limite já passou (ou não houve toque).
+ */
+export function rearmUntilFromLastTap(lastTapAtMs: number | null | undefined, nowMs: number): number | null {
+  if (typeof lastTapAtMs !== "number" || !Number.isFinite(lastTapAtMs)) return null
+  const until = lastTapAtMs + ACTIONS_ARM_MS
+  return until > nowMs ? until : null
+}
+
+/** Aviso de um toque que caiu na janela de inércia do bloco (aria-live, neutro). */
+export const INERT_TAP_NOTICE = "Um instante. Toque de novo para escolher."
+
+/** Aviso de um clique que o servidor ignorou como toque múltiplo (menu segue vivo). */
+export const DOUBLE_TAP_NOTICE = "Toque registrado uma vez. Escolha de novo, se quiser."
+
+/** Classe do bloco inerte: sinal visual SEM reflow (mesma caixa, mesmo tamanho). */
+export const INERT_CLASS = "opacity-60 cursor-wait"

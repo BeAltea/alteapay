@@ -57,6 +57,7 @@ async function persistClaimEcho(ctx: {
       .from("negotiation_sessions")
       .select("thread_epoch")
       .eq("id", ctx.sessionId)
+      .eq("company_id", ctx.companyId)
       .maybeSingle()
     const epoch = Number((sess as { thread_epoch?: number | null } | null)?.thread_epoch ?? 0)
     const row: Record<string, unknown> = {

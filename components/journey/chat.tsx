@@ -38,13 +38,24 @@ import { FOCUS_RING } from "./button-tiers"
 import { OUTCOME_STAGES } from "@/lib/journey/display-class"
 import {
   createInFlightGuard,
+  IGNORED_CLICK_RESULT,
   PROCESSING_CHOICE_NOTICE,
+  shouldConsumeClickedPrompt,
   staleClickFeedback,
   toRenderablePrompt,
 } from "@/lib/journey/click-feedback"
 import { isFencedPoll, isStalePoll, shouldHoldPromptOnNull, type PollStamp } from "@/lib/journey/poll-order"
 import { isHrefDead, LINK_BUBBLE_GRACE_MS, resolveLinkView } from "@/lib/journey/link-view"
-import { ACTIONS_ARM_MS, extendInertUntil, shouldRearm, TAP_INERT_MS, type ActionBlockPosition } from "@/lib/journey/tap-guard"
+import {
+  DOUBLE_TAP_NOTICE,
+  extendInertUntil,
+  INERT_CLASS,
+  INERT_TAP_NOTICE,
+  rearmUntilFromLastTap,
+  shouldRearm,
+  TAP_INERT_MS,
+  type ActionBlockPosition,
+} from "@/lib/journey/tap-guard"
 import { IDLE_ACTIVITY_EVENTS, isRealActivity, type PointerPos } from "@/lib/journey/idle-input"
 import { DebtCard, type PinnedDebtData } from "./debt-card"
 import {
@@ -325,15 +336,19 @@ export function JourneyChat() {
   const fenceSeqRef = useRef<number | null>(null)
   const lastPostPromptAtRef = useRef<number | null>(null)
   // QA round 4 (R-11/R-21, S2): bloco de ações INERTE após qualquer toque
-  // (TAP_INERT_MS) e quando nasce/se desloca (ACTIONS_ARM_MS). O controle fica
+  // (TAP_INERT_MS) e, quando nasce/se desloca, até último toque + ACTIONS_ARM_MS. O controle fica
   // no lugar (aria-disabled + pointer-events:none); o handler ignora.
   const [actionsInert, setActionsInert] = useState(false)
   const inertUntilRef = useRef(0)
   const inertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const actionBlockPosRef = useRef<ActionBlockPosition | null>(null)
-  const armActions = useCallback((ms: number) => {
+  // Correção B8 (A-2): instante do ÚLTIMO toque num controle de ação — a
+  // inércia de nascimento/deslocamento é ancorada nele (nunca no render).
+  const lastTapAtRef = useRef<number | null>(null)
+  const armActionsUntil = useCallback((until: number) => {
     const now = Date.now()
-    inertUntilRef.current = extendInertUntil(inertUntilRef.current, now, ms)
+    if (until <= now) return
+    inertUntilRef.current = extendInertUntil(inertUntilRef.current, now, until - now)
     setActionsInert(true)
     if (inertTimerRef.current) clearTimeout(inertTimerRef.current)
     const release = () => {
@@ -347,6 +362,17 @@ export function JourneyChat() {
     }
     inertTimerRef.current = setTimeout(release, inertUntilRef.current - now)
   }, [])
+  /** Toque num controle de ação: registra o instante e deixa o bloco inerte por TAP_INERT_MS. */
+  const armOnTap = useCallback(() => {
+    const now = Date.now()
+    lastTapAtRef.current = now
+    armActionsUntil(now + TAP_INERT_MS)
+  }, [armActionsUntil])
+  /** Bloco nasceu/se deslocou (ou reapareceu após uma ação): inerte só até último toque + ACTIONS_ARM_MS. */
+  const rearmFromLastTap = useCallback(() => {
+    const until = rearmUntilFromLastTap(lastTapAtRef.current, Date.now())
+    if (until !== null) armActionsUntil(until)
+  }, [armActionsUntil])
   const isActionsInertNow = () => Date.now() < inertUntilRef.current
   // QA round 4 (R-14/R-25): a 1ª resposta do poll chegou (antes: tela vazia).
   const [firstPaintDone, setFirstPaintDone] = useState(false)
@@ -1007,7 +1033,7 @@ export function JourneyChat() {
     resetIdle()
     // QA round 4 (R-11/R-21): todo o bloco de ações fica inerte logo após o
     // toque — o 2º/3º toque de um toque múltiplo nunca acerta outro controle.
-    armActions(TAP_INERT_MS)
+    armOnTap()
     const isNegotiate = isNegotiateLabel(buttonLabel)
     // R1 — ESCOLHA DE PARCELA: no prompt 'offer_choice' um item de lista (2..97,
     // não a volta[98]/atendimento[99]) seleciona uma oferta da matriz → o servidor
@@ -1092,7 +1118,9 @@ export function JourneyChat() {
       const data = await res.json().catch(() => ({}))
       // A2: o prompt clicado foi consumido no servidor (200) ou já era obsoleto
       // (409) — um poll atrasado não o repõe por cima do prompt novo.
-      if (res.ok || res.status === 409) consumedPromptIds.current.add(promptId)
+      // Correção B8 (A-1): um clique IGNORADO (toque múltiplo) não consumiu nada
+      // no servidor — o prompt segue vivo e o poll pode repô-lo.
+      if (shouldConsumeClickedPrompt(res.ok, res.status, data)) consumedPromptIds.current.add(promptId)
       // QA round 1 (QAA1-01) — o servidor ignorou um handoff como TOQUE DUPLO:
       // nada mudou no servidor; só reconcilia pelo poll (nunca reabre menu por
       // cima das parcelas, nunca encerra).
@@ -1102,9 +1130,13 @@ export function JourneyChat() {
         if (isPay) resetWaitToIdle()
         // QA round 4 (R-21, D-1): a resposta traz o prompt ativo → o menu volta
         // na hora (nunca uma amostra sem botão).
+        // Correção B8 (A-1/M-1): NÃO respondido — o bloco reabilita (mesmo que o
+        // prompt ativo seja o mesmo id: sem remontagem) e um aviso curto e
+        // neutro explica o toque (inclusive o Pagar, que sai do "gerando").
         applyActionBody(data)
+        setPromptNotice(DOUBLE_TAP_NOTICE)
         void pollMessages()
-        return { ok: true }
+        return IGNORED_CLICK_RESULT
       }
       // QA round 1 (QAA1-06) — CLIQUE DUPLICADO (o mesmo botão já respondeu este
       // prompt há instantes): sem efeito novo. PAGAR: o outro pedido está
@@ -1521,10 +1553,16 @@ export function JourneyChat() {
   const [claimInFlight, setClaimInFlight] = useState(false)
   const claimInFlightRef = useRef(false)
   async function requestPaymentClaim() {
-    if (claimInFlightRef.current || isActionsInertNow()) return
+    if (claimInFlightRef.current) return
+    // Correção B8 (A-2): toque na janela de inércia nunca é mudo.
+    if (isActionsInertNow()) {
+      setPromptNotice(INERT_TAP_NOTICE)
+      return
+    }
+    setPromptNotice(null)
     claimInFlightRef.current = true
     setClaimInFlight(true)
-    armActions(TAP_INERT_MS)
+    armOnTap()
     resetIdle()
     try {
       const res = await fetch("/api/chat/reopen", {
@@ -1538,8 +1576,8 @@ export function JourneyChat() {
     } finally {
       claimInFlightRef.current = false
       setClaimInFlight(false)
-      // o bloco que reaparece sob o dedo nasce inerte (arming), sem reflow.
-      armActions(ACTIONS_ARM_MS)
+      // o bloco que reaparece sob o dedo fica inerte até último toque + ARM (sem reflow).
+      rearmFromLastTap()
     }
     void pollMessages()
   }
@@ -1737,7 +1775,9 @@ export function JourneyChat() {
       promptId: activePrompt && !ended ? activePrompt.id : null,
       top: el ? el.getBoundingClientRect().top + (typeof window !== "undefined" ? window.scrollY : 0) : null,
     }
-    if (shouldRearm(actionBlockPosRef.current, next)) armActions(ACTIONS_ARM_MS)
+    // Correção B8 (A-2): ancorado no ÚLTIMO TOQUE — um menu que nasce/se move
+    // ≥ ACTIONS_ARM_MS depois dele já nasce clicável (nunca clique mudo).
+    if (shouldRearm(actionBlockPosRef.current, next)) rearmFromLastTap()
     actionBlockPosRef.current = next
   })
   // QA round 4 (R-17/R-28, S8): ao expandir, o log abre no PONTO DO CORTE (a
@@ -2084,7 +2124,7 @@ export function JourneyChat() {
                       onClick={requestPaymentClaim}
                       disabled={claimInFlight}
                       aria-disabled={claimInFlight || actionsInert}
-                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50${actionsInert ? " pointer-events-none" : ""}`}
+                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50${actionsInert ? ` ${INERT_CLASS}` : ""}`}
                     >
                       Já paguei este valor
                     </button>
@@ -2269,7 +2309,7 @@ export function JourneyChat() {
               onClick={requestPaymentClaim}
               disabled={claimInFlight}
               aria-disabled={claimInFlight || actionsInert}
-              className={`${FOCUS_RING} mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800${actionsInert || claimInFlight ? " pointer-events-none" : ""}`}
+              className={`${FOCUS_RING} mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800${actionsInert || claimInFlight ? ` ${INERT_CLASS}` : ""}`}
             >
               Já paguei este valor
             </button>

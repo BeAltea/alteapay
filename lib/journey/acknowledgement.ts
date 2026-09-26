@@ -507,13 +507,14 @@ const SUCCESSOR_POLL_MS = 150
  * transição (ou o sucessor não apareceu): o chamador segue o fluxo normal.
  * Nunca lança.
  */
-async function awaitPromptSuccessor(sessionId: string): Promise<PromptRow | null> {
+async function awaitPromptSuccessor(sessionId: string, companyId: string): Promise<PromptRow | null> {
   try {
     const supabase = createServiceClient()
     const { data } = await supabase
       .from("chat_prompts")
       .select("id, status, answered_at, created_at")
       .eq("session_id", sessionId)
+      .eq("company_id", companyId)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
@@ -624,7 +625,7 @@ export async function bootstrapThreeOptionsPrompt(input: {
   //  (2) contestação em curso/registrada: o último clique da sessão é o "Não
   //      reconheço" [0] → publica o menu-volta [98], NUNCA o menu pagável.
   if (mode === "initial") {
-    const successor = await awaitPromptSuccessor(input.sessionId)
+    const successor = await awaitPromptSuccessor(input.sessionId, input.companyId)
     if (successor) return { ok: true, created: false, reason: "already_active", prompt: successor }
     const { lastCustomerClick } = await import("./double-tap")
     const last = await lastCustomerClick(input.sessionId)

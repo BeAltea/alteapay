@@ -36,6 +36,17 @@ vi.mock("@/lib/journey/events", () => ({
   recordEvent: async () => ({ ok: true, duplicate: false }),
   getTimeline: async () => [],
 }))
+// QA round 4 (B8 B-3): o disparo do negotiation.start pode ser SEGURADO (nunca
+// resolve) para o desfecho "pending" ser determinístico; por padrão segue o real.
+let hangKickoff = false
+vi.mock("@/lib/negotiation/engine", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("@/lib/negotiation/engine")>()
+  return {
+    ...orig,
+    emitNegotiationStart: (...args: Parameters<typeof orig.emitNegotiationStart>) =>
+      hangKickoff ? new Promise<never>(() => {}) : orig.emitNegotiationStart(...args),
+  }
+})
 // close-agreement é o caminho real de cobrança; mockamos só a fronteira ASAAS.
 vi.mock("@/lib/negotiation/close-agreement", () => ({
   closeAgreement: async () => {
@@ -237,12 +248,24 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     const answered = await answerPrompt({ sessionId: SID, companyId: CO, promptId, buttonId: 3 })
     expect(answered.ok).toBe(true)
 
-    const out = await handleDebtNegotiate({
-      companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, debtIds: [DEBT], promptId, buttonId: 3,
-    })
-    // owner síncrono nunca é 'n8n' presumido (o handoff n8n é best-effort/background).
-    // QA round 4 (R-27): desfecho ainda desconhecido → "pending" explícito.
-    expect(["platform", "pending"]).toContain(out.engineOwner)
+    // QA round 4 (R-27, B8 B-3): deadline fixo (0 ms) + disparo segurado → o
+    // desfecho do kickoff é desconhecido na resposta: "pending" explícito, nunca
+    // "platform"/"n8n" presumido (o handoff n8n é best-effort/background).
+    const prevDeadline = process.env.N8N_KICKOFF_DEADLINE_MS
+    process.env.N8N_KICKOFF_DEADLINE_MS = "0"
+    hangKickoff = true
+    let out: Awaited<ReturnType<typeof handleDebtNegotiate>>
+    try {
+      out = await handleDebtNegotiate({
+        companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, debtIds: [DEBT], promptId, buttonId: 3,
+      })
+    } finally {
+      hangKickoff = false
+      if (prevDeadline === undefined) delete process.env.N8N_KICKOFF_DEADLINE_MS
+      else process.env.N8N_KICKOFF_DEADLINE_MS = prevDeadline
+    }
+    expect(out.engineOwner).toBe("pending")
+    expect(out.kickoff).toBe("pending")
 
     const assistantTexts = (db.chat_messages ?? []).filter((m) => m.role === "assistant").map((m) => m.text)
     // dados da dívida (debtInfoMessage) E o reply — os DOIS no histórico local,

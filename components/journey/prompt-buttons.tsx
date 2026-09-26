@@ -29,9 +29,10 @@
 // VIVACIDADE: o clique NUNCA fica preso em "..." — quando onClick resolve com erro
 // (rede/timeout/4xx/5xx), o `finally` para o loading, reabilita os botões e
 // mostramos um aviso curto. O pai (chat.tsx) garante o resolve via AbortController.
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 // HIERARQUIA/ALVO/ESTILO derivados por lógica PURA num .ts irmão (button-tiers.ts)
 // — testável no node do vitest sem montar React (a decisão vive fora do .tsx).
+import { INERT_CLASS, INERT_TAP_NOTICE } from "@/lib/journey/tap-guard"
 import {
   buttonTier,
   isContestation,
@@ -48,6 +49,9 @@ export const PROMPT_STALE_NOTICE = "Esta opção já foi atualizada. Veja as op�
 /** Aviso humano por código de falha do clique (puro/testável). null = sem aviso. */
 export function clickNotice(code: string | undefined): string | null {
   if (!code) return null
+  // Correção B8 (A-1): toque ignorado pelo servidor — o aviso neutro é do pai
+  // (acima do bloco, também para os atalhos); aqui só reabilita os botões.
+  if (code === "ignored") return null
   if (code === "prompt_stale" || code === "prompt_not_active") return PROMPT_STALE_NOTICE
   if (code === "timeout") return "A conexão está lenta. Toque no botão novamente."
   return "Não foi possível processar agora. Toque no botão novamente."
@@ -95,6 +99,14 @@ export function PromptButtons({
   // Aviso curto ao cliente quando o clique falha (rede/timeout/servidor/prompt
   // substituído). Sem termos técnicos e sem código de erro.
   const [notice, setNotice] = useState<string | null>(null)
+  const [noticeNeutral, setNoticeNeutral] = useState(false)
+  // o aviso de inércia sai quando o bloco volta a responder.
+  useEffect(() => {
+    if (!inert && noticeNeutral) {
+      setNotice(null)
+      setNoticeNeutral(false)
+    }
+  }, [inert, noticeNeutral])
 
   // Ordem contratual order-aware (M2/D.2): se algum botão traz `order`, ordena por
   // order (menor primeiro) com o id como desempate; sem `order`, mantém o legado
@@ -119,8 +131,16 @@ export function PromptButtons({
   }, [buttons, prompt.kind])
 
   async function handle(buttonId: number) {
-    if (pending !== null || answered || inert) return
+    if (pending !== null || answered) return
+    // Correção B8 (A-2): toque na janela de inércia NUNCA é mudo — aviso curto
+    // (aria-live) e nenhum efeito; o bloco já mostra o estado (opacity/cursor).
+    if (inert) {
+      setNotice(INERT_TAP_NOTICE)
+      setNoticeNeutral(true)
+      return
+    }
     setNotice(null)
+    setNoticeNeutral(false)
     setPending(buttonId)
     const label = buttons.find((b) => b.id === buttonId)?.label ?? ""
     try {
@@ -160,7 +180,9 @@ export function PromptButtons({
             ? { backgroundColor: "var(--brand-secondary)", color: "var(--brand-secondary-fg, #ffffff)" }
             : undefined
         }
-        className={inert ? `${tierClass(tier)} pointer-events-none` : tierClass(tier)}
+        // Correção B8 (A-2): inerte = sinal visual SEM reflow (opacity + cursor
+        // de espera, mesma caixa); o toque chega ao handler, que avisa.
+        className={inert ? `${tierClass(tier)} ${INERT_CLASS}` : tierClass(tier)}
         // QA round 3 (QAB3-05): enquanto pendente o VISUAL mostra "…", mas o
         // nome acessível continua o rótulo (aria-label) e o estado é aria-busy.
         aria-busy={pending === b.id || undefined}
@@ -197,7 +219,7 @@ export function PromptButtons({
         </div>
       ) : null}
       {notice ? (
-        <p className="text-xs text-red-600" role="status" aria-live="polite">
+        <p className={noticeNeutral ? "text-xs text-neutral-600" : "text-xs text-red-600"} role="status" aria-live="polite">
           {notice}
         </p>
       ) : null}

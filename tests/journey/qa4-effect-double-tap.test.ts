@@ -232,17 +232,16 @@ describe("client — bloco de ações inerte (tap-guard)", () => {
     expect(shouldRearm({ promptId: "p1", top: 500 }, { promptId: null, top: null })).toBe(false)
   })
 
-  it("chat.tsx/PromptButtons: toque arma o bloco; Já paguei fica NO LUGAR desabilitado; o handler ignora toque inerte", () => {
+  it("chat.tsx/PromptButtons: toque arma o bloco; Já paguei fica NO LUGAR desabilitado", () => {
     const root = join(__dirname, "..", "..")
     const chat = readFileSync(join(root, "components/journey/chat.tsx"), "utf8")
     const pb = readFileSync(join(root, "components/journey/prompt-buttons.tsx"), "utf8")
-    expect(chat).toMatch(/resetIdle\(\)\s*\/\/[^\n]*\n[^\n]*\n\s*armActions\(TAP_INERT_MS\)/)
-    expect(chat).toMatch(/async function requestPaymentClaim\(\) \{\s*if \(claimInFlightRef\.current \|\| isActionsInertNow\(\)\) return/)
+    // (Correção B8: inércia ancorada no último toque; toque inerte avisa — ver qa4-b8-inert-ignored)
+    expect(chat).toMatch(/resetIdle\(\)\s*\/\/[^\n]*\n[^\n]*\n\s*armOnTap\(\)/)
+    expect(chat).toMatch(/async function requestPaymentClaim\(\) \{\s*if \(claimInFlightRef\.current\) return/)
     expect(chat).toContain("inert={actionsInert || claimInFlight}")
     expect(chat).not.toContain("!claimSent")
-    expect(chat).toContain("if (shouldRearm(actionBlockPosRef.current, next)) armActions(ACTIONS_ARM_MS)")
-    expect(pb).toContain("if (pending !== null || answered || inert) return")
-    expect(pb).toContain("pointer-events-none")
+    expect(chat).toContain("if (shouldRearm(actionBlockPosRef.current, next)) rearmFromLastTap()")
     expect(pb).toContain("aria-disabled={answered || pending !== null || inert || undefined}")
   })
 })
