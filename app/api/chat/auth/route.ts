@@ -5,6 +5,7 @@
 //      → admin-only, decidido na página; a rota exige company_id já resolvido.
 // Timing equalizado (padding ~600ms) para não vazar lock/erro/inexistente.
 import { NextRequest, NextResponse } from "next/server"
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { validateToken } from "@/lib/journey/tokens"
 import { authenticateDebtor, GENERIC_AUTH_MESSAGE } from "@/lib/journey/auth"
 import { authenticateByDocument, authenticateByPublicLink, PUBLIC_NO_DEBT_MESSAGE } from "@/lib/journey/generic-auth"
@@ -18,11 +19,10 @@ export const revalidate = 0
 
 const MIN_RESPONSE_MS = 600
 
-function clientIp(req: NextRequest): string | null {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-    ?? req.headers.get("x-nf-client-connection-ip")
-    ?? null
-}
+// QA rodada 5 (Q1-5): o IP do rate limit/auditoria vem SÓ de cabeçalho de proxy
+// confiável (x-nf-client-connection-ip da borda Netlify › último elemento do XFF),
+// nunca do 1º elemento do X-Forwarded-For (forjável pelo cliente).
+const clientIp = (req: NextRequest): string | null => clientIpFromHeaders(req.headers)
 
 export async function POST(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {

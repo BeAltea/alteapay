@@ -6,6 +6,7 @@
 //   POST { action: "confirm", offerId, termsHash } → passo 2: fecha + cobra
 //   POST { action: "reject"|"dispute"|"payment_claim"|"human_transfer", ... }
 import { NextRequest, NextResponse } from "next/server"
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { runChatbotTurn } from "@/lib/negotiation/turn"
 import { createServiceClient } from "@/lib/supabase/service"
@@ -20,9 +21,8 @@ export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
 export const revalidate = 0
 
-function clientIp(req: NextRequest): string | null {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null
-}
+// QA rodada 5 (Q1-5): IP só de cabeçalho de proxy confiável.
+const clientIp = (req: NextRequest): string | null => clientIpFromHeaders(req.headers)
 
 async function sessionFromCookie(req: NextRequest) {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") return null

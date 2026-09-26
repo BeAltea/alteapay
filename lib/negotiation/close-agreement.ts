@@ -77,10 +77,27 @@ export interface CloseAgreementInput {
   channel?: string
   /** Jornada (D8): termos JÁ validados pela matriz substituem deriveTerms. */
   journey?: JourneyClose
+  /**
+   * QA rodada 5 (Q2-01) — espelho ANTES da cobrança: chamado logo após o insert
+   * do acordo e ANTES de qualquer chamada ao ASAAS. A jornada grava aqui a prova
+   * do aceite (offer → agreement) e o vínculo sessão → acordo, para que uma
+   * função morta no meio da criação nunca deixe cobrança sem espelho local.
+   * Se lançar, a cobrança NÃO é criada (o acordo fica sem cobrança e é devolvido
+   * com charge_status 'not_started').
+   */
+  beforeCharge?: (agreementId: string) => Promise<void>
+  /** QA rodada 5 (Q2-01) — opções do caminho inline (prazo e customer conhecido). */
+  charge?: { notAfter?: number | null; knownAsaasCustomerId?: string | null }
+  /** QA rodada 5: customer_id já conhecido (sessão) — lido em paralelo com a
+   *  dívida; conferido contra debts.customer_id (divergência → releitura). */
+  customer_id_hint?: string
 }
 
+/** Resultado da criação da cobrança no fechamento (inline) ou do enfileiramento. */
+export type CloseChargeStatus = "created" | "failed" | "not_started" | "queued"
+
 export type CloseAgreementResult =
-  | { ok: true; agreement_id: string; message: string; terms: AgreementTerms }
+  | { ok: true; agreement_id: string; message: string; terms: AgreementTerms; charge_status?: CloseChargeStatus }
   | { ok: false; status: number; error: string }
 
 export async function closeAgreement(input: CloseAgreementInput): Promise<CloseAgreementResult> {
@@ -92,12 +109,13 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
 
   const supabase = createServiceClient()
 
-  const { data: debt, error: debtError } = await supabase
-    .from("debts")
-    .select("*")
-    .eq("id", debt_id)
-    .eq("company_id", company_id)
-    .maybeSingle()
+  const loadCustomer = (id: string) =>
+    supabase.from("customers").select("id, name, document, email, phone").eq("id", id).maybeSingle()
+  // QA rodada 5: dívida e cliente em paralelo quando a sessão já sabe o cliente.
+  const [{ data: debt, error: debtError }, hinted] = await Promise.all([
+    supabase.from("debts").select("*").eq("id", debt_id).eq("company_id", company_id).maybeSingle(),
+    input.customer_id_hint ? loadCustomer(input.customer_id_hint) : Promise.resolve(null),
+  ])
 
   if (debtError) throw debtError
   if (!debt) return { ok: false, status: 404, error: "Dívida não encontrada para esta empresa" }
@@ -121,11 +139,8 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
     return { ok: false, status: 400, error: `offer_id inválido: ${offer_id} (use 'avista' ou 'parc_N')` }
   }
 
-  const { data: customer, error: customerError } = await supabase
-    .from("customers")
-    .select("id, name, document, email, phone")
-    .eq("id", debt.customer_id)
-    .maybeSingle()
+  const { data: customer, error: customerError } =
+    hinted && input.customer_id_hint === debt.customer_id ? hinted : await loadCustomer(debt.customer_id)
 
   if (customerError) throw customerError
   if (!customer) return { ok: false, status: 404, error: "Cliente da dívida não encontrado" }
@@ -170,11 +185,19 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
 
   // O CHECK real de debts.status é pending|paid|cancelled|in_negotiation;
   // "in_agreement" violava a constraint (bug D1 do diagnóstico FASE0_CHATBOT.md).
-  const { data: debtUpdated, error: debtUpdateError } = await supabase
-    .from("debts")
-    .update({ status: "in_negotiation", updated_at: new Date().toISOString() })
-    .eq("id", debt.id)
-    .select("id")
+  // QA rodada 5 (Q2-01): status da dívida e espelho da jornada (beforeCharge) em
+  // paralelo — os dois ANTES da cobrança. Falha no espelho = não cobra.
+  let mirrorError: unknown = null
+  const [{ data: debtUpdated, error: debtUpdateError }] = await Promise.all([
+    supabase
+      .from("debts")
+      .update({ status: "in_negotiation", updated_at: new Date().toISOString() })
+      .eq("id", debt.id)
+      .select("id"),
+    input.beforeCharge
+      ? input.beforeCharge(agreement.id).catch((err: unknown) => { mirrorError = err })
+      : Promise.resolve(),
+  ])
 
   if (debtUpdateError || !debtUpdated?.length) {
     console.warn("[CLOSE-AGREEMENT] Failed to update debt status:", debtUpdateError?.message ?? "0 rows")
@@ -223,31 +246,40 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   //  - 'inline': cria a cobrança na PRÓPRIA request (import dinâmico de
   //    charge-inline p/ nunca puxar lib/queue/Redis no caminho inline).
   // Em ambos os modos, falha na cobrança NÃO pode perder o acordo já registrado.
+  const result = (charge_status: CloseChargeStatus) => ({
+    ok: true as const,
+    agreement_id: agreement.id,
+    message: `Acordo registrado. Pagamento: ${terms.summary}`,
+    terms,
+    charge_status,
+  })
+
+  if (mirrorError) {
+    console.warn("[CLOSE-AGREEMENT] beforeCharge falhou; cobrança NÃO criada:", (mirrorError as Error)?.message)
+    return result("not_started")
+  }
+
   const chargeMode = (process.env.CHARGE_MODE || "queue").toLowerCase()
   if (chargeMode === "inline") {
     try {
       const { createAsaasChargeInline } = await import("@/lib/journey/charge-inline")
-      const inline = await createAsaasChargeInline(chargeJobData)
+      const inline = await createAsaasChargeInline(chargeJobData, input.charge ?? {})
       if (!inline.ok) {
         console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge failed:", inline.error)
+        return result(inline.notStarted ? "not_started" : "failed")
       }
+      return result("created")
     } catch (inlineError: any) {
       console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge threw:", inlineError?.message)
-    }
-  } else {
-    try {
-      const { chargeQueue } = await import("@/lib/queue/queues")
-      await chargeQueue.add(`agent-agreement-${agreement.id}`, chargeJobData)
-    } catch (queueError: any) {
-      // O acordo já está registrado; falha no enqueue não pode perdê-lo.
-      console.warn("[CLOSE-AGREEMENT] Failed to enqueue ASAAS charge:", queueError?.message)
+      return result("failed")
     }
   }
-
-  return {
-    ok: true,
-    agreement_id: agreement.id,
-    message: `Acordo registrado. Pagamento: ${terms.summary}`,
-    terms,
+  try {
+    const { chargeQueue } = await import("@/lib/queue/queues")
+    await chargeQueue.add(`agent-agreement-${agreement.id}`, chargeJobData)
+  } catch (queueError: any) {
+    // O acordo já está registrado; falha no enqueue não pode perdê-lo.
+    console.warn("[CLOSE-AGREEMENT] Failed to enqueue ASAAS charge:", queueError?.message)
   }
+  return result("queued")
 }

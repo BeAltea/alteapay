@@ -58,6 +58,8 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { isBlockingAgreement, isBlockingPayment } from "@/lib/asaas-idempotency"
 import { PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
+import { isPendingCharge } from "./charge-reconcile"
+import { timed } from "./server-timing"
 import {
   persistOffer,
   validateProposedTerms,
@@ -69,6 +71,20 @@ import {
 export function payLinkDueDays(): number {
   const raw = Number.parseInt(process.env.PAY_LINK_DUE_DAYS ?? "", 10)
   return Number.isFinite(raw) && raw > 0 ? raw : 3
+}
+
+/**
+ * QA rodada 5 (Q2-01) — orçamento (ms, desde o início da request do clique) para
+ * a cobrança COMEÇAR no ASAAS. O teto observado da função é ~30 s (504 em
+ * 30,4 s; `maxDuration=60` da rota NÃO é honrado pelo plano). Depois do POST
+ * /payments ainda restam: o próprio POST (p99 alguns segundos), o write-back e a
+ * entrega do link (bolha + prompt). Começar até ~17 s deixa folga para tudo
+ * terminar antes do teto. Passado o orçamento, nada é cobrado: o clique devolve
+ * `charge_deferred` (copy de erro com "tentar de novo") e nenhum acordo fica.
+ */
+export function payChargeStartBudgetMs(): number {
+  const raw = Number.parseInt(process.env.PAY_CHARGE_START_BUDGET_MS ?? "", 10)
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 17_000
 }
 
 /** D+N em YYYY-MM-DD (borda ASAAS espera date-only). */
@@ -536,11 +552,15 @@ async function ensureIntegralOffer(
     if (!agreementId) continue
     const { data: ag } = await supabase
       .from("agreements")
-      .select("id, asaas_payment_id, payment_status, asaas_status, status")
+      .select("id, asaas_payment_id, payment_status, asaas_status, status, origin, offer_id, negotiation_session_id")
       .eq("id", agreementId)
       .eq("company_id", ctx.companyId)
       .maybeSingle()
-    if (ag && isBlockingAgreement(ag)) return { ok: true, offerId: accepted.id, valor }
+    // QA rodada 5 (Q2-01): acordo pending_charge (espelho gravado antes do ASAAS,
+    // função morta no meio) também é reusado — o clique repetido cai na
+    // idempotência (session, offer) → 'processing' → o poll reconcilia. NUNCA
+    // gera oferta nova (que levaria a uma 2ª cobrança se o ASAAS já criou a 1ª).
+    if (ag && (isBlockingAgreement(ag) || isPendingCharge(ag))) return { ok: true, offerId: accepted.id, valor }
   }
 
   // Resolve a faixa da matriz vigente para o (aging, valor) do débito. Sem
@@ -617,7 +637,14 @@ async function ensureIntegralOffer(
  */
 export async function payService(
   ctx: SessionCtx,
-  opts?: { debtIds?: string[]; eventId?: string; primaryDebtId?: string | null },
+  opts?: {
+    debtIds?: string[]
+    eventId?: string
+    primaryDebtId?: string | null
+    /** QA rodada 5 (Q2-01): início da request do clique (epoch ms). Com ele, a
+     *  cobrança só COMEÇA dentro de payChargeStartBudgetMs(). */
+    requestStartedAt?: number
+  },
 ): Promise<PayServiceResult> {
   const eventId = opts?.eventId
   // Conjunto de dívidas cobradas = o MESMO do rótulo do botão (D3 ALTO). Sem
@@ -636,14 +663,18 @@ export async function payService(
       actor: "customer",
       payload: { option: "pagar" },
     }).catch(() => ({ ok: false, duplicate: false })),
-    ensureIntegralOffer(ctx, debtIds),
+    timed("offer", () => ensureIntegralOffer(ctx, debtIds)),
   ])
   if (!offer.ok) {
     await emitPayFailed(ctx, offer.error)
     return { ok: false, error: offer.error }
   }
 
-  const r = await paymentCreateOrExistingLink(ctx, offer.offerId, eventId, { summary: offer.summary })
+  const chargeNotAfter =
+    typeof opts?.requestStartedAt === "number" ? opts.requestStartedAt + payChargeStartBudgetMs() : null
+  const r = await timed("payment_create", () =>
+    paymentCreateOrExistingLink(ctx, offer.offerId, eventId, { summary: offer.summary, chargeNotAfter }),
+  )
 
   if (!r.ok) {
     // Rótulo curto e estável (a copy humana é da UI, §5.4). NUNCA a mensagem
@@ -688,7 +719,7 @@ export async function payService(
   // + menu curto. Telemetria em paralelo. Na cobrança já existente, o valor da
   // copy é o da COBRANÇA (um acordo 3x cobra o total com desconto, não o rótulo
   // "Pagar R$ X" do menu).
-  const [, delivered] = await Promise.all([
+  const [, delivered] = await timed("deliver", () => Promise.all([
     emitPayLinkReady(ctx, payment, { already_charged: alreadyCharged }),
     deliverPaymentOutcome(ctx, {
       payment,
@@ -697,7 +728,7 @@ export async function payService(
       debtIds,
       primaryDebtId: opts?.primaryDebtId ?? ctx.debtId,
     }),
-  ])
+  ]))
 
   return {
     ok: true,

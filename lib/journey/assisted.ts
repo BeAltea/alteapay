@@ -60,8 +60,12 @@ export async function acceptMatrixCondition(
   ctx: SessionCtx,
   offerId: string,
   eventId?: string,
+  opts?: { chargeNotAfter?: number | null },
 ): Promise<AssistedAcceptResult> {
-  const r: PaymentCreateOrLink = await paymentCreateOrExistingLink(ctx, offerId, eventId)
+  // QA rodada 5 (Q2-01): prazo para a cobrança COMEÇAR (teto da função).
+  const r: PaymentCreateOrLink = await paymentCreateOrExistingLink(ctx, offerId, eventId, {
+    chargeNotAfter: opts?.chargeNotAfter ?? null,
+  })
   if (!r.ok) return r
   if (r.status === "processing") {
     // Sem link ainda (worker gerando): não persiste nada — nasce depois no poll.

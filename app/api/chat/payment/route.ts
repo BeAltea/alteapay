@@ -4,6 +4,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { isTerminalAgreement } from "@/lib/asaas-idempotency"
+import { isPendingCharge, reconcilePendingCharge } from "@/lib/journey/charge-reconcile"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -26,11 +27,29 @@ export async function GET(req: NextRequest) {
   if (!session?.agreement_id) {
     return NextResponse.json({ ok: true, status: "generating" })
   }
-  const { data: ag } = await supabase
-    .from("agreements")
-    .select("id, asaas_payment_id, asaas_billing_type, payment_status, asaas_status, status, asaas_payment_url, asaas_invoice_url, asaas_boleto_url, asaas_pix_qrcode_url, installments, installment_amount, agreed_amount, due_date")
-    .eq("id", session.agreement_id)
-    .single()
+  const AGREEMENT_COLS =
+    "id, company_id, debt_id, origin, offer_id, negotiation_session_id, created_at, asaas_payment_id, asaas_billing_type, payment_status, asaas_status, status, asaas_payment_url, asaas_invoice_url, asaas_boleto_url, asaas_pix_qrcode_url, installments, installment_amount, agreed_amount, due_date"
+  const readAgreement = async () =>
+    (await supabase.from("agreements").select(AGREEMENT_COLS).eq("id", session.agreement_id).single()).data
+  let ag = await readAgreement()
+  if (ag && !ag.asaas_payment_id && isPendingCharge(ag)) {
+    // QA rodada 5 (Q2-01): acordo espelhado ANTES do ASAAS e ainda sem cobrança
+    // (a request do clique está criando, ou morreu no meio). Reconciliação
+    // idempotente pela externalReference: achou → espelha e segue 'ready';
+    // órfão vencido sem cobrança → cancelado → 'failed' (o devedor tenta de
+    // novo; nenhuma cobrança existe). NUNCA cria cobrança aqui.
+    const outcome = await reconcilePendingCharge(ag)
+    if (outcome === "linked") ag = await readAgreement()
+    if (outcome === "cancelled") {
+      return NextResponse.json({ ok: true, status: "failed", reason: "charge_not_created" })
+    }
+  }
+  // Acordo da jornada cancelado SEM nunca ter tido cobrança (órfão reconciliado
+  // ou fechamento desfeito por prazo): estado estável 'failed' — o client mostra
+  // o erro com "Tentar novamente" em vez de esperar um link que não virá.
+  if (ag && !ag.asaas_payment_id && ag.origin === "chat_journey" && isTerminalAgreement(ag)) {
+    return NextResponse.json({ ok: true, status: "failed", reason: "charge_not_created" })
+  }
   if (!ag?.asaas_payment_id) {
     return NextResponse.json({ ok: true, status: "generating" })
   }
