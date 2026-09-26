@@ -1,5 +1,6 @@
 "use server"
 
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { headers } from "next/headers"
 import { sendEmailViaSendGrid } from "@/lib/notifications/sendgrid"
 import { CONTACT_EMAIL } from "@/content/site"
@@ -82,8 +83,8 @@ export async function submitContactLead(input: ContactLeadFormValues): Promise<C
   }
 
   const requestHeaders = headers()
-  const forwardedFor = requestHeaders.get("x-forwarded-for") || ""
-  const ip = forwardedFor.split(",")[0]?.trim() || requestHeaders.get("x-real-ip") || "desconhecido"
+  // QA rodada 5 (Q1-5): IP só de cabeçalho de proxy confiável (nunca o 1º do XFF).
+  const ip = clientIpFromHeaders(requestHeaders) ?? "desconhecido"
 
   if (isRateLimited(ip)) {
     log(lead.tipo, false)

@@ -2,6 +2,7 @@
 // um cookie httpOnly de sessão de chat e devolve o contexto público (nome
 // mascarado, valor, branding, consentimento pendente). Rate limit 10/min/IP.
 
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { z } from "zod"
@@ -25,7 +26,7 @@ export const dynamic = "force-dynamic"
 const bodySchema = z.object({ token: z.string().regex(/^[a-f0-9]{64}$/) })
 
 function clientIp(request: Request): string {
-  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown"
+  return clientIpFromHeaders(request.headers) ?? "unknown"
 }
 
 export async function OPTIONS(request: Request) {

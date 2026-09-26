@@ -18,6 +18,7 @@
 //
 // Documentação completa: docs/N8N_INTEGRATION.md
 
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { NextResponse } from "next/server"
 import { z } from "zod"
 
@@ -529,7 +530,7 @@ export async function POST(request: Request) {
   )
   if (!verdict.ok) return jsonError(verdict.status, verdict.reason)
 
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown"
+  const ip = clientIpFromHeaders(request.headers) ?? "unknown"
   const byIp = await rateLimit(`n8n:ip:${ip}`, N8N_IP_LIMIT.limit, N8N_IP_LIMIT.windowSeconds)
   if (!byIp.allowed) return jsonError(429, "rate limit excedido")
 

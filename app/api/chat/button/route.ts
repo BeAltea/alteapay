@@ -16,6 +16,7 @@
 //  - engine ativa (n8n) → envia um turno de BOTÃO ao fluxo (Apêndice A.2) e
 //    devolve o reply; engine disabled → próxima etapa determinística (sem reply).
 import { NextRequest, NextResponse } from "next/server"
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
 import {
@@ -68,9 +69,8 @@ export const fetchCache = "force-no-store"
 export const revalidate = 0
 export const maxDuration = 60
 
-function clientIp(req: NextRequest): string | null {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null
-}
+// QA rodada 5 (Q1-5): IP do cliente só de cabeçalho de proxy confiável.
+const clientIp = (req: NextRequest): string | null => clientIpFromHeaders(req.headers)
 
 /**
  * Grava wait_state='aguardando_motor' + wait_started_at=now() na sessão (M11,

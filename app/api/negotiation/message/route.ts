@@ -2,6 +2,7 @@
 // chama o engine (fluxo n8n por padrão; agente legado por env), grava
 // outbound com rastreabilidade LGPD (art. 20) e atualiza o funil da sessão.
 
+import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 import { z } from "zod"
@@ -34,7 +35,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: false, error: "sessão sem thread" }, { status: 409 })
   }
 
-  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown"
+  const ip = clientIpFromHeaders(request.headers) ?? "unknown"
   const [bySession, byIp] = await Promise.all([
     rateLimit(`msg:s:${session.id}`, LIMITS.messagePerSession.limit, LIMITS.messagePerSession.windowSeconds),
     rateLimit(`msg:ip:${ip}`, LIMITS.messagePerIp.limit, LIMITS.messagePerIp.windowSeconds),
