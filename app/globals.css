@@ -229,6 +229,20 @@
   }
 }
 
+/* QA round 4 (R-19): rede de segurança do anel de foco SÓ na jornada do devedor
+   (porta + chat): o `outline-ring/50` global sai a 50% de alfa (1,4:1 no
+   checkbox LGPD e nos links do rodapé). Anel escuro + halo branco ≥ 3:1 sobre
+   qualquer fundo claro ou de marca (inclusive o #EAB308 da VMAX). Fora de
+   [data-journey] nada muda. */
+@layer base {
+  /* camada base: os utilitários (FOCUS_RING) continuam valendo onde aplicados. */
+  [data-journey] :focus-visible {
+    outline: 2px solid #171717;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px #ffffff;
+  }
+}
+
 /* Added dark mode specific utility classes for better control */
 .dark .bg-card {
   background-color: var(--card);

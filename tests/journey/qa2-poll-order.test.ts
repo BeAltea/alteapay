@@ -107,7 +107,11 @@ describe("QAB1-H4 client (chat.tsx) — wire-up (leitura do fonte)", () => {
   })
 
   it("dead_payment_links é aplicado em TODO poll aplicado (inclusive com since) e a liveness por mensagem vem do delta", () => {
-    expect(poll).toContain("if (Array.isArray(data?.dead_payment_links)) setDeadLinkHrefs(deadHrefs)")
+    // QA round 4 (R-15/R-23): aplicado a cada poll, mas só troca a identidade
+    // quando o conteúdo muda (sem re-render por poll).
+    expect(poll).toContain("if (Array.isArray(data?.dead_payment_links)) {")
+    expect(poll).toContain("if (!sameSet(incomingDead, deadHrefsRef.current)) {")
+    expect(poll).toContain("setDeadLinkHrefs(incomingDead)")
     expect(poll).toContain("isLivePaymentLink(action, deadHrefs)")
   })
 })

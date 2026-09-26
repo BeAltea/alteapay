@@ -14,6 +14,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { makeFakeSupabase, type FakeDb } from "./_fake-supabase"
 
+// QA round 4 (R-11/R-21): cliques de controles de efeito (Pagar/Não reconheço/
+// Já paguei) < 2 s depois de OUTRO clique da sessão são toque múltiplo (ignorados
+// — qa4-effect-double-tap). Estes cenários são cliques NOVOS: envelhece os ecos.
+function ageClicks(ms = 3000) {
+  for (const m of (db.chat_messages ?? []) as Array<{ role?: string; created_at?: string }>) {
+    if (m.role === "customer" && m.created_at) m.created_at = new Date(Date.parse(m.created_at) - ms).toISOString()
+  }
+}
+
+
 process.env.CHAT_JOURNEY_ENABLED = "true"
 process.env.NEGOTIATION_JWT_SECRET = "test-secret-a1-stale"
 
@@ -169,6 +179,7 @@ describe("re-alvejamento: prompt obsoleto + ativo do MESMO kind com o MESMO bot�
     // Voltar/Detalhes reabriu o menu (p2); a aba antiga ainda mostra p1
     await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 2 }))
     const p2 = active()!
+    ageClicks()
     const r = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 4 }))
     const b = await r.json()
     expect(r.status).toBe(200)
@@ -215,6 +226,7 @@ describe("409 prompt_stale: ativo de OUTRO kind ou sem o botão → aviso + acti
     await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 0 }))
     const back = active()!
     expect(back.buttons.map((x: any) => x.id)).toEqual([98])
+    ageClicks()
     const r = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 4 }))
     const b = await r.json()
     expect(r.status).toBe(409)
@@ -283,6 +295,7 @@ describe("re-alvejamento exige o MESMO botão: id + rótulo + value iguais (A1-R
     p2.buttons = p2.buttons.map((b: any) => (b.id === 4 ? { ...b, label: "Pagar R$ 260,00" } : b))
     expect(staleLabel).not.toBe("Pagar R$ 260,00")
 
+    ageClicks()
     const r = await POST(buttonReq(await signed(), { prompt_id: p1.id, button_id: 4 }))
     const b = await r.json()
     expect(r.status).toBe(409)

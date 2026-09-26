@@ -9,6 +9,7 @@ import { buildPinnedDebt } from "@/lib/journey/pinned-debt"
 import { buildRecap } from "@/lib/journey/recap"
 import { annotateMessageGenerations, type GenerationPromptRow } from "@/lib/journey/display-class"
 import { isTerminalAgreement, type AgreementLike } from "@/lib/asaas-idempotency"
+import { isPromptPending } from "@/lib/journey/poll-order"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -24,32 +25,22 @@ export async function GET(req: NextRequest) {
 
   const since = req.nextUrl.searchParams.get("since")
   const supabase = createServiceClient()
+  // QA round 4 (R-13/R-22, S3): `server_time` é tirado ANTES da 1ª leitura — o
+  // client compara este carimbo com o `state_time` de um POST (tirado depois da
+  // última escrita): um GET cujas leituras começaram antes do POST terminar é
+  // mais antigo e não regride o estado aplicado.
+  const serverTime = new Date().toISOString()
+  const t0 = Date.now()
+  const timing: string[] = []
+  const mark = (name: string, since0: number) => timing.push(`${name};dur=${Date.now() - since0}`)
 
-  // C3: época (thread) CORRENTE da sessão — o reset 24h incrementa thread_epoch e
-  // ARQUIVA as linhas velhas (não deleta). Filtramos a época corrente aqui para a
-  // conversa nova começar limpa; painel/reconstrução/recap leem todas as épocas à
-  // parte. DEFENSIVO: se thread_epoch não existir (20260935 pendente em prod), a
-  // leitura cai em 0 e o filtro no client é no-op (compat total). Nunca PII.
-  let currentEpoch = 0
-  try {
-    const { data: sessRow } = await supabase
-      .from("negotiation_sessions")
-      .select("thread_epoch")
-      .eq("id", claims.sid)
-      .eq("company_id", claims.cid)
-      .maybeSingle()
-    const raw = (sessRow as { thread_epoch?: number | null } | null)?.thread_epoch
-    currentEpoch = typeof raw === "number" ? raw : 0
-  } catch {
-    currentEpoch = 0
-  }
-
-  // QA round 3 (QAB3-02b): SEM `since` (1ª pintura/retomada) a fatia de 200 é a
-  // das linhas MAIS RECENTES (order desc + limit, re-ordenada ascendente em
-  // memória) — antes eram as 200 mais ANTIGAS, e numa sessão longa (> 200
-  // linhas) a retomada elegia um outcome velho e o trocava quando o delta
-  // chegava. COM `since` (poll incremental) segue ascendente + limit (contíguo a
-  // partir do `since`; o excedente vem no poll seguinte).
+  // QA round 4 (R-14/R-25, S5): as leituras INDEPENDENTES rodam em paralelo
+  // (antes: 5-6 idas ao banco em série — 6 s na 1ª pintura de sessões longas).
+  //  - sessão (época + wait_state) numa leitura só;
+  //  - mensagens (QA round 3 / QAB3-02b: SEM `since` a fatia de 200 é a das
+  //    linhas MAIS RECENTES; COM `since`, ascendente e contígua);
+  //  - prompts da sessão (geração por mensagem + prompt_pending) e o ATIVO;
+  //  - card fixo, recap (só no 1º poll) e links mortos.
   const base = supabase
     .from("chat_messages")
     .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, offers_snapshot, thread_epoch, archived_at, created_at")
@@ -58,13 +49,86 @@ export async function GET(req: NextRequest) {
   const q = since
     ? base.gt("created_at", since).order("created_at", { ascending: true }).limit(200)
     : base.order("created_at", { ascending: false }).limit(200)
-  const { data: rawFetched } = await q
+
+  const [sessRes, msgRes, promptRes, activeRes, pinnedDebt, recap, deadPaymentLinks] = await Promise.all([
+    // C3: época (thread) CORRENTE da sessão — o reset 24h incrementa thread_epoch
+    // e ARQUIVA as linhas velhas. Estado de espera (M11): o client reconstrói a
+    // máquina de espera a partir de wait_state/wait_started_at. DEFENSIVO: se as
+    // colunas não existirem, cai na leitura mínima (época 0, sem espera).
+    (async () => {
+      const ts = Date.now()
+      try {
+        const full = await supabase
+          .from("negotiation_sessions")
+          .select("thread_epoch, wait_state, wait_started_at")
+          .eq("id", claims.sid)
+          .eq("company_id", claims.cid)
+          .maybeSingle()
+        if (!full.error) return full.data as { thread_epoch?: number | null; wait_state?: string | null; wait_started_at?: string | null } | null
+        const min = await supabase
+          .from("negotiation_sessions")
+          .select("thread_epoch")
+          .eq("id", claims.sid)
+          .eq("company_id", claims.cid)
+          .maybeSingle()
+        return (min.error ? null : min.data) as { thread_epoch?: number | null } | null
+      } catch {
+        return null
+      } finally {
+        mark("session", ts)
+      }
+    })(),
+    (async () => {
+      const ts = Date.now()
+      const r = await q
+      mark("messages", ts)
+      return r
+    })(),
+    // A3 (§2.4 / G4 / N3): GERAÇÃO por mensagem — join EM MEMÓRIA com os
+    // chat_prompts da sessão. R-22: answered_at alimenta `prompt_pending`.
+    supabase
+      .from("chat_prompts")
+      .select("id, kind, status, created_at, answered_at")
+      .eq("session_id", claims.sid)
+      .order("created_at", { ascending: true })
+      .limit(500),
+    supabase
+      .from("chat_prompts")
+      .select("id, kind, question, buttons, status, thread_epoch, archived_at, created_at")
+      .eq("session_id", claims.sid)
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    // CARD FIXO do débito (C1 / R-11): best-effort (null → o card não renderiza).
+    (async () => {
+      const ts = Date.now()
+      const r = await buildPinnedDebt(claims.sid, claims.cid)
+      mark("pinned", ts)
+      return r
+    })(),
+    // RECAPITULATIVO de retomada (C7 / R-17): só no 1º poll (since ausente).
+    since
+      ? Promise.resolve(null)
+      : (async () => {
+          const ts = Date.now()
+          const r = await buildRecap(claims.sid, claims.cid)
+          mark("recap", ts)
+          return r
+        })(),
+    // QA round 1 (QAA1-07): links MORTOS também no poll incremental.
+    deadPaymentLinkHrefs(supabase, claims.sid, claims.cid),
+  ])
+
+  const sessRow = sessRes
+  const rawEpoch = sessRow?.thread_epoch
+  const currentEpoch = typeof rawEpoch === "number" ? rawEpoch : 0
+  const rawFetched = msgRes.data
   const rawMessages = since ? rawFetched : [...(rawFetched ?? [])].reverse()
 
   // Filtra a THREAD CORRENTE (C3): época corrente OU null (=época 0, compat) e
   // NÃO-arquivada. As linhas de épocas anteriores ficam preservadas no banco (o
-  // painel/recap as leem), mas não voltam à tela da conversa nova. Best-effort: se
-  // as colunas não existirem, thread_epoch/archived_at vêm undefined → tudo passa.
+  // painel/recap as leem), mas não voltam à tela da conversa nova.
   const inCurrentThread = (rawMessages ?? []).filter((m) => {
     const row = m as { thread_epoch?: number | null; archived_at?: string | null }
     if (row.archived_at != null) return false
@@ -72,20 +136,12 @@ export async function GET(req: NextRequest) {
     return Number(row.thread_epoch) === currentEpoch
   })
 
-  // Anexa o botão-link (ex.: quitação → #contato; link de pagamento) quando a
-  // mensagem o carrega em offers_snapshot.message_action, e o marcador de
-  // estágio (offers_snapshot.stage: greeting | detail | payment_link |
-  // not_recognized | payment_claim — A1) que a poda/retomada usa. A UI renderiza
-  // a ação como <a> abaixo da bolha; offers_snapshot cru não vaza. Sem PII.
-  //
-  // A1-R1 — LINK MORTO na retomada: a bolha do link de pagamento carrega
-  // offers_snapshot.agreement_id. Se esse acordo já é TERMINAL (cancelado no
-  // ASAAS / estornado — isTerminalAgreement, a MESMA regra do guard e do
-  // GET /api/chat/payment), a ação sai com `live:false`: o texto fica como
-  // histórico (outcome), mas o client NÃO renderiza Abrir/Copiar nem trata a
-  // bolha como "link entregue" — o devedor nunca cai em "Fatura cancelada" pela
-  // retomada. 1 `in()` por request; best-effort (falha → nada muda, compat).
+  // Anexa o botão-link e o marcador de estágio (offers_snapshot). A1-R1 — LINK
+  // MORTO na retomada: a ação de uma bolha cujo acordo já é TERMINAL sai com
+  // `live:false` (texto fica como histórico; o client não renderiza Abrir/Copiar).
+  const tDead = Date.now()
   const deadAgreementIds = await terminalAgreementIds(supabase, claims.cid, inCurrentThread)
+  mark("liveness", tDead)
   const mapped = inCurrentThread.map((m) => {
     const snapshot = m.offers_snapshot as { message_action?: unknown; stage?: unknown; agreement_id?: unknown } | null
     const rawAction =
@@ -96,34 +152,14 @@ export async function GET(req: NextRequest) {
     return { ...rest, ...(action ? { action } : {}), ...(stage ? { stage } : {}) }
   })
 
-  // A3 (§2.4 / G4 / N3): GERAÇÃO por mensagem — join EM MEMÓRIA com os
-  // chat_prompts da sessão (kind/status/created_at): cada mensagem ganha
-  // `prompt_kind` (o prompt que a governa: o seu prompt_id ou o último criado
-  // até ela) e `generation` (derivada do kind; prompt ativo = corrente). O client
-  // poda gerações anteriores (Sim/Não → Consultar/Negociar → 3 opções) sem
-  // migration nem arquivamento; painel/auditoria continuam lendo tudo. Sem PII.
-  const { data: promptRows } = await supabase
-    .from("chat_prompts")
-    .select("id, kind, status, created_at")
-    .eq("session_id", claims.sid)
-    .order("created_at", { ascending: true })
-    .limit(500)
+  const promptRows = (promptRes.data ?? []) as Array<GenerationPromptRow & { answered_at?: string | null }>
   const messages = annotateMessageGenerations(
     mapped as Array<Record<string, unknown> & { prompt_id?: string | null; created_at?: string | null }>,
-    (promptRows ?? []) as GenerationPromptRow[],
+    promptRows as GenerationPromptRow[],
   )
 
-  const { data: activePromptRaw } = await supabase
-    .from("chat_prompts")
-    .select("id, kind, question, buttons, status, thread_epoch, archived_at, created_at")
-    .eq("session_id", claims.sid)
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
-  // C3: um prompt 'active' de época anterior (não deveria existir — o reset o
-  // supersede) é ignorado para não vazar na thread nova. Best-effort: colunas
-  // ausentes → passa (compat). Devolve sem os campos internos de época.
+  // C3: um prompt 'active' de época anterior é ignorado (não vaza na thread nova).
+  const activePromptRaw = activeRes.data
   let activePrompt: Record<string, unknown> | null = null
   if (activePromptRaw) {
     const ap = activePromptRaw as {
@@ -138,56 +174,30 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // Estado de espera (M11 — onda "3 opções", trilha D2): o client reconstrói a
-  // máquina de espera (degraus 1,2/4/10/15s) a partir destes dois campos + o
-  // relógio local, então um reload durante a espera restaura o degrau. Zero
-  // request extra — vem junto do 1º poll. DEFENSIVO: se as colunas M-4 ainda não
-  // existirem em produção (aplicadas só no G6), o SELECT erra → devolvemos null e
-  // a UI só não restaura o degrau (nunca quebra o poll). Nunca é PII.
-  let waitState: string | null = null
-  let waitStartedAt: string | null = null
-  const { data: waitRow, error: waitErr } = await supabase
-    .from("negotiation_sessions")
-    .select("wait_state, wait_started_at")
-    .eq("id", claims.sid)
-    .eq("company_id", claims.cid)
-    .maybeSingle()
-  if (!waitErr && waitRow) {
-    waitState = (waitRow as { wait_state?: string | null }).wait_state ?? null
-    waitStartedAt = (waitRow as { wait_started_at?: string | null }).wait_started_at ?? null
-  }
+  const waitRow = sessRow as { wait_state?: string | null; wait_started_at?: string | null } | null
+  const waitState: string | null = waitRow?.wait_state ?? null
+  const waitStartedAt: string | null = waitRow?.wait_started_at ?? null
 
-  // CARD FIXO do débito (C1 / R-11): bloco pinned montado no servidor a cada poll
-  // (imutável entre polls; sobrevive a reload). Reusa buildAckContext (mesma fonte
-  // canônica do resumo — D3 ALTO: valor do card = valor cobrado). Best-effort: se
-  // falhar, pinned_debt=null e o card não renderiza, mas o chat funciona (nunca
-  // derruba o poll). Só computa se houver dívida associada à sessão. Sem PII.
-  const pinnedDebt = await buildPinnedDebt(claims.sid, claims.cid)
-
-  // RECAPITULATIVO de retomada (C7 / R-17): só no 1º poll (since ausente =
-  // carregamento inicial/retomada). Nos polls incrementais não repetimos o recap.
-  // Montado no servidor a partir das bolhas PRESERVADAS (C3) → idêntico após F5.
-  // QA round 1 (QAA1-07 / B2 / A1-R10): links MORTOS também no poll incremental —
-  // a bolha do link já renderizada não volta no `since`, então a liveness por
-  // mensagem (acima) não a alcança; `dead_payment_links` traz os hrefs das
-  // cobranças TERMINAIS do cliente nesta empresa a cada poll, e o client desliga
-  // Abrir/Copiar da bolha correspondente no próximo ciclo (2,5 s), sem F5.
-  const [recap, deadPaymentLinks] = await Promise.all([
-    since ? Promise.resolve(null) : buildRecap(claims.sid, claims.cid),
-    deadPaymentLinkHrefs(supabase, claims.sid, claims.cid),
-  ])
-
-  return NextResponse.json({
+  mark("total", t0)
+  const res = NextResponse.json({
     ok: true,
     messages: messages ?? [],
     active_prompt: activePrompt ?? null,
+    // QA round 4 (R-22): sem prompt ativo mas com a troca em curso (o último
+    // prompt acabou de ser respondido e o sucessor ainda não foi gravado) — o
+    // client MANTÉM o prompt da tela em vez de aplicar "nenhum".
+    prompt_pending: activePrompt ? false : isPromptPending(promptRows, Date.parse(serverTime)),
     wait_state: waitState,
     wait_started_at: waitStartedAt,
     pinned_debt: pinnedDebt,
     recap,
     dead_payment_links: deadPaymentLinks,
-    server_time: new Date().toISOString(),
+    server_time: serverTime,
   })
+  // QA round 4 (R-16/R-26, S7): etapas nomeadas para o QA separar servidor ×
+  // rede × render. Sem PII.
+  res.headers.set("Server-Timing", timing.join(", "))
+  return res
 }
 
 /**

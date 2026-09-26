@@ -159,11 +159,13 @@ describe("chat.tsx — wire-up (leitura do fonte)", () => {
     expect(src).toContain("pollMessages({ skipIfInFlight: true })")
     expect(src).toContain("if (opts?.skipIfInFlight && pollInFlightRef.current) return")
     expect(src).toContain("data?.dead_payment_links")
-    expect(src).toContain("setDeadLinkHrefs(deadHrefs)")
+    expect(src).toContain("setDeadLinkHrefs(incomingDead)") // QA round 4: só quando o conjunto muda
   })
 
   it("o painel Abrir/Copiar e o 'link entregue' derivam de paymentLinkActionOf/isLivePaymentLink (nunca de m.action cru)", () => {
-    expect(src).toContain("latestLivePaymentLinkId(messages, deadLinkHrefs)")
+    // QA round 4 (R-10/R-20): o painel vem de resolveLinkView (link-view.ts), que
+    // elege a ÚLTIMA bolha VIVA (live:false / dead_payment_links do servidor).
+    expect(src).toContain("const latestPaymentLinkId = linkView.panelMessageId")
     expect(src).toContain("m.id === latestPaymentLinkId && paymentLinkActionOf(m)")
     expect(src).toContain("isLivePaymentLink(action, deadHrefs)")
     expect(src).not.toMatch(/m\.action\?\.type === "open_payment_link" &&\s*m\.action\.live !== false/)

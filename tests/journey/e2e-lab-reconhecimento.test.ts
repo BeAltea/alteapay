@@ -240,8 +240,9 @@ describe("C1 — Negociar não trava e SEMPRE persiste o histórico", () => {
     const out = await handleDebtNegotiate({
       companyId: CO, sessionId: SID, customerId: CUST, debtId: DEBT, debtIds: [DEBT], promptId, buttonId: 3,
     })
-    // owner síncrono é sempre 'platform' (o handoff n8n é best-effort/background).
-    expect(out.engineOwner).toBe("platform")
+    // owner síncrono nunca é 'n8n' presumido (o handoff n8n é best-effort/background).
+    // QA round 4 (R-27): desfecho ainda desconhecido → "pending" explícito.
+    expect(["platform", "pending"]).toContain(out.engineOwner)
 
     const assistantTexts = (db.chat_messages ?? []).filter((m) => m.role === "assistant").map((m) => m.text)
     // dados da dívida (debtInfoMessage) E o reply — os DOIS no histórico local,

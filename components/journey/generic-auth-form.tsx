@@ -9,6 +9,7 @@
 // cor adaptativa --brand-secondary-fg (branco fixo sobre #EAB308 = 1,92:1) e o
 // "Quem somos" tem alvo >= 44 px. Só classe/estilo; nenhuma lógica alterada.
 import { useState } from "react"
+import { FOCUS_RING } from "./button-tiers"
 import { useRouter } from "next/navigation"
 import { entrySealText, entrySealWhoText, ENTRY_SEAL_WHO_LABEL } from "@/lib/journey/entry-seal"
 
@@ -143,7 +144,8 @@ export function JourneyGenericAuthForm({
           type="checkbox"
           checked={consent}
           onChange={(e) => setConsent(e.target.checked)}
-          className="mt-0.5 h-4 w-4 flex-shrink-0"
+          // QA round 4 (R-19): anel de foco ≥ 3:1 (neutral-900 + offset branco).
+          className={`${FOCUS_RING} mt-0.5 h-4 w-4 flex-shrink-0 rounded-sm`}
         />
         <span>
           Autorizo o tratamento dos meus dados para fins desta negociação, conforme a Lei Geral

@@ -301,7 +301,8 @@ describe("GET /api/chat/messages — anotação de geração no servidor + recap
     const cookie = signChatJwt({ sid: SID, cid: CO }, 3600)
     const body = await (await GET(makeReq(cookie))).json()
     expect(body.recap).toBeTruthy()
-    expect(body.recap.text).toBe("Olá de novo, Ana. Você já viu os detalhes do valor em aberto. Como prefere seguir?")
+    // QA round 4 (PO 08 §3): sem Detalhes aberto na thread → variante sem "já viu os detalhes".
+    expect(body.recap.text).toBe("Olá de novo, Ana. Como prefere seguir?")
     expect(body.recap.firstName).toBe("Ana")
     expect(body.recap.lastDecisionLabel).toBe("Sim, reconheço")
     const inc = await (await GET(makeReq(cookie, "2026-09-01T00:00:00Z"))).json()
@@ -312,7 +313,7 @@ describe("GET /api/chat/messages — anotação de geração no servidor + recap
     const { buildRecap } = await import("@/lib/journey/recap")
     db.customers = []
     const r1 = await buildRecap(SID, CO)
-    expect(r1!.text).toBe("Olá de novo. Você já viu os detalhes do valor em aberto. Como prefere seguir?")
+    expect(r1!.text).toBe("Olá de novo. Como prefere seguir?") // QA round 4: sem Detalhes na thread
     expect(r1!.firstName).toBeNull()
     const r2 = await buildRecap(SID, CO, { firstName: "Bia" })
     expect(r2!.text).toMatch(/^Olá de novo, Bia\./)

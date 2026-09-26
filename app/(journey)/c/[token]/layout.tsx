@@ -7,6 +7,7 @@ import type { Metadata } from "next"
 import { cookies } from "next/headers"
 import { CHAT_COOKIE_NAME, verifyChatJwt } from "@/lib/negotiation/crypto"
 import { adaptiveTextColor } from "@/lib/journey/contrast"
+import { FOCUS_RING } from "@/components/journey/button-tiers"
 import { loadJourneyTenant } from "./_lib/tenant"
 
 export const dynamic = "force-dynamic"
@@ -106,6 +107,7 @@ export default async function JourneyLayout({
   return (
     <div
       style={{ ...cssVars, minHeight: "100dvh" }}
+      data-journey=""
       className="flex flex-col bg-neutral-50 text-neutral-900"
     >
       <header
@@ -141,12 +143,12 @@ export default async function JourneyLayout({
                 href={view.privacyHref}
                 target="_blank"
                 rel="noreferrer noopener"
-                className="inline-flex min-h-[24px] items-center underline underline-offset-2"
+                className={`${FOCUS_RING} inline-flex min-h-[24px] items-center rounded-sm underline underline-offset-2`}
               >
                 Política de privacidade
               </a>
             ) : (
-              <a href="/politica-de-privacidade" className="inline-flex min-h-[24px] items-center underline underline-offset-2">
+              <a href="/politica-de-privacidade" className={`${FOCUS_RING} inline-flex min-h-[24px] items-center rounded-sm underline underline-offset-2`}>
                 Política de privacidade
               </a>
             )}

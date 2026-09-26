@@ -78,8 +78,13 @@ export interface PromptClickResult {
 export function PromptButtons({
   prompt,
   onClick,
+  inert = false,
 }: {
   prompt: ActivePrompt
+  /** QA round 4 (R-11/R-21): bloco INERTE (toque recente, bloco que acabou de
+   *  nascer/se deslocar, ação em voo). Os botões ficam NO LUGAR (sem mudar de
+   *  tamanho): aria-disabled + pointer-events:none, e o handler ignora o toque. */
+  inert?: boolean
   /** Envia o clique; retorna ok/erro. 409 prompt_stale volta pro pai re-hidratar.
    *  O `buttonLabel` deixa o pai reconhecer o botão Negociar (pela label, já que a
    *  UI não tem o `kind`) para injetar o indicador optimistic "preparando negociação". */
@@ -114,7 +119,7 @@ export function PromptButtons({
   }, [buttons, prompt.kind])
 
   async function handle(buttonId: number) {
-    if (pending !== null || answered) return
+    if (pending !== null || answered || inert) return
     setNotice(null)
     setPending(buttonId)
     const label = buttons.find((b) => b.id === buttonId)?.label ?? ""
@@ -146,6 +151,8 @@ export function PromptButtons({
         type="button"
         onClick={() => handle(b.id)}
         disabled={answered || pending !== null}
+        aria-disabled={answered || pending !== null || inert || undefined}
+        data-inert={inert ? "true" : undefined}
         data-tier={tier}
         // R-23: primary preenche com a marca e usa a cor de texto adaptativa (AA).
         style={
@@ -153,7 +160,7 @@ export function PromptButtons({
             ? { backgroundColor: "var(--brand-secondary)", color: "var(--brand-secondary-fg, #ffffff)" }
             : undefined
         }
-        className={tierClass(tier)}
+        className={inert ? `${tierClass(tier)} pointer-events-none` : tierClass(tier)}
         // QA round 3 (QAB3-05): enquanto pendente o VISUAL mostra "…", mas o
         // nome acessível continua o rótulo (aria-label) e o estado é aria-busy.
         aria-busy={pending === b.id || undefined}

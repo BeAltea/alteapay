@@ -36,7 +36,9 @@ function seedWithPlatformOfferChoice() {
       id: "p-offer", company_id: CO, session_id: SID, kind: "offer_choice", status: "active",
       created_by: "platform", question: "Estas são as condições…",
       buttons: [{ id: 2, label: "À vista", value: OFFER_A }, { id: 3, label: "2x", value: OFFER_B }, { id: 98, label: "Voltar às opções" }],
-      context: { offer_ids: [OFFER_A, OFFER_B] }, created_at: "2026-09-25T10:00:00.000Z",
+      // QA round 4 (R-27): parcelas apresentadas AGORA (dentro da janela de tomada
+      // do n8n); a janela em si é coberta em qa4-kickoff-window.
+      context: { offer_ids: [OFFER_A, OFFER_B] }, created_at: new Date().toISOString(),
     }],
     chat_messages: [],
   }

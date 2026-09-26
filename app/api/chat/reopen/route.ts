@@ -20,8 +20,62 @@ import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { handlePaymentClaim, loadSessionCtx, transferToHuman } from "@/lib/journey/actions"
 import { reopenThreeOptions } from "@/lib/journey/acknowledgement"
-import { isDoubleTapHandoff } from "@/lib/journey/double-tap"
+import {
+  BTN_PAYMENT_CLAIM,
+  checkEffectDoubleTap,
+  DOUBLE_TAP_WINDOW_MS,
+  isDoubleTapHandoff,
+  isWithinWindow,
+  lastCustomerClick,
+} from "@/lib/journey/double-tap"
+import { getActivePrompt, promptView, type PromptView } from "@/lib/journey/prompts"
 import { createServiceClient } from "@/lib/supabase/service"
+
+/** Rótulo do eco do "Já paguei" (o mesmo da afordância na tela). */
+const PAYMENT_CLAIM_LABEL = "Já paguei este valor"
+
+/** Prompt ATIVO no shape do GET (null se não houver / falha). Nunca lança. */
+async function activePromptView(sessionId: string): Promise<PromptView | null> {
+  try {
+    return promptView(await getActivePrompt(sessionId))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * QA round 4 — eco do "Já paguei" (role customer, button_id 96, sem prompt_id),
+ * carimbado na época corrente. Best-effort: falha → null (o claim segue).
+ */
+async function persistClaimEcho(ctx: {
+  sessionId: string
+  companyId: string
+}): Promise<{ id: string; text: string; button_id: number; created_at: string } | null> {
+  try {
+    const supabase = createServiceClient()
+    const { data: sess } = await supabase
+      .from("negotiation_sessions")
+      .select("thread_epoch")
+      .eq("id", ctx.sessionId)
+      .maybeSingle()
+    const epoch = Number((sess as { thread_epoch?: number | null } | null)?.thread_epoch ?? 0)
+    const row: Record<string, unknown> = {
+      company_id: ctx.companyId,
+      session_id: ctx.sessionId,
+      role: "customer",
+      text: PAYMENT_CLAIM_LABEL,
+      button_id: BTN_PAYMENT_CLAIM,
+    }
+    if (epoch > 0) row.thread_epoch = epoch
+    const { data } = await supabase.from("chat_messages").insert(row).select("id, created_at").single()
+    const r = data as { id?: string; created_at?: string } | null
+    if (!r?.id) return null
+    return { id: r.id, text: PAYMENT_CLAIM_LABEL, button_id: BTN_PAYMENT_CLAIM, created_at: r.created_at ?? new Date().toISOString() }
+  } catch (err) {
+    console.warn("[chat:reopen] eco do payment_claim falhou (não-fatal):", (err as Error).message)
+    return null
+  }
+}
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -70,7 +124,15 @@ async function sessionDebtIds(
   }
 }
 
+/** QA round 4 (R-16/R-26, S7): `Server-Timing: total` em toda resposta. Sem PII. */
 export async function POST(req: NextRequest) {
+  const t0 = Date.now()
+  const res = await handleReopen(req)
+  res.headers.set("Server-Timing", `total;dur=${Date.now() - t0}`)
+  return res
+}
+
+async function handleReopen(req: NextRequest): Promise<NextResponse> {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return NextResponse.json({ error: "not found" }, { status: 404 })
   }
@@ -107,6 +169,31 @@ export async function POST(req: NextRequest) {
     // logo em seguida para o devedor seguir (nunca beco sem saída, M7). O poll
     // seguinte traz a bolha de orientação + o menu de volta.
     if (action === "payment_claim") {
+      // QA round 4 (R-11/R-21): toque múltiplo — um "Já paguei" < 2 s depois de
+      // um clique VÁLIDO de outro controle da sessão é ignorado (nenhum caso);
+      // < 2 s depois de outro "Já paguei" é o MESMO pedido (o caso aberto é
+      // reusado e nenhuma bolha nova é gravada). Em ambos devolve o estado atual.
+      const last = await lastCustomerClick(ctx.sessionId)
+      if (last.buttonId === BTN_PAYMENT_CLAIM && isWithinWindow(last.at, Date.now(), DOUBLE_TAP_WINDOW_MS)) {
+        return NextResponse.json({
+          ok: true, action: "payment_claim", claim_registered: true, duplicate: true,
+          prompt: await activePromptView(ctx.sessionId), state_time: new Date().toISOString(),
+        })
+      }
+      const dt = await checkEffectDoubleTap({
+        sessionId: ctx.sessionId, companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+        buttonId: BTN_PAYMENT_CLAIM, source: "reopen",
+      })
+      if (dt.doubleTap) {
+        return NextResponse.json({
+          ok: true, action: "payment_claim", claim_registered: false, ignored: "double_tap",
+          prompt: await activePromptView(ctx.sessionId), state_time: new Date().toISOString(),
+        })
+      }
+      // Eco do clique (R-11/R-13): a escolha do devedor fica no histórico ANTES
+      // do resultado, com button_id 96 — o guard de toque múltiplo do /button a
+      // enxerga (um 2º toque que caia em "Não reconheço" é ignorado).
+      const echo = await persistClaimEcho(ctx)
       const claim = await handlePaymentClaim(ctx, "customer")
       const { debtIds: cDebtIds, primaryDebtId: cPrimary } = await sessionDebtIds(ctx.sessionId, ctx.debtId)
       // reabre o menu payável (best-effort — a orientação já foi persistida).
@@ -118,8 +205,16 @@ export async function POST(req: NextRequest) {
         primaryDebtId: cPrimary,
       })
       await clearWaitState(ctx.sessionId)
+      // QA round 4 (R-24/R-13): o corpo É o próximo estado — eco + resultado
+      // persistidos (ids reais, o client deduplica com o poll) + o menu ativo.
       return NextResponse.json({
         ok: true, action: "payment_claim", claim_registered: true, case_id: claim.caseId, reply: claim.reply,
+        echo,
+        outcome: claim.messageId
+          ? { id: claim.messageId, text: claim.reply, stage: "payment_claim", created_at: new Date().toISOString() }
+          : null,
+        prompt: await activePromptView(ctx.sessionId),
+        state_time: new Date().toISOString(),
       })
     }
 
@@ -136,7 +231,11 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
     }
     await clearWaitState(ctx.sessionId) // A-02: encerra a espera para não duplicar o menu
-    return NextResponse.json({ ok: true, action: "reopen_options", reply: back.reply })
+    // QA round 4 (R-13): o menu reaberto vai no corpo (o client aplica sem esperar o poll).
+    return NextResponse.json({
+      ok: true, action: "reopen_options", reply: back.reply,
+      prompt: await activePromptView(ctx.sessionId), state_time: new Date().toISOString(),
+    })
   } catch (err) {
     // Nunca deixa a request morrer sem JSON (o front re-habilita a UI e o poll
     // reconstrói o estado). Rótulo curto, sem PII/segredo.

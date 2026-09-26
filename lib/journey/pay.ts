@@ -358,6 +358,9 @@ export interface DeliveredPaymentOutcome {
   postPromptId: string | null
   /** prompt ATIVO após a entrega (pós-link, ou o menu curto sem link). */
   prompt: PromptView | null
+  /** QA round 4 (R-10/R-20): id da bolha do link persistida — o client reconcilia
+   *  o resultado do clique com ELA por id (nunca 2 bolhas/painéis). */
+  linkMessageId?: string | null
 }
 
 /**
@@ -380,7 +383,7 @@ export async function deliverPaymentOutcome(
   const resolved = await resolveLiveChargeLink(ctx, input.payment)
   const agreementId = input.payment?.agreement_id ?? null
   if (resolved.link) {
-    await persistPaymentLinkMessage(ctx, {
+    const linkMessageId = await persistPaymentLinkMessage(ctx, {
       link: resolved.link,
       valor: resolved.total ?? input.valor,
       vencimentoLink: resolved.dueDate,
@@ -399,6 +402,7 @@ export async function deliverPaymentOutcome(
       agreementId,
       postPromptId: post?.id ?? null,
       prompt: promptView(post),
+      linkMessageId,
     }
   }
   // Sem link resolvível: outcome humano ligado a este resultado (fora do dedup de
@@ -452,6 +456,8 @@ export interface PayServiceOk {
   agreement_id: string | null
   /** id do prompt pós-link persistido pelo servidor (null se sem link). */
   post_prompt_id: string | null
+  /** QA round 4 (R-10/R-20): id da bolha do link persistida (null se sem link). */
+  link_message_id?: string | null
   /** QA round 1 (QAA1-02): prompt ATIVO após a entrega (pós-link ou menu curto),
    *  no shape do GET — o client renderiza na hora. null só em 'processing'. */
   prompt?: PromptView | null
@@ -703,6 +709,7 @@ export async function payService(
     agreement_id: delivered.agreementId,
     post_prompt_id: delivered.postPromptId,
     prompt: delivered.prompt,
+    link_message_id: delivered.linkMessageId ?? null,
   }
 }
 

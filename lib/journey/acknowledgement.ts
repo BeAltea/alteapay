@@ -28,7 +28,7 @@ import {
   BTN_YES,
   type Button,
 } from "./buttons"
-import { createPrompt, answerPrompt, promptView, type PromptRow, type PromptView } from "./prompts"
+import { createPrompt, answerPrompt, getActivePrompt, promptView, type PromptRow, type PromptView } from "./prompts"
 import { listOffers, type ListedOffer, type SessionCtx } from "./actions"
 import type { OfferTerms } from "@/lib/negotiation/offers"
 import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "./wait-machine"
@@ -495,6 +495,44 @@ function sameButtons(a: Button[], b: Button[]): boolean {
  *    status) — a copy nova chega a prompts já gravados. O menu-volta do "não
  *    reconheço" (stage not_recognized_back) não é tocado.
  */
+/** QA round 4 (R-12): janela em que um prompt recém-respondido ainda espera o sucessor. */
+export const PROMPT_SWAP_GRACE_MS = 3000
+const SUCCESSOR_WAIT_MS = 2000
+const SUCCESSOR_POLL_MS = 150
+
+/**
+ * QA round 4 (R-12) — se o prompt mais recente da sessão foi respondido há menos
+ * de PROMPT_SWAP_GRACE_MS e não há ativo (um clique está criando o sucessor),
+ * espera até SUCCESSOR_WAIT_MS pelo sucessor e o devolve. null = nada em
+ * transição (ou o sucessor não apareceu): o chamador segue o fluxo normal.
+ * Nunca lança.
+ */
+async function awaitPromptSuccessor(sessionId: string): Promise<PromptRow | null> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("chat_prompts")
+      .select("id, status, answered_at, created_at")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    const last = data as { status?: string | null; answered_at?: string | null } | null
+    if (!last || last.status !== "answered") return null
+    const at = Date.parse(last.answered_at ?? "")
+    if (!Number.isFinite(at) || Date.now() - at >= PROMPT_SWAP_GRACE_MS) return null
+    const deadline = Date.now() + SUCCESSOR_WAIT_MS
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, SUCCESSOR_POLL_MS))
+      const active = await getActivePrompt(sessionId)
+      if (active) return active
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 export async function bootstrapThreeOptionsPrompt(input: {
   companyId: string
   sessionId: string
@@ -575,6 +613,36 @@ export async function bootstrapThreeOptionsPrompt(input: {
       }
     }
     return { ok: true, created: false, reason: "already_active", prompt: existing }
+  }
+
+  // QA round 4 (R-12, S4) — LOGIN/RETOMADA CONCORRENTE a um clique em curso
+  // (só no modo inicial: o modo 'reopen' é chamado pelos próprios handlers, que
+  // acabaram de responder o prompt):
+  //  (1) clique em voo: o prompt mais recente acabou de ser respondido e o
+  //      sucessor ainda não foi gravado → espera o sucessor (até 2 s) e o reusa,
+  //      em vez de publicar um menu que a outra aba vai superseder (409);
+  //  (2) contestação em curso/registrada: o último clique da sessão é o "Não
+  //      reconheço" [0] → publica o menu-volta [98], NUNCA o menu pagável.
+  if (mode === "initial") {
+    const successor = await awaitPromptSuccessor(input.sessionId)
+    if (successor) return { ok: true, created: false, reason: "already_active", prompt: successor }
+    const { lastCustomerClick } = await import("./double-tap")
+    const last = await lastCustomerClick(input.sessionId)
+    if (last.buttonId === BTN_NO) {
+      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+      const back = await createPrompt({
+        companyId: input.companyId,
+        sessionId: input.sessionId,
+        kind: "debt_three_options",
+        question: "",
+        buttons: backToOptionsButtons(),
+        context: { primary_debt_id: input.primaryDebtId, debt_ids: input.debtIds, stage: "not_recognized_back" },
+        createdBy: "platform",
+        threadEpoch,
+      })
+      if (!back.ok) return { ok: false, error: back.error }
+      return { ok: true, created: true, prompt: back.prompt }
+    }
   }
 
   // Saudação ANTES do menu (ordem cronológica na tela): só no modo inicial e só
@@ -1655,7 +1723,9 @@ async function dispatchNegotiationStartInBackground(input: {
 export type KickoffStatus =
   | { status: "delivered"; owner: "n8n" }
   | { status: "unavailable"; owner: "platform"; reason: string }
-  | { status: "pending"; owner: "platform" }
+  // QA round 4 (R-18/R-27, S9): desfecho ainda desconhecido → "pending" explícito
+  // (nunca "platform" presumido — o banco virava n8n depois e divergia do corpo).
+  | { status: "pending"; owner: "pending" }
 
 export interface KickoffHandle {
   eventId: string
@@ -1706,7 +1776,7 @@ export function kickoffNegotiationStart(input: {
         return await Promise.race<KickoffStatus>([
           settledPromise,
           new Promise<KickoffStatus>((resolve) => {
-            timer = setTimeout(() => resolve({ status: "pending", owner: "platform" }), Math.max(0, deadlineMs))
+            timer = setTimeout(() => resolve({ status: "pending", owner: "pending" }), Math.max(0, deadlineMs))
             // não segura o event loop: o disparo, se estourar, segue solto.
             timer.unref?.()
           }),
@@ -1872,7 +1942,7 @@ export async function handleDebtNegotiate(input: {
   dispatchDeadlineMs?: number // deadline do kickoff no caminho do clique (default N8N_KICKOFF_DEADLINE_MS/2500)
 }): Promise<{
   ok: true
-  engineOwner: "platform" | "n8n"
+  engineOwner: "platform" | "n8n" | "pending"
   reply: string
   kickoff: KickoffStatus["status"]
   offersPresented: boolean

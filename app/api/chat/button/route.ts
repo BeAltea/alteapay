@@ -46,7 +46,7 @@ import {
   type PresentMatrixOffersResult,
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
-import { isDoubleTapHandoff, isDuplicateClick } from "@/lib/journey/double-tap"
+import { checkEffectDoubleTap, isDoubleTapHandoff, isDuplicateClick } from "@/lib/journey/double-tap"
 import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { setSessionWaitState } from "@/lib/journey/session-wait"
 import { engineName } from "@/lib/negotiation/engine"
@@ -211,6 +211,25 @@ async function ensureAssistedPrompt(ctx: { sessionId: string; companyId: string;
   }
 }
 
+/**
+ * QA round 4 (R-13/R-22/R-24, S3) — o CORPO do POST é o próximo estado: o prompt
+ * ATIVO depois das escritas (shape do GET) e `state_time` tirado DEPOIS da última
+ * escrita. O client aplica na hora (sem esperar o poll) e ergue a cerca contra
+ * GETs disparados antes. Aditivo: clientes antigos ignoram os campos.
+ */
+async function withState(body: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> {
+  let prompt = body.prompt
+  if (prompt === undefined) {
+    prompt = await getActivePrompt(sessionId).then(promptView).catch(() => null)
+  }
+  return { ...body, prompt, state_time: new Date().toISOString() }
+}
+
+/** Linha persistida devolvida no corpo (o client deduplica com o poll por id). */
+function outcomeOf(id: string | null, text: string, stage: string, promptId: string) {
+  return id ? { id, text, stage, prompt_id: promptId, created_at: new Date().toISOString() } : null
+}
+
 /** debt_ids/primary_debt_id do contexto do prompt (fallback: dívida do ctx). */
 function debtIdsOf(prompt: PromptRow, fallbackDebtId: string): { debtIds: string[]; primaryDebtId: string } {
   const debtIds = Array.isArray((prompt.context as { debt_ids?: unknown } | null)?.debt_ids)
@@ -223,7 +242,26 @@ function debtIdsOf(prompt: PromptRow, fallbackDebtId: string): { debtIds: string
   return { debtIds, primaryDebtId }
 }
 
+/**
+ * QA round 4 (R-16/R-26, S7) — `Server-Timing` em toda resposta do clique:
+ * `total` (e `charge` no Pagar/aceite, o trecho ASAAS + persistência) para o QA
+ * separar servidor × rede × render. Sem PII.
+ */
 export async function POST(req: NextRequest) {
+  const t0 = Date.now()
+  const res = await handleButton(req)
+  const prev = res.headers.get("Server-Timing")
+  res.headers.set("Server-Timing", `${prev ? `${prev}, ` : ""}total;dur=${Date.now() - t0}`)
+  return res
+}
+
+/** Anexa a etapa `charge` (serviço de cobrança) ao Server-Timing da resposta. */
+function withChargeTiming(res: NextResponse, chargeMs: number): NextResponse {
+  res.headers.set("Server-Timing", `charge;dur=${chargeMs}`)
+  return res
+}
+
+async function handleButton(req: NextRequest): Promise<NextResponse> {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return NextResponse.json({ error: "not found" }, { status: 404 })
   }
@@ -262,7 +300,28 @@ export async function POST(req: NextRequest) {
     })
     if (dt.doubleTap) {
       const active = await getActivePrompt(ctx.sessionId).catch(() => null)
-      return NextResponse.json({ ok: true, button_id: buttonId, ignored: "double_tap", prompt: promptView(active) })
+      return NextResponse.json({ ok: true, button_id: buttonId, ignored: "double_tap", prompt: promptView(active), state_time: new Date().toISOString() })
+    }
+  }
+  // QA round 4 (R-11/R-21, QAB1-R2-01) — TOQUE MÚLTIPLO com efeito de negócio:
+  // Não reconheço [0] / Pagar [4] < 2 s depois de um clique VÁLIDO de OUTRO
+  // controle da sessão (inclusive o eco [96] do "Já paguei") é o 2º toque de um
+  // toque múltiplo → 200 ignored, nenhum efeito (ack negativo, disputa, handoff,
+  // cobrança). Só nos kinds em que esses ids SÃO os controles de efeito (menu de
+  // 3 opções e legados); nas parcelas (offer_choice) o id 4 é uma oferta. O Não
+  // reconheço relê após 250 ms (o eco do 1º toque pode estar sendo gravado por
+  // outra requisição concorrente). Checado ANTES do re-alvejamento.
+  if (
+    (buttonId === BTN_NO || buttonId === BTN_PAY) &&
+    (prompt.kind === "debt_three_options" || prompt.kind === "debt_consult" || prompt.kind === "debt_acknowledgement")
+  ) {
+    const dt = await checkEffectDoubleTap({
+      sessionId: ctx.sessionId, companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+      buttonId, promptId: prompt.id, source: "button", recheckAfterMs: buttonId === BTN_NO ? 250 : 0,
+    })
+    if (dt.doubleTap) {
+      const active = await getActivePrompt(ctx.sessionId).catch(() => null)
+      return NextResponse.json({ ok: true, button_id: buttonId, ignored: "double_tap", prompt: promptView(active), state_time: new Date().toISOString() })
     }
   }
 
@@ -321,7 +380,7 @@ export async function POST(req: NextRequest) {
         if (!back.ok) {
           return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
         }
-        return NextResponse.json({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply })
+        return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
       }
 
       // --- ATENDIMENTO [99] → handoff. ---------------------------------------
@@ -345,55 +404,57 @@ export async function POST(req: NextRequest) {
       // e persiste o link (outcome) + o prompt pós-link.
       // QA round 2 (QAB1-H1): 'gerando_cobranca' persistido ANTES do serviço;
       // limpo/'erro_cobranca' ao final (reload durante o aceite nunca fica mudo).
+      const tCharge = Date.now()
       const { result: accepted, wait_state: acceptWait } = await withChargeWaitState(ctx.sessionId, () =>
         acceptMatrixCondition(ctx, offerId),
       )
+      const chargeMs = Date.now() - tCharge
       if (!accepted.ok) {
         // Rótulo de negócio (não erro de transporte): o D2 mostra a copy humana
         // §5.4. HTTP 200 para o front tratar como resultado do pagamento, não como
         // falha de rede. NUNCA a mensagem crua/HTTP/"n8n" ao devedor.
-        return NextResponse.json(
+        return withChargeTiming(NextResponse.json(
           { ok: false, button_id: buttonId, action: "pay", error: accepted.code, wait_state: acceptWait },
           { status: 200 },
-        )
+        ), chargeMs)
       }
       if (accepted.status === "already_charged") {
         // D23/M14: devolve o LINK EXISTENTE, nunca cria 2ª cobrança. QA round 1
         // (QAA1-02): o link vem resolvido pelo acordo/ASAAS; sem link, o servidor
         // já persistiu o outcome humano + menu curto e devolve o `prompt` ativo.
-        return NextResponse.json({
+        return withChargeTiming(NextResponse.json({
           ok: true, button_id: buttonId, action: "pay", acknowledged: true,
           link: accepted.link,
           valor: accepted.payment?.total_value ?? null,
           vencimento_link: accepted.vencimento_link,
           already_charged: true, processing: false,
           agreement_id: accepted.payment?.agreement_id ?? null,
-          post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt,
+          post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt, link_message_id: accepted.link_message_id,
           wait_state: acceptWait,
-        })
+        }), chargeMs)
       }
       if (accepted.status === "processing") {
         // Cobrança aceita, worker ainda não gravou as URLs. A UI faz polling; NÃO
         // declaramos pago (M15).
-        return NextResponse.json({
+        return withChargeTiming(NextResponse.json({
           ok: true, button_id: buttonId, action: "pay", acknowledged: true,
           link: null, valor: null, vencimento_link: null,
           already_charged: false, processing: true,
           agreement_id: accepted.agreementId,
           wait_state: acceptWait,
-        })
+        }), chargeMs)
       }
       // status: 'created' — link pronto (inline).
-      return NextResponse.json({
+      return withChargeTiming(NextResponse.json({
         ok: true, button_id: buttonId, action: "pay", acknowledged: true,
         link: accepted.link,
         valor: accepted.payment.total_value ?? null,
         vencimento_link: accepted.vencimento_link,
         already_charged: false, processing: false,
         agreement_id: accepted.payment.agreement_id ?? null,
-        post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt,
+        post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt, link_message_id: accepted.link_message_id,
         wait_state: acceptWait,
-      })
+      }), chargeMs)
     } catch (err) {
       console.error("[chat:button] offer_choice falhou:", (err as Error).message)
       return NextResponse.json(
@@ -423,7 +484,7 @@ export async function POST(req: NextRequest) {
         if (!back.ok) {
           return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
         }
-        return NextResponse.json({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply })
+        return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
       }
       if (buttonId === BTN_HANDOFF) {
         await transferToHuman(ctx, "handoff_button", "customer")
@@ -476,25 +537,28 @@ export async function POST(req: NextRequest) {
         // bater com o valor exibido (D3 ALTO).
         // QA round 2 (QAB1-H1): wait_state='gerando_cobranca' ANTES do payService
         // (reload durante a cobrança reidrata a espera); limpo/'erro_cobranca' ao final.
+        const tCharge = Date.now()
         const { result: pay, wait_state: payWait } = await withChargeWaitState(ctx.sessionId, () =>
           payService(ctx, { debtIds, primaryDebtId }),
         )
+        const chargeMs = Date.now() - tCharge
         if (!pay.ok) {
-          return NextResponse.json(
+          return withChargeTiming(NextResponse.json(
             { ok: false, button_id: buttonId, action: "pay", error: pay.error, wait_state: payWait },
             { status: 200 }, // rótulo de negócio, não erro de transporte: o D2 mostra a copy §5.4
-          )
+          ), chargeMs)
         }
-        return NextResponse.json({
+        return withChargeTiming(NextResponse.json({
           ok: true, button_id: buttonId, action: "pay", acknowledged: true,
           link: pay.link, valor: pay.valor, vencimento_link: pay.vencimento_link,
           already_charged: pay.already_charged, processing: pay.processing,
           agreement_id: pay.agreement_id, post_prompt_id: pay.post_prompt_id,
+          link_message_id: pay.link_message_id ?? null,
           // QA round 1 (QAA1-02): prompt ATIVO no corpo (pós-link, ou o menu curto
           // quando não há link resolvível) — o client renderiza na hora.
           prompt: pay.prompt ?? null,
           wait_state: payWait,
-        })
+        }), chargeMs)
       }
 
       // --- NEGOCIAR [1] ------------------------------------------------------
@@ -599,7 +663,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
         const reply = debtConsultReply(ackCtx)
-        await persistAssistantMessage({
+        const detailId = await persistAssistantMessage({
           companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply,
           promptId, stage: "detail",
         })
@@ -607,11 +671,12 @@ export async function POST(req: NextRequest) {
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtIds, primaryDebtId, ackCtx,
         })
-        return NextResponse.json({
+        return NextResponse.json(await withState({
           ok: true, button_id: buttonId, action: "consult", acknowledged: false, reply,
           ...(retargetedFrom ? { retargeted_from: retargetedFrom } : {}),
           prompt_id: reopened.ok ? reopened.promptId : null,
-        })
+          outcome: outcomeOf(detailId, reply, "detail", promptId),
+        }, ctx.sessionId))
       }
 
       // --- NÃO RECONHEÇO [0] -------------------------------------------------
@@ -641,26 +706,37 @@ export async function POST(req: NextRequest) {
         }
         const reply = notRecognizedReply(channel)
         // A1: resultado da ação como OUTCOME (ligado ao clique) ANTES do menu-volta.
-        await persistAssistantMessage({
+        const nrId = await persistAssistantMessage({
           companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply,
           promptId, stage: "not_recognized",
         })
         // Botão de VOLTA (M7): [98] reabre o menu de 3 opções. Só um botão-link de
         // ação; a UI (D2) o renderiza. Persistido como prompt para a re-entrada.
+        // QA round 4 (R-12): um login concorrente pode já ter publicado o
+        // menu-volta (bootstrap vê a contestação em curso) — reusa, sem
+        // supersede (a outra aba nunca recebe 409 por isso).
         const { createPrompt } = await import("@/lib/journey/prompts")
         const { backToOptionsButtons } = await import("@/lib/journey/acknowledgement")
-        await createPrompt({
-          companyId: ctx.companyId, sessionId: ctx.sessionId, kind: "debt_three_options",
-          // A4/S12: sem pergunta — o rótulo "Voltar às opções" basta.
-          question: "",
-          buttons: backToOptionsButtons(),
-          context: { primary_debt_id: primaryDebtId, debt_ids: debtIds, stage: "not_recognized_back" },
-          createdBy: "platform",
-        })
-        return NextResponse.json({
+        const current = await getActivePrompt(ctx.sessionId).catch(() => null)
+        const alreadyBack =
+          !!current &&
+          current.kind === "debt_three_options" &&
+          (current.context as { stage?: unknown } | null)?.stage === "not_recognized_back"
+        if (!alreadyBack) {
+          await createPrompt({
+            companyId: ctx.companyId, sessionId: ctx.sessionId, kind: "debt_three_options",
+            // A4/S12: sem pergunta — o rótulo "Voltar às opções" basta.
+            question: "",
+            buttons: backToOptionsButtons(),
+            context: { primary_debt_id: primaryDebtId, debt_ids: debtIds, stage: "not_recognized_back" },
+            createdBy: "platform",
+          })
+        }
+        return NextResponse.json(await withState({
           ok: true, button_id: buttonId, action: "not_recognized", acknowledged: false,
           on_not_recognized: out.onNotRecognized, has_channel_config: channel.hasConfig, reply,
-        })
+          outcome: outcomeOf(nrId, reply, "not_recognized", promptId),
+        }, ctx.sessionId))
       }
 
       // --- VOLTA [98] --------------------------------------------------------
@@ -677,7 +753,7 @@ export async function POST(req: NextRequest) {
         if (!back.ok) {
           return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
         }
-        return NextResponse.json({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply })
+        return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
       }
 
       // --- ATENDIMENTO [99] --------------------------------------------------
