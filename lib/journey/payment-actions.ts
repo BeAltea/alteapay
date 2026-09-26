@@ -25,6 +25,7 @@ import { buildAcceptSummary, confirmAccept } from "./closing"
 import { debtSummary, registerPaymentClaim, rejectOffer, type DebtSummary, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
 import { assertAcknowledgedForPayment } from "./acknowledgement"
+import { timed } from "./server-timing"
 
 const PAID_STATUSES = new Set([
   "received", "confirmed", "paid", "RECEIVED", "CONFIRMED", "RECEIVED_IN_CASH",
@@ -155,6 +156,9 @@ async function assertOfferWithinMatrix(
 export interface PaymentCreateOpts {
   /** debtSummary já calculado (evita repetir 4 leituras + evento — N-D1-1). */
   summary?: DebtSummary
+  /** QA rodada 5 (Q2-01): prazo (epoch ms) para a cobrança COMEÇAR — ver
+   *  confirmAccept. Ausente = sem prazo (n8n/worker). */
+  chargeNotAfter?: number | null
 }
 
 export async function paymentCreate(
@@ -163,9 +167,20 @@ export async function paymentCreate(
   eventId?: string,
   opts?: PaymentCreateOpts,
 ): Promise<PaymentCreateResult> {
+  // QA rodada 5 (latência Q2-01/Q2-02): origem do tenant, idempotência por
+  // (sessão, oferta) e o guard de reconhecimento são LEITURAS independentes —
+  // correm em paralelo. A ordem das DECISÕES é a mesma de antes.
+  const [origin, existingAgreementId, ackGuard] = await timed("pre_checks", () => Promise.all([
+    loadTenantPaymentOrigin(ctx.companyId),
+    findExistingPaymentForOffer(ctx, offerId),
+    assertAcknowledgedForPayment({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      debtId: ctx.debtId,
+    }),
+  ]))
   // Variante A é o ÚNICO caminho (D17/GATE R0). payment_origin != 'platform' →
   // 501 not_implemented (variante B fora do escopo desta onda).
-  const origin = await loadTenantPaymentOrigin(ctx.companyId)
   if (origin !== "platform") {
     return {
       ok: false,
@@ -177,7 +192,8 @@ export async function paymentCreate(
 
   // Idempotência por (session_id, offer_id) (§4.2): 2ª chamada devolve payload
   // IDÊNTICO (mesmo agreement/link) com idempotent:true, ZERO cobrança nova.
-  const existingAgreementId = await findExistingPaymentForOffer(ctx, offerId)
+  // Acordo ainda sem cobrança (pending_charge: a 1ª request está criando ou
+  // morreu no meio) → 'processing'; o poll reconcilia pela externalReference.
   if (existingAgreementId) {
     const details = await fetchPaymentDetails(existingAgreementId, ctx.companyId)
     if (!details.payment_id) {
@@ -188,11 +204,6 @@ export async function paymentCreate(
 
   // Invariante do reconhecimento (§3): com acknowledged=false (ou sem resposta)
   // recusa a menos que allow_payment_without_acknowledgement=true.
-  const ackGuard = await assertAcknowledgedForPayment({
-    companyId: ctx.companyId,
-    sessionId: ctx.sessionId,
-    debtId: ctx.debtId,
-  })
   if (!ackGuard.ok) {
     await rejectOffer(ctx, offerId, "system", "debt_not_acknowledged", eventId)
     return {
@@ -205,7 +216,11 @@ export async function paymentCreate(
 
   // Revalida a oferta contra a matriz VIGENTE (§3): fora da matriz → 422.
   // O servidor decide — se a matriz mudou e a oferta não cabe mais, não cobra.
-  const matrix = await assertOfferWithinMatrix(ctx, offerId, opts?.summary)
+  // Em paralelo com o resumo do aceite (as duas só LEEM a oferta).
+  const [matrix, pre] = await timed("matrix_summary", () => Promise.all([
+    assertOfferWithinMatrix(ctx, offerId, opts?.summary),
+    buildAcceptSummary(ctx, offerId),
+  ]))
   if (!matrix.ok) {
     await rejectOffer(ctx, offerId, "system", matrix.code, eventId)
     return {
@@ -221,16 +236,22 @@ export async function paymentCreate(
 
   // valida a oferta e termos (passo 1) para obter o termsHash (revalida matriz
   // vigente dentro de confirmAccept → closeAgreement).
-  const pre = await buildAcceptSummary(ctx, offerId)
   if (!pre.ok) {
     return { ok: false, status: 409, code: pre.error, message: pre.error }
   }
 
   // `pre` já montado → confirmAccept NÃO refaz buildAcceptSummary (N-D1-1).
-  const result = await confirmAccept({ ctx, offerId, termsHash: pre.summary.termsHash, eventId, pre: pre.summary })
+  const result = await confirmAccept({
+    ctx, offerId, termsHash: pre.summary.termsHash, eventId, pre: pre.summary,
+    chargeNotAfter: opts?.chargeNotAfter ?? null,
+  })
   if (!result.ok) {
     if (result.error === "ALREADY_CHARGED") {
       return { ok: false, status: 409, code: "already_charged", message: "dívida já possui cobrança viva" }
+    }
+    if (result.error === "CHARGE_DEFERRED") {
+      // QA rodada 5: nenhuma cobrança foi enviada ao ASAAS (prazo da função).
+      return { ok: false, status: 503, code: "charge_deferred", message: "cobrança não iniciada (tempo esgotado); tente novamente" }
     }
     return { ok: false, status: 422, code: result.error, message: result.error }
   }

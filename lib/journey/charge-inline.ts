@@ -24,6 +24,7 @@ import {
 } from "@/lib/asaas"
 import { isBlockingAgreement } from "@/lib/asaas-idempotency"
 import { createAdminClient } from "@/lib/supabase/admin"
+import { timed } from "./server-timing"
 
 /** Payload idêntico ao enfileirado em close-agreement.ts (jobData da chargeQueue). */
 export interface InlineChargeJobData {
@@ -54,7 +55,26 @@ export interface InlineChargeResult {
   invoiceUrl: string | null
   paymentId: string | null
   error?: string
+  /** QA rodada 5 (Q2-01): true quando NENHUMA chamada de criação de cobrança foi
+   *  enviada ao ASAAS (prazo `notAfter` estourado antes do POST /payments). O
+   *  chamador pode cancelar o acordo com segurança: não há cobrança órfã. */
+  notStarted?: boolean
 }
+
+/** QA rodada 5 (Q2-01) — opções do caminho inline (todas opcionais). */
+export interface InlineChargeOpts {
+  /** Epoch ms: se já passou quando a cobrança estiver para ser enviada ao ASAAS,
+   *  NÃO envia (devolve notStarted). Garante que a criação nunca começa tão
+   *  tarde que a função seria morta entre criar e espelhar (teto da plataforma). */
+  notAfter?: number | null
+  /** Customer ASAAS já conhecido (agreements.asaas_customer_id do mesmo cliente):
+   *  pula a busca por CPF/CNPJ (1 chamada ASAAS a menos). O update de supressão
+   *  de notificações continua (cliente legado pode ter notificação ligada). */
+  knownAsaasCustomerId?: string | null
+}
+
+const deadlinePassed = (notAfter: number | null | undefined) =>
+  typeof notAfter === "number" && Date.now() > notAfter
 
 /**
  * Cria a cobrança ASAAS na própria request e faz o write-back no agreement.
@@ -71,6 +91,7 @@ export interface InlineChargeResult {
  */
 export async function createAsaasChargeInline(
   jobData: InlineChargeJobData,
+  opts: InlineChargeOpts = {},
 ): Promise<InlineChargeResult> {
   const { customer, payment, metadata } = jobData
   const agreementId = metadata.agreementId
@@ -96,29 +117,40 @@ export async function createAsaasChargeInline(
     }
   }
 
+  // Prazo já estourado antes de qualquer chamada ao ASAAS: não começa.
+  if (deadlinePassed(opts.notAfter)) {
+    return { ok: false, paymentId: null, invoiceUrl: null, error: "charge_deadline", notStarted: true }
+  }
+
   try {
-    // ---- Passo 1: acha/cria customer ASAAS (notificationDisabled forçado nas 2 vias)
+    // ---- Passo 1: acha/cria customer ASAAS (notificationDisabled forçado nas 2 vias).
+    // QA rodada 5: customer já conhecido pelos acordos do cliente → pula a busca.
     const cpfCnpj = (customer.cpfCnpj || "").replace(/[^\d]/g, "")
     let asaasCustomerId: string
-    const found = await getAsaasCustomerByCpfCnpj(cpfCnpj)
+    const known = opts.knownAsaasCustomerId || null
+    const found = known ? { id: known } : await timed("asaas_customer_lookup", () => getAsaasCustomerByCpfCnpj(cpfCnpj))
     if (found?.id) {
       asaasCustomerId = found.id
-      await updateAsaasCustomer(asaasCustomerId, {
+      await timed("asaas_customer_update", () => updateAsaasCustomer(asaasCustomerId, {
         name: customer.name,
         email: customer.email,
         mobilePhone: customer.mobilePhone,
-      })
+      }))
     } else {
-      const created = await createAsaasCustomer({
+      const created = await timed("asaas_customer_create", () => createAsaasCustomer({
         name: customer.name || "Cliente",
         cpfCnpj,
         email: customer.email,
         mobilePhone: customer.mobilePhone,
-      })
+      }))
       asaasCustomerId = created.id
     }
 
-    // ---- Passo 2: cria o pagamento
+    // ---- Passo 2: cria o pagamento — SÓ se ainda dentro do prazo (nada foi
+    // enviado ao ASAAS que crie cobrança até aqui; customer não é cobrança).
+    if (deadlinePassed(opts.notAfter)) {
+      return { ok: false, paymentId: null, invoiceUrl: null, error: "charge_deadline", notStarted: true }
+    }
     const paymentParams: CreatePaymentParams = {
       customer: asaasCustomerId,
       billingType: payment.billingType,
@@ -131,10 +163,10 @@ export async function createAsaasChargeInline(
       paymentParams.installmentCount = payment.installmentCount
       paymentParams.installmentValue = payment.installmentValue
     }
-    const asaasPayment = await createAsaasPayment(paymentParams)
+    const asaasPayment = await timed("asaas_payment", () => createAsaasPayment(paymentParams))
 
     // ---- Passo 3: write-back no agreement (mesmas colunas do worker)
-    const { data: updated, error: updateError } = await supabase
+    const { data: updated, error: updateError } = await timed("charge_writeback", async () => await supabase
       .from("agreements")
       .update({
         asaas_customer_id: asaasCustomerId,
@@ -149,7 +181,7 @@ export async function createAsaasChargeInline(
       })
       .eq("id", agreementId)
       .eq("company_id", metadata.companyId)
-      .select("id")
+      .select("id"))
 
     if (updateError || !updated?.length) {
       console.warn(

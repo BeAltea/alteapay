@@ -936,6 +936,12 @@ export function JourneyChat() {
             already_charged: false,
           })
           setWaitState("link_entregue")
+        } else if (out.status === "failed") {
+          // QA rodada 5 (Q2-01): o servidor confirmou que nenhuma cobrança existe
+          // (acordo órfão cancelado) → erro §5.4 com "Tentar novamente".
+          stopPayPoll()
+          setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false, confirmedNotCreated: true })
+          setWaitState("erro_cobranca")
         } else {
           setPayPollAttempts((n) => n + 1)
         }

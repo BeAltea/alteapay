@@ -17,6 +17,7 @@
 //    devolve o reply; engine disabled → próxima etapa determinística (sem reply).
 import { NextRequest, NextResponse } from "next/server"
 import { clientIpFromHeaders } from "@/lib/journey/client-ip"
+import { formatServerTiming, runWithTimings } from "@/lib/journey/server-timing"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
 import {
@@ -48,7 +49,7 @@ import {
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { checkEffectDoubleTap, isDoubleTapHandoff, isDuplicateClick } from "@/lib/journey/double-tap"
-import { payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
+import { payChargeStartBudgetMs, payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { setSessionWaitState } from "@/lib/journey/session-wait"
 import { engineName } from "@/lib/negotiation/engine"
 import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"
@@ -249,9 +250,16 @@ function debtIdsOf(prompt: PromptRow, fallbackDebtId: string): { debtIds: string
  */
 export async function POST(req: NextRequest) {
   const t0 = Date.now()
-  const res = await handleButton(req)
+  // QA rodada 5 (Q2-01): etapas do caminho da cobrança (guard_local, guard_asaas,
+  // close, asaas_customer_*, asaas_payment, charge_writeback, deliver, ...) no
+  // Server-Timing, para o QA ver onde vão os segundos do Pagar.
+  const { result: res, timings } = await runWithTimings(() => handleButton(req, t0))
   const prev = res.headers.get("Server-Timing")
-  res.headers.set("Server-Timing", `${prev ? `${prev}, ` : ""}total;dur=${Date.now() - t0}`)
+  const steps = formatServerTiming(timings)
+  res.headers.set(
+    "Server-Timing",
+    [prev, steps, `total;dur=${Date.now() - t0}`].filter(Boolean).join(", "),
+  )
   return res
 }
 
@@ -261,7 +269,7 @@ function withChargeTiming(res: NextResponse, chargeMs: number): NextResponse {
   return res
 }
 
-async function handleButton(req: NextRequest): Promise<NextResponse> {
+async function handleButton(req: NextRequest, requestStartedAt: number = Date.now()): Promise<NextResponse> {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return NextResponse.json({ error: "not found" }, { status: 404 })
   }
@@ -406,7 +414,9 @@ async function handleButton(req: NextRequest): Promise<NextResponse> {
       // limpo/'erro_cobranca' ao final (reload durante o aceite nunca fica mudo).
       const tCharge = Date.now()
       const { result: accepted, wait_state: acceptWait } = await withChargeWaitState(ctx.sessionId, () =>
-        acceptMatrixCondition(ctx, offerId),
+        acceptMatrixCondition(ctx, offerId, undefined, {
+          chargeNotAfter: requestStartedAt + payChargeStartBudgetMs(),
+        }),
       )
       const chargeMs = Date.now() - tCharge
       if (!accepted.ok) {
@@ -539,7 +549,7 @@ async function handleButton(req: NextRequest): Promise<NextResponse> {
         // (reload durante a cobrança reidrata a espera); limpo/'erro_cobranca' ao final.
         const tCharge = Date.now()
         const { result: pay, wait_state: payWait } = await withChargeWaitState(ctx.sessionId, () =>
-          payService(ctx, { debtIds, primaryDebtId }),
+          payService(ctx, { debtIds, primaryDebtId, requestStartedAt }),
         )
         const chargeMs = Date.now() - tCharge
         if (!pay.ok) {

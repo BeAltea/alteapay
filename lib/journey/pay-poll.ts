@@ -10,7 +10,7 @@
 /** Shape mínimo da resposta de GET /api/chat/payment que nos interessa. */
 export interface ChatPaymentResponse {
   ok?: boolean
-  status?: string // "generating" | "ready"
+  status?: string // "generating" | "ready" | "failed" (QA rodada 5)
   payment?: {
     invoiceUrl?: string | null
     boletoUrl?: string | null
@@ -24,6 +24,10 @@ export interface ChatPaymentResponse {
 export type PayPollResult =
   | { status: "ready"; link: string; valor: number | null; vencimentoLink: string | null }
   | { status: "generating" }
+  // QA rodada 5 (Q2-01): o servidor reconciliou o acordo sem cobrança e confirmou
+  // que NENHUMA cobrança existe no ASAAS (acordo cancelado) — o devedor pode
+  // tentar de novo. Só vem do servidor; nunca inferido pelo client.
+  | { status: "failed" }
 
 /** Melhor URL de pagamento: invoice › boleto › PIX copia-e-cola. */
 function bestLink(p: NonNullable<ChatPaymentResponse["payment"]>): string | null {
@@ -37,6 +41,7 @@ function bestLink(p: NonNullable<ChatPaymentResponse["payment"]>): string | null
  */
 export function interpretPaymentPoll(data: ChatPaymentResponse | null | undefined): PayPollResult {
   if (!data || data.ok === false) return { status: "generating" }
+  if (data.status === "failed") return { status: "failed" }
   const p = data.payment
   if (data.status === "ready" && p) {
     const link = bestLink(p)
