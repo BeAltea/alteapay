@@ -59,9 +59,13 @@ describe("QAB3-08 / QAB3-10 — copy miúda e alvos", () => {
       const s = src(rel)
       expect(s, rel).toMatch(/em nome da \$?\{/)
       expect(s, rel).not.toMatch(/em nome de \$?\{/)
-      const links = [...s.matchAll(/className="([^"]*)"\s*>\s*\n\s*Política de privacidade/g)]
+      // QA round 4 (R-19): o className virou template com o FOCUS_RING.
+      const links = [...s.matchAll(/className=\{?[`"]([^`"]*)[`"]\}?\s*>\s*\n\s*Política de privacidade/g)]
       expect(links.length, rel).toBe(2)
-      for (const l of links) expect(l[1], rel).toContain("min-h-[24px]")
+      for (const l of links) {
+        expect(l[1], rel).toContain("min-h-[24px]")
+        expect(l[1], rel).toContain("${FOCUS_RING}")
+      }
     }
   })
   it("card diz 'vencimento' por extenso; 'Link copiado.' sem exclamação", () => {

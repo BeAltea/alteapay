@@ -109,6 +109,19 @@ async function sessionPresentedOfferIds(sessionId: string): Promise<Set<string>>
   }
 }
 
+/** QA round 4 (R-18/R-27): janela (ms) em que o n8n ainda pode tomar as parcelas do assistido. */
+export function n8nTakeoverWindowMs(): number {
+  const n = Number(process.env.N8N_TAKEOVER_WINDOW_MS)
+  return Number.isFinite(n) && n > 0 ? n : 15_000
+}
+
+/** PURA: `createdAt` (ISO) do offer_choice ainda dentro da janela de tomada? Sem data → dentro (compat). */
+export function isWithinTakeoverWindow(createdAt: string | null | undefined, nowMs: number, windowMs = n8nTakeoverWindowMs()): boolean {
+  const t = Date.parse(createdAt ?? "")
+  if (!Number.isFinite(t)) return true
+  return nowMs - t < windowMs
+}
+
 type ProtectedGuard =
   | { actionable: true; protectedActive: boolean }
   | { actionable: false; refusal: { ok: false; status: 422; code: string; message: string } }
@@ -124,6 +137,21 @@ async function guardProtectedActive(
 ): Promise<ProtectedGuard> {
   const active = await getActivePrompt(ctx.sessionId)
   if (!isProtectedPlatformPrompt(active)) return { actionable: true, protectedActive: false }
+  // QA round 4 (R-18/R-27, S9 §3): JANELA DO MOTOR — com as parcelas do assistido
+  // (offer_choice) na tela, o n8n só as substitui até N8N_TAKEOVER_WINDOW_MS
+  // depois de apresentadas. Fora da janela o devedor já está lendo/escolhendo:
+  // 422 e o assistido permanece (nunca troca de menu sob o dedo).
+  if (active!.kind === "offer_choice" && !isWithinTakeoverWindow(active!.created_at, Date.now())) {
+    return {
+      actionable: false,
+      refusal: {
+        ok: false,
+        status: 422,
+        code: "prompt_outside_window",
+        message: "prompt do n8n fora da janela de tomada; as parcelas do assistido foram preservadas",
+      },
+    }
+  }
   const offerIds = await sessionPresentedOfferIds(ctx.sessionId)
   const verdict = assessPromptActionability(prompt, offerIds)
   if (verdict.ok) return { actionable: true, protectedActive: true }

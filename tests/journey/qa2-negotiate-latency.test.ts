@@ -101,7 +101,7 @@ describe("QAA2-02 — Negociar responde sem esperar o kickoff quando as parcelas
     const ms = Date.now() - t0
     const b = await res.json()
     expect(res.status).toBe(200)
-    expect(b).toMatchObject({ ok: true, action: "negotiate", offers_presented: true, kickoff: "pending", engine_owner: "platform" })
+    expect(b).toMatchObject({ ok: true, action: "negotiate", offers_presented: true, kickoff: "pending", engine_owner: "pending" }) // QA round 4 (R-27): desfecho desconhecido = "pending"
     expect(b.prompt.kind).toBe("offer_choice")
     expect(b.prompt.buttons.map((x: { id: number }) => x.id)).toEqual([2, 3, 4, 98])
     expect(ms).toBeLessThan(BUDGET_FIRST_MS)

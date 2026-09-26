@@ -36,6 +36,7 @@ interface DeliveredFields {
   vencimento_link: string | null
   post_prompt_id: string | null
   prompt: PromptView | null
+  link_message_id: string | null
 }
 
 export type AssistedAcceptResult =
@@ -46,7 +47,7 @@ export type AssistedAcceptResult =
   | { ok: false; status: number; code: string; message: string }
 
 function fields(d: DeliveredPaymentOutcome): DeliveredFields {
-  return { link: d.link, vencimento_link: d.vencimentoLink, post_prompt_id: d.postPromptId, prompt: d.prompt }
+  return { link: d.link, vencimento_link: d.vencimentoLink, post_prompt_id: d.postPromptId, prompt: d.prompt, link_message_id: d.linkMessageId ?? null }
 }
 
 /**

@@ -577,7 +577,7 @@ export async function transferToHuman(
  */
 export async function handlePaymentClaim(
   ctx: SessionCtx, actor: JourneyActor, eventId?: string,
-): Promise<{ ok: true; caseId: string; reply: string }> {
+): Promise<{ ok: true; caseId: string; reply: string; messageId: string | null }> {
   const caseId = await registerPaymentClaim(
     ctx,
     { channel: "chat", note: "devedor informou que já pagou (Já paguei); aguardando conferência" },
@@ -586,13 +586,16 @@ export async function handlePaymentClaim(
   )
   const creditor = await resolveCreditorName({ companyId: ctx.companyId })
   const reply = paymentClaimReply(creditor.name)
+  let messageId: string | null = null
   try {
     const { persistAssistantMessage } = await import("./acknowledgement")
     // A1: resultado da ação como OUTCOME (stage 'payment_claim') — persistido
     // ANTES de o menu ser reemitido pelo chamador. QA round 1 (M1): é a resposta
     // a ESTE clique — fora do dedup de conteúdo de 15 min (um 2º "Já paguei" na
     // janela ficava sem resposta visível).
-    await persistAssistantMessage({
+    // QA round 4 (R-24): o id volta ao chamador para o corpo do POST levar a
+    // bolha persistida (o client a aplica na hora e deduplica com o poll por id).
+    messageId = await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
       text: reply,
@@ -603,7 +606,7 @@ export async function handlePaymentClaim(
   } catch (err) {
     console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)
   }
-  return { ok: true, caseId, reply }
+  return { ok: true, caseId, reply, messageId }
 }
 
 /**

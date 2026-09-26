@@ -89,6 +89,11 @@ describe("QAA1-05 — 'Já paguei' repetido: resposta sempre visível, 1 caso ab
     const { POST } = await import("@/app/api/chat/reopen/route")
     const jwt = await signed()
     const b1 = await (await POST(req(jwt, { action: "payment_claim" }))).json()
+    // QA round 4 (R-21): o 2º "Já paguei" é um clique NOVO (≥ 2 s depois) — dentro
+    // da janela de toque múltiplo ele é o MESMO pedido (qa4-effect-double-tap).
+    for (const m of db.chat_messages ?? []) {
+      if (m.role === "customer") m.created_at = new Date(Date.parse(m.created_at) - 3000).toISOString()
+    }
     const b2 = await (await POST(req(jwt, { action: "payment_claim" }))).json()
     expect(b1.claim_registered).toBe(true)
     expect(b2.claim_registered).toBe(true)

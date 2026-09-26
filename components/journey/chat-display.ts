@@ -534,3 +534,58 @@ export function resolvePromptForRender<T extends { question: string }>(
   const againstLog = stripDuplicateQuestion(prompt, lastAssistantVisibleText(visible))
   return stripDuplicateQuestion(againstLog, recapText)
 }
+
+// ============================================================================
+// QA round 4 (R-17/R-28, S8) — TRANSCRIÇÃO POR TURNO (só apresentação; dado
+// histórico e journey_events intocados).
+// ============================================================================
+
+/** Eco de clique (bolha do cliente com button_id). */
+function isEcho(m: ChatMsg): boolean {
+  return m.from === "customer" && typeof m.buttonId === "number"
+}
+
+/** Resposta ligada a um eco: resultado do clique (ação/stage de outcome) com o
+ *  MESMO prompt_id. */
+function isReplyOf(reply: ChatMsg, echo: ChatMsg): boolean {
+  return (
+    reply.from === "assistant" &&
+    !!echo.promptId &&
+    reply.promptId === echo.promptId &&
+    isClickBoundOutcome(reply)
+  )
+}
+
+/**
+ * Insere o ECO de um clique que chegou pelo poll ANTES da resposta desse clique
+ * quando a resposta já está na lista (aplicada do corpo do POST, ou gravada
+ * antes do eco numa corrida de inserts). Sem resposta presente → no fim. Pura.
+ */
+export function placeEchoBeforeReply(list: ChatMsg[], echo: ChatMsg): ChatMsg[] {
+  if (!isEcho(echo) || !echo.promptId) return [...list, echo]
+  const idx = list.findIndex((m) => isReplyOf(m, echo))
+  if (idx < 0) return [...list, echo]
+  return [...list.slice(0, idx), echo, ...list.slice(idx)]
+}
+
+/**
+ * Ordena por TURNO: a resposta de um clique (mesmo prompt_id, outcome) que ficou
+ * ANTES do seu eco é recolocada logo DEPOIS dele. Com `dropOrphanEchoes` (vista
+ * expandida): um eco sem resposta seguido diretamente de outro eco colapsa no
+ * seguinte (nunca dois ecos consecutivos sem resposta). Outcomes nunca são
+ * removidos. Pura; preserva a ordem do resto.
+ */
+export function pairTurns(list: ChatMsg[], opts: { dropOrphanEchoes?: boolean } = {}): ChatMsg[] {
+  let out = [...list]
+  for (const echo of list) {
+    if (!isEcho(echo) || !echo.promptId) continue
+    const ei = out.indexOf(echo)
+    const early = out.slice(0, ei).filter((m) => isReplyOf(m, echo))
+    if (early.length === 0) continue
+    const rest = out.filter((m) => !early.includes(m))
+    const at = rest.indexOf(echo) + 1
+    out = [...rest.slice(0, at), ...early, ...rest.slice(at)]
+  }
+  if (!opts.dropOrphanEchoes) return out
+  return out.filter((m, i) => !(isEcho(m) && i + 1 < out.length && isEcho(out[i + 1])))
+}

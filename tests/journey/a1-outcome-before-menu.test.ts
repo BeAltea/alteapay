@@ -12,6 +12,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { makeFakeSupabase, type FakeDb } from "./_fake-supabase"
 
+// QA round 4 (R-11/R-21): cliques de controles de efeito (Pagar/Não reconheço/
+// Já paguei) < 2 s depois de OUTRO clique da sessão são toque múltiplo (ignorados
+// — qa4-effect-double-tap). Estes cenários são cliques NOVOS: envelhece os ecos.
+function ageClicks(ms = 3000) {
+  for (const m of (db.chat_messages ?? []) as Array<{ role?: string; created_at?: string }>) {
+    if (m.role === "customer" && m.created_at) m.created_at = new Date(Date.parse(m.created_at) - ms).toISOString()
+  }
+}
+
+
 process.env.CHAT_JOURNEY_ENABLED = "true"
 process.env.NEGOTIATION_JWT_SECRET = "test-secret-a1-outcome"
 
@@ -170,6 +180,7 @@ describe("Não reconheço [0] e Já paguei — outcome ligado ao clique, antes d
     // consome o menu sem reabrir outro (handoff-like): supersede manualmente
     await BUTTON(req(await signed(), { prompt_id: p1.id, button_id: 2 }))
     for (const p of db.chat_prompts) p.status = "superseded"
+    ageClicks()
     const res = await REOPEN(req(await signed(), { action: "payment_claim" }))
     expect((await res.json()).claim_registered).toBe(true)
     const menu = active()

@@ -157,9 +157,10 @@ describe("RECAP de retomada (C7/R-17/R-42)", () => {
     const recap = await buildRecap(SID, CO)
     expect(recap!.state).toBe("after_payment_claim")
     expect(recap!.lastDecisionLabel).toBe("Já paguei")
-    // A3: o texto do recap é a saudação de retorno (Apêndice B), igual para todo
-    // estado — o desfecho ("já paguei") é o outcome preservado acima do menu.
-    expect(recap!.text).toBe("Olá de novo, Fabio. Você já viu os detalhes do valor em aberto. Como prefere seguir?")
+    // A3: o texto do recap é a saudação de retorno (Apêndice B) — o desfecho ("já
+    // paguei") é o outcome preservado acima do menu. QA round 4 (PO 08 §3): sem
+    // Detalhes aberto na thread → variante sem "já viu os detalhes".
+    expect(recap!.text).toBe("Olá de novo, Fabio. Como prefere seguir?")
   })
 
   // Precedência: "Já paguei" tem prioridade sobre um link entregue na mesma thread —

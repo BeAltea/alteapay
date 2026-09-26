@@ -12,7 +12,7 @@
 //   trava num estado morto).
 // - Timer de inatividade: 5min sem interação → volta para a tela de login do CHAT
 //   (/n/{code}), NÃO o login da AlteaPay.
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { PromptButtons, PROMPT_STALE_NOTICE, type ActivePrompt, type PromptClickResult } from "./prompt-buttons"
 import {
   capHistory,
@@ -21,10 +21,11 @@ import {
   dedupAssistantByContent,
   isLivePaymentLink,
   isNegotiateLabel,
-  latestLivePaymentLinkId,
   NEGOTIATION_PENDING_TEXT,
+  pairTurns,
   paymentLinkActionOf,
   placeAfterCustomerEcho,
+  placeEchoBeforeReply,
   prunePresentation,
   resolvePromptForRender,
   RESUME_DEAD_LINK_NOTICE,
@@ -37,11 +38,25 @@ import { FOCUS_RING } from "./button-tiers"
 import { OUTCOME_STAGES } from "@/lib/journey/display-class"
 import {
   createInFlightGuard,
+  IGNORED_CLICK_RESULT,
   PROCESSING_CHOICE_NOTICE,
+  shouldConsumeClickedPrompt,
   staleClickFeedback,
   toRenderablePrompt,
 } from "@/lib/journey/click-feedback"
-import { isStalePoll, type PollStamp } from "@/lib/journey/poll-order"
+import { isFencedPoll, isStalePoll, shouldHoldPromptOnNull, type PollStamp } from "@/lib/journey/poll-order"
+import { isHrefDead, LINK_BUBBLE_GRACE_MS, resolveLinkView } from "@/lib/journey/link-view"
+import {
+  DOUBLE_TAP_NOTICE,
+  extendInertUntil,
+  INERT_CLASS,
+  INERT_TAP_NOTICE,
+  rearmUntilFromLastTap,
+  shouldRearm,
+  TAP_INERT_MS,
+  type ActionBlockPosition,
+} from "@/lib/journey/tap-guard"
+import { IDLE_ACTIVITY_EVENTS, isRealActivity, type PointerPos } from "@/lib/journey/idle-input"
 import { DebtCard, type PinnedDebtData } from "./debt-card"
 import {
   DEGRADED_MENU_COPY,
@@ -95,6 +110,36 @@ interface PayResult {
    *  Pagar) ou de recuperação de transporte — copy "Ainda estou gerando…" e o
    *  servidor é a autoridade (decidePayResume). */
   resumed?: boolean
+  /** QA round 4 (R-10/R-20): id da bolha persistida do link (devolvido pelo
+   *  servidor ou visto no poll) — a reconciliação é por id, nunca 2 painéis. */
+  linkMessageId?: string | null
+}
+
+/** QA round 4 (R-13/R-24): linha persistida devolvida no CORPO de um POST
+ *  (eco do clique / resultado) — aplicada na hora e deduplicada com o poll por id. */
+function bodyRowToMsg(raw: unknown, from: ChatMsg["from"]): ChatMsg | null {
+  if (!raw || typeof raw !== "object") return null
+  const r = raw as Record<string, unknown>
+  if (typeof r.id !== "string" || !r.id || typeof r.text !== "string" || !r.text) return null
+  return {
+    id: r.id,
+    from,
+    text: r.text,
+    action: null,
+    promptId: typeof r.prompt_id === "string" ? r.prompt_id : null,
+    engine: null,
+    buttonId: typeof r.button_id === "number" ? r.button_id : null,
+    stage: typeof r.stage === "string" ? r.stage : null,
+    generation: null,
+    createdAt: typeof r.created_at === "string" ? r.created_at : null,
+  }
+}
+
+/** Conjuntos iguais por conteúdo (evita re-render — e o mousemove sintético — a cada poll). */
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const x of a) if (!b.has(x)) return false
+  return true
 }
 
 const TICK_MS = 250 // granularidade da troca de copy (menor que o poll de 2500ms)
@@ -257,6 +302,8 @@ export function JourneyChat() {
   // a CADA poll (inclusive incremental) — a bolha do link cancelado perde
   // Abrir/Copiar no ciclo seguinte, sem F5.
   const [deadLinkHrefs, setDeadLinkHrefs] = useState<ReadonlySet<string>>(() => new Set())
+  const deadHrefsRef = useRef<ReadonlySet<string>>(new Set())
+  const pinnedDebtJsonRef = useRef<string | null>(null)
   const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const endedRef = useRef(false)
   // Modal de inatividade (5min) / sessão expirada — NUNCA redireciona sozinho
@@ -282,6 +329,55 @@ export function JourneyChat() {
   const lastAppliedPollRef = useRef<PollStamp | null>(null)
   // QA round 2 (QAB1-H5): guarda de clique duplo dos atalhos do painel de pagamento.
   const shortcutGuardRef = useRef(createInFlightGuard())
+  // QA round 4 (R-13/R-22, S3): CERCA de polls — sequência do último poll
+  // disparado quando um corpo de POST foi aplicado (GETs mais antigos não mexem
+  // no estado) — e o instante em que um POST aplicou um prompt (um GET com
+  // `active_prompt:null` não o limpa logo em seguida).
+  const fenceSeqRef = useRef<number | null>(null)
+  const lastPostPromptAtRef = useRef<number | null>(null)
+  // QA round 4 (R-11/R-21, S2): bloco de ações INERTE após qualquer toque
+  // (TAP_INERT_MS) e, quando nasce/se desloca, até último toque + ACTIONS_ARM_MS. O controle fica
+  // no lugar (aria-disabled + pointer-events:none); o handler ignora.
+  const [actionsInert, setActionsInert] = useState(false)
+  const inertUntilRef = useRef(0)
+  const inertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const actionBlockPosRef = useRef<ActionBlockPosition | null>(null)
+  // Correção B8 (A-2): instante do ÚLTIMO toque num controle de ação — a
+  // inércia de nascimento/deslocamento é ancorada nele (nunca no render).
+  const lastTapAtRef = useRef<number | null>(null)
+  const armActionsUntil = useCallback((until: number) => {
+    const now = Date.now()
+    if (until <= now) return
+    inertUntilRef.current = extendInertUntil(inertUntilRef.current, now, until - now)
+    setActionsInert(true)
+    if (inertTimerRef.current) clearTimeout(inertTimerRef.current)
+    const release = () => {
+      const left = inertUntilRef.current - Date.now()
+      if (left <= 0) {
+        inertTimerRef.current = null
+        setActionsInert(false)
+      } else {
+        inertTimerRef.current = setTimeout(release, left)
+      }
+    }
+    inertTimerRef.current = setTimeout(release, inertUntilRef.current - now)
+  }, [])
+  /** Toque num controle de ação: registra o instante e deixa o bloco inerte por TAP_INERT_MS. */
+  const armOnTap = useCallback(() => {
+    const now = Date.now()
+    lastTapAtRef.current = now
+    armActionsUntil(now + TAP_INERT_MS)
+  }, [armActionsUntil])
+  /** Bloco nasceu/se deslocou (ou reapareceu após uma ação): inerte só até último toque + ACTIONS_ARM_MS. */
+  const rearmFromLastTap = useCallback(() => {
+    const until = rearmUntilFromLastTap(lastTapAtRef.current, Date.now())
+    if (until !== null) armActionsUntil(until)
+  }, [armActionsUntil])
+  const isActionsInertNow = () => Date.now() < inertUntilRef.current
+  // QA round 4 (R-14/R-25): a 1ª resposta do poll chegou (antes: tela vazia).
+  const [firstPaintDone, setFirstPaintDone] = useState(false)
+  // QA round 4 (R-15/R-23): última posição REAL do ponteiro (relógio de inatividade).
+  const lastPointerRef = useRef<PointerPos | null>(null)
 
   // --- Máquina de espera (D2, §6.3) ----------------------------------------
   // waitState: estado DECIDIDO (idle/aguardando_motor/menu_degradado/…). O degrau
@@ -303,6 +399,15 @@ export function JourneyChat() {
   // Resultado do PAGAR (link/processando/erro) renderizado abaixo do histórico.
   const [payResult, setPayResult] = useState<PayResult | null>(null)
   const [copied, setCopied] = useState(false)
+  // QA round 4 (R-10/R-20): carência para a bolha persistida do link chegar
+  // antes de o painel local (rede de segurança) aparecer.
+  const [linkGraceExpired, setLinkGraceExpired] = useState(false)
+  useEffect(() => {
+    setLinkGraceExpired(false)
+    if (payResult?.status !== "link") return
+    const t = setTimeout(() => setLinkGraceExpired(true), LINK_BUBBLE_GRACE_MS)
+    return () => clearTimeout(t)
+  }, [payResult?.status, payResult?.link])
   // A1 — aviso humano do 409 (prompt substituído), acima do bloco de botões. Vive
   // no pai (não no PromptButtons) para sobreviver à remontagem por key={id}.
   const [promptNotice, setPromptNotice] = useState<string | null>(null)
@@ -431,11 +536,19 @@ export function JourneyChat() {
     }, IDLE_MS)
   }, [])
 
+  // QA round 4 (R-15/R-23, S6): só INPUT REAL reinicia o relógio — o Chrome
+  // emite mousemove SEM deslocamento quando o conteúdo muda sob o ponteiro parado
+  // (a cada poll), e o modal nunca abria no desktop. Regra pura em idle-input.ts.
   useEffect(() => {
-    const events: (keyof WindowEventMap)[] = [
-      "mousemove", "mousedown", "keydown", "touchstart", "scroll", "click",
-    ]
-    const onActivity = () => {
+    const events = IDLE_ACTIVITY_EVENTS as readonly string[]
+    const onActivity = (ev: Event) => {
+      const pe = ev as Event & { clientX?: number; clientY?: number }
+      const verdict = isRealActivity(
+        { type: ev.type, isTrusted: ev.isTrusted, clientX: pe.clientX, clientY: pe.clientY },
+        lastPointerRef.current,
+      )
+      lastPointerRef.current = verdict.pos
+      if (!verdict.real) return
       if (!modalRef.current && !endedRef.current) resetIdle()
     }
     events.forEach((e) => window.addEventListener(e, onActivity, { passive: true }))
@@ -484,17 +597,29 @@ export function JourneyChat() {
       // Nada se perde (as linhas vêm ascendentes e `since` só avança com a
       // resposta aplicada); o prompt na tela nunca regride ao obsoleto.
       const stamp: PollStamp = { seq, serverTime: typeof data?.server_time === "string" ? data.server_time : null }
+      // QA round 4 (R-13/R-22): um GET disparado ANTES de um corpo de POST
+      // aplicado (seq ≤ cerca) é mais antigo que o estado na tela — ignorado por
+      // inteiro (as mensagens dele chegam no GET seguinte; o `since` não avançou).
+      if (isFencedPoll(seq, fenceSeqRef.current)) return
       if (isStalePoll(stamp, lastAppliedPollRef.current)) return
       lastAppliedPollRef.current = stamp
+      setFirstPaintDone(true)
       // M11: reidrata a máquina de espera a partir do estado do servidor (vem no
       // 1º poll e nos seguintes). Um reload durante a espera restaura o degrau.
       rehydrateWait(data?.wait_state ?? null, data?.wait_started_at ?? null)
       // D2 — CARD FIXO (C1): vem a cada poll (imutável entre polls). Best-effort: se
       // o servidor não montou (null), o card some e o chat segue. Não é linha de
       // chat_messages — mora fora do log.
+      // QA round 4 (R-15/R-23): só troca o estado quando o conteúdo muda — um
+      // objeto novo a cada poll re-renderizava a página (mousemove sintético).
       if (data?.pinned_debt && typeof data.pinned_debt === "object") {
-        setPinnedDebt(data.pinned_debt as PinnedDebtData)
-      } else if (data?.pinned_debt === null) {
+        const next = JSON.stringify(data.pinned_debt)
+        if (next !== pinnedDebtJsonRef.current) {
+          pinnedDebtJsonRef.current = next
+          setPinnedDebt(data.pinned_debt as PinnedDebtData)
+        }
+      } else if (data?.pinned_debt === null && pinnedDebtJsonRef.current !== null) {
+        pinnedDebtJsonRef.current = null
         setPinnedDebt(null)
       }
       // D2 — RECAP (C7): só o 1º poll (retomada) traz recap != null. Guardamos para
@@ -503,10 +628,23 @@ export function JourneyChat() {
         setRecap({ text: data.recap.text })
       }
       // QA round 1 (QAA1-07): cobranças terminais do cliente — vem a cada poll.
-      const deadHrefs: ReadonlySet<string> = Array.isArray(data?.dead_payment_links)
-        ? new Set((data.dead_payment_links as unknown[]).filter((h): h is string => typeof h === "string"))
-        : deadLinkHrefs
-      if (Array.isArray(data?.dead_payment_links)) setDeadLinkHrefs(deadHrefs)
+      let deadHrefs: ReadonlySet<string> = deadHrefsRef.current
+      if (Array.isArray(data?.dead_payment_links)) {
+        const incomingDead = new Set((data.dead_payment_links as unknown[]).filter((h): h is string => typeof h === "string"))
+        // QA round 4 (R-15/R-23): mesma identidade quando o conteúdo não muda.
+        if (!sameSet(incomingDead, deadHrefsRef.current)) {
+          deadHrefsRef.current = incomingDead
+          setDeadLinkHrefs(incomingDead)
+        }
+        deadHrefs = deadHrefsRef.current
+      }
+      // QA round 4 (R-10/R-20, QAA1-R4-01): a cobrança do resultado LOCAL foi
+      // cancelada (href em dead_payment_links) → o estado local some no mesmo
+      // poll: nenhum Abrir/Copiar nem fileira pós-link órfã para ela.
+      const localPay = payResultRef.current
+      if (localPay?.status === "link" && localPay.link && isHrefDead(localPay.link, deadHrefs)) {
+        clearLinkLocalState()
+      }
       // A3 — RETOMADA: no 1º poll COM recap, o corte é o created_at do menu
       // corrente (sem prompt ativo, o relógio do servidor). Sem recap (1º login,
       // nenhuma decisão ainda) não há corte — nada é recolhido.
@@ -588,7 +726,7 @@ export function JourneyChat() {
             stopTick()
             waitStartedAtRef.current = null
             payResumedRef.current = false
-            setPayResult({ status: "link", link: action.href, valor: null, vencimento_link: null, already_charged: false })
+            setPayResult({ status: "link", link: action.href, valor: null, vencimento_link: null, already_charged: false, linkMessageId: m.id })
             setWaitState("link_entregue")
           }
         }
@@ -621,7 +759,10 @@ export function JourneyChat() {
         }
         setMessages((prev) => {
           const base = dropOptimistic ? prev.filter((x) => x.id !== optimisticId) : prev
-          return echoReorderId ? placeAfterCustomerEcho(base, echoReorderId, incoming) : [...base, incoming]
+          if (echoReorderId) return placeAfterCustomerEcho(base, echoReorderId, incoming)
+          // QA round 4 (R-28): o eco que chega DEPOIS da sua resposta (aplicada
+          // do corpo do POST / gravada antes numa corrida) entra ANTES dela.
+          return incoming.from === "customer" ? placeEchoBeforeReply(base, incoming) : [...base, incoming]
         })
       }
       // Nunca sobrescreve o prompt depois de encerrado (preserva o histórico).
@@ -630,7 +771,17 @@ export function JourneyChat() {
       if (!endedRef.current) {
         const ap = data?.active_prompt ?? null
         const apId = ap && typeof ap === "object" ? (ap as { id?: unknown }).id : null
-        if (!(typeof apId === "string" && consumedPromptIds.current.has(apId))) setActivePrompt(ap)
+        // QA round 4 (R-22): "nenhum prompt" durante a troca (prompt_pending) ou
+        // logo depois de um POST ter aplicado o prompt seguinte não apaga o menu.
+        const hold =
+          !ap &&
+          shouldHoldPromptOnNull({
+            promptPending: data?.prompt_pending === true,
+            lastPostPromptAtMs: lastPostPromptAtRef.current,
+            nowMs: Date.now(),
+            hasPromptOnScreen: !!activePromptRef.current,
+          })
+        if (!hold && !(typeof apId === "string" && consumedPromptIds.current.has(apId))) setActivePrompt(ap)
         // QA round 2 (QAB1-H2): chegou o prompt seguinte → o aviso de
         // processamento já foi atendido.
         if (ap) setProcessingNotice(null)
@@ -880,6 +1031,9 @@ export function JourneyChat() {
     buttonLabel: string,
   ): Promise<PromptClickResult> {
     resetIdle()
+    // QA round 4 (R-11/R-21): todo o bloco de ações fica inerte logo após o
+    // toque — o 2º/3º toque de um toque múltiplo nunca acerta outro controle.
+    armOnTap()
     const isNegotiate = isNegotiateLabel(buttonLabel)
     // R1 — ESCOLHA DE PARCELA: no prompt 'offer_choice' um item de lista (2..97,
     // não a volta[98]/atendimento[99]) seleciona uma oferta da matriz → o servidor
@@ -964,14 +1118,25 @@ export function JourneyChat() {
       const data = await res.json().catch(() => ({}))
       // A2: o prompt clicado foi consumido no servidor (200) ou já era obsoleto
       // (409) — um poll atrasado não o repõe por cima do prompt novo.
-      if (res.ok || res.status === 409) consumedPromptIds.current.add(promptId)
+      // Correção B8 (A-1): um clique IGNORADO (toque múltiplo) não consumiu nada
+      // no servidor — o prompt segue vivo e o poll pode repô-lo.
+      if (shouldConsumeClickedPrompt(res.ok, res.status, data)) consumedPromptIds.current.add(promptId)
       // QA round 1 (QAA1-01) — o servidor ignorou um handoff como TOQUE DUPLO:
       // nada mudou no servidor; só reconcilia pelo poll (nunca reabre menu por
       // cima das parcelas, nunca encerra).
       if (res.ok && data?.ignored === "double_tap") {
         clearPendingNegotiation()
-        await pollMessages()
-        return { ok: true }
+        // nada foi cobrado: sai do "gerando" armado no clique.
+        if (isPay) resetWaitToIdle()
+        // QA round 4 (R-21, D-1): a resposta traz o prompt ativo → o menu volta
+        // na hora (nunca uma amostra sem botão).
+        // Correção B8 (A-1/M-1): NÃO respondido — o bloco reabilita (mesmo que o
+        // prompt ativo seja o mesmo id: sem remontagem) e um aviso curto e
+        // neutro explica o toque (inclusive o Pagar, que sai do "gerando").
+        applyActionBody(data)
+        setPromptNotice(DOUBLE_TAP_NOTICE)
+        void pollMessages()
+        return IGNORED_CLICK_RESULT
       }
       // QA round 1 (QAA1-06) — CLIQUE DUPLICADO (o mesmo botão já respondeu este
       // prompt há instantes): sem efeito novo. PAGAR: o outro pedido está
@@ -1001,18 +1166,18 @@ export function JourneyChat() {
       if (isPay && data && data.action === "pay") {
         applyPayResult(data)
         // O menu de 3 opções já foi respondido; o poll traz a bolha do link
-        // (outcome) e o prompt pós-link persistidos pelo servidor (A1). O botão
-        // sai do "..." (ok) — o painel deriva da mensagem persistida. QA round 1
-        // (QAA1-02): sem link resolvível o corpo traz o MENU CURTO ativo →
-        // renderiza na hora (nunca uma tela sem botão). O prompt pós-link continua
-        // chegando pelo poll junto da bolha (evita duplicar Voltar/Falar/Já paguei
-        // ao lado do painel-fallback do client no intervalo até o poll).
-        const payPrompt = asActivePrompt(data?.prompt)
-        setActivePrompt(payPrompt && payPrompt.kind !== "post_payment_link" && !endedRef.current ? payPrompt : null)
+        // (outcome) persistida pelo servidor (A1) — o painel deriva DELA. QA
+        // round 4 (R-10/R-20): sem painel local paralelo (link-view.ts), o prompt
+        // do corpo (pós-link, ou o menu curto sem link resolvível) entra na hora
+        // e é a ÚNICA fileira pós-link.
+        if (!applyActionBody(data)) setActivePrompt(null)
         await pollMessages()
         return { ok: true }
       }
       if (res.ok) {
+        // QA round 4 (R-10/R-20, C2): Voltar às opções ([98] do pós-link / das
+        // parcelas / do menu-volta) limpa o estado local do link.
+        if (data?.action === "back_to_options") clearLinkLocalState()
         // NEGOCIAR — dois desfechos (R1):
         //  (a) offers_presented=true → o servidor JÁ apresentou as PARCELAS DA
         //      MATRIZ como um prompt 'offer_choice' (fallback assistido). NÃO há
@@ -1035,6 +1200,9 @@ export function JourneyChat() {
               // paralelo para trazer eco + bolhas persistidas.
               pendingNegotiationRef.current = null
               setActivePrompt(offerPrompt)
+              // QA round 4 (R-22): cerca contra o GET em voo desde antes do clique.
+              fenceSeqRef.current = pollSeqRef.current
+              lastPostPromptAtRef.current = Date.now()
               void pollMessages()
               return { ok: true }
             }
@@ -1050,9 +1218,20 @@ export function JourneyChat() {
         // A2 — prompt genérico (criado pelo n8n) / fallback do assistido: quando o
         // servidor devolve o prompt seguinte no corpo (menu reaberto ou o ativo),
         // renderiza já — nunca uma tela sem caminho enquanto o poll não chega.
-        const bodyPrompt = asActivePrompt(data?.prompt)
-        if (bodyPrompt && !endedRef.current && data?.action !== "consult" && data?.action !== "not_recognized") {
-          setActivePrompt(bodyPrompt)
+        // QA round 4 (R-13/R-22/R-24): TODO corpo 200 com prompt (inclusive
+        // Detalhes / Não reconheço / Voltar) é aplicado na hora — eco, resultado
+        // persistido (id real) e o menu seguinte — sem 0 botões esperando o poll.
+        if (asActivePrompt(data?.prompt) && !endedRef.current && data?.transferred !== true) {
+          applyActionBody(data)
+          if (!data?.outcome && typeof data?.reply === "string" && data.reply && (data?.action === "consult" || data?.action === "not_recognized")) {
+            // compat: servidor sem `outcome` no corpo → bolha local (o dedup por
+            // conteúdo a colapsa com a persistida quando o poll chegar).
+            const replyText = data.reply as string
+            setMessages((prev) => [
+              ...prev,
+              { id: `${data.action}-${Date.now()}`, from: "assistant", text: replyText, action: null, promptId: null },
+            ])
+          }
           void pollMessages()
           return { ok: true }
         }
@@ -1244,6 +1423,8 @@ export function JourneyChat() {
         valor: typeof data.valor === "number" ? data.valor : null,
         vencimento_link: typeof data.vencimento_link === "string" ? data.vencimento_link : null,
         already_charged: data.already_charged === true,
+        // QA round 4 (R-10/R-20): a bolha persistida deste link (reconciliação por id).
+        linkMessageId: typeof data.link_message_id === "string" ? data.link_message_id : null,
       })
       // link_entregue é ABSORVENTE (M12): a resposta tardia do motor é descartada.
       setWaitState(processing ? "gerando_cobranca" : "link_entregue")
@@ -1275,6 +1456,58 @@ export function JourneyChat() {
     setWaitState("idle")
   }
 
+  // QA round 4 (R-10/R-20, C2) — "Voltar às opções" (e cobrança cancelada) limpa
+  // o estado LOCAL do link em TODO caminho: nenhum painel/fileira pós-link
+  // remanescente ao lado do menu novo. Nunca cancela nem recobra (servidor).
+  function clearLinkLocalState() {
+    if (payInFlightRef.current) return // o POST do Pagar em voo governa o estado
+    payResumedRef.current = false
+    setPayResult(null)
+    setCopied(false)
+    const w = waitStateRef.current
+    if (w === "link_entregue" || w === "gerando_cobranca" || w === "erro_cobranca") {
+      stopTick()
+      waitStartedAtRef.current = null
+      setWaitState("idle")
+    }
+  }
+
+  // QA round 4 (R-13/R-22/R-24/R-29, S3) — o CORPO do POST é o próximo estado:
+  // aplica eco → resultado → prompt na hora (sem esperar o poll de 2,5 s), marca
+  // as linhas como vistas (o poll não as duplica) e ergue a CERCA contra GETs
+  // disparados antes (não regridem o prompt aplicado). Devolve true quando um
+  // prompt foi aplicado.
+  function applyActionBody(data: Record<string, unknown> | null | undefined, opts: { applyPrompt?: boolean } = {}): boolean {
+    if (!data) return false
+    // A cerca é por SEQUÊNCIA de disparo (não por relógio): um GET disparado
+    // depois de o corpo chegar começou a ler depois das escritas do POST — sem
+    // depender do relógio de outra instância da função (`state_time` fica para
+    // a telemetria/QA).
+    fenceSeqRef.current = pollSeqRef.current
+    const rows: ChatMsg[] = []
+    const echo = bodyRowToMsg(data.echo, "customer")
+    const outcome = bodyRowToMsg(data.outcome, "assistant")
+    if (echo) rows.push(echo)
+    if (outcome) rows.push(outcome)
+    const fresh = rows.filter((r) => !seenIds.current.has(r.id))
+    if (fresh.length > 0) {
+      for (const r of fresh) seenIds.current.add(r.id)
+      setMessages((prev) => {
+        let next = prev
+        for (const r of fresh) next = r.from === "customer" ? placeEchoBeforeReply(next, r) : [...next, r]
+        return next
+      })
+      setProcessingNotice(null)
+    }
+    if (opts.applyPrompt === false || endedRef.current) return false
+    const p = asActivePrompt(data.prompt)
+    if (!p) return false
+    setActivePrompt(p)
+    lastPostPromptAtRef.current = Date.now()
+    setProcessingNotice(null)
+    return true
+  }
+
   // --- Ações dos atalhos da espera/degradação (§6.3 d3 / §4 A.5) -----------
   // CAMINHO REAL SEMPRE (M10): quando o menu de 3 opções já foi consumido (ex.: o
   // devedor clicou "Quero negociar" e o prompt ficou answered/sumiu), NÃO há
@@ -1288,13 +1521,18 @@ export function JourneyChat() {
   // espera para idle e puxa o novo active_prompt. Best-effort: mesmo em erro de
   // rede o poll reconcilia o estado.
   async function reopenOptions() {
+    // QA round 4 (R-10/R-20, C2): Voltar limpa painel/fileira do link local em
+    // todo caminho (espera, degradação, erro, pós-link local, handoff).
+    clearLinkLocalState()
     resetWaitToIdle()
     try {
-      await fetch("/api/chat/reopen", {
+      const res = await fetch("/api/chat/reopen", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "reopen_options" }),
       })
+      // QA round 4 (R-13): o menu reaberto vem no corpo → na tela na hora.
+      if (res.ok) applyActionBody(await res.json().catch(() => null))
     } catch {
       /* silencioso: o poll abaixo reconcilia mesmo sem a re-emissão */
     }
@@ -1307,21 +1545,41 @@ export function JourneyChat() {
   // opções (nunca beco sem saída, M7); o poll seguinte traz a bolha de orientação +
   // o menu de volta. Best-effort: em erro de rede, o poll reconcilia. Não encerra a
   // conversa (diferente do handoff). Guarda contra clique duplo com um flag local.
-  const [claimSent, setClaimSent] = useState(false)
+  // QA round 4 (R-11/R-21/R-24/R-29): `claimInFlight` é só "em voo" (volta a
+  // false no finally — antes o "Já paguei" sumia até o F5); durante o voo TODO o
+  // bloco de ações fica inerte e a afordância continua no lugar, desabilitada
+  // (sem reflow sob o dedo). O corpo do POST traz eco + "Obrigado por avisar…" +
+  // o menu: aplicados na hora (≤ 1 s), deduplicados com o poll por id.
+  const [claimInFlight, setClaimInFlight] = useState(false)
+  const claimInFlightRef = useRef(false)
   async function requestPaymentClaim() {
-    if (claimSent) return
-    setClaimSent(true)
+    if (claimInFlightRef.current) return
+    // Correção B8 (A-2): toque na janela de inércia nunca é mudo.
+    if (isActionsInertNow()) {
+      setPromptNotice(INERT_TAP_NOTICE)
+      return
+    }
+    setPromptNotice(null)
+    claimInFlightRef.current = true
+    setClaimInFlight(true)
+    armOnTap()
     resetIdle()
     try {
-      await fetch("/api/chat/reopen", {
+      const res = await fetch("/api/chat/reopen", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "payment_claim" }),
       })
+      if (res.ok) applyActionBody(await res.json().catch(() => null))
     } catch {
       /* silencioso: o poll abaixo reconcilia a orientação + o menu reaberto */
+    } finally {
+      claimInFlightRef.current = false
+      setClaimInFlight(false)
+      // o bloco que reaparece sob o dedo fica inerte até último toque + ARM (sem reflow).
+      rearmFromLastTap()
     }
-    await pollMessages()
+    void pollMessages()
   }
 
   // Handoff SEM prompt ativo: transfere ao atendimento direto no servidor e
@@ -1461,7 +1719,9 @@ export function JourneyChat() {
   )
   const prunedMessages = prunePresentation(visibleMessages, activePromptId, waitState, currentGeneration)
   const collapsedDecisions = collapseConsecutiveDecisions(prunedMessages, activePromptId, waitState, currentGeneration)
-  const dedupedMessages = dedupAssistantByContent(collapsedDecisions)
+  // QA round 4 (R-17/R-28, S8): ordem por TURNO (a resposta nunca acima do seu
+  // eco); na vista expandida, eco sem resposta seguido de outro eco colapsa.
+  const dedupedMessages = pairTurns(dedupAssistantByContent(collapsedDecisions), { dropOrphanEchoes: historyExpanded })
   const resume = splitResumeHistory(dedupedMessages, {
     cutoffAt: resumeCutoffAt,
     expanded: historyExpanded,
@@ -1487,20 +1747,56 @@ export function JourneyChat() {
   // botões. Composição pura em chat-display.resolvePromptForRender.
   const promptForRender =
     activePrompt && !ended ? resolvePromptForRender(activePrompt, capped.visible, recap?.text) : activePrompt
-  // A1: há bolha persistida do link (ação open_payment_link VIVA) para o link
-  // corrente? QA round 1 (QAA1-08/QAA1-07): a ação deriva da bolha persistida
-  // (paymentLinkActionOf — também quando o shape chegou sem message_action) e a
-  // vivacidade cruza `live:false` + os hrefs terminais do poll (deadLinkHrefs).
-  const hasPersistedLink = messages.some((m) => {
-    const a = paymentLinkActionOf(m)
-    return isLivePaymentLink(a, deadLinkHrefs) && (!payResult?.link || a!.href === payResult.link)
+  // QA round 4 (R-10/R-20, S1) — UM link, UM painel, UMA fileira pós-link, em
+  // qualquer caminho: o painel Abrir/Copiar deriva EXCLUSIVAMENTE da bolha
+  // persistida (a ÚLTIMA de link VIVO — `live:false`/dead_payment_links do
+  // servidor); o resultado local do clique é só otimista (copy "gerando" no slot,
+  // reconciliado por id/href/qualquer bolha viva) e nunca um 2º painel. A fileira
+  // pós-link é a do prompt do servidor. Regra pura em lib/journey/link-view.ts.
+  const linkView = resolveLinkView({
+    payResult: payResult ? { status: payResult.status, link: payResult.link, linkMessageId: payResult.linkMessageId ?? null } : null,
+    messages,
+    deadHrefs: deadLinkHrefs,
+    activePromptKind: activePrompt && !ended ? activePrompt.kind : null,
+    graceExpired: linkGraceExpired,
   })
-  // A1: só a ÚLTIMA bolha de link VIVO ganha o painel (Abrir/Copiar). Bolhas de
-  // links anteriores (cobrança cancelada e recriada) e bolhas cujo acordo o
-  // servidor marcou como terminal (action.live === false — A1-R1, ou href em
-  // dead_payment_links — QAA1-07) ficam só como texto: nenhum botão para um
-  // link morto, nem na retomada após cancelamento, nem no poll seguinte.
-  const latestPaymentLinkId = latestLivePaymentLinkId(messages, deadLinkHrefs)
+  const latestPaymentLinkId = linkView.panelMessageId
+  // href do resultado local morto (cobrança cancelada) → estado local zerado.
+  useEffect(() => {
+    if (linkView.clearLocal) clearLinkLocalState()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkView.clearLocal])
+  // QA round 4 (R-11/R-21, S2): o bloco de ações que NASCE (prompt novo) ou SE
+  // DESLOCA (> 4 px na página — o log cresceu com uma bolha nova acima) re-arma:
+  // inerte por ACTIONS_ARM_MS, sem mudar de tamanho nem de lugar.
+  useLayoutEffect(() => {
+    const el = menuRef.current
+    const next: ActionBlockPosition = {
+      promptId: activePrompt && !ended ? activePrompt.id : null,
+      top: el ? el.getBoundingClientRect().top + (typeof window !== "undefined" ? window.scrollY : 0) : null,
+    }
+    // Correção B8 (A-2): ancorado no ÚLTIMO TOQUE — um menu que nasce/se move
+    // ≥ ACTIONS_ARM_MS depois dele já nasce clicável (nunca clique mudo).
+    if (shouldRearm(actionBlockPosRef.current, next)) rearmFromLastTap()
+    actionBlockPosRef.current = next
+  })
+  // QA round 4 (R-17/R-28, S8): ao expandir, o log abre no PONTO DO CORTE (a
+  // 1ª bolha que já estava na tela), não no topo da conversa inteira.
+  const expandAnchorRef = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    if (!historyExpanded) return
+    const log = scrollRef.current
+    const id = expandAnchorRef.current
+    expandAnchorRef.current = null
+    if (!log) return
+    const target = id ? (log.querySelector(`[data-mid="${CSS.escape(id)}"]`) as HTMLElement | null) : null
+    if (target) log.scrollTop = Math.max(0, target.offsetTop - 8)
+    else log.scrollTop = log.scrollHeight
+  }, [historyExpanded])
+  const toggleHistory = () => {
+    if (!historyExpanded) expandAnchorRef.current = capped.visible[0]?.id ?? null
+    setHistoryExpanded((v) => !v)
+  }
   // Classes das saídas de espera/erro: inertes até o arming (QAA1-01).
   const exitBtnGuard = waitExitsArmed ? "" : " pointer-events-none opacity-60"
 
@@ -1552,8 +1848,15 @@ export function JourneyChat() {
         aria-atomic="false"
         aria-label="Conversa de negociação"
         tabIndex={-1}
-        className={`min-h-[96px] max-h-[42dvh] space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm sm:max-h-[58dvh] ${FOCUS_RING}`}
+        className={`relative min-h-[96px] max-h-[42dvh] space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm sm:max-h-[58dvh] ${FOCUS_RING}`}
       >
+        {/* QA round 4 (R-14/R-25): antes da 1ª resposta do servidor, um status
+            curto no lugar da tela vazia. */}
+        {!firstPaintDone && messages.length === 0 ? (
+          <p className="px-1 text-sm text-neutral-500" role="status" aria-live="polite">
+            Carregando sua conversa…
+          </p>
+        ) : null}
         {/* QA round 3 (QAB3-02): o último resultado era um link MORTO (cobrança
             cancelada) e não há outcome vivo para elevar — bolha NEUTRA de status,
             sem botão, no lugar de "Aqui está seu link…" sem link. */}
@@ -1571,7 +1874,7 @@ export function JourneyChat() {
           // bolha, sem markdown, não "responde" nem empurra o menu.
           if (engineDisplay?.mode === "note") {
             return (
-              <div key={m.id} className="flex flex-col items-start">
+              <div key={m.id} data-mid={m.id} className="flex flex-col items-start">
                 <p className="max-w-[85%] whitespace-pre-line px-1 text-xs italic text-neutral-500">
                   <span className="sr-only">{srSpeakerPrefix("assistant")}</span>
                   {engineDisplay.text}
@@ -1582,6 +1885,7 @@ export function JourneyChat() {
           return (
           <div
             key={m.id}
+            data-mid={m.id}
             className={m.from === "customer" ? "flex justify-end" : "flex flex-col items-start"}
           >
             <div
@@ -1757,13 +2061,21 @@ export function JourneyChat() {
           </div>
         ) : null}
 
-        {/* --- Resultado do PAGAR: link (com copiar) / processando / erro ---
-            A1: o painel do LINK só renderiza como FALLBACK quando a bolha
-            persistida (com ação open_payment_link) ainda não chegou pelo poll —
-            a bolha é a fonte única (sem copy duplicada, N-D1-8). */}
-        {!ended && payResult && !(payResult.status === "link" && hasPersistedLink) ? (
+        {/* --- Resultado do PAGAR: link (otimista) / processando / erro ---
+            QA round 4 (R-10/R-20): o link NUNCA tem painel local paralelo à
+            bolha persistida — linkView.fallback decide o slot: "gerando" até a
+            bolha chegar; só sem bolha após a carência (falha de persistência) o
+            painel local aparece, e só com href vivo. */}
+        {!ended && payResult && payResult.status === "link" && linkView.fallback?.mode === "generating" ? (
+          <div role="status" aria-live="polite" className="flex flex-col items-start">
+            <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+              Certo. Estou gerando seu link de pagamento.
+            </div>
+          </div>
+        ) : null}
+        {!ended && payResult && (payResult.status !== "link" || linkView.fallback?.mode === "panel") ? (
           <div className="flex flex-col items-start gap-2" role="status" aria-live="polite">
-            {payResult.status === "link" ? (
+            {payResult.status === "link" && linkView.fallback?.mode === "panel" ? (
               <>
                 <div className="max-w-[90%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
                   {/* A4 (S14/S15, N-D5-8): a MESMA função da bolha persistida
@@ -1776,59 +2088,55 @@ export function JourneyChat() {
                     alreadyCharged: payResult.already_charged,
                   })}
                 </div>
-                {payResult.link ? (
-                  <div className="flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
-                    <a
-                      href={payResult.link}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={BRAND_FILL_STYLE}
-                      className={`${FOCUS_RING} inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold`}
-                    >
-                      Abrir link de pagamento
-                    </a>
-                    <button
-                      type="button"
-                      onClick={() => onCopyLink(payResult.link as string)}
-                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
-                    >
-                      {copied ? "Link copiado." : "Copiar link"}
-                    </button>
-                  </div>
-                ) : null}
-                {/* R-05 (C13) — link_entregue NÃO é beco absorvente: além de abrir/
-                    copiar, o devedor tem caminhos de RETORNO. Antes, entregue o link,
-                    o painel só mostrava Abrir/Copiar — quem quisesse trocar de opção,
-                    avisar que já pagou ou falar com humano ficava preso e abandonava.
-                    "Voltar às opções" re-emite o menu payável no servidor (reopen);
-                    "Já paguei" registra o claim (sem declarar pago); "Falar com
-                    atendimento" transfere. NÃO cancela nem recobra: a idempotência é
-                    do servidor (nunca 2ª cobrança). */}
-                <div className="flex flex-wrap gap-2 pt-1">
+                <div className="flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
+                  <a
+                    href={linkView.fallback.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={BRAND_FILL_STYLE}
+                    className={`${FOCUS_RING} inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold`}
+                  >
+                    Abrir link de pagamento
+                  </a>
                   <button
                     type="button"
-                    onClick={onWaitRetryOptions}
-                    className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
+                    onClick={() => onCopyLink(linkView.fallback?.mode === "panel" ? linkView.fallback.href : "")}
+                    className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
                   >
-                    Voltar às opções
+                    {copied ? "Link copiado." : "Copiar link"}
                   </button>
-                  {!claimSent ? (
+                </div>
+                {/* R-05 (C13) — link_entregue NÃO é beco absorvente. QA round 4
+                    (R-10/R-29): esta fileira LOCAL só existe sem prompt do
+                    servidor (postLinkRow 'local'); com o pós-link do servidor, os
+                    botões são os dele — nunca as duas. */}
+                {linkView.postLinkRow === "local" ? (
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={onWaitRetryOptions}
+                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
+                    >
+                      Voltar às opções
+                    </button>
                     <button
                       type="button"
                       onClick={requestPaymentClaim}
-                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
+                      disabled={claimInFlight}
+                      aria-disabled={claimInFlight || actionsInert}
+                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50${actionsInert ? ` ${INERT_CLASS}` : ""}`}
                     >
                       Já paguei este valor
                     </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={onWaitHandoff}
-                    className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
-                  >
-                    Falar com atendimento
-                  </button>
-                </div>
+                    <button
+                      type="button"
+                      onClick={onWaitHandoff}
+                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
+                    >
+                      Falar com atendimento
+                    </button>
+                  </div>
+                ) : null}
               </>
             ) : payResult.status === "processing" ? (
               <>
@@ -1930,6 +2238,20 @@ export function JourneyChat() {
           </div>
         ) : null}
 
+        {/* QA round 4 (R-17/R-28, S8): "Recolher conversa" SEMPRE visível na
+            vista expandida — fixo no rodapé do log, em qualquer rolagem. */}
+        {historyExpanded ? (
+          <div className="sticky bottom-0 -mx-3 -mb-3 flex justify-center bg-white/95 py-1">
+            <button
+              type="button"
+              onClick={toggleHistory}
+              aria-expanded={true}
+              className={`${FOCUS_RING} inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800`}
+            >
+              Recolher conversa
+            </button>
+          </div>
+        ) : null}
       </div>
 
       {/* QA round 2 (QAB1-H2) — aviso de processamento FORA do bloco de botões:
@@ -1960,24 +2282,34 @@ export function JourneyChat() {
               'answered'/'pending' — sem isso o novo menu nasceria desabilitado.
               A3: promptForRender = o prompt ativo sem a pergunta quando a saudação
               de retorno já a faz (uma só pergunta na tela). */}
-          <PromptButtons key={activePrompt.id} prompt={promptForRender ?? activePrompt} onClick={clickButton} />
+          <PromptButtons
+            key={activePrompt.id}
+            prompt={promptForRender ?? activePrompt}
+            onClick={clickButton}
+            inert={actionsInert || claimInFlight}
+          />
           {/* R5 — afordância "Já paguei": secundária/discreta, disponível no menu de
               3 opções (payável). Registra o payment_claim (conferência da equipe),
-              sem declarar pago; o servidor reabre o menu em seguida. Some após o
-              clique (claimSent) para não empilhar.
+              sem declarar pago; o servidor reabre o menu em seguida.
               R-36 — COERÊNCIA em nao_reconhecida: o prompt de VOLTA do "Não
               reconheço" também é kind 'debt_three_options', mas traz só o botão
               [98] (sem PAGAR). Oferecer "Já paguei" a quem acabou de dizer que NÃO
               reconhece o débito é incoerente (C13/C14). Por isso só mostramos a
               afordância quando o menu é o MENU PAYÁVEL de fato — tem o botão PAGAR
               (id 4) —, não o menu-volta de contestação. */}
-          {((activePrompt.kind === "debt_three_options" && activePrompt.buttons.some((b) => b.id === 4)) ||
-            activePrompt.kind === "post_payment_link") &&
-          !claimSent ? (
+          {/* QA round 4 (R-29): a afordância deriva do PROMPT do servidor (menu
+              pagável, ou pós-link com link VIVO na tela) — o mesmo conjunto antes
+              e depois do F5. (R-11/R-21): durante o claim ela fica NO LUGAR,
+              desabilitada, e o bloco inteiro inerte — o 2º/3º toque nunca cai em
+              "Não reconheço". */}
+          {(activePrompt.kind === "debt_three_options" && activePrompt.buttons.some((b) => b.id === 4)) ||
+          (activePrompt.kind === "post_payment_link" && linkView.hasLiveLink) ? (
             <button
               type="button"
               onClick={requestPaymentClaim}
-              className={`${FOCUS_RING} mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800`}
+              disabled={claimInFlight}
+              aria-disabled={claimInFlight || actionsInert}
+              className={`${FOCUS_RING} mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800${actionsInert || claimInFlight ? ` ${INERT_CLASS}` : ""}`}
             >
               Já paguei este valor
             </button>
@@ -1993,7 +2325,7 @@ export function JourneyChat() {
         <div className="flex justify-center">
           <button
             type="button"
-            onClick={() => setHistoryExpanded((v) => !v)}
+            onClick={toggleHistory}
             aria-expanded={historyExpanded}
             className={`${FOCUS_RING} inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800`}
           >

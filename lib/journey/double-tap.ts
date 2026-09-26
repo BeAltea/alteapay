@@ -159,3 +159,93 @@ export async function isDoubleTapHandoff(input: {
   }
   return { doubleTap, lastClickAt }
 }
+
+// ---------------------------------------------------------------------------
+// QA round 4 (R-11/R-21, S2 servidor) — TOQUE MÚLTIPLO com EFEITO DE NEGÓCIO.
+//
+// QAB1-R2-01 (ALTO): triplo toque em "Já paguei este valor" → o 2º toque caiu
+// em "Não reconheço" e gravou uma contestação que o devedor não declarou. O
+// guard do handoff [99] (acima) é generalizado para os controles cujo efeito é
+// de negócio: Não reconheço [0], Pagar [4] e o "Já paguei" [96] (payment_claim,
+// POST /api/chat/reopen — eco persistido com button_id 96). Um clique num
+// desses que chega < DOUBLE_TAP_WINDOW_MS depois de um clique VÁLIDO de OUTRO
+// controle da sessão é o 2º toque de um toque múltiplo: ignorado com 200
+// { ok:true, ignored:'double_tap', prompt } — nenhum efeito (ack negativo,
+// disputa, handoff, cobrança, caso), decisão auditada em journey_events
+// (`chat.click_ignored`, só append). O MESMO controle repetido segue pelos
+// caminhos próprios (isDuplicateClick no /button; claim reusado no /reopen).
+// Um clique isolado ≥ 2 s depois de outro grava normalmente (fluxo intocado).
+
+/** "Já paguei este valor" — id reservado do eco do payment_claim (fora do
+ *  alcance das ofertas 2..N e dos ids de menu). */
+export const BTN_PAYMENT_CLAIM = 96
+
+/** Controles com efeito de negócio protegidos pelo guard de toque múltiplo. */
+export const EFFECT_BUTTON_IDS: ReadonlySet<number> = new Set([0, 4, BTN_PAYMENT_CLAIM])
+
+/**
+ * Regra PURA: o clique em `buttonId` é o 2º toque de um toque múltiplo iniciado
+ * noutro controle? Só para controles de efeito; o último clique precisa ser de
+ * OUTRO botão e estar dentro da janela.
+ */
+export function isEffectDoubleTap(
+  last: { at: string | null; buttonId: number | null },
+  buttonId: number,
+  nowMs: number = Date.now(),
+  windowMs: number = DOUBLE_TAP_WINDOW_MS,
+): boolean {
+  if (!EFFECT_BUTTON_IDS.has(buttonId)) return false
+  if (typeof last.buttonId !== "number" || last.buttonId === buttonId) return false
+  return isWithinWindow(last.at, nowMs, windowMs)
+}
+
+/**
+ * Guard de toque múltiplo para os controles de efeito (lê o último clique da
+ * SESSÃO — qualquer prompt, inclusive o eco [96] do payment_claim). Registra a
+ * decisão na auditoria quando ignora (best-effort). `recheckAfterMs` (> 0): se o
+ * 1º exame não achou toque múltiplo, relê depois dessa pausa — cobre a corrida
+ * em que o eco do 1º toque ainda está sendo gravado por outra requisição
+ * concorrente (usado só no Não reconheço, efeito irreversível e raro).
+ */
+export async function checkEffectDoubleTap(input: {
+  sessionId: string
+  companyId: string
+  customerId?: string | null
+  debtId?: string | null
+  buttonId: number
+  promptId?: string | null
+  source: "button" | "reopen"
+  recheckAfterMs?: number
+  nowMs?: number
+}): Promise<DoubleTapCheck> {
+  if (!EFFECT_BUTTON_IDS.has(input.buttonId)) return { doubleTap: false, lastClickAt: null }
+  const startMs = input.nowMs ?? Date.now()
+  let last = await lastCustomerClick(input.sessionId)
+  let doubleTap = isEffectDoubleTap(last, input.buttonId, startMs)
+  if (!doubleTap && input.recheckAfterMs && input.recheckAfterMs > 0) {
+    await new Promise((r) => setTimeout(r, input.recheckAfterMs))
+    last = await lastCustomerClick(input.sessionId)
+    // a janela é medida contra o instante em que ESTE clique chegou.
+    doubleTap = isEffectDoubleTap(last, input.buttonId, startMs)
+  }
+  if (doubleTap) {
+    await recordEvent({
+      companyId: input.companyId,
+      customerId: input.customerId ?? null,
+      debtId: input.debtId ?? null,
+      sessionId: input.sessionId,
+      type: "chat.click_ignored",
+      actor: "customer",
+      payload: {
+        reason: "double_tap",
+        source: input.source,
+        button_id: input.buttonId,
+        previous_button_id: last.buttonId,
+        ...(input.promptId ? { prompt_id: input.promptId } : {}),
+        last_click_at: last.at,
+        window_ms: DOUBLE_TAP_WINDOW_MS,
+      },
+    }).catch(() => ({ ok: false, duplicate: false }))
+  }
+  return { doubleTap, lastClickAt: last.at }
+}

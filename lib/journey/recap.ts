@@ -42,6 +42,43 @@ export function returnGreeting(firstName: string | null | undefined): string {
   return `Olá de novo${name ? `, ${name}` : ""}. Você já viu os detalhes do valor em aberto. Como prefere seguir?`
 }
 
+/** QA round 4 (PO 08 §3, QAB3-R2-05) — variante da saudação de retorno por estado. */
+export type ReturnGreetingVariant = "detail_seen" | "no_detail" | "not_recognized"
+
+/** Canal do credor para a variante `not_recognized` (mesma fonte do "Não reconheço"). */
+export interface GreetingChannel {
+  creditorName: string
+  hasConfig: boolean
+  channelLabel: string | null
+  channelUrl: string | null
+}
+
+/**
+ * QA round 4 — saudação de retorno VARIANTE POR ESTADO (decisão do PO, 08 §3):
+ *  - abriu Detalhes      → "Olá de novo, {nome}. Você já viu os detalhes do valor em aberto. Como prefere seguir?"
+ *  - não abriu Detalhes  → "Olá de novo, {nome}. Como prefere seguir?"
+ *  - não reconheceu      → "Olá de novo, {nome}. Você nos informou que não reconhece esta cobrança.
+ *                           Para contestar, fale com a {credor}: {canal_oficial}." (+ menu-volta [98])
+ * Sem travessão, sem emoji, sem valor (D45). Sem config de canal, o mesmo
+ * fallback seguro do "Não reconheço" (nunca "null"/vazio). Sem PII além do nome.
+ */
+export function returnGreetingFor(
+  variant: ReturnGreetingVariant,
+  firstName: string | null | undefined,
+  channel?: GreetingChannel | null,
+): string {
+  const name = (firstName ?? "").trim()
+  const hello = `Olá de novo${name ? `, ${name}` : ""}.`
+  if (variant === "detail_seen") return returnGreeting(firstName)
+  if (variant === "no_detail") return `${hello} Como prefere seguir?`
+  const creditor = (channel?.creditorName ?? "").trim() || "empresa credora"
+  const contact =
+    channel?.hasConfig && channel.channelLabel
+      ? `: ${channel.channelLabel}${channel.channelUrl ? ` (${channel.channelUrl})` : ""}`
+      : ` pelo canal informado na sua fatura ou no site oficial da ${creditor}`
+  return `${hello} Você nos informou que não reconhece esta cobrança. Para contestar, fale com a ${creditor}${contact}.`
+}
+
 /** Reconhece uma URL http(s) crua (a bolha do link é persistida como texto). */
 function hasPaymentLink(text: string | null | undefined): boolean {
   return typeof text === "string" && /https?:\/\/\S+/i.test(text)
@@ -90,11 +127,17 @@ export async function buildRecap(
     // estado da sessão (wait_state) + época corrente + cliente (primeiro nome).
     const { data: session } = await supabase
       .from("negotiation_sessions")
-      .select("wait_state, thread_epoch, customer_id")
+      .select("wait_state, thread_epoch, customer_id, debt_id, primary_debt_id")
       .eq("id", sessionId)
       .eq("company_id", companyId)
       .maybeSingle()
-    const sess = session as { wait_state?: string | null; thread_epoch?: number | null; customer_id?: string | null } | null
+    const sess = session as {
+      wait_state?: string | null
+      thread_epoch?: number | null
+      customer_id?: string | null
+      debt_id?: string | null
+      primary_debt_id?: string | null
+    } | null
     const waitState = sess?.wait_state ?? null
     const epoch = Number(sess?.thread_epoch ?? 0)
 
@@ -137,10 +180,12 @@ export async function buildRecap(
 
     // último clique de decisão (role='customer' com button_id) → label real (R-42).
     let lastDecisionLabel: string | null = null
+    let lastDecisionButtonId: number | null = null
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i] as { role?: string | null; text?: string | null; button_id?: number | null }
       if (m.role === "customer" && m.button_id != null) {
         lastDecisionLabel = (m.text ?? "").trim() || null
+        lastDecisionButtonId = typeof m.button_id === "number" ? m.button_id : null
         break
       }
     }
@@ -181,9 +226,34 @@ export async function buildRecap(
       firstName = firstNameOf(row?.name, row?.document)
     }
 
+    // QA round 4 (PO 08 §3): a contestação vale enquanto o último clique for o
+    // "Não reconheço" [0] (um [98] Voltar depois dele reabre o menu pagável).
+    const notRecognized = waitState === "nao_reconhecida" || lastDecisionButtonId === 0
     // escolhe o estado retomável a partir de wait_state + sinais das bolhas.
-    const state = resolveRecapState(waitState, hasLink, claimed)
-    return { state, text: recapText(state, lastDecisionLabel, firstName), lastDecisionLabel, firstName }
+    const state = notRecognized ? "after_not_recognized" : resolveRecapState(waitState, hasLink, claimed)
+    // abriu Detalhes nesta thread? (outcome stage 'detail' preservado)
+    const detailSeen = messages.some((m) => {
+      const row = m as { role?: string | null; offers_snapshot?: unknown }
+      const snap = row.offers_snapshot as { stage?: unknown } | null
+      return row.role !== "customer" && !!snap && typeof snap === "object" && snap.stage === "detail"
+    })
+    let text: string
+    if (state === "after_not_recognized") {
+      let channel: GreetingChannel | null = null
+      const debtId = sess?.primary_debt_id ?? sess?.debt_id ?? null
+      if (sess?.customer_id && debtId) {
+        try {
+          const { resolveCreditorChannel } = await import("./acknowledgement")
+          channel = await resolveCreditorChannel({ companyId, customerId: sess.customer_id, debtId })
+        } catch {
+          channel = null
+        }
+      }
+      text = returnGreetingFor("not_recognized", firstName, channel)
+    } else {
+      text = returnGreetingFor(detailSeen ? "detail_seen" : "no_detail", firstName)
+    }
+    return { state, text, lastDecisionLabel, firstName }
   } catch (err) {
     console.warn("[journey] buildRecap (não-fatal):", (err as Error).message)
     return null

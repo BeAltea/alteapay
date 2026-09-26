@@ -92,3 +92,23 @@ export function createInFlightGuard(): InFlightGuard {
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// Correção B8 (A-1) — `200 { ignored:'double_tap', prompt }`: o servidor NÃO
+// respondeu o prompt clicado (toque múltiplo). O client não o marca como
+// consumido, o bloco de botões NÃO fica "respondido" (reabilita, mesmo quando o
+// prompt ativo devolvido tem o mesmo id e o componente não remonta) e um aviso
+// curto explica o toque. Nunca uma tela sem próximo passo (D36).
+
+/** O clique consumiu o prompt no servidor? (200 efetivo ou 409 obsoleto). */
+export function shouldConsumeClickedPrompt(
+  httpOk: boolean,
+  status: number,
+  data: { ignored?: unknown } | null | undefined,
+): boolean {
+  if (status === 409) return true
+  return httpOk && data?.ignored !== "double_tap"
+}
+
+/** Resultado do clique devolvido ao bloco de botões quando o servidor o ignorou. */
+export const IGNORED_CLICK_RESULT = { ok: false as const, code: "ignored" as const }

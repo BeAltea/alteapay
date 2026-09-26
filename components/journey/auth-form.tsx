@@ -4,6 +4,7 @@
 // data de nascimento condicional, consentimento LGPD obrigatório.
 // Nunca guarda PII em title/localStorage/query; erro SEMPRE genérico.
 import { useState } from "react"
+import { FOCUS_RING } from "./button-tiers"
 
 function maskCpf(digits: string): string {
   const d = digits.replace(/\D/g, "").slice(0, 11)
@@ -109,7 +110,8 @@ export function JourneyAuthForm({
           type="checkbox"
           checked={consent}
           onChange={(e) => setConsent(e.target.checked)}
-          className="mt-0.5 h-4 w-4 flex-shrink-0"
+          // QA round 4 (R-19): anel de foco ≥ 3:1 (neutral-900 + offset branco).
+          className={`${FOCUS_RING} mt-0.5 h-4 w-4 flex-shrink-0 rounded-sm`}
         />
         <span>
           Autorizo o tratamento dos meus dados para fins desta negociação, conforme a Lei Geral
