@@ -75,6 +75,16 @@ export function isNegotiateLabel(label: string): boolean {
   return /\bnegociar\b/i.test(label)
 }
 
+/** QA round 3 (QAB3-05) — prefixo SÓ para tecnologia assistiva (`sr-only`) que
+ *  identifica quem fala em cada bolha: o leitor de tela ouvia "Detalhes da
+ *  dívida" "Vencimento original…" "Negociar" "Certo…" sem saber o que foi escolha
+ *  e o que foi resposta. Sem mudança visual. */
+export const SR_SPEAKER_CUSTOMER = "Você: "
+export const SR_SPEAKER_ASSISTANT = "AlteaPay: "
+export function srSpeakerPrefix(from: ChatMsg["from"]): string {
+  return from === "customer" ? SR_SPEAKER_CUSTOMER : SR_SPEAKER_ASSISTANT
+}
+
 /** QA round 1 (F-QAA3-1 / QAA1-06): bolha do assistente que é o RESULTADO de um
  *  clique (ação anexada ou stage de outcome) — cada eco tem a sua resposta, o
  *  dedup por conteúdo nunca a apaga (senão o clique parece "não ter feito nada"). */
@@ -325,6 +335,21 @@ export interface ResumeSplit {
   collapsed: ChatMsg[]
   /** id do último outcome (link/acordo/desfecho) preservado acima do menu, se houver. */
   lastOutcomeId: string | null
+  /** QA round 3 (QAB3-02): bolha NEUTRA de status a renderizar no lugar do
+   *  outcome elevado quando o último resultado é um link MORTO e não há outcome
+   *  vivo para elevar. Sem botão. null = nada a mostrar. */
+  notice: string | null
+}
+
+/** QA round 3 (QAB3-02) — copy da bolha neutra da retomada (carta de voz: sem
+ *  promessa, sem "aqui está seu link" para um link que já não existe). */
+export const RESUME_DEAD_LINK_NOTICE = "Sua cobrança anterior foi cancelada."
+
+/** Link de pagamento MORTO: ação `open_payment_link` com `live:false` ou href
+ *  entre as cobranças terminais do poll (`dead_payment_links`). */
+function isDeadPaymentLink(m: ChatMsg, deadHrefs: ReadonlySet<string> | null | undefined): boolean {
+  const a = paymentLinkActionOf(m)
+  return !!a && !isLivePaymentLink(a, deadHrefs)
 }
 
 /**
@@ -335,6 +360,21 @@ export interface ResumeSplit {
  * (link/acordo, "não reconheço", "já paguei"): "Se a última escolha produziu um
  * resultado, o resultado vem acima do menu". Bolhas locais (sem createdAt) e as
  * que chegam depois do corte ficam visíveis. `expanded` devolve tudo.
+ *
+ * QA round 3 (QAB3-02):
+ *  (a) NUNCA eleva um link MORTO (`action.live === false` ou href em
+ *      `deadHrefs`): a retomada mostrava "Aqui está seu link para pagar R$ …"
+ *      sem link, sem "Abrir" e sem dizer que a cobrança fora cancelada. Um link
+ *      morto no fim da lista é pulado; eleva-se o outcome anterior VIVO só se
+ *      for um LINK vivo (um resultado que ainda vale) — um outcome não-link mais
+ *      antigo que o Pagar cancelado (ex.: "não reconheço" de dias antes) não é
+ *      "o resultado da última escolha" e não é elevado; na falta, `notice` =
+ *      RESUME_DEAD_LINK_NOTICE (bolha neutra, sem botão) e nada é elevado.
+ *  (b) ESTABILIDADE: `pinnedOutcomeId` (o id eleito na 1ª pintura da retomada,
+ *      guardado pelo client) continua eleito enquanto for elegível (existe, é
+ *      outcome e, se link, está vivo) — um poll posterior nunca troca o texto do
+ *      resultado destacado sob os olhos do devedor. Só se o pino deixar de ser
+ *      elegível (a cobrança foi cancelada) a eleição roda de novo.
  */
 export function splitResumeHistory(
   list: ChatMsg[],
@@ -344,19 +384,41 @@ export function splitResumeHistory(
     activePromptId: string | null
     waitState: WaitState | null
     currentGeneration?: number | null
+    /** hrefs das cobranças terminais do poll (QAA1-07); null = só `live:false`. */
+    deadHrefs?: ReadonlySet<string> | null
+    /** id eleito na 1ª pintura da retomada (QAB3-02b); null = eleger. */
+    pinnedOutcomeId?: string | null
   },
 ): ResumeSplit {
   const cutoff = opts.cutoffAt
-  if (!cutoff || opts.expanded) return { visible: list, collapsed: [], lastOutcomeId: null }
+  if (!cutoff || opts.expanded) return { visible: list, collapsed: [], lastOutcomeId: null, notice: null }
   const gen = opts.currentGeneration ?? null
+  const deadHrefs = opts.deadHrefs ?? null
+  const isOutcome = (m: ChatMsg) =>
+    m.stage !== "detail" && classOf(m, opts.activePromptId, opts.waitState, gen) === "outcome"
+  const isEligible = (m: ChatMsg) => isOutcome(m) && !isDeadPaymentLink(m, deadHrefs)
+
   let lastOutcomeId: string | null = null
-  for (let i = list.length - 1; i >= 0; i--) {
-    const m = list[i]
-    if (m.stage === "detail") continue // detalhes já estão resumidos na saudação de retorno
-    if (classOf(m, opts.activePromptId, opts.waitState, gen) === "outcome") {
+  let notice: string | null = null
+  const pinned = opts.pinnedOutcomeId ? list.find((m) => m.id === opts.pinnedOutcomeId) : undefined
+  if (pinned && isEligible(pinned)) {
+    lastOutcomeId = pinned.id
+  } else {
+    let deadSkipped = false
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m = list[i]
+      if (!isOutcome(m)) continue // detalhes já estão resumidos na saudação de retorno
+      if (isDeadPaymentLink(m, deadHrefs)) {
+        deadSkipped = true
+        continue
+      }
+      // depois de um link morto só um LINK vivo ainda descreve "o resultado da
+      // última escolha"; outro outcome mais antigo não é elevado.
+      if (deadSkipped && !paymentLinkActionOf(m)) break
       lastOutcomeId = m.id
       break
     }
+    if (!lastOutcomeId && deadSkipped) notice = RESUME_DEAD_LINK_NOTICE
   }
   const visible: ChatMsg[] = []
   const collapsed: ChatMsg[] = []
@@ -365,7 +427,7 @@ export function splitResumeHistory(
     if (before && m.id !== lastOutcomeId) collapsed.push(m)
     else visible.push(m)
   }
-  return { visible, collapsed, lastOutcomeId }
+  return { visible, collapsed, lastOutcomeId, notice }
 }
 
 export interface CappedHistory {

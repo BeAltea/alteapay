@@ -111,7 +111,8 @@ function classBefore(source: string, label: string, window = 700): string {
   const idx = source.indexOf(label)
   expect(idx, `rótulo "${label}" não encontrado`).toBeGreaterThan(-1)
   const slice = source.slice(Math.max(0, idx - window), idx)
-  const m = slice.match(/className="([^"]*)"(?![\s\S]*className=")/)
+  // QAB3-01: aceita também className={`${FOCUS_RING} …`} / {FOCUS_RING + " …"}.
+  const m = slice.match(/className=(?:\{[^"`]*)?["`]([^"`]*)["`](?![\s\S]*className=)/)
   expect(m, `className antes de "${label}"`).toBeTruthy()
   return m![1]
 }
@@ -124,7 +125,7 @@ describe("N-D5-5 — alvos de toque ≥ 44px", () => {
     expect(positions.length).toBeGreaterThanOrEqual(2)
     for (const pos of positions) {
       const slice = chat.slice(Math.max(0, pos - 700), pos)
-      const cls = slice.match(/className="([^"]*)"(?![\s\S]*className=")/)![1]
+      const cls = slice.match(/className=(?:\{[^"`]*)?["`]([^"`]*)["`](?![\s\S]*className=)/)![1]
       expect(cls, `Já paguei @${pos}`).toContain("min-h-[44px]")
     }
     expect(classBefore(chat, "\n          Sair\n")).toContain("min-h-[44px]")

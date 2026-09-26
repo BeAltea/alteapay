@@ -397,13 +397,90 @@ async function findOpenPaymentClaimCase(ctx: SessionCtx): Promise<string | null>
   }
 }
 
+/**
+ * QA round 3 (QAB2-02) — convergência sob CORRIDA entre instâncias: dois "Já
+ * paguei" concorrentes podem ambos não achar caso aberto e ambos inserir. Depois
+ * do insert, relê os casos `payment_claim` abertos da sessão; o CANÔNICO é o mais
+ * antigo (created_at, desempate por id — todas as instâncias elegem o mesmo). Se
+ * o nosso não é o canônico, ele é removido (fallback: marcado `rejected` com
+ * resolution `duplicate_concurrent`, fora da fila de abertos) e devolvemos o
+ * canônico. Nunca lança; falha de leitura → mantém o nosso.
+ */
+export async function reconcilePaymentClaimCase(ctx: SessionCtx, ownId: string): Promise<string> {
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from("negotiation_cases")
+      .select("id, status, created_at")
+      .eq("company_id", ctx.companyId)
+      .eq("session_id", ctx.sessionId)
+      .eq("type", "payment_claim")
+      .limit(50)
+    const open = ((data ?? []) as Array<{ id: string; status?: string | null; created_at?: string | null }>)
+      .filter((c) => c.status == null || c.status === "open")
+      .sort((a, b) => {
+        const ta = a.created_at ?? ""
+        const tb = b.created_at ?? ""
+        if (ta !== tb) return ta < tb ? -1 : 1
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+      })
+    const canonical = open[0]?.id
+    if (!canonical || canonical === ownId) return ownId
+    const { error } = await supabase
+      .from("negotiation_cases")
+      .delete()
+      .eq("id", ownId)
+      .eq("company_id", ctx.companyId)
+    if (error) {
+      await supabase
+        .from("negotiation_cases")
+        .update({ status: "rejected", resolution: "duplicate_concurrent", updated_at: new Date().toISOString() })
+        .eq("id", ownId)
+        .eq("company_id", ctx.companyId)
+    }
+    return canonical
+  } catch {
+    return ownId
+  }
+}
+
+/** QAB2-02 — single-flight por sessão NA MESMA instância: "Já paguei"
+ *  concorrentes da mesma sessão compartilham o mesmo registro (1 leitura, no
+ *  máximo 1 insert). Entre instâncias, `reconcilePaymentClaimCase` converge. */
+const inflightPaymentClaims = new Map<string, Promise<{ caseId: string; reused: boolean }>>()
+
+async function resolvePaymentClaimCase(
+  ctx: SessionCtx,
+  details: Record<string, unknown>,
+): Promise<{ caseId: string; reused: boolean }> {
+  const key = `${ctx.companyId}:${ctx.sessionId}`
+  const pending = inflightPaymentClaims.get(key)
+  if (pending) {
+    const r = await pending
+    return { caseId: r.caseId, reused: true }
+  }
+  const p = (async () => {
+    const existing = await findOpenPaymentClaimCase(ctx)
+    if (existing) return { caseId: existing, reused: true }
+    const inserted = await openCase(ctx, "payment_claim", details)
+    const canonical = await reconcilePaymentClaimCase(ctx, inserted)
+    return { caseId: canonical, reused: canonical !== inserted }
+  })()
+  inflightPaymentClaims.set(key, p)
+  try {
+    return await p
+  } finally {
+    if (inflightPaymentClaims.get(key) === p) inflightPaymentClaims.delete(key)
+  }
+}
+
 export async function registerPaymentClaim(
   ctx: SessionCtx,
   details: { paidAt?: string; amount?: number; channel?: string; note?: string },
   actor: JourneyActor, eventId?: string,
 ): Promise<string> {
-  const existing = await findOpenPaymentClaimCase(ctx)
-  const caseId = existing ?? (await openCase(ctx, "payment_claim", details))
+  const { caseId, reused } = await resolvePaymentClaimCase(ctx, details)
+  const existing = reused ? caseId : null
   await recordEvent({
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
     sessionId: ctx.sessionId, eventId, type: "payment_claim.registered", actor,
@@ -414,18 +491,19 @@ export async function registerPaymentClaim(
 
 /**
  * R2 — copy de confirmação da transferência ao atendimento (nunca silêncio/"Sessão
- * encerrada" seca). NOMEIA o canal (WhatsApp AlteaPay) e a expectativa de contato,
- * SEM prometer prazo que não podemos cumprir e SEM expor número em claro (o número
- * real do WhatsApp AlteaPay não foi fornecido — mensagem de fallback segura).
+ * encerrada" seca). QA round 3 (QAB3-07, carta de voz D45/Apêndice B — sem
+ * promessa): a frase anterior ("A nossa equipe vai falar com você pelo WhatsApp da
+ * AlteaPay.") prometia canal e contato que o tenant pode não ter (VMAX sem plano
+ * Voxuy; o próprio handoff grava contact_suppressions channel=all). Agora só
+ * REGISTRA o pedido e orienta sem prazo nem canal prometido; SEM número em claro.
  * D36: sem ameaça; dúvidas sobre a origem do débito ficam com o cedente ({credor}).
  * `creditorName` já vem resolvido pela precedência canônica (R15). Sem PII.
  */
 export function humanHandoffReply(creditorName: string): string {
-  // T12 / R-33: remove "em breve" (promessa de prazo sem SLA) e o "se já pagou
-  // desconsidere" deslocado. Nomeia o canal (WhatsApp AlteaPay) sem número em claro.
+  // T12 / R-33 / QAB3-07: sem "em breve", sem "vai falar com você", sem canal.
   return (
-    "Certo. Vou encaminhar você ao nosso atendimento. " +
-    "A nossa equipe vai falar com você pelo WhatsApp da AlteaPay. " +
+    "Certo. Registramos o seu pedido de atendimento. " +
+    "Se precisar, volte a este link para consultar o valor em aberto. " +
     `Dúvidas sobre a origem da dívida são com a ${creditorName}.`
   )
 }

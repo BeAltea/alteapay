@@ -44,15 +44,22 @@ export async function GET(req: NextRequest) {
     currentEpoch = 0
   }
 
-  let q = supabase
+  // QA round 3 (QAB3-02b): SEM `since` (1ª pintura/retomada) a fatia de 200 é a
+  // das linhas MAIS RECENTES (order desc + limit, re-ordenada ascendente em
+  // memória) — antes eram as 200 mais ANTIGAS, e numa sessão longa (> 200
+  // linhas) a retomada elegia um outcome velho e o trocava quando o delta
+  // chegava. COM `since` (poll incremental) segue ascendente + limit (contíguo a
+  // partir do `since`; o excedente vem no poll seguinte).
+  const base = supabase
     .from("chat_messages")
     .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, offers_snapshot, thread_epoch, archived_at, created_at")
     .eq("session_id", claims.sid)
     .eq("company_id", claims.cid)
-    .order("created_at", { ascending: true })
-    .limit(200)
-  if (since) q = q.gt("created_at", since)
-  const { data: rawMessages } = await q
+  const q = since
+    ? base.gt("created_at", since).order("created_at", { ascending: true }).limit(200)
+    : base.order("created_at", { ascending: false }).limit(200)
+  const { data: rawFetched } = await q
+  const rawMessages = since ? rawFetched : [...(rawFetched ?? [])].reverse()
 
   // Filtra a THREAD CORRENTE (C3): época corrente OU null (=época 0, compat) e
   // NÃO-arquivada. As linhas de épocas anteriores ficam preservadas no banco (o

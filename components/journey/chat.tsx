@@ -27,10 +27,13 @@ import {
   placeAfterCustomerEcho,
   prunePresentation,
   resolvePromptForRender,
+  RESUME_DEAD_LINK_NOTICE,
   splitResumeHistory,
+  srSpeakerPrefix,
   type ChatMsg,
   type MsgAction,
 } from "./chat-display"
+import { FOCUS_RING } from "./button-tiers"
 import { OUTCOME_STAGES } from "@/lib/journey/display-class"
 import {
   createInFlightGuard,
@@ -170,7 +173,7 @@ function linkifyUrls(text: string, keyBase: string) {
         href={chunk}
         target="_blank"
         rel="noopener noreferrer"
-        className="break-all font-medium text-neutral-800 underline underline-offset-2"
+        className={`${FOCUS_RING} break-all font-medium text-neutral-800 underline underline-offset-2`}
       >
         {chunk}
       </a>
@@ -226,6 +229,14 @@ export function JourneyChat() {
   // montagem (o que chega depois, via poll, é conversa nova e aparece).
   const [resumeCutoffAt, setResumeCutoffAt] = useState<string | null>(null)
   const resumeInitRef = useRef(false)
+  // QA round 3 (QAB3-02b): id do outcome eleito na 1ª pintura da retomada — um
+  // poll posterior nunca troca o resultado destacado sob os olhos do devedor
+  // (splitResumeHistory só re-elege se o pino deixar de ser elegível).
+  const resumeOutcomePinRef = useRef<string | null>(null)
+  // QA round 3 (QAB3-04): alvo do foco inicial pós-login = o CARD (quem cobra,
+  // quanto, vencimento) — o leitor de tela parte do início do conteúdo, não do
+  // meio do log. Cai no log só quando o card não veio do servidor.
+  const cardFocusRef = useRef<HTMLElement | null>(null)
   // A3 (G7) — bloco do menu (FORA do log): alvo do scrollIntoView pós-login.
   const menuRef = useRef<HTMLDivElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -808,14 +819,16 @@ export function JourneyChat() {
     return () => clearTimeout(t)
   }, [waitState, payResult?.status, waitHandoffExitVisible])
 
-  // R8 — ao aparecer o resumo pós-login + menu de 3 opções, move o foco para a
-  // região do resumo UMA vez, para o leitor de tela anunciá-la (M18). Só quando
-  // já há conteúdo e um prompt ativo (o menu). Não re-anuncia em loop.
+  // R8 — ao aparecer o resumo pós-login + menu de 3 opções, move o foco UMA vez,
+  // para o leitor de tela partir do início (M18). Só quando já há conteúdo e um
+  // prompt ativo (o menu). Não re-anuncia em loop. QA round 3 (QAB3-04): o alvo
+  // é o CARD (tabIndex=-1) — card → saudação de retorno → log → menu na ordem de
+  // leitura; o log (que antes recebia o foco) fica como fallback sem card.
   useEffect(() => {
     if (summaryFocusedRef.current) return
     if (ended) return
     if (messages.length === 0 && !activePrompt) return
-    const el = summaryFocusRef.current
+    const el = cardFocusRef.current ?? summaryFocusRef.current
     if (!el) return
     summaryFocusedRef.current = true
     // rAF para garantir que o nó já está no DOM antes de focar.
@@ -830,7 +843,7 @@ export function JourneyChat() {
         /* noop */
       }
     })
-  }, [messages.length, activePrompt, ended])
+  }, [messages.length, activePrompt, ended, pinnedDebt])
 
   // Remove a bolha optimistic "preparando negociação" (se houver). Chamada nos
   // caminhos de erro do clique — não faz sentido manter "preparando" se o clique
@@ -1455,7 +1468,14 @@ export function JourneyChat() {
     activePromptId,
     waitState,
     currentGeneration,
+    // QA round 3 (QAB3-02): link morto (live:false OU href terminal do poll)
+    // nunca é o outcome elevado; o id eleito na 1ª pintura fica pinado.
+    deadHrefs: deadLinkHrefs,
+    pinnedOutcomeId: resumeOutcomePinRef.current,
   })
+  if (resumeCutoffAt && resume.lastOutcomeId && resume.lastOutcomeId !== resumeOutcomePinRef.current) {
+    resumeOutcomePinRef.current = resume.lastOutcomeId // idempotente: mesmo id a cada render
+  }
   const capped = capHistory(resume.visible, activePromptId, waitState, {
     expanded: historyExpanded,
     currentGeneration,
@@ -1492,7 +1512,7 @@ export function JourneyChat() {
         <button
           type="button"
           onClick={goToChatLogin}
-          className="inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 hover:bg-neutral-100 hover:text-neutral-800"
+          className={`${FOCUS_RING} inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 hover:bg-neutral-100 hover:text-neutral-800`}
         >
           Sair
         </button>
@@ -1500,18 +1520,17 @@ export function JourneyChat() {
       {/* D2 — CARD FIXO do débito (C1/R-11): FORA do log (não é linha de chat),
           aparece 1x no topo, imutável entre polls, sobrevive a reload. O valor mora
           aqui (e nos outcomes), não nas guidance/perguntas (R-12). D3 estiliza. */}
-      <DebtCard debt={pinnedDebt} />
+      <DebtCard debt={pinnedDebt} focusRef={cardFocusRef} />
       {/* D2/A3 — SAUDAÇÃO DE RETORNO (§2.2, C7/R-17): ACIMA do log, no lugar da
           repetição integral e da saudação original (recolhida). Só na retomada
-          (recap != null vindo do 1º poll). Uma só saudação na tela. */}
+          (recap != null vindo do 1º poll). Uma só saudação na tela.
+          QA round 3 (QAB3-04): NÃO é região viva — nasce junto com o conteúdo e
+          nunca muda depois do carregamento (uma live region inserida já cheia não
+          é anunciada); o leitor de tela a lê na ordem, logo após o card focado. */}
       {recap && !ended ? (
-        <div
-          role="status"
-          aria-live="polite"
-          className="rounded-lg border border-neutral-200 bg-neutral-50 px-3.5 py-2 text-sm text-neutral-700"
-        >
+        <p className="rounded-lg border border-neutral-200 bg-neutral-50 px-3.5 py-2 text-sm text-neutral-700">
           {recap.text}
-        </div>
+        </p>
       ) : null}
       {/* R8 — a região de mensagens é um log acessível: o resumo pós-login e as
           respostas do assistente são anunciados ao leitor de tela (aria-live
@@ -1533,8 +1552,19 @@ export function JourneyChat() {
         aria-atomic="false"
         aria-label="Conversa de negociação"
         tabIndex={-1}
-        className="min-h-[96px] max-h-[42dvh] space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-secondary)]/40 sm:max-h-[58dvh]"
+        className={`min-h-[96px] max-h-[42dvh] space-y-3 overflow-y-auto rounded-lg bg-white p-3 shadow-sm sm:max-h-[58dvh] ${FOCUS_RING}`}
       >
+        {/* QA round 3 (QAB3-02): o último resultado era um link MORTO (cobrança
+            cancelada) e não há outcome vivo para elevar — bolha NEUTRA de status,
+            sem botão, no lugar de "Aqui está seu link…" sem link. */}
+        {resume.notice ? (
+          <div className="flex flex-col items-start">
+            <div className="max-w-[85%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800">
+              <span className="sr-only">{srSpeakerPrefix("assistant")}</span>
+              {RESUME_DEAD_LINK_NOTICE}
+            </div>
+          </div>
+        ) : null}
         {capped.visible.map((m) => {
           const engineDisplay = engineDisplayOf(m)
           // A2: nota discreta do motor (texto solto com o assistido ativo) — sem
@@ -1543,6 +1573,7 @@ export function JourneyChat() {
             return (
               <div key={m.id} className="flex flex-col items-start">
                 <p className="max-w-[85%] whitespace-pre-line px-1 text-xs italic text-neutral-500">
+                  <span className="sr-only">{srSpeakerPrefix("assistant")}</span>
                   {engineDisplay.text}
                 </p>
               </div>
@@ -1561,6 +1592,8 @@ export function JourneyChat() {
                   : "max-w-[85%] whitespace-pre-line rounded-2xl rounded-bl-sm bg-neutral-100 px-3.5 py-2 text-sm text-neutral-800"
               }
             >
+              {/* QAB3-05: quem fala, só para tecnologia assistiva (sem mudar o visual). */}
+              <span className="sr-only">{srSpeakerPrefix(m.from)}</span>
               {renderRichText(
                 engineDisplay
                   ? engineDisplay.text
@@ -1583,16 +1616,16 @@ export function JourneyChat() {
                   target="_blank"
                   rel="noopener noreferrer"
                   style={BRAND_FILL_STYLE}
-                  className="inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold"
+                  className={`${FOCUS_RING} inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold`}
                 >
                   {(paymentLinkActionOf(m) as MsgAction).label}
                 </a>
                 <button
                   type="button"
                   onClick={() => onCopyLink((paymentLinkActionOf(m) as MsgAction).href)}
-                  className="min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                  className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
                 >
-                  {copied ? "Link copiado!" : "Copiar link"}
+                  {copied ? "Link copiado." : "Copiar link"}
                 </button>
               </div>
             ) : null}
@@ -1603,7 +1636,7 @@ export function JourneyChat() {
                 target="_blank"
                 rel="noopener noreferrer"
                 style={BRAND_FILL_STYLE}
-                className="mt-2 inline-flex min-h-[44px] items-center rounded-md px-4 py-2 text-sm font-semibold"
+                className={`${FOCUS_RING} mt-2 inline-flex min-h-[44px] items-center rounded-md px-4 py-2 text-sm font-semibold`}
               >
                 {m.action.label}
               </a>
@@ -1653,7 +1686,7 @@ export function JourneyChat() {
                 disabled={!waitExitsArmed}
                 aria-disabled={!waitExitsArmed}
                 style={BRAND_FILL_STYLE}
-                className={"min-h-[44px] rounded-md px-4 text-sm font-semibold" + exitBtnGuard}
+                className={FOCUS_RING + " min-h-[44px] rounded-md px-4 text-sm font-semibold" + exitBtnGuard}
               >
                 Pagar agora
               </button>
@@ -1663,7 +1696,7 @@ export function JourneyChat() {
                   onClick={onWaitHandoff}
                   disabled={!waitExitsArmed}
                   aria-disabled={!waitExitsArmed}
-                  className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                  className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
                 >
                   Falar com atendimento
                 </button>
@@ -1686,7 +1719,7 @@ export function JourneyChat() {
                 disabled={!waitExitsArmed}
                 aria-disabled={!waitExitsArmed}
                 style={BRAND_FILL_STYLE}
-                className={"min-h-[44px] rounded-md px-4 text-sm font-semibold" + exitBtnGuard}
+                className={FOCUS_RING + " min-h-[44px] rounded-md px-4 text-sm font-semibold" + exitBtnGuard}
               >
                 Pagar à vista
               </button>
@@ -1695,7 +1728,7 @@ export function JourneyChat() {
                 onClick={onWaitRetryOptions}
                 disabled={!waitExitsArmed}
                 aria-disabled={!waitExitsArmed}
-                className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
               >
                 Tentar as opções de novo
               </button>
@@ -1704,7 +1737,7 @@ export function JourneyChat() {
                 onClick={onWaitHandoff}
                 disabled={!waitExitsArmed}
                 aria-disabled={!waitExitsArmed}
-                className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
               >
                 Falar com atendimento
               </button>
@@ -1750,16 +1783,16 @@ export function JourneyChat() {
                       target="_blank"
                       rel="noopener noreferrer"
                       style={BRAND_FILL_STYLE}
-                      className="inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold"
+                      className={`${FOCUS_RING} inline-flex min-h-[44px] items-center justify-center rounded-md px-4 py-2 text-center text-sm font-semibold`}
                     >
                       Abrir link de pagamento
                     </a>
                     <button
                       type="button"
                       onClick={() => onCopyLink(payResult.link as string)}
-                      className="min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
                     >
-                      {copied ? "Link copiado!" : "Copiar link"}
+                      {copied ? "Link copiado." : "Copiar link"}
                     </button>
                   </div>
                 ) : null}
@@ -1775,7 +1808,7 @@ export function JourneyChat() {
                   <button
                     type="button"
                     onClick={onWaitRetryOptions}
-                    className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
                   >
                     Voltar às opções
                   </button>
@@ -1783,7 +1816,7 @@ export function JourneyChat() {
                     <button
                       type="button"
                       onClick={requestPaymentClaim}
-                      className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                      className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
                     >
                       Já paguei este valor
                     </button>
@@ -1791,7 +1824,7 @@ export function JourneyChat() {
                   <button
                     type="button"
                     onClick={onWaitHandoff}
-                    className="min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50"
+                    className={`${FOCUS_RING} min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50`}
                   >
                     Falar com atendimento
                   </button>
@@ -1828,7 +1861,7 @@ export function JourneyChat() {
                         onClick={onPayBackToOptions}
                         disabled={!waitExitsArmed}
                         aria-disabled={!waitExitsArmed}
-                        className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                        className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
                       >
                         Voltar às opções
                       </button>
@@ -1837,7 +1870,7 @@ export function JourneyChat() {
                         onClick={onWaitHandoff}
                         disabled={!waitExitsArmed}
                         aria-disabled={!waitExitsArmed}
-                        className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                        className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
                       >
                         Falar com atendimento
                       </button>
@@ -1869,7 +1902,7 @@ export function JourneyChat() {
                     disabled={!waitExitsArmed}
                     aria-disabled={!waitExitsArmed}
                     style={BRAND_FILL_STYLE}
-                    className={"min-h-[44px] rounded-md px-4 text-sm font-semibold" + exitBtnGuard}
+                    className={FOCUS_RING + " min-h-[44px] rounded-md px-4 text-sm font-semibold" + exitBtnGuard}
                   >
                     Tentar de novo
                   </button>
@@ -1878,7 +1911,7 @@ export function JourneyChat() {
                     onClick={onPayBackToOptions}
                     disabled={!waitExitsArmed}
                     aria-disabled={!waitExitsArmed}
-                    className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                    className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
                   >
                     Voltar às opções
                   </button>
@@ -1887,7 +1920,7 @@ export function JourneyChat() {
                     onClick={onWaitHandoff}
                     disabled={!waitExitsArmed}
                     aria-disabled={!waitExitsArmed}
-                    className={"min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
+                    className={FOCUS_RING + " min-h-[44px] rounded-md border border-neutral-300 px-4 text-sm font-semibold text-neutral-700 hover:bg-neutral-50" + exitBtnGuard}
                   >
                     Falar com atendimento
                   </button>
@@ -1944,7 +1977,7 @@ export function JourneyChat() {
             <button
               type="button"
               onClick={requestPaymentClaim}
-              className="mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800"
+              className={`${FOCUS_RING} mt-1 inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800`}
             >
               Já paguei este valor
             </button>
@@ -1962,7 +1995,7 @@ export function JourneyChat() {
             type="button"
             onClick={() => setHistoryExpanded((v) => !v)}
             aria-expanded={historyExpanded}
-            className="inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800"
+            className={`${FOCUS_RING} inline-flex min-h-[44px] items-center rounded-md px-3 text-sm font-medium text-neutral-600 underline underline-offset-2 hover:text-neutral-800`}
           >
             {historyExpanded ? "Recolher conversa" : "Ver conversa completa"}
           </button>
@@ -1987,14 +2020,14 @@ export function JourneyChat() {
                   type="button"
                   onClick={resumeFromIdle}
                   style={BRAND_FILL_STYLE}
-                  className="mt-5 min-h-[44px] w-full rounded-md px-4 py-2.5 text-sm font-semibold"
+                  className={`${FOCUS_RING} mt-5 min-h-[44px] w-full rounded-md px-4 py-2.5 text-sm font-semibold`}
                 >
                   Continuar
                 </button>
                 <button
                   type="button"
                   onClick={goToChatLogin}
-                  className="mt-2 min-h-[44px] w-full rounded-md border border-neutral-300 px-4 py-2.5 text-sm font-semibold text-neutral-600 hover:bg-neutral-50"
+                  className={`${FOCUS_RING} mt-2 min-h-[44px] w-full rounded-md border border-neutral-300 px-4 py-2.5 text-sm font-semibold text-neutral-600 hover:bg-neutral-50`}
                 >
                   Sair
                 </button>
@@ -2009,7 +2042,7 @@ export function JourneyChat() {
                   type="button"
                   onClick={goToChatLogin}
                   style={BRAND_FILL_STYLE}
-                  className="mt-5 min-h-[44px] w-full rounded-md px-4 py-2.5 text-sm font-semibold"
+                  className={`${FOCUS_RING} mt-5 min-h-[44px] w-full rounded-md px-4 py-2.5 text-sm font-semibold`}
                 >
                   Entrar novamente
                 </button>

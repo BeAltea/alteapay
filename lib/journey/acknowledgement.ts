@@ -96,11 +96,12 @@ export interface AckContext {
   oldestDueDate: string | null
 }
 
-/** Primeiro token do nome (ex.: "Fabio Mendes" → "Fabio"). Vazio se não houver.
- *  Exportado (A3) para a saudação de retorno do recap usar a mesma regra. */
-export function firstNameOf(name: string | null | undefined): string {
-  return (name ?? "").trim().split(/\s+/)[0] ?? ""
-}
+/** Primeiro nome de PESSOA FÍSICA (ex.: "Fabio Mendes" → "Fabio"); null para
+ *  vazio, CNPJ, razão social ou 1º token inválido (QA round 3 / QAB3-03). Fonte
+ *  única em lib/journey/first-name.ts; re-exportado aqui (A3: o recap e o
+ *  campaign-send usam a MESMA regra). */
+export { firstNameOf } from "./first-name"
+import { firstNameOf } from "./first-name"
 
 /** Resumo objetivo da dívida (cliente, credor, valor atualizado, vencimento). */
 export async function buildAckContext(input: {
@@ -138,7 +139,7 @@ export async function buildAckContext(input: {
     .select("name, document")
     .eq("id", input.customerId)
     .maybeSingle()
-  const firstName = firstNameOf(customer?.name)
+  const firstName = firstNameOf(customer?.name, customer?.document) ?? ""
   const doc = (customer?.document ?? "").replace(/\D/g, "")
   const { data: invoices } = await supabase
     .from("vmax_invoices")
@@ -1062,11 +1063,11 @@ export async function buildSettledContext(input: {
     (typeof branding.brand_name === "string" && branding.brand_name) || company?.name || "Credor"
   const { data: customer } = await supabase
     .from("customers")
-    .select("name")
+    .select("name, document")
     .eq("id", input.customerId)
     .maybeSingle()
   return {
-    firstName: firstNameOf(customer?.name),
+    firstName: firstNameOf(customer?.name, customer?.document) ?? "",
     creditorName,
     totalPaid: input.totalPaid,
     oldestDueDate: input.oldestDueDate,

@@ -60,7 +60,7 @@ export function JourneyOptout() {
         onClick={requestOptout}
         disabled={submitting}
         style={{ backgroundColor: "var(--brand-secondary)" }}
-        className="mt-auto h-11 rounded-md text-base font-semibold text-white disabled:opacity-40"
+        className="mt-auto h-11 rounded-md text-base font-semibold text-white disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
       >
         {submitting ? "Registrando..." : "Registrar solicitação"}
       </button>

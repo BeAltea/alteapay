@@ -68,19 +68,19 @@ export default async function GenericJourneyLayout({
 
       <footer className="border-t border-neutral-200 bg-white px-4 py-4 text-[11px] text-neutral-500 sm:px-6">
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-          <span>Atendimento operado pela AlteaPay em nome de {branding.brandName}.</span>
+          <span>Atendimento operado pela AlteaPay em nome da {branding.brandName}.</span>
           <span className="flex flex-wrap gap-x-3 gap-y-1">
             {privacyPolicyUrl ? (
               <a
                 href={privacyPolicyUrl}
                 target="_blank"
                 rel="noreferrer noopener"
-                className="underline underline-offset-2"
+                className="inline-flex min-h-[24px] items-center underline underline-offset-2"
               >
                 Política de privacidade
               </a>
             ) : (
-              <a href="/politica-de-privacidade" className="underline underline-offset-2">
+              <a href="/politica-de-privacidade" className="inline-flex min-h-[24px] items-center underline underline-offset-2">
                 Política de privacidade
               </a>
             )}

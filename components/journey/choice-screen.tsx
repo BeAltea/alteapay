@@ -24,7 +24,7 @@ export function ChoiceScreen({ token }: { token: string }) {
           type="button"
           onClick={() => router.push(`/c/${token}/consultar`)}
           style={{ backgroundColor: "var(--brand-secondary)" }}
-          className="h-12 rounded-md text-base font-semibold text-white"
+          className="h-12 rounded-md text-base font-semibold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
         >
           Consultar atualização
         </button>
@@ -32,7 +32,7 @@ export function ChoiceScreen({ token }: { token: string }) {
         <button
           type="button"
           onClick={() => router.push(`/c/${token}/cancelar`)}
-          className="h-11 rounded-md border border-neutral-300 bg-white text-sm font-medium text-neutral-700"
+          className="h-11 rounded-md border border-neutral-300 bg-white text-sm font-medium text-neutral-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
         >
           Cancelar inscrição (não quero mais mensagens)
         </button>
@@ -40,7 +40,7 @@ export function ChoiceScreen({ token }: { token: string }) {
         <button
           type="button"
           onClick={() => router.push(`/c/${token}/bloquear`)}
-          className="h-11 rounded-md border border-neutral-300 bg-white text-sm font-medium text-neutral-700"
+          className="h-11 rounded-md border border-neutral-300 bg-white text-sm font-medium text-neutral-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900 focus-visible:ring-offset-2"
         >
           Bloquear este número
         </button>

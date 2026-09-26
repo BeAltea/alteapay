@@ -79,7 +79,7 @@ export default async function JourneyLayout({
         logoUrl: branding.logoUrl,
         primary: branding.brandPrimaryColor,
         secondary: branding.brandSecondaryColor,
-        footer: `Atendimento operado pela AlteaPay em nome de ${branding.brandName}.`,
+        footer: `Atendimento operado pela AlteaPay em nome da ${branding.brandName}.`,
         privacyHref: privacyPolicyUrl,
         dpoContact,
       }
@@ -141,12 +141,12 @@ export default async function JourneyLayout({
                 href={view.privacyHref}
                 target="_blank"
                 rel="noreferrer noopener"
-                className="underline underline-offset-2"
+                className="inline-flex min-h-[24px] items-center underline underline-offset-2"
               >
                 Política de privacidade
               </a>
             ) : (
-              <a href="/politica-de-privacidade" className="underline underline-offset-2">
+              <a href="/politica-de-privacidade" className="inline-flex min-h-[24px] items-center underline underline-offset-2">
                 Política de privacidade
               </a>
             )}
