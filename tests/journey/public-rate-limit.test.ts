@@ -23,6 +23,7 @@ function reset() {
   delete process.env.PUBLIC_AUTH_DOC_MAX_ATTEMPTS
   delete process.env.PUBLIC_AUTH_DOC_WINDOW_MIN
   delete process.env.PUBLIC_AUTH_TENANT_HOURLY_CAP
+  delete process.env.AUTH_IP_LOCK_ENABLED
 }
 
 async function mod() {
@@ -47,7 +48,10 @@ describe("public-rate-limit", () => {
     expect(ipHashOf(null)).toBeNull()
   })
 
-  it("lock por IP após o teto de falhas (independente do documento)", async () => {
+  it("lock por IP após o teto de falhas (independente do documento) — só com AUTH_IP_LOCK_ENABLED=true", async () => {
+    // QA rodada 6 (Q1r2-5): a dimensão IP é telemetria por padrão; aqui ela é
+    // religada explicitamente (o default desligado é coberto em qa6-ip-lock).
+    process.env.AUTH_IP_LOCK_ENABLED = "true"
     process.env.PUBLIC_AUTH_IP_MAX_ATTEMPTS = "3"
     // 3 falhas do MESMO IP com documentos diferentes → lock por IP.
     await fail(DOC_A, IP_1)

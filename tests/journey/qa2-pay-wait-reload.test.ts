@@ -243,8 +243,11 @@ describe("QAB1-H1 regra pura (pay-poll.ts) — decidePayResume", () => {
     expect(decidePayResume({ serverWaitState: null, localWaitState: "gerando_cobranca", payInFlight: false, resumed: true, hasActivePrompt: true, linkDelivered: false })).toBe("settle_idle")
     expect(decidePayResume({ serverWaitState: null, localWaitState: "erro_cobranca", payInFlight: false, resumed: true, hasActivePrompt: true, linkDelivered: false })).toBe("settle_idle")
     expect(decidePayResume({ serverWaitState: null, localWaitState: "gerando_cobranca", payInFlight: false, resumed: true, hasActivePrompt: false, linkDelivered: false })).toBe("none")
-    // clique próprio (não retomado) com servidor null → o clique governa
-    expect(decidePayResume({ serverWaitState: null, localWaitState: "erro_cobranca", payInFlight: false, resumed: false, hasActivePrompt: true, linkDelivered: false })).toBe("none")
+    // QA rodada 6 (Q2r2-02): erro de cobrança NUNCA coexiste com o menu — mesmo
+    // num clique próprio, um prompt ativo na tela aposenta o erro.
+    expect(decidePayResume({ serverWaitState: null, localWaitState: "erro_cobranca", payInFlight: false, resumed: false, hasActivePrompt: true, linkDelivered: false })).toBe("settle_idle")
+    // clique próprio (não retomado), servidor null e SEM prompt → o clique governa
+    expect(decidePayResume({ serverWaitState: null, localWaitState: "erro_cobranca", payInFlight: false, resumed: false, hasActivePrompt: false, linkDelivered: false })).toBe("none")
   })
 
   it("teto do poll (~60 s): shouldOfferProcessingExit após PAY_POLL_MAX_ATTEMPTS (24 × 2,5 s)", async () => {

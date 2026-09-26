@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { headers } from "next/headers"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
+import { checkInstallmentHold, fetchInstallmentPayments, isInstallmentAgreement } from "@/lib/asaas-installments"
 
 /**
  * ASAAS Payment Sync Endpoint (Polling Fallback)
@@ -1519,7 +1520,7 @@ export async function POST(request: NextRequest) {
     // Build query for pending/active agreements
     let query = supabase
       .from("agreements")
-      .select("id, asaas_payment_id, payment_status, status, asaas_last_synced_at, company_id, debt_id, user_id, agreed_amount")
+      .select("id, asaas_payment_id, payment_status, status, asaas_last_synced_at, company_id, debt_id, user_id, agreed_amount, installments, asaas_subscription_id")
       .not("asaas_payment_id", "is", null) // Must have ASAAS payment ID
       .in("payment_status", SYNC_STATUSES)
       .order("asaas_last_synced_at", { ascending: true, nullsFirst: true })
@@ -1569,8 +1570,34 @@ export async function POST(request: NextRequest) {
         const asaasResult = await fetchAsaasPaymentStatus(agreement.asaas_payment_id)
         results.synced++
 
+        // Correção B10 (A1/M4): acordo PARCELADO — o status de UMA parcela
+        // (a 1ª, que é o asaas_payment_id) nunca quita nem cancela o acordo
+        // sozinho. Vale o parcelamento inteiro no ASAAS: quita só com TODAS as
+        // parcelas pagas; cancelamento com parcela já paga fica para conciliação.
+        const installmentHold = async (status: string, installmentId?: string | null) => {
+          if (!isInstallmentAgreement(agreement)) return false
+          const hold = await checkInstallmentHold({
+            installments: agreement.installments,
+            installmentId: agreement.asaas_subscription_id ?? installmentId ?? null,
+            status,
+            listPayments: fetchInstallmentPayments,
+          })
+          if (!hold.hold) return false
+          console.log(`[ASAAS Sync] Agreement ${agreement.id} parcelado mantido (${hold.reason})`)
+          await supabase
+            .from("agreements")
+            .update({
+              asaas_last_synced_at: new Date().toISOString(),
+              ...(!agreement.asaas_subscription_id && installmentId ? { asaas_subscription_id: installmentId } : {}),
+            })
+            .eq("id", agreement.id)
+          results.skipped++
+          return true
+        }
+
         // Handle deleted payments (404 from ASAAS)
         if (asaasResult.status === "deleted") {
+          if (await installmentHold("DELETED")) continue
           console.log(`[ASAAS Sync] Payment ${agreement.asaas_payment_id} was DELETED from ASAAS`)
 
           // Mark agreement as cancelled
@@ -1648,6 +1675,14 @@ export async function POST(request: NextRequest) {
         }
 
         const newPaymentStatus = statusMap[asaasPayment.status] || agreement.payment_status
+
+        if (
+          (newPaymentStatus === "received" || newPaymentStatus === "confirmed" ||
+            newPaymentStatus === "refunded" || asaasPayment.status === "DELETED" || asaasPayment.deleted === true) &&
+          (await installmentHold(asaasPayment.deleted === true ? "DELETED" : asaasPayment.status, asaasPayment.installment ?? null))
+        ) {
+          continue
+        }
 
         // Check if status changed
         if (newPaymentStatus !== agreement.payment_status) {

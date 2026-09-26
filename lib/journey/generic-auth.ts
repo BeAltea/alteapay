@@ -23,12 +23,14 @@ import { isAcceptableDocument, normalizeDocument } from "./document"
 import { resolveByDocument, type ResolvedDebtor, type SettledDebtor } from "./resolver"
 import { bootstrapSettledSafe, bootstrapThreeOptionsSafe } from "./acknowledgement"
 import { verifyCaptcha as verifyCaptchaFunctional } from "./captcha"
+import { ipLockEnabled } from "./client-ip"
 import {
   docHashOf,
   ipHashOf,
   registerPublicAttempt,
   evaluatePublicRateLimit,
   onPublicFailure,
+  isTenantOverHourlyCap,
 } from "./public-rate-limit"
 
 export { GENERIC_AUTH_MESSAGE }
@@ -178,15 +180,27 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   const fail = async (reason: string): Promise<GenericAuthResult> => {
     await recordAttempt(supabase, input.companyId, dHash, ipH, false, reason)
     await maybeLock(supabase, input.companyId, "document", dHash, docLockMin, docMax, docLockMin)
-    if (ipH) await maybeLock(supabase, input.companyId, "ip", ipH, ipWindowMin(), ipMaxAttempts(), IP_LOCK_MIN)
+    // QA rodada 6 (Q1r2-5): lock por IP só com a dimensão religada (telemetria por padrão).
+    if (ipH && ipLockEnabled()) await maybeLock(supabase, input.companyId, "ip", ipH, ipWindowMin(), ipMaxAttempts(), IP_LOCK_MIN)
     await recordEvent({ companyId: input.companyId, type: "auth.failed", actor: "customer", payload: {} })
     return { ok: false, message: GENERIC_AUTH_MESSAGE }
   }
 
   // Locks são checados PRIMEIRO e retornam a MESMA resposta uniforme (sem
   // revelar o bloqueio) — mas sem contabilizar nova tentativa/lock.
-  if (await isIpLocked(supabase, input.companyId, ipH)) return { ok: false, message: GENERIC_AUTH_MESSAGE }
+  if (ipLockEnabled() && (await isIpLocked(supabase, input.companyId, ipH))) return { ok: false, message: GENERIC_AUTH_MESSAGE }
   if (await isDocLocked(supabase, input.companyId, dHash)) return { ok: false, message: GENERIC_AUTH_MESSAGE }
+
+  // Correção B10 (A2): TETO DE VOLUME por cedente/hora também no /t/{slug} (sem
+  // o lock por IP, o lock por documento sozinho não impede enumerar CPFs
+  // distintos). Estourado → modo DEGRADADO, o mesmo do /n/: captcha OBRIGATÓRIO
+  // (mesmo com a flag desligada) + alerta de operação. Resposta uniforme.
+  if (await isTenantOverHourlyCap(supabase, input.companyId, { scope: "all" })) {
+    await recordEvent({ companyId: input.companyId, type: "auth.locked", actor: "system", payload: { scope: "tenant_hourly_cap", degraded: true, channel: input.channel } })
+    if (!input.captchaToken || !(await verifyCaptchaFunctional(input.captchaToken, input.ip))) {
+      return { ok: false, message: GENERIC_AUTH_MESSAGE }
+    }
+  }
 
   // captcha (se flag) — falha vira resposta uniforme, contabiliza.
   if (!(await verifyCaptcha(input.captchaToken))) return fail("captcha_failed")

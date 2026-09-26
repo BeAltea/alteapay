@@ -6,10 +6,11 @@ import { createServiceClient } from "@/lib/supabase/service"
 import { agingDays } from "@/lib/negotiation/config"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import {
-  generateOfferTerms, persistOffer, validateProposedTerms,
+  generateOfferTerms, isPayIntegralOfferRow, persistOffer, validateProposedTerms,
   type OfferTerms,
 } from "@/lib/negotiation/offers"
 import { recordEvent, type JourneyActor } from "./events"
+import { HANDOFF_STAGE } from "./display-class"
 import { addSuppression } from "./suppressions"
 
 export interface SessionCtx {
@@ -191,7 +192,37 @@ export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary
   const sessionRows = (allRows ?? []) as Array<{
     id: string; terms: OfferTerms; valid_until: string | null; created_at?: string | null; status: string; source?: string | null
   }>
-  const rows = sessionRows.filter((r) => r.status === "presented")
+  // QA rodada 6 (Q2r2-03, ALTO): a oferta INTEGRAL do PAGAR (0%/1x, gerada pelo
+  // botão Pagar) NÃO é o conjunto da matriz. Depois de um Pagar abortado
+  // (`charge_deferred`) ela ficava 'presented' e era reapresentada SOZINHA no
+  // Negociar ("À vista R$ 250,00"), escondendo desconto e parcelas. O Negociar
+  // sempre apresenta o conjunto COMPLETO da matriz: a integral órfã sai de cena
+  // ('superseded', auditado) e nunca entra no conjunto vigente.
+  const systemRows = sessionRows.filter((r) => (r.source ?? "system") === "system")
+  const payIntegrals = sessionRows.filter(
+    (r) => r.status === "presented" && isPayIntegralOfferRow(r, systemRows),
+  )
+  const payIntegralIds = new Set(payIntegrals.map((r) => r.id))
+  const rows = sessionRows.filter((r) => r.status === "presented" && !payIntegralIds.has(r.id))
+  const retirePayIntegrals: Promise<unknown> =
+    payIntegrals.length === 0
+      ? Promise.resolve()
+      : Promise.all([
+          supabase
+            .from("negotiation_offers")
+            .update({ status: "superseded", responded_at: now })
+            .eq("session_id", ctx.sessionId)
+            .eq("status", "presented")
+            .in("id", [...payIntegralIds]),
+          ...payIntegrals.map((r) =>
+            recordEvent({
+              companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+              sessionId: ctx.sessionId, type: "offer.rejected", actor: "system",
+              eventId: `offer.superseded|${r.id}`,
+              payload: { offer_id: r.id, reason: "pay_integral_superseded_by_negotiate" },
+            }).catch(() => {}),
+          ),
+        ]).catch(() => {})
   const isExpired = (o: { valid_until: string | null }) => {
     if (!o.valid_until) return false
     const t = Date.parse(o.valid_until)
@@ -226,11 +257,11 @@ export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary
   // 'system'); intacto → reusa. Ofertas de IA/cliente ('ai'/'customer') não
   // formam conjunto e continuam listadas como antes.
   const setIntact = isOfferSetIntact(
-    sessionRows.filter((r) => (r.source ?? "system") === "system"),
+    systemRows.filter((r) => !payIntegralIds.has(r.id)),
     new Set(current.map((o) => o.id)),
   )
   if (current.length > 0 && setIntact) {
-    await expireWrite
+    await Promise.all([expireWrite, retirePayIntegrals])
     return current.map((o) => ({ id: o.id, terms: o.terms, valid_until: o.valid_until }))
   }
 
@@ -240,7 +271,7 @@ export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary
     companyId: ctx.companyId, agingDays: summary.agingDays, debtValue: summary.originalValue,
   })
   if (!row) {
-    await expireWrite
+    await Promise.all([expireWrite, retirePayIntegrals])
     // sem faixa vigente não há como regenerar: devolve o que resta (nunca some
     // uma opção válida por falta de matriz).
     return current.map((o) => ({ id: o.id, terms: o.terms, valid_until: o.valid_until }))
@@ -278,6 +309,7 @@ export async function listOffers(ctx: SessionCtx, opts?: { summary?: DebtSummary
   // N-D2-8: 3 offer.presented no mesmo segundo não colapsam mais em 1).
   await Promise.all([
     expireWrite,
+    retirePayIntegrals,
     ...ids.map((id, i) =>
       recordEvent({
         companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
@@ -508,11 +540,32 @@ export function humanHandoffReply(creditorName: string): string {
   )
 }
 
+// QA rodada 6 (Q5r2-02): estágio do outcome do pedido de atendimento (fonte
+// única client-safe em display-class.ts).
+export { HANDOFF_STAGE }
+
 export async function transferToHuman(
   ctx: SessionCtx, reason: string, actor: JourneyActor, eventId?: string,
 ): Promise<string> {
+  return (await transferToHumanWithOutcome(ctx, reason, actor, eventId)).caseId
+}
+
+/**
+ * Handoff com o OUTCOME devolvido (QA rodada 6, Q5r2-02): a rota coloca a bolha
+ * persistida no corpo da resposta e o client a renderiza na hora, sem depender
+ * de um último poll. A bolha é gravada com stage 'handoff' e FORA do dedup de
+ * conteúdo: cada pedido tem a sua resposta (um 2º pedido em menos de 15 min não
+ * some mais). Também aposenta a espera/erro da sessão (erro_cobranca,
+ * aguardando_motor, menu_degradado): depois do handoff não há bloco de erro
+ * para o F5 trazer de volta.
+ */
+export async function transferToHumanWithOutcome(
+  ctx: SessionCtx, reason: string, actor: JourneyActor, eventId?: string,
+): Promise<{ caseId: string; messageId: string | null; reply: string | null }> {
   const supabase = createServiceClient()
   const caseId = await openCase(ctx, "human_handoff", { reason })
+  let messageId: string | null = null
+  let reply: string | null = null
 
   // R2 (N-01 ALTO): ANTES de suprimir/encerrar, persistir uma MENSAGEM ao devedor
   // com o próximo passo — nunca cair em "Sessão encerrada" mudo (silêncio = erro
@@ -526,13 +579,25 @@ export async function transferToHuman(
       console.warn(`[journey] handoff: cedente sem nome real (company=${ctx.companyId}); usando fallback "Credor"`)
     }
     const { persistAssistantMessage } = await import("./acknowledgement")
-    await persistAssistantMessage({
+    reply = humanHandoffReply(creditor.name)
+    messageId = await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
-      text: humanHandoffReply(creditor.name),
+      text: reply,
+      stage: HANDOFF_STAGE,
+      skipContentDedup: true,
     })
   } catch (err) {
     console.warn("[journey] mensagem de handoff ao devedor falhou (não-fatal):", (err as Error).message)
+  }
+  try {
+    await supabase
+      .from("negotiation_sessions")
+      .update({ wait_state: null, wait_started_at: null })
+      .eq("id", ctx.sessionId)
+      .in("wait_state", ["erro_cobranca", "aguardando_motor", "menu_degradado"])
+  } catch (err) {
+    console.warn("[journey] limpeza do wait_state no handoff falhou (não-fatal):", (err as Error).message)
   }
 
   await addSuppression({
@@ -563,7 +628,7 @@ export async function transferToHuman(
   } catch (err) {
     console.warn("[journey] aviso de handoff falhou:", (err as Error).message)
   }
-  return caseId
+  return { caseId, messageId, reply }
 }
 
 /**

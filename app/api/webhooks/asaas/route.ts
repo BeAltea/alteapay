@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
+import { checkInstallmentHold, fetchInstallmentPayments, isInstallmentCharge, PAID_ASAAS_EVENTS } from "@/lib/asaas-installments"
 
 /**
  * @deprecated This endpoint is kept for backward compatibility.
@@ -156,6 +157,40 @@ export async function POST(request: NextRequest) {
     }
 
     console.log("[v0] Found agreement:", agreement.id, "via:", searchMethod)
+
+    // QA rodada 6 (Q4r2-03): parcela paga que não é a última NUNCA quita o
+    // acordo (mesma regra da rota canônica /api/asaas/webhook/payments).
+    if (isInstallmentCharge(payment, agreement) && PAID_ASAAS_EVENTS.has(event)) {
+      const { data: priorPaid } = await supabase
+        .from("asaas_webhook_events")
+        .select("payment_id")
+        .eq("agreement_id", agreement.id)
+        .in("event_type", [...PAID_ASAAS_EVENTS])
+      // Correção B10: mesma decisão da rota canônica (parcelamento inteiro no ASAAS).
+      const hold = await checkInstallmentHold({
+        installments: Number(agreement.installments),
+        installmentId: payment.installment ?? agreement.asaas_subscription_id ?? null,
+        status: event,
+        listPayments: fetchInstallmentPayments,
+        knownPaidPaymentIds: [
+          ...((priorPaid ?? []) as Array<{ payment_id?: string | null }>).map((r) => r.payment_id),
+          payment.id,
+        ],
+      })
+      if (hold.hold) {
+        await supabase
+          .from("agreements")
+          .update({ asaas_last_webhook_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq("id", agreement.id)
+        if (eventId) {
+          await supabase
+            .from("asaas_webhook_events")
+            .update({ processed: true, processed_at: new Date().toISOString(), agreement_id: agreement.id })
+            .eq("event_id", eventId)
+        }
+        return NextResponse.json({ success: true, message: "Installment paid - agreement still open" })
+      }
+    }
 
     // Update agreement status based on payment event
     let paymentStatus = agreement.payment_status

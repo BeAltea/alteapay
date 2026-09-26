@@ -76,6 +76,19 @@ export interface ClassifiableMessage {
   generation?: number | null
 }
 
+/** QA rodada 6 (Q5r2-02): estágio do outcome do pedido de atendimento (handoff). */
+export const HANDOFF_STAGE = "handoff"
+
+/**
+ * QA rodada 6 (Q5r2-02) — estado TERMINAL do handoff, derivado do servidor (vale
+ * também após F5): a última bolha do assistente é a confirmação do pedido de
+ * atendimento e não há prompt ativo. Um login novo publica o menu (prompt ativo)
+ * e a conversa volta a andar. Pura.
+ */
+export function isHandoffTerminal(lastAssistantStage: string | null | undefined, hasActivePrompt: boolean): boolean {
+  return !hasActivePrompt && lastAssistantStage === HANDOFF_STAGE
+}
+
 /** Estágios que marcam o RESULTADO de uma ação do devedor (outcome, C8). */
 export const OUTCOME_STAGES: ReadonlySet<string> = new Set([
   "detail",
@@ -85,6 +98,9 @@ export const OUTCOME_STAGES: ReadonlySet<string> = new Set([
   // QA round 1 (QAA1-02): "já tem cobrança ativa" SEM link resolvível — o
   // resultado humano do Pagar quando o link não aparece (nunca beco).
   "charge_active",
+  // QA rodada 6 (Q5r2-02 / Q2r2-09): a confirmação do pedido de atendimento é o
+  // RESULTADO da ação — nunca podada (sobrevive ao F5).
+  HANDOFF_STAGE,
 ])
 
 /** Contexto opcional da classificação (sem ele, cai em heurística por sinais). */

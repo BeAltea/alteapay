@@ -115,6 +115,8 @@ async function updateSupabaseRecords(
         asaas_boleto_url: asaasPayment.bankSlipUrl,
         asaas_pix_qrcode_url: asaasPayment.pixQrCodeUrl,
         due_date: asaasPayment.dueDate || null,
+        // QA rodada 6 (Q4r2-03): id do parcelamento (webhook das parcelas 2..N).
+        ...(asaasPayment.installment ? { asaas_subscription_id: asaasPayment.installment } : {}),
         status: 'pending',
         updated_at: new Date().toISOString(),
       })

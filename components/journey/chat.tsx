@@ -35,7 +35,7 @@ import {
   type MsgAction,
 } from "./chat-display"
 import { FOCUS_RING } from "./button-tiers"
-import { OUTCOME_STAGES } from "@/lib/journey/display-class"
+import { isHandoffTerminal, OUTCOME_STAGES } from "@/lib/journey/display-class"
 import {
   createInFlightGuard,
   IGNORED_CLICK_RESULT,
@@ -83,6 +83,7 @@ import {
   PAY_RESUME_GENERATING_TEXT,
   payLinkMessageText,
   shouldOfferProcessingExit,
+  shouldRetireChargeError,
 } from "@/lib/journey/pay-poll"
 
 // D2 — ESPERA CONFIÁVEL: a máquina de espera (§6.3) é client-side sobre o polling
@@ -102,6 +103,9 @@ interface PayResult {
   valor: number | null
   vencimento_link: string | null
   already_charged: boolean
+  /** QA rodada 6 (Q4r2-01): parcelado — o link cobra a 1ª parcela. */
+  installments?: number | null
+  installment_value?: number | null
   /** A1: só true quando o SERVIDOR respondeu ok:false (erro de negócio) — é a
    *  única situação em que "Nenhuma cobrança foi criada" é verdade. Timeout/rede
    *  NUNCA afirmam isso (a cobrança pode ter sido criada). */
@@ -252,10 +256,18 @@ export function JourneyChat() {
   const [activePrompt, setActivePromptRaw] = useState<ActivePrompt | null>(null)
   // Espelho do prompt ativo para os callbacks assíncronos (poll/reconciliação).
   const activePromptRef = useRef<ActivePrompt | null>(null)
+  // QA rodada 6 (Q2r2-02): aposenta o bloco de erro do Pagar quando um prompt
+  // NOVO chega (atribuída a cada render, abaixo — usa refs/setters estáveis).
+  const retireChargeErrorRef = useRef<(promptId: string) => void>(() => {})
   const setActivePrompt = useCallback((p: ActivePrompt | null) => {
+    const prevId = activePromptRef.current?.id ?? null
     activePromptRef.current = p
     setActivePromptRaw(p)
+    if (p && p.id !== prevId) retireChargeErrorRef.current(p.id)
   }, [])
+  // QA rodada 6 (Q5r2-02): estágio da última bolha do assistente vista (deriva o
+  // estado terminal do handoff também após F5).
+  const lastAssistantStageRef = useRef<string | null>(null)
   // QA round 2 (QAB1-H2): aviso "Já estou processando a sua escolha." — um clique
   // tardio (409 sem active_prompt / duplicate sem prompt) enquanto o vencedor
   // ainda processa. Fica FORA do bloco de botões (que some) e sai quando o
@@ -693,6 +705,7 @@ export function JourneyChat() {
         }
         seenIds.current.add(m.id)
         sinceRef.current = m.created_at
+        if (isAssistant) lastAssistantStageRef.current = typeof m.stage === "string" ? m.stage : null
         // A2 (N-D2-6 / §2.3): texto do motor SEM prompt (sem botões) NÃO conta como
         // condução — não derruba a bolha de confirmação nem resolve a espera; só
         // um prompt acionável (mensagem ligada a um prompt) o faz.
@@ -785,6 +798,13 @@ export function JourneyChat() {
         // QA round 2 (QAB1-H2): chegou o prompt seguinte → o aviso de
         // processamento já foi atendido.
         if (ap) setProcessingNotice(null)
+        // QA rodada 6 (Q5r2-02): handoff concluído (última bolha = confirmação do
+        // pedido de atendimento, sem prompt ativo) → estado TERMINAL claro, também
+        // após F5. Nunca durante um Pagar em voo.
+        if (!hold && !payInFlightRef.current && isHandoffTerminal(lastAssistantStageRef.current, !!activePromptRef.current)) {
+          enterHandoffTerminal()
+          return
+        }
       }
       // QA round 2 (QAB1-H1): reconcilia o estado de PAGAR persistido pelo
       // servidor (reload durante a cobrança) DEPOIS de aplicar mensagens/prompt.
@@ -1271,15 +1291,17 @@ export function JourneyChat() {
         // menu pós-consulta, quando houver). O poll re-hidrata activePrompt.
         // NÃO limpamos a optimistic aqui: a resposta do n8n costuma vir num poll
         // seguinte, não neste — a bolha "preparando" fica até ela chegar.
+        // QA rodada 6 (Q5r2-02): no handoff, a confirmação persistida vem no
+        // corpo — entra na tela na hora (não depende do poll nem do dedup).
+        if (data?.transferred === true) {
+          applyActionBody(data, { applyPrompt: false })
+          clearLinkLocalState()
+        }
         setActivePrompt(null)
         await pollMessages()
         // Desfecho terminal: só uma transferência a humano encerra a conversa.
         // Consultar/Negociar/Não reconheço mantêm o chat vivo (menu ou negociação).
-        if (data?.transferred === true) {
-          endedRef.current = true
-          setEnded(true)
-          stopPoll()
-        }
+        if (data?.transferred === true) enterHandoffTerminal()
         return { ok: true }
       }
       // A1 (N-D3-3/N-D1-4) — 409 prompt_stale/prompt_not_active NUNCA é mudo: o
@@ -1429,6 +1451,8 @@ export function JourneyChat() {
         valor: typeof data.valor === "number" ? data.valor : null,
         vencimento_link: typeof data.vencimento_link === "string" ? data.vencimento_link : null,
         already_charged: data.already_charged === true,
+        installments: typeof data.installments === "number" ? data.installments : null,
+        installment_value: typeof data.installment_value === "number" ? data.installment_value : null,
         // QA round 4 (R-10/R-20): a bolha persistida deste link (reconciliação por id).
         linkMessageId: typeof data.link_message_id === "string" ? data.link_message_id : null,
       })
@@ -1476,6 +1500,34 @@ export function JourneyChat() {
       waitStartedAtRef.current = null
       setWaitState("idle")
     }
+  }
+
+  // QA rodada 6 (Q2r2-02): prompt NOVO na tela → o bloco de erro do Pagar sai.
+  retireChargeErrorRef.current = (promptId: string) => {
+    if (
+      shouldRetireChargeError({
+        localWaitState: waitStateRef.current,
+        payInFlight: payInFlightRef.current,
+        localPayStatus: payResultRef.current?.status ?? null,
+        incomingPromptId: promptId,
+      })
+    ) {
+      clearLinkLocalState()
+    }
+  }
+
+  // QA rodada 6 (Q5r2-02): estado TERMINAL do handoff — sem erro de cobrança,
+  // sem espera, sem menu; a confirmação persistida fica na tela.
+  function enterHandoffTerminal() {
+    if (endedRef.current) return
+    endedRef.current = true
+    payResumedRef.current = false
+    setPayResult(null)
+    stopTick()
+    waitStartedAtRef.current = null
+    setWaitState("idle")
+    setEnded(true)
+    stopPoll()
   }
 
   // QA round 4 (R-13/R-22/R-24/R-29, S3) — o CORPO do POST é o próximo estado:
@@ -1599,10 +1651,15 @@ export function JourneyChat() {
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data?.transferred === true) {
-        endedRef.current = true
-        setEnded(true)
-        stopTick()
-        stopPoll()
+        // QA rodada 6 (Q5r2-02, ALTO): a confirmação do handoff (outcome
+        // persistido, no corpo) entra na tela ANTES de encerrar; o bloco de erro
+        // do Pagar (erro_cobranca) é aposentado. Um último poll traz o que mais
+        // tiver sido gravado. Nunca uma tela sem resposta.
+        applyActionBody(data, { applyPrompt: false })
+        clearLinkLocalState()
+        setActivePrompt(null)
+        await pollMessages()
+        enterHandoffTerminal()
         return
       }
       // QA round 1 (QAA1-01): o servidor tratou o handoff como TOQUE DUPLO (< 2 s
@@ -2079,7 +2136,7 @@ export function JourneyChat() {
             </div>
           </div>
         ) : null}
-        {!ended && payResult && (payResult.status !== "link" || linkView.fallback?.mode === "panel") ? (
+        {!ended && payResult && !(payResult.status === "error" && activePrompt) && (payResult.status !== "link" || linkView.fallback?.mode === "panel") ? (
           <div className="flex flex-col items-start gap-2" role="status" aria-live="polite">
             {payResult.status === "link" && linkView.fallback?.mode === "panel" ? (
               <>
@@ -2092,6 +2149,8 @@ export function JourneyChat() {
                     valor: payResult.valor,
                     vencimentoLink: payResult.vencimento_link,
                     alreadyCharged: payResult.already_charged,
+                    installments: payResult.installments ?? null,
+                    installmentValue: payResult.installment_value ?? null,
                   })}
                 </div>
                 <div className="flex w-full max-w-[90%] flex-col gap-2 rounded-lg border border-neutral-200 bg-white p-3">
@@ -2266,6 +2325,14 @@ export function JourneyChat() {
       {processingNotice && !ended ? (
         <p className="px-1 text-sm text-neutral-600" role="status" aria-live="polite">
           {processingNotice}
+        </p>
+      ) : null}
+
+      {ended ? (
+        // QA rodada 6 (Q5r2-02): estado terminal claro após o pedido de atendimento
+        // (também após F5). A confirmação persistida fica logo acima.
+        <p className="px-1 text-sm text-neutral-600" role="status" aria-live="polite">
+          Conversa encerrada. Seu pedido de atendimento está registrado.
         </p>
       ) : null}
 

@@ -49,6 +49,8 @@ export interface AsaasPayment {
   externalReference?: string
   installmentCount?: number
   installmentValue?: number
+  /** id do parcelamento (presente em cada parcela de uma cobrança parcelada). */
+  installment?: string | null
   invoiceUrl?: string
   bankSlipUrl?: string
   transactionReceiptUrl?: string
@@ -404,6 +406,23 @@ export async function getAsaasPaymentsForCustomer(
   } catch (error: any) {
     console.error(`[ASAAS] Error fetching payments for customer ${customerId}:`, error.message)
     return []
+  }
+}
+
+/**
+ * Correção B10 (Q4r2-03/A1): parcelas de um PARCELAMENTO no ASAAS
+ * (`GET /installments/{id}/payments`). null quando a consulta falha — quem chama
+ * nunca decide "pago" no escuro.
+ */
+export async function getAsaasInstallmentPayments(
+  installmentId: string
+): Promise<Array<{ id: string; status: string; deleted?: boolean }> | null> {
+  try {
+    const data = await asaasRequest(`/installments/${encodeURIComponent(installmentId)}/payments`, "GET")
+    return Array.isArray(data?.data) ? data.data : null
+  } catch (error: any) {
+    console.error(`[ASAAS] Error fetching installment ${installmentId}:`, error.message)
+    return null
   }
 }
 

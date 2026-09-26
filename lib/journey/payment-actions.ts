@@ -44,6 +44,8 @@ export interface PaymentDetails {
   due_date: string | null
   total_value: number | null // REAIS na base; a borda n8n converte p/ centavos
   installments: number | null
+  /** QA rodada 6 (Q4r2-01): valor de CADA parcela (agreements.installment_amount). */
+  installment_value?: number | null
 }
 
 export type PaymentCreateResult =
@@ -67,7 +69,7 @@ async function fetchPaymentDetails(agreementId: string, companyId: string): Prom
   const { data } = await supabase
     .from("agreements")
     .select(
-      "id, asaas_payment_id, asaas_billing_type, asaas_pix_qrcode_url, asaas_boleto_url, asaas_invoice_url, asaas_payment_url, due_date, agreed_amount, installments",
+      "id, asaas_payment_id, asaas_billing_type, asaas_pix_qrcode_url, asaas_boleto_url, asaas_invoice_url, asaas_payment_url, due_date, agreed_amount, installments, installment_amount",
     )
     .eq("id", agreementId)
     .eq("company_id", companyId)
@@ -84,6 +86,7 @@ async function fetchPaymentDetails(agreementId: string, companyId: string): Prom
     due_date: data?.due_date ?? null,
     total_value: data?.agreed_amount != null ? Number(data.agreed_amount) : null,
     installments: data?.installments ?? null,
+    installment_value: data?.installment_amount != null ? Number(data.installment_amount) : null,
   }
 }
 

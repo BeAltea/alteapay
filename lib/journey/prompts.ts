@@ -162,6 +162,11 @@ export async function createPrompt(input: CreatePromptInput): Promise<CreateProm
     typeof input.threadEpoch === "number"
       ? Promise.resolve(input.threadEpoch)
       : currentThreadEpoch(input.sessionId),
+    // QA rodada 6 (Q2r2-02, ALTO): um prompt NOVO aposenta o erro do Pagar. O
+    // `erro_cobranca` sobrevivia a F5/relogin/Negociar e o client desenhava o
+    // bloco de erro JUNTO do menu novo (duas fileiras de ação). Condicional ao
+    // próprio estado (nunca apaga 'gerando_cobranca' de um Pagar em voo).
+    retireChargeError(supabase, input.sessionId),
   ])
 
   const buttons = sortButtons(input.buttons)
@@ -196,6 +201,26 @@ export async function createPrompt(input: CreatePromptInput): Promise<CreateProm
     eventId: `prompt.ask|${data.id}`,
   })
   return { ok: true, prompt: data as PromptRow }
+}
+
+/**
+ * QA rodada 6 (Q2r2-02) — limpa `wait_state='erro_cobranca'` da sessão (só esse
+ * estado). Chamado quando qualquer outra ação/prompt é publicado: o erro de
+ * cobrança nunca coexiste com o menu. Defensivo: nunca lança.
+ */
+export async function retireChargeError(
+  supabase: ReturnType<typeof createServiceClient>,
+  sessionId: string,
+): Promise<void> {
+  try {
+    await supabase
+      .from("negotiation_sessions")
+      .update({ wait_state: null, wait_started_at: null })
+      .eq("id", sessionId)
+      .eq("wait_state", "erro_cobranca")
+  } catch (err) {
+    console.warn("[journey] retireChargeError falhou (defensivo):", (err as Error).message)
+  }
 }
 
 /** Prompt 'active' da sessão (no máximo um). null se não houver. */

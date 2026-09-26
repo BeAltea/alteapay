@@ -61,6 +61,7 @@ import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import { isPendingCharge } from "./charge-reconcile"
 import { timed } from "./server-timing"
 import {
+  PAY_INTEGRAL_PURPOSE,
   persistOffer,
   validateProposedTerms,
   type BillingType,
@@ -135,6 +136,9 @@ export async function persistPaymentLinkMessage(
     vencimentoLink: string | null
     alreadyCharged: boolean
     agreementId?: string | null
+    /** QA rodada 6 (Q4r2-01): parcelado → a copy fala da 1ª parcela. */
+    installments?: number | null
+    installmentValue?: number | null
   },
 ): Promise<string | null> {
   // Sem link nenhum não há o que restaurar (processing persiste depois, no poll).
@@ -151,6 +155,8 @@ export async function persistPaymentLinkMessage(
         already_charged: input.alreadyCharged,
         valor: input.valor,
         vencimento_link: input.vencimentoLink,
+        installments: input.installments ?? null,
+        installment_value: input.installmentValue ?? null,
       },
     })
   } catch (err) {
@@ -405,6 +411,8 @@ export async function deliverPaymentOutcome(
       vencimentoLink: resolved.dueDate,
       alreadyCharged: input.alreadyCharged,
       agreementId,
+      installments: input.payment?.installments ?? null,
+      installmentValue: input.payment?.installment_value ?? null,
     })
     const post = await publishPostPaymentLinkPrompt(ctx, {
       link: resolved.link,
@@ -496,6 +504,41 @@ function isIntegralTerms(t: OfferTerms | null, valor: number): boolean {
   )
 }
 
+/** Oferta candidata ao reuso do PAGAR (leitura única da sessão). */
+export interface IntegralCandidate {
+  id: string
+  terms: OfferTerms | null
+  status: string
+  valid_until?: string | null
+  created_at?: string | null
+}
+
+/**
+ * QA rodada 6 (Q2r2-01) — decisão PURA do reuso, sem I/O por oferta:
+ *  - `presentedId`: a oferta integral 'presented' mais recente e NÃO vencida
+ *    (reutilizável direto);
+ *  - `acceptedIds`: as integrais 'accepted' (mais recentes primeiro), candidatas
+ *    a reuso só se o acordo delas continuar vivo (checado numa leitura em lote).
+ */
+export function pickReusableIntegralOffer(
+  candidates: IntegralCandidate[],
+  valor: number,
+  nowMs: number,
+): { presentedId: string | null; acceptedIds: string[] } {
+  const newestFirst = [...candidates].sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))
+  const integrals = newestFirst.filter((o) => isIntegralTerms(o.terms, valor))
+  const presented = integrals.find((o) => {
+    if (o.status !== "presented") return false
+    if (!o.valid_until) return true
+    const t = Date.parse(o.valid_until)
+    return !Number.isFinite(t) || t >= nowMs
+  })
+  return {
+    presentedId: presented?.id ?? null,
+    acceptedIds: integrals.filter((o) => o.status === "accepted").map((o) => o.id),
+  }
+}
+
 /**
  * Gera (ou reusa) a oferta INTEGRAL 0% da sessão e devolve o offer_id.
  *
@@ -513,7 +556,7 @@ function isIntegralTerms(t: OfferTerms | null, valor: number): boolean {
  * Uma oferta aceita cujo acordo foi cancelado/deletado NÃO é reusada: o clique
  * gera oferta nova → cobrança nova (runbook Q3.5).
  */
-async function ensureIntegralOffer(
+export async function ensureIntegralOffer(
   ctx: SessionCtx,
   debtIds: string[],
 ): Promise<
@@ -523,44 +566,71 @@ async function ensureIntegralOffer(
   // Valor canônico (fonte única do rótulo do botão e do e-mail — D39/D41). O
   // conjunto `debtIds` é o MESMO que gerou o rótulo do botão (o menu de 3 opções
   // persiste debt_ids no prompt.context e a rota os repassa).
+  //
+  // QA rodada 6 (Q2r2-01/Q3r2-01, ALTO): antes, as ofertas integrais `accepted`
+  // da sessão eram percorridas EM SÉRIE com 2 consultas cada (aceite → acordo).
+  // Um devedor com ~60 tentativas anteriores gastava 18–21 s só aqui e o 1º Pagar
+  // estourava o orçamento (`charge_deferred`). Agora são no máximo DUAS rodadas,
+  // todas por colunas indexadas e sem laço de I/O:
+  //   rodada 1 (paralela): valor canônico · ofertas presented/accepted da sessão
+  //            (1 leitura) · aceites da sessão (1 leitura, offer→agreement);
+  //   rodada 2 (só se houver integral aceita): os acordos NÃO cancelados dessas
+  //            integrais numa leitura `in(id)` — acordos cancelados nem voltam.
   const supabase = createServiceClient()
-  const [ack, { data: candidates }] = await Promise.all([
+  const [ack, { data: candidates }, { data: acceptances }] = await Promise.all([
     buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds }),
     supabase
       .from("negotiation_offers")
-      .select("id, terms, status")
+      .select("id, terms, status, valid_until, created_at")
       .eq("session_id", ctx.sessionId)
       .in("status", ["presented", "accepted"]),
+    supabase
+      .from("negotiation_acceptances")
+      .select("offer_id, agreement_id")
+      .eq("session_id", ctx.sessionId),
   ])
   const valor = round2(ack.updatedValue)
   if (!(valor > 0)) return { ok: false, error: "no_open_amount" }
 
-  const integrals = ((candidates ?? []) as Array<{ id: string; terms: OfferTerms | null; status: string }>).filter((o) =>
-    isIntegralTerms(o.terms, valor),
+  const reuse = pickReusableIntegralOffer(
+    (candidates ?? []) as IntegralCandidate[],
+    valor,
+    Date.now(),
   )
-  const presented = integrals.find((o) => o.status === "presented")
-  if (presented) return { ok: true, offerId: presented.id, valor }
+  if (reuse.presentedId) return { ok: true, offerId: reuse.presentedId, valor }
 
   // Oferta integral já ACEITA: só reusa se o acordo dela continua VIVO.
-  for (const accepted of integrals.filter((o) => o.status === "accepted")) {
-    const { data: acc } = await supabase
-      .from("negotiation_acceptances")
-      .select("agreement_id")
-      .eq("offer_id", accepted.id)
-      .maybeSingle()
-    const agreementId = (acc as { agreement_id?: string | null } | null)?.agreement_id
-    if (!agreementId) continue
-    const { data: ag } = await supabase
-      .from("agreements")
-      .select("id, asaas_payment_id, payment_status, asaas_status, status, origin, offer_id, negotiation_session_id")
-      .eq("id", agreementId)
-      .eq("company_id", ctx.companyId)
-      .maybeSingle()
-    // QA rodada 5 (Q2-01): acordo pending_charge (espelho gravado antes do ASAAS,
-    // função morta no meio) também é reusado — o clique repetido cai na
-    // idempotência (session, offer) → 'processing' → o poll reconcilia. NUNCA
-    // gera oferta nova (que levaria a uma 2ª cobrança se o ASAAS já criou a 1ª).
-    if (ag && (isBlockingAgreement(ag) || isPendingCharge(ag))) return { ok: true, offerId: accepted.id, valor }
+  if (reuse.acceptedIds.length > 0) {
+    const agreementByOffer = new Map<string, string>()
+    for (const a of (acceptances ?? []) as Array<{ offer_id?: string | null; agreement_id?: string | null }>) {
+      if (a.offer_id && a.agreement_id) agreementByOffer.set(a.offer_id, a.agreement_id)
+    }
+    const agreementIds = [
+      ...new Set(reuse.acceptedIds.map((id) => agreementByOffer.get(id)).filter((v): v is string => !!v)),
+    ]
+    if (agreementIds.length > 0) {
+      const { data: ags } = await supabase
+        .from("agreements")
+        .select("id, asaas_payment_id, payment_status, asaas_status, status, origin, offer_id, negotiation_session_id")
+        .in("id", agreementIds)
+        .eq("company_id", ctx.companyId)
+        .neq("status", "cancelled")
+      // QA rodada 5 (Q2-01): acordo pending_charge (espelho gravado antes do
+      // ASAAS, função morta no meio) também é reusado — o clique repetido cai na
+      // idempotência (session, offer) → 'processing' → o poll reconcilia. NUNCA
+      // gera oferta nova (que levaria a uma 2ª cobrança se o ASAAS já criou a 1ª).
+      const live = new Set(
+        ((ags ?? []) as Array<Parameters<typeof isPendingCharge>[0] & { id: string }>)
+          .filter((ag) => !!ag && (isBlockingAgreement(ag) || isPendingCharge(ag)))
+          .map((ag) => ag.id),
+      )
+      // mais recente primeiro (acceptedIds já vem ordenado)
+      const offerId = reuse.acceptedIds.find((id) => {
+        const agId = agreementByOffer.get(id)
+        return !!agId && live.has(agId)
+      })
+      if (offerId) return { ok: true, offerId, valor }
+    }
   }
 
   // Resolve a faixa da matriz vigente para o (aging, valor) do débito. Sem
@@ -586,6 +656,9 @@ async function ensureIntegralOffer(
     total_value: valor,
     billing_type: cashBillingType(row.allowed_billing_types),
     first_due_date: firstDue,
+    // QA rodada 6 (Q2r2-03): marca a integral do PAGAR — o Negociar nunca a
+    // confunde com o conjunto da matriz (e a supersede se ela ficou órfã).
+    purpose: PAY_INTEGRAL_PURPOSE,
   }
 
   // Sanidade: a oferta integral 0%/1x tem que caber na matriz vigente (cabe
