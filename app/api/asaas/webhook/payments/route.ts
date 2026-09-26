@@ -3,7 +3,8 @@ import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
 import { effectiveAsaasStatusFromWebhook } from "@/lib/asaas-idempotency"
 import {
-  isFinalInstallmentPaid,
+  checkInstallmentHold,
+  fetchInstallmentPayments,
   isFirstInstallmentOf,
   isInstallmentCharge,
   PAID_ASAAS_EVENTS,
@@ -319,6 +320,9 @@ export async function POST(request: NextRequest) {
     const installmentCharge = isInstallmentCharge(payment, agreement)
     const firstInstallment = !installmentCharge || isFirstInstallmentOf(payment, agreement)
     let partialInstallmentPaid = false
+    // Correção B10 (M4): DELETED/REFUNDED de uma parcela com outra já paga NÃO
+    // cancela o acordo inteiro nem reabre a dívida cheia — vai para conciliação.
+    let partialInstallmentCancel = false
     if (installmentCharge) {
       if (!agreement.asaas_subscription_id) {
         await supabase
@@ -327,28 +331,48 @@ export async function POST(request: NextRequest) {
           .eq("id", agreement.id)
           .is("asaas_subscription_id", null)
       }
-      if (PAID_ASAAS_EVENTS.has(event)) {
-        const { data: priorPaid } = await supabase
+      const paidEvent = PAID_ASAAS_EVENTS.has(event)
+      const destructiveEvent = event === "PAYMENT_DELETED" || event === "PAYMENT_REFUNDED"
+      if (paidEvent || destructiveEvent) {
+        // Correção B10 (M1): parcelas pagas contadas pelo id do PARCELAMENTO no
+        // payload + payment_id distintos — NÃO depende de agreement_id (gravado só
+        // no fim do processamento). Sob rajada, cada evento já está no log (passo
+        // 4) antes desta leitura, então os PAGOs concorrentes se enxergam. Janela
+        // limitada à vida do acordo (índice de created_at).
+        let paidQuery = supabase
           .from("asaas_webhook_events")
-          .select("payment_id, event_type")
-          .eq("agreement_id", agreement.id)
+          .select("payment_id, event_type, payload")
+          .eq("customer_id", payment.customer)
           .in("event_type", [...PAID_ASAAS_EVENTS])
-        partialInstallmentPaid = !isFinalInstallmentPaid({
+        if (agreement.created_at) paidQuery = paidQuery.gte("created_at", agreement.created_at)
+        const { data: paidRows } = await paidQuery
+        const knownPaid = ((paidRows ?? []) as Array<{ payment_id?: string | null; payload?: any }>)
+          .filter((r) => r.payload?.payment?.installment === payment.installment)
+          .map((r) => r.payment_id)
+        if (paidEvent) knownPaid.push(payment.id)
+        // O ASAAS (parcelamento inteiro) é a 2ª fonte: cobre eventos anteriores ao
+        // deploy e perda de webhook. Nunca quita no escuro.
+        const hold = await checkInstallmentHold({
           installments: Number(agreement.installments),
-          priorPaidPaymentIds: ((priorPaid ?? []) as Array<{ payment_id?: string | null }>).map((r) => r.payment_id),
-          currentPaymentId: payment.id,
+          installmentId: payment.installment,
+          status: event,
+          listPayments: fetchInstallmentPayments,
+          knownPaidPaymentIds: knownPaid,
         })
+        if (hold.hold && paidEvent) partialInstallmentPaid = true
+        if (hold.hold && destructiveEvent) partialInstallmentCancel = true
       }
     }
+    const holdInstallment = partialInstallmentPaid || partialInstallmentCancel
 
     // 7. Determine new statuses based on event type
-    const newPaymentStatus = partialInstallmentPaid
+    const newPaymentStatus = holdInstallment
       ? agreement.payment_status
       : PAYMENT_STATUS_MAP[event] ?? agreement.payment_status
-    const newAgreementStatus = partialInstallmentPaid
+    const newAgreementStatus = holdInstallment
       ? agreement.status
       : AGREEMENT_STATUS_MAP[event] ?? agreement.status
-    const newDebtStatus = partialInstallmentPaid ? null : DEBT_STATUS_MAP[event]
+    const newDebtStatus = holdInstallment ? null : DEBT_STATUS_MAP[event]
 
     // 8. Build the update object for agreement
     // N-D1-2: o ASAAS mantém status=PENDING numa cobrança deletada (só liga
@@ -364,7 +388,7 @@ export async function POST(request: NextRequest) {
     // de outras parcelas (CREATED/UPDATED/VIEWED) não mexem no status da parcela 1.
     const informativeOtherInstallment =
       installmentCharge && !firstInstallment && INFORMATIVE_EVENTS.has(event)
-    if (!partialInstallmentPaid && !informativeOtherInstallment) {
+    if (!holdInstallment && !informativeOtherInstallment) {
       agreementUpdate.asaas_status = effectiveAsaasStatusFromWebhook(event, payment)
     }
 
@@ -498,7 +522,12 @@ export async function POST(request: NextRequest) {
         .update({
           processed: true,
           processed_at: new Date().toISOString(),
-          agreement_id: agreement.id
+          agreement_id: agreement.id,
+          // Correção B10 (M4): cancelamento/estorno PARCIAL de parcelamento com
+          // parcela já paga fica sinalizado para conciliação (acordo intacto).
+          ...(partialInstallmentCancel
+            ? { error_message: "installment_partial_cancel: acordo mantido; conciliar" }
+            : {}),
         })
         .eq("id", webhookEvent.id)
     }
@@ -515,6 +544,7 @@ export async function POST(request: NextRequest) {
           installmentIndex: typeof payment.installmentNumber === "number" ? payment.installmentNumber : null,
           // QA rodada 6 (Q4r2-03): parcela paga que não quita o acordo.
           partialInstallmentPaid,
+          partialInstallmentCancel,
         })
       } catch (journeyErr) {
         console.error("[ASAAS Webhook] journey hook error (isolado):", (journeyErr as Error).message)
@@ -527,6 +557,7 @@ export async function POST(request: NextRequest) {
       agreementId: agreement.id,
       searchMethod,
       partialInstallmentPaid,
+      partialInstallmentCancel,
       paymentStatus: newPaymentStatus,
       agreementStatus: newAgreementStatus,
     })

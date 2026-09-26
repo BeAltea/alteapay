@@ -35,6 +35,9 @@ vi.mock("@supabase/supabase-js", () => ({
   }),
 }))
 vi.mock("@/lib/supabase/url", () => ({ getServerSupabaseUrl: () => "http://fake" }))
+// ASAAS indisponível para o parcelamento (null): a decisão fica com a contagem
+// local por id do parcelamento (Correção B10/M1).
+vi.mock("@/lib/asaas", () => ({ getAsaasInstallmentPayments: async () => null }))
 
 function seed(opts: { installments?: number; subscriptionId?: string | null } = {}) {
   db = {

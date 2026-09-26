@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
-import { isFinalInstallmentPaid, isInstallmentCharge, PAID_ASAAS_EVENTS } from "@/lib/asaas-installments"
+import { checkInstallmentHold, fetchInstallmentPayments, isInstallmentCharge, PAID_ASAAS_EVENTS } from "@/lib/asaas-installments"
 
 /**
  * @deprecated This endpoint is kept for backward compatibility.
@@ -166,12 +166,18 @@ export async function POST(request: NextRequest) {
         .select("payment_id")
         .eq("agreement_id", agreement.id)
         .in("event_type", [...PAID_ASAAS_EVENTS])
-      const final = isFinalInstallmentPaid({
+      // Correção B10: mesma decisão da rota canônica (parcelamento inteiro no ASAAS).
+      const hold = await checkInstallmentHold({
         installments: Number(agreement.installments),
-        priorPaidPaymentIds: ((priorPaid ?? []) as Array<{ payment_id?: string | null }>).map((r) => r.payment_id),
-        currentPaymentId: payment.id,
+        installmentId: payment.installment ?? agreement.asaas_subscription_id ?? null,
+        status: event,
+        listPayments: fetchInstallmentPayments,
+        knownPaidPaymentIds: [
+          ...((priorPaid ?? []) as Array<{ payment_id?: string | null }>).map((r) => r.payment_id),
+          payment.id,
+        ],
       })
-      if (!final) {
+      if (hold.hold) {
         await supabase
           .from("agreements")
           .update({ asaas_last_webhook_at: new Date().toISOString(), updated_at: new Date().toISOString() })

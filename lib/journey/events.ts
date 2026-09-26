@@ -27,6 +27,9 @@ export type JourneyEventType =
   | "payment.generated" | "payment.viewed" | "payment.paid" | "payment.overdue" | "payment.cancelled"
   // QA rodada 6 (Q4r2-03): parcela intermediária paga (o acordo segue em aberto).
   | "payment.installment_paid"
+  // Correção B10 (M4): cancelamento/estorno de UMA parcela com outra já paga
+  // (acordo mantido; conciliação manual).
+  | "payment.installment_cancelled"
   | "receipt.issued" | "creditor.notified" | "payment.sync_error"
   | "dispute.registered" | "payment_claim.registered" | "human.transfer"
   | "optout.received" | "block.received"

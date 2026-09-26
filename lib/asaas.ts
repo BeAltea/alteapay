@@ -409,6 +409,23 @@ export async function getAsaasPaymentsForCustomer(
   }
 }
 
+/**
+ * Correção B10 (Q4r2-03/A1): parcelas de um PARCELAMENTO no ASAAS
+ * (`GET /installments/{id}/payments`). null quando a consulta falha — quem chama
+ * nunca decide "pago" no escuro.
+ */
+export async function getAsaasInstallmentPayments(
+  installmentId: string
+): Promise<Array<{ id: string; status: string; deleted?: boolean }> | null> {
+  try {
+    const data = await asaasRequest(`/installments/${encodeURIComponent(installmentId)}/payments`, "GET")
+    return Array.isArray(data?.data) ? data.data : null
+  } catch (error: any) {
+    console.error(`[ASAAS] Error fetching installment ${installmentId}:`, error.message)
+    return null
+  }
+}
+
 // ====== Notification Batch Update ======
 
 export interface NotificationConfig {

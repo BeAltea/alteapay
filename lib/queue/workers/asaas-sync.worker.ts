@@ -9,6 +9,7 @@ import {
   startBatchProcessing,
   getSupabaseAdmin,
 } from './asaas-api';
+import { applyAsaasSyncResult } from './asaas-sync-apply';
 
 export interface AsaasSyncJobData {
   batchId: string;
@@ -19,48 +20,6 @@ export interface AsaasSyncJobData {
   agreementId: string;
   debtId?: string;
   companyId?: string;
-}
-
-// Map ASAAS status to Supabase agreement status
-function mapAsaasStatusToAgreement(asaasStatus: string): string {
-  const statusMap: Record<string, string> = {
-    PENDING: 'pending',
-    RECEIVED: 'paid',
-    CONFIRMED: 'paid',
-    RECEIVED_IN_CASH: 'paid',
-    OVERDUE: 'overdue',
-    REFUND_REQUESTED: 'refund_requested',
-    REFUNDED: 'refunded',
-    CHARGEBACK_REQUESTED: 'chargeback_requested',
-    CHARGEBACK_DISPUTE: 'chargeback_dispute',
-    AWAITING_CHARGEBACK_REVERSAL: 'chargeback_dispute',
-    DUNNING_REQUESTED: 'dunning',
-    DUNNING_RECEIVED: 'dunning',
-    AWAITING_RISK_ANALYSIS: 'pending',
-  };
-
-  return statusMap[asaasStatus] || 'unknown';
-}
-
-// Map ASAAS status to Supabase debt status
-function mapAsaasStatusToDebt(asaasStatus: string): string {
-  const statusMap: Record<string, string> = {
-    PENDING: 'in_agreement',
-    RECEIVED: 'paid',
-    CONFIRMED: 'paid',
-    RECEIVED_IN_CASH: 'paid',
-    OVERDUE: 'in_agreement',
-    REFUND_REQUESTED: 'open',
-    REFUNDED: 'open',
-    CHARGEBACK_REQUESTED: 'open',
-    CHARGEBACK_DISPUTE: 'open',
-    AWAITING_CHARGEBACK_REVERSAL: 'open',
-    DUNNING_REQUESTED: 'in_agreement',
-    DUNNING_RECEIVED: 'in_agreement',
-    AWAITING_RISK_ANALYSIS: 'in_agreement',
-  };
-
-  return statusMap[asaasStatus] || 'open';
 }
 
 export const asaasSyncWorker = WorkerManager.registerWorker<AsaasSyncJobData>(
@@ -87,50 +46,19 @@ export const asaasSyncWorker = WorkerManager.registerWorker<AsaasSyncJobData>(
       const payment = paymentResult.data;
       console.log(`[ASAAS-SYNC] ASAAS status: ${payment.status}`);
 
-      // Update Supabase records
+      // Update Supabase records (Correção B10/A1: parcelado só quita com o
+      // parcelamento inteiro pago — ver asaas-sync-apply.ts).
       const supabase = getSupabaseAdmin();
-
-      const agreementStatus = mapAsaasStatusToAgreement(payment.status);
-      const agreementUpdate: Record<string, any> = {
-        status: agreementStatus,
-        asaas_status: payment.status,
-        updated_at: new Date().toISOString(),
-        last_synced_at: new Date().toISOString(),
-      };
-
-      // Add payment-specific data if available
-      if (payment.confirmedDate) {
-        agreementUpdate.paid_at = payment.confirmedDate;
-      }
-      if (payment.paymentDate) {
-        agreementUpdate.payment_date = payment.paymentDate;
-      }
-      if (payment.netValue !== undefined) {
-        agreementUpdate.net_value = payment.netValue;
-      }
-
-      await (supabase as any)
-        .from('agreements')
-        .update(agreementUpdate)
-        .eq('id', agreementId);
-
-      // Update debt if exists
-      if (debtId) {
-        const debtStatus = mapAsaasStatusToDebt(payment.status);
-        const debtUpdate: Record<string, any> = {
-          status: debtStatus,
-          updated_at: new Date().toISOString(),
-        };
-
-        if (payment.status === 'RECEIVED' || payment.status === 'CONFIRMED') {
-          debtUpdate.paid_at = payment.confirmedDate || new Date().toISOString();
-        }
-
-        await (supabase as any)
-          .from('debts')
-          .update(debtUpdate)
-          .eq('id', debtId);
-      }
+      const { agreementStatus, held } = await applyAsaasSyncResult(supabase, {
+        agreementId,
+        debtId,
+        payment,
+        listPayments: async (installmentId: string) => {
+          const r = await asaasRequest(`/installments/${encodeURIComponent(installmentId)}/payments`);
+          return r.success && Array.isArray(r.data?.data) ? r.data.data : null;
+        },
+      });
+      if (held) console.log(`[ASAAS-SYNC] Agreement ${agreementId} parcelado mantido (${held})`);
 
       console.log(`[ASAAS-SYNC] Agreement ${agreementId} synced: ${agreementStatus}`);
 

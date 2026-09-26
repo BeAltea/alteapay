@@ -39,4 +39,11 @@ describe("QA rodada 6 — jornada e parcelas (Q4r2-03)", () => {
     expect(events).toContain("payment.paid")
     expect(db.negotiation_sessions[0].outcome).toBe("agreement_closed")
   })
+
+  it("Correção B10 (M4): cancelamento parcial → só 'payment.installment_cancelled' (conciliação), sessão intacta", async () => {
+    const { journeyOnPaymentEvent } = await import("@/lib/journey/reconciliation")
+    await journeyOnPaymentEvent({ eventType: "PAYMENT_DELETED", paymentId: "pay_2", agreementId: "ag-3x", installmentIndex: 2, partialInstallmentCancel: true })
+    expect(events).toEqual(["payment.installment_cancelled"])
+    expect(db.negotiation_sessions[0].outcome).toBe("in_progress")
+  })
 })

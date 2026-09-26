@@ -24,6 +24,9 @@ export interface JourneyPaymentEvent {
   /** QA rodada 6 (Q4r2-03): parcela paga que NÃO quita o acordo (parcelado).
    *  Só auditoria: nunca `payment.paid`, nunca fecha a sessão/suprime/revoga. */
   partialInstallmentPaid?: boolean
+  /** Correção B10 (M4): DELETED/REFUNDED de uma parcela com outra já paga — o
+   *  acordo é mantido e o caso fica para conciliação (evento próprio). */
+  partialInstallmentCancel?: boolean
 }
 
 export function journeyEnabled(): boolean {
@@ -50,6 +53,14 @@ export async function journeyOnPaymentEvent(ev: JourneyPaymentEvent): Promise<vo
   }
 
   try {
+    if (ev.partialInstallmentCancel === true) {
+      await recordEvent({
+        ...base, type: "payment.installment_cancelled", actor: "provider",
+        eventId: `journey-installment-cancel-${ev.paymentId}-${ev.eventType}`,
+        payload: { installment_index: ev.installmentIndex ?? null, event: ev.eventType, needs_reconciliation: true },
+      })
+      return
+    }
     if (PAID_EVENTS.has(ev.eventType) && ev.partialInstallmentPaid === true) {
       // Parcela intermediária paga: o acordo segue em aberto (D6 — nunca declarar
       // pago antes da última parcela). Evento próprio, fora da projeção de estágio.
