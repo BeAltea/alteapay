@@ -121,15 +121,22 @@ describe("authenticateByDocument", () => {
     expect(r).toEqual({ ok: false, message: UNIFORM })
   })
 
-  it("lock por IP após max tentativas (independente do documento)", async () => {
-    process.env.CHAT_AUTH_IP_MAX_ATTEMPTS = "3"
-    resolveResult = { kind: "none" }
-    // 3 falhas do mesmo IP com documentos válidos diferentes
-    await auth({ document: "11144477735", ip: "5.5.5.5" })
-    await auth({ document: "52998224725", ip: "5.5.5.5" })
-    await auth({ document: "11444777000161", ip: "5.5.5.5" })
-    const ipLock = db.chat_auth_generic_locks?.find((l) => l.scope === "ip")
-    expect(ipLock).toBeTruthy()
+  it("lock por IP após max tentativas (independente do documento) — só com AUTH_IP_LOCK_ENABLED=true", async () => {
+    // QA rodada 6 (Q1r2-5): a dimensão IP do lock é telemetria por padrão; este
+    // teste cobre o caminho religado explicitamente.
+    process.env.AUTH_IP_LOCK_ENABLED = "true"
+    try {
+      process.env.CHAT_AUTH_IP_MAX_ATTEMPTS = "3"
+      resolveResult = { kind: "none" }
+      // 3 falhas do mesmo IP com documentos válidos diferentes
+      await auth({ document: "11144477735", ip: "5.5.5.5" })
+      await auth({ document: "52998224725", ip: "5.5.5.5" })
+      await auth({ document: "11444777000161", ip: "5.5.5.5" })
+      const ipLock = db.chat_auth_generic_locks?.find((l) => l.scope === "ip")
+      expect(ipLock).toBeTruthy()
+    } finally {
+      delete process.env.AUTH_IP_LOCK_ENABLED
+    }
   })
 
   it("captcha desligado por padrão não bloqueia", async () => {

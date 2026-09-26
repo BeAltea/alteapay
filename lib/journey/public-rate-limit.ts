@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { normalizeDocument } from "./document"
+import { ipLockEnabled } from "./client-ip"
 
 type Supabase = ReturnType<typeof createServiceClient>
 
@@ -156,8 +157,9 @@ export async function evaluatePublicRateLimit(input: {
 }): Promise<RateLimitDecision> {
   const supabase = createServiceClient()
 
-  // 1) IP lock
-  if (await isLocked(supabase, input.companyId, "ip", input.ipHash)) {
+  // 1) IP lock — QA rodada 6 (Q1r2-5): só com a dimensão IP religada (sem fonte
+  //    confiável do IP do cliente, um lock por IP bloqueia todos atrás do proxy).
+  if (ipLockEnabled() && (await isLocked(supabase, input.companyId, "ip", input.ipHash))) {
     return { blocked: true, scope: "ip", degraded: false }
   }
   // 2) documento lock
@@ -207,8 +209,9 @@ export async function onPublicFailure(input: {
     await createLock(supabase, input.companyId, "document", input.docHash, lockMinutesForCount(prior))
   }
 
-  // IP (só se houver ip_hash)
-  if (input.ipHash) {
+  // IP (só se houver ip_hash) — QA rodada 6 (Q1r2-5): telemetria por padrão; o
+  // lock por IP só existe com a dimensão religada (AUTH_IP_LOCK_ENABLED=true).
+  if (input.ipHash && ipLockEnabled()) {
     const ipFails = await countFailuresInWindow(
       supabase, input.companyId, "ip_hash", input.ipHash, ipWindowMin(),
     )

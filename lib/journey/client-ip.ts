@@ -33,6 +33,29 @@ export function normalizeIp(raw: string | null | undefined): string | null {
   return null
 }
 
+/**
+ * QA rodada 6 (Q1r2-5, ALTO) — a dimensão IP do LOCK de autenticação está
+ * DESLIGADA por padrão: vira só telemetria (o `ip_hash` continua gravado em cada
+ * tentativa), sem bloquear ninguém.
+ *
+ * Por quê: em produção (Next na Netlify, a88c0f2) o valor que este helper
+ * devolve NÃO é o IP do cliente. `x-nf-client-connection-ip` não chega utilizável
+ * à função do Next e o último elemento do `X-Forwarded-For` é um salto
+ * intermediário da Netlify, estável há horas e comum a vários clientes. Com a
+ * dimensão IP ligada, 5 CPFs inexistentes em 10 min travavam o login de TODOS os
+ * devedores atrás desse salto (DoS do link público). Não há, no código nem no
+ * runtime disponível à rota (o `request.ip` do Next só é preenchido na Vercel; o
+ * `context.ip` da Netlify só existe em Functions/Edge Functions nativas, não no
+ * handler do Next), uma fonte de IP do cliente VERIFICÁVEL. Até existir (ex.:
+ * middleware de borda que repasse um cabeçalho assinado, confirmado com 2 redes
+ * distintas), o bloqueio vale só por DOCUMENTO e pelo teto por cedente/hora.
+ *
+ * Religar exige decisão explícita: `AUTH_IP_LOCK_ENABLED=true`.
+ */
+export function ipLockEnabled(): boolean {
+  return process.env.AUTH_IP_LOCK_ENABLED === "true"
+}
+
 /** IP do cliente a partir de cabeçalhos definidos por proxy confiável. */
 export function clientIpFromHeaders(headers: HeaderReader): string | null {
   const edge = normalizeIp(headers.get("x-nf-client-connection-ip"))
