@@ -30,6 +30,7 @@ import {
   registerPublicAttempt,
   evaluatePublicRateLimit,
   onPublicFailure,
+  isTenantOverHourlyCap,
 } from "./public-rate-limit"
 
 export { GENERIC_AUTH_MESSAGE }
@@ -189,6 +190,17 @@ export async function authenticateByDocument(input: GenericAuthInput): Promise<G
   // revelar o bloqueio) — mas sem contabilizar nova tentativa/lock.
   if (ipLockEnabled() && (await isIpLocked(supabase, input.companyId, ipH))) return { ok: false, message: GENERIC_AUTH_MESSAGE }
   if (await isDocLocked(supabase, input.companyId, dHash)) return { ok: false, message: GENERIC_AUTH_MESSAGE }
+
+  // Correção B10 (A2): TETO DE VOLUME por cedente/hora também no /t/{slug} (sem
+  // o lock por IP, o lock por documento sozinho não impede enumerar CPFs
+  // distintos). Estourado → modo DEGRADADO, o mesmo do /n/: captcha OBRIGATÓRIO
+  // (mesmo com a flag desligada) + alerta de operação. Resposta uniforme.
+  if (await isTenantOverHourlyCap(supabase, input.companyId, { scope: "all" })) {
+    await recordEvent({ companyId: input.companyId, type: "auth.locked", actor: "system", payload: { scope: "tenant_hourly_cap", degraded: true, channel: input.channel } })
+    if (!input.captchaToken || !(await verifyCaptchaFunctional(input.captchaToken, input.ip))) {
+      return { ok: false, message: GENERIC_AUTH_MESSAGE }
+    }
+  }
 
   // captcha (se flag) — falha vira resposta uniforme, contabiliza.
   if (!(await verifyCaptcha(input.captchaToken))) return fail("captcha_failed")

@@ -171,10 +171,14 @@ export async function evaluatePublicRateLimit(input: {
   return { blocked: false, degraded }
 }
 
-/** true se o tenant estourou o teto de tentativas/hora (VOLUME, sucesso incluso). */
+/** true se o tenant estourou o teto de tentativas/hora (VOLUME, sucesso incluso).
+ *  `scope`: 'nlink' (default) conta só o link público /n/; 'all' conta TODAS as
+ *  tentativas por documento do tenant (/n/ + /t/{slug}) — Correção B10 (A2): o
+ *  caminho genérico passa a ter teto de volume por cedente. */
 export async function isTenantOverHourlyCap(
   supabase: Supabase,
   companyId: string,
+  opts: { scope?: "nlink" | "all" } = {},
 ): Promise<boolean> {
   const since = new Date(Date.now() - 60 * 60_000).toISOString()
   const { data } = await supabase
@@ -182,9 +186,9 @@ export async function isTenantOverHourlyCap(
     .select("id, failure_reason")
     .eq("company_id", companyId)
     .gte("created_at", since)
-  const total = (data ?? []).filter((r) =>
-    String(r.failure_reason ?? "").startsWith(NLINK_PREFIX),
-  ).length
+  const total = opts.scope === "all"
+    ? (data ?? []).length
+    : (data ?? []).filter((r) => String(r.failure_reason ?? "").startsWith(NLINK_PREFIX)).length
   return total >= tenantHourlyCap()
 }
 

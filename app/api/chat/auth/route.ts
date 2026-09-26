@@ -11,6 +11,7 @@ import { authenticateDebtor, GENERIC_AUTH_MESSAGE } from "@/lib/journey/auth"
 import { authenticateByDocument, authenticateByPublicLink, PUBLIC_NO_DEBT_MESSAGE } from "@/lib/journey/generic-auth"
 import { normalizeDocument } from "@/lib/journey/document"
 import { resolveCompanyBySlug } from "@/lib/journey/resolver"
+import { slugAuthAllowed } from "@/lib/journey/slug-gate"
 import { resolvePublicLink } from "@/lib/journey/public-link"
 
 export const dynamic = "force-dynamic"
@@ -96,7 +97,9 @@ export async function POST(req: NextRequest) {
   // ---------- caminho GENÉRICO (slug, sem token) ----------
   if (!body.token && body.tenantSlug) {
     const companyId = await resolveCompanyBySlug(body.tenantSlug)
-    if (!companyId) {
+    // Correção B10 (A2): jornada pública DESLIGADA → só admin (preview); os
+    // demais recebem a mesma resposta de slug inexistente (nada vaza).
+    if (!companyId || !(await slugAuthAllowed(req, companyId))) {
       await pad()
       // slug inexistente é 404 (não é erro de credencial)
       return NextResponse.json({ ok: false, message: "not found" }, { status: 404 })
