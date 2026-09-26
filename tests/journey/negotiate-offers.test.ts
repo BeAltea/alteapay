@@ -267,7 +267,8 @@ describe("R1 — aceite de uma parcela gera o link canônico", () => {
     // respondido como already_charged ("Você já tem uma cobrança ativa…") com o
     // MESMO link — 2 bolhas distintas, e o 3º aceite NÃO empilha (dedup 15min).
     expect(withLink.length).toBe(2)
-    expect(withLink[0].text).toMatch(/Aqui está seu link/i)
+    // QA rodada 6 (Q4r2-01): parcelado → a copy fala da 1ª parcela (o que o link cobra).
+    expect(withLink[0].text).toMatch(/Aqui está o link da 1ª parcela/i)
     expect(withLink[1].text).toMatch(/já tem uma cobrança ativa/i)
     // ambas carregam a ação open_payment_link (fonte única do painel do client)
     expect(withLink.every((m: any) => m.offers_snapshot?.message_action?.type === "open_payment_link")).toBe(true)

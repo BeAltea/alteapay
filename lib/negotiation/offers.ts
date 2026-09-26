@@ -20,6 +20,34 @@ export interface OfferTerms {
   total_value: number
   billing_type: BillingType
   first_due_date: string // YYYY-MM-DD
+  /** QA rodada 6 (Q2r2-03): marca a oferta INTEGRAL 0%/1x gerada pelo botão
+   *  PAGAR (payService). Ela não pertence ao conjunto da matriz do Negociar. */
+  purpose?: "pay_integral"
+}
+
+/** Marcador da oferta integral do PAGAR (OfferTerms.purpose). */
+export const PAY_INTEGRAL_PURPOSE = "pay_integral" as const
+
+/**
+ * QA rodada 6 (Q2r2-03) — a linha é a oferta integral do PAGAR (e não uma oferta
+ * do conjunto da matriz)? Marcador explícito (`terms.purpose`) ou, para ofertas
+ * legadas sem marcador, a assinatura do PAGAR: origem 'system', 1 parcela, 0% de
+ * desconto e SEM irmãs (o conjunto da matriz é gravado em lote com o mesmo
+ * `valid_until`; a integral do PAGAR tem `valid_until` próprio). Pura.
+ */
+export function isPayIntegralOfferRow(
+  row: { id: string; terms: Partial<OfferTerms> | null; source?: string | null; valid_until?: string | null },
+  sessionSystemRows: Array<{ id: string; source?: string | null; valid_until?: string | null }>,
+): boolean {
+  const t = row.terms
+  if (!t) return false
+  if (t.purpose === PAY_INTEGRAL_PURPOSE) return true
+  if ((row.source ?? "system") !== "system") return false
+  if (Number(t.installments) !== 1 || Number(t.discount_value ?? 0) !== 0) return false
+  const key = row.valid_until ?? ""
+  return !sessionSystemRows.some(
+    (r) => r.id !== row.id && (r.source ?? "system") === "system" && (r.valid_until ?? "") === key,
+  )
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100

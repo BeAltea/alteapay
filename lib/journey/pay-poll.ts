@@ -97,13 +97,41 @@ export function formatDueDatePt(iso: string | null | undefined): string {
  */
 export function payLinkMessageText(input: {
   link: string | null
+  /** TOTAL do acordo (à vista: o valor cobrado; parcelado: a soma das parcelas). */
   valor: number | null
   vencimentoLink: string | null
   alreadyCharged: boolean
+  /** QA rodada 6 (Q4r2-01): nº de parcelas do acordo (>1 = parcelado). */
+  installments?: number | null
+  /** QA rodada 6 (Q4r2-01): valor de cada parcela (o que o link cobra agora). */
+  installmentValue?: number | null
 }): string {
   const valorTxt = input.valor != null ? formatBRL(input.valor) : ""
   const venc = formatDueDatePt(input.vencimentoLink)
   const linkLine = input.link ? `\n${input.link}` : ""
+  const n = typeof input.installments === "number" && Number.isFinite(input.installments) ? Math.trunc(input.installments) : 1
+  if (n > 1) {
+    // QA rodada 6 (Q4r2-01, ALTO): no parcelado o link cobra a 1ª PARCELA, não o
+    // total. A copy diz exatamente isso (carta de voz, sem travessão).
+    const parcela =
+      typeof input.installmentValue === "number" && Number.isFinite(input.installmentValue)
+        ? input.installmentValue
+        : input.valor != null
+          ? Math.round((input.valor / n) * 100) / 100
+          : null
+    const parcelaTxt = parcela != null ? formatBRL(parcela) : ""
+    const totalPart = valorTxt ? ` (total ${valorTxt})` : ""
+    const acordo = parcelaTxt ? `${n}x de ${parcelaTxt}${totalPart}` : `${n}x${totalPart}`
+    if (input.alreadyCharged) {
+      // B-3: na cobrança já existente o destaque é o TOTAL do acordo (a parcela
+      // que o link cobra agora pode não ser a 1ª).
+      return `Você já tem uma cobrança ativa do acordo de ${n}x${totalPart}. Use o link abaixo; não é preciso gerar outro.${linkLine}`
+    }
+    const vencShort = formatDueDateShortPt(input.vencimentoLink)
+    const head = parcelaTxt ? `Aqui está o link da 1ª parcela: ${parcelaTxt}` : "Aqui está o link da 1ª parcela"
+    const vencPart = vencShort ? `, com vencimento em ${vencShort}` : ""
+    return `${head}${vencPart}. O acordo é de ${acordo}; as próximas parcelas chegam pelo mesmo canal.${linkLine}`
+  }
   if (input.alreadyCharged) {
     // S15: sem travessão; sem "se já pagou desconsidere" (é o botão "Já paguei").
     const head = valorTxt
@@ -115,6 +143,13 @@ export function payLinkMessageText(input: {
   const head = valorTxt ? `Aqui está seu link para pagar ${valorTxt}` : "Aqui está seu link de pagamento"
   const vencPart = venc ? `, válido até ${venc}` : ""
   return `${head}${vencPart}.${linkLine}`
+}
+
+/** Vencimento (YYYY-MM-DD) → dd/mm para a copy do parcelado. Ausente → "". */
+export function formatDueDateShortPt(iso: string | null | undefined): string {
+  if (!iso) return ""
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso)
+  return m ? `${m[3]}/${m[2]}` : ""
 }
 
 // ---------------------------------------------------------------------------
@@ -187,10 +222,31 @@ export function decidePayResume(i: PayResumeInput): PayResumeDecision {
     return "resume_generating"
   }
   if (i.serverWaitState === "erro_cobranca") {
+    // QA rodada 6 (Q2r2-02): o erro de cobrança NUNCA coexiste com o menu. Com
+    // um prompt ativo na tela (relogin, Negociar, menu reaberto), o erro é
+    // aposentado; o servidor também o limpa ao publicar o prompt.
+    if (i.hasActivePrompt) return i.localWaitState === "erro_cobranca" ? "settle_idle" : "none"
     if (i.localWaitState === "erro_cobranca") return "none"
     if (localPay && !i.resumed) return "none"
     return "show_error"
   }
+  // QA rodada 6 (Q2r2-02): erro local + prompt novo na tela → o menu conduz.
+  if (i.localWaitState === "erro_cobranca" && i.hasActivePrompt) return "settle_idle"
   if (localPay && i.resumed && i.hasActivePrompt) return "settle_idle"
   return "none"
+}
+
+/**
+ * QA rodada 6 (Q2r2-02) — ao aplicar um prompt NOVO na tela (poll ou corpo de
+ * POST), o bloco de erro do Pagar é aposentado: nunca duas fileiras de ação.
+ * Um POST do Pagar em voo governa o estado (não mexe). Pura.
+ */
+export function shouldRetireChargeError(i: {
+  localWaitState: string
+  payInFlight: boolean
+  localPayStatus: string | null | undefined
+  incomingPromptId: string | null | undefined
+}): boolean {
+  if (i.payInFlight || !i.incomingPromptId) return false
+  return i.localWaitState === "erro_cobranca" || i.localPayStatus === "error"
 }

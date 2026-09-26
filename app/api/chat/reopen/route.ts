@@ -18,7 +18,7 @@
 // menu se já houver um prompt ativo). NUNCA declara pago, NUNCA cobra aqui.
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
-import { handlePaymentClaim, loadSessionCtx, transferToHuman } from "@/lib/journey/actions"
+import { HANDOFF_STAGE, handlePaymentClaim, loadSessionCtx, transferToHumanWithOutcome } from "@/lib/journey/actions"
 import { reopenThreeOptions } from "@/lib/journey/acknowledgement"
 import {
   BTN_PAYMENT_CLAIM,
@@ -160,8 +160,17 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
       if (dt.doubleTap) {
         return NextResponse.json({ ok: true, action: "handoff", transferred: false, ignored: "double_tap" })
       }
-      await transferToHuman(ctx, "wait_degraded_handoff", "customer")
-      return NextResponse.json({ ok: true, action: "handoff", transferred: true })
+      // QA rodada 6 (Q5r2-02): o corpo traz o OUTCOME persistido do handoff —
+      // o client renderiza a confirmação na hora (antes encerrava sem bolha).
+      const out = await transferToHumanWithOutcome(ctx, "wait_degraded_handoff", "customer")
+      return NextResponse.json({
+        ok: true, action: "handoff", transferred: true,
+        outcome: out.messageId && out.reply
+          ? { id: out.messageId, text: out.reply, stage: HANDOFF_STAGE, created_at: new Date().toISOString() }
+          : null,
+        prompt: null,
+        state_time: new Date().toISOString(),
+      })
     }
 
     // R5 — "Já paguei / enviar comprovante": registra o payment_claim (conferência

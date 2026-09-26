@@ -19,7 +19,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { formatServerTiming, runWithTimings } from "@/lib/journey/server-timing"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
-import { loadSessionCtx, registerDispute, transferToHuman } from "@/lib/journey/actions"
+import { HANDOFF_STAGE, loadSessionCtx, registerDispute, transferToHuman, transferToHumanWithOutcome, type SessionCtx } from "@/lib/journey/actions"
 import {
   answerPrompt,
   getActivePrompt,
@@ -114,6 +114,24 @@ async function withChargeWaitState<T extends { ok: boolean }>(
       : null
   if (next !== "gerando_cobranca") await setSessionWaitState(sessionId, next)
   return { result, wait_state: next }
+}
+
+/**
+ * QA rodada 6 (Q5r2-02, ALTO) — resposta do HANDOFF [99]: além de `transferred`,
+ * o corpo traz o OUTCOME persistido ("Registramos o seu pedido de atendimento…",
+ * stage 'handoff') para o client renderizar a confirmação na hora, sem depender
+ * de um último poll antes de encerrar.
+ */
+async function handoffBody(ctx: SessionCtx, buttonId: number): Promise<Record<string, unknown>> {
+  const out = await transferToHumanWithOutcome(ctx, "handoff_button", "customer")
+  return {
+    ok: true, transferred: true, button_id: buttonId,
+    outcome: out.messageId && out.reply
+      ? { id: out.messageId, text: out.reply, stage: HANDOFF_STAGE, created_at: new Date().toISOString() }
+      : null,
+    prompt: null,
+    state_time: new Date().toISOString(),
+  }
 }
 
 /**
@@ -393,8 +411,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
 
       // --- ATENDIMENTO [99] → handoff. ---------------------------------------
       if (buttonId === BTN_HANDOFF) {
-        await transferToHuman(ctx, "handoff_button", "customer")
-        return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+        return NextResponse.json(await handoffBody(ctx, buttonId))
       }
 
       // --- ESCOLHA DE UMA OFERTA [2..N] --------------------------------------
@@ -437,6 +454,9 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
           link: accepted.link,
           valor: accepted.payment?.total_value ?? null,
           vencimento_link: accepted.vencimento_link,
+          // QA rodada 6 (Q4r2-01): parcelado → o painel fala da 1ª parcela.
+          installments: accepted.payment?.installments ?? null,
+          installment_value: accepted.payment?.installment_value ?? null,
           already_charged: true, processing: false,
           agreement_id: accepted.payment?.agreement_id ?? null,
           post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt, link_message_id: accepted.link_message_id,
@@ -460,6 +480,9 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         link: accepted.link,
         valor: accepted.payment.total_value ?? null,
         vencimento_link: accepted.vencimento_link,
+        // QA rodada 6 (Q4r2-01): parcelado → o painel fala da 1ª parcela.
+        installments: accepted.payment.installments ?? null,
+        installment_value: accepted.payment.installment_value ?? null,
         already_charged: false, processing: false,
         agreement_id: accepted.payment.agreement_id ?? null,
         post_prompt_id: accepted.post_prompt_id, prompt: accepted.prompt, link_message_id: accepted.link_message_id,
@@ -497,8 +520,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
       }
       if (buttonId === BTN_HANDOFF) {
-        await transferToHuman(ctx, "handoff_button", "customer")
-        return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+        return NextResponse.json(await handoffBody(ctx, buttonId))
       }
       return NextResponse.json({ ok: true, button_id: buttonId })
     } catch (err) {
@@ -774,8 +796,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
       }
       if (buttonId === BTN_HANDOFF) {
-        await transferToHuman(ctx, "handoff_button", "customer")
-        return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+        return NextResponse.json(await handoffBody(ctx, buttonId))
       }
       return NextResponse.json({ ok: true, button_id: buttonId })
     } catch (err) {
@@ -862,8 +883,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
     }
 
     if (buttonId === BTN_HANDOFF) {
-      await transferToHuman(ctx, "handoff_button", "customer")
-      return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+      return NextResponse.json(await handoffBody(ctx, buttonId))
     }
 
     // Botão fora do catálogo esperado do debt_consult: já respondido, sem efeito.
@@ -984,8 +1004,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
       if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
       return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
     }
-    await transferToHuman(ctx, "handoff_button", "customer")
-    return NextResponse.json({ ok: true, transferred: true, button_id: buttonId })
+    return NextResponse.json(await handoffBody(ctx, buttonId))
   }
 
   // Demais prompts (criados pelo n8n): responde (marca answered + grava a mensagem
