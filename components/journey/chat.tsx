@@ -78,6 +78,8 @@ import {
   decidePayResume,
   interpretPaymentPoll,
   isPayWaitState,
+  PAY_NOT_SENT_NOTICE,
+  PAY_NOT_SENT_OFFER_NOTICE,
   PAY_PROCESSING_SLOW_TEXT,
   PAY_PROCESSING_TEXT,
   PAY_RESUME_GENERATING_TEXT,
@@ -335,6 +337,11 @@ export function JourneyChat() {
   // reidratação ou recuperação (o servidor é a autoridade).
   const payInFlightRef = useRef(false)
   const payResumedRef = useRef(false)
+  // QA rodada 5 (Q6r5-01): prompt clicado pelo último Pagar desta aba. Se o poll
+  // devolve esse MESMO prompt como ativo, o clique nunca chegou ao servidor.
+  const payClickedPromptIdRef = useRef<string | null>(null)
+  const payClickedAtRef = useRef<number | null>(null)
+  const payClickWasOfferRef = useRef(false)
   // QA round 2 (QAA2-06 / QAB1-H4): sequência de disparo dos polls e carimbo da
   // última resposta APLICADA — uma resposta mais antiga é ignorada por inteiro.
   const pollSeqRef = useRef(0)
@@ -833,7 +840,13 @@ export function JourneyChat() {
       resumed: payResumedRef.current,
       hasActivePrompt: !!activePromptRef.current,
       linkDelivered: liveLinkSeen,
+      clickNotReceived:
+        !!payClickedPromptIdRef.current && activePromptRef.current?.id === payClickedPromptIdRef.current,
+      msSinceClick: payClickedAtRef.current === null ? undefined : Date.now() - payClickedAtRef.current,
     })
+    // Dev B #2: o aviso de "não chegou" nunca convive com um link, uma espera
+    // retomada ou um erro vindos do servidor.
+    if (liveLinkSeen || decision === "resume_generating" || decision === "show_error") clearNotSentNotice()
     if (decision === "resume_generating") {
       stopTick()
       waitStartedAtRef.current = null
@@ -848,11 +861,27 @@ export function JourneyChat() {
       payResumedRef.current = true
       setPayResult({ status: "error", link: null, valor: null, vencimento_link: null, already_charged: false, confirmedNotCreated: false, resumed: true })
       setWaitState("erro_cobranca")
-    } else if (decision === "settle_idle") {
+    } else if (decision === "settle_idle" || decision === "settle_idle_not_sent") {
       payResumedRef.current = false
+      const wasOffer = payClickWasOfferRef.current
+      forgetPayClick()
       setPayResult(null)
       setWaitState("idle")
+      // Q6r5-01: o menu volta, mas nunca em silêncio — diz o que houve e como
+      // tentar de novo (o Pagar do menu, ou a parcela, é a nova tentativa).
+      if (decision === "settle_idle_not_sent") setPromptNotice(wasOffer ? PAY_NOT_SENT_OFFER_NOTICE : PAY_NOT_SENT_NOTICE)
     }
+  }
+
+  // Q6r5-01 / Dev B #4: o clique do Pagar desta aba já teve desfecho.
+  function forgetPayClick() {
+    payClickedPromptIdRef.current = null
+    payClickedAtRef.current = null
+    payClickWasOfferRef.current = false
+  }
+
+  function clearNotSentNotice() {
+    setPromptNotice((n) => (n === PAY_NOT_SENT_NOTICE || n === PAY_NOT_SENT_OFFER_NOTICE ? null : n))
   }
 
   useEffect(() => {
@@ -1086,6 +1115,9 @@ export function JourneyChat() {
       // QA round 2 (QAB1-H1): o clique governa o estado até o POST resolver.
       payInFlightRef.current = true
       payResumedRef.current = false
+      payClickedPromptIdRef.current = promptId
+      payClickedAtRef.current = Date.now()
+      payClickWasOfferRef.current = isOfferSelect
     }
     // OPTIMISTIC: ao Negociar, injeta já uma bolha "preparando sua negociação"
     // (antes do await). Feedback imediato de que o sistema está trabalhando
@@ -1435,6 +1467,7 @@ export function JourneyChat() {
     stopTick()
     waitStartedAtRef.current = null
     payResumedRef.current = false
+    forgetPayClick()
     if (data.ok === true) {
       // QA round 1 (QAA1-02): cobrança já existente SEM link resolvível — o
       // servidor persistiu o outcome humano + menu curto (vêm no poll/corpo).
@@ -1480,6 +1513,7 @@ export function JourneyChat() {
   // Volta a espera ao idle (NEGOCIAR falhou/consumido): o devedor pode reabrir o
   // menu e tentar de novo. Não mexe em payResult.
   function resetWaitToIdle() {
+    forgetPayClick()
     stopTick()
     waitStartedAtRef.current = null
     setWaitStep("d0_suppressed")
