@@ -182,7 +182,16 @@ export const PAY_PROCESSING_TEXT = "Estou gerando seu link de pagamento. Assim q
 export const PAY_PROCESSING_SLOW_TEXT =
   "Está demorando um pouco mais que o normal para gerar o link. Você pode continuar aguardando, voltar às opções ou falar com o nosso atendimento."
 
-export type PayResumeDecision = "resume_generating" | "show_error" | "settle_idle" | "none"
+/** QA rodada 5 (Q6r5-01) — o clique do PAGAR nunca chegou ao servidor (rede caiu
+ *  no meio): o menu volta com um aviso humano, nunca em silêncio (G1/§2.3). */
+export const PAY_NOT_SENT_NOTICE = "Não consegui gerar o link agora. Toque em Pagar para tentar de novo."
+/** Mesmo caso quando o clique foi numa PARCELA (offer_choice): o botão é a opção. */
+export const PAY_NOT_SENT_OFFER_NOTICE = "Não consegui gerar o link agora. Escolha a opção de novo para tentar."
+/** Só se conclui "o clique não chegou" depois deste intervalo desde o clique: um
+ *  POST lento (cold start/fila) ainda pode chegar e consumir o menu (Dev B #1). */
+export const PAY_NOT_SENT_MIN_MS = 12_000
+
+export type PayResumeDecision = "resume_generating" | "show_error" | "settle_idle" | "settle_idle_not_sent" | "none"
 
 export interface PayResumeInput {
   /** wait_state devolvido pelo GET /api/chat/messages (null = sem espera). */
@@ -198,6 +207,12 @@ export interface PayResumeInput {
   hasActivePrompt: boolean
   /** este poll trouxe uma bolha de link VIVO (o resultado já está na tela). */
   linkDelivered: boolean
+  /** QA rodada 5 (Q6r5-01): o prompt ativo é o MESMO que o Pagar desta aba
+   *  clicou — o servidor nunca consumiu o clique (falha de transporte antes de
+   *  chegar). Ausente = false. */
+  clickNotReceived?: boolean
+  /** ms desde o clique do Pagar desta aba (sem clique = ausente). */
+  msSinceClick?: number
 }
 
 /**
@@ -210,7 +225,9 @@ export interface PayResumeInput {
  *  - servidor sem espera de pagamento e o client numa espera RETOMADA com um
  *    prompt ativo na tela → 'settle_idle' (o servidor já concluiu: outcome +
  *    menu vieram no poll; o menu conduz). Sem prompt ainda → espera (o teto dá
- *    a saída). Pura.
+ *    a saída). Se esse prompt é o próprio menu clicado (o clique nunca chegou ao
+ *    servidor), 'settle_idle_not_sent': o menu conduz COM aviso humano (Q6r5-01).
+ *    Pura.
  */
 export function decidePayResume(i: PayResumeInput): PayResumeDecision {
   if (i.payInFlight) return "none"
@@ -232,7 +249,13 @@ export function decidePayResume(i: PayResumeInput): PayResumeDecision {
   }
   // QA rodada 6 (Q2r2-02): erro local + prompt novo na tela → o menu conduz.
   if (i.localWaitState === "erro_cobranca" && i.hasActivePrompt) return "settle_idle"
-  if (localPay && i.resumed && i.hasActivePrompt) return "settle_idle"
+  if (localPay && i.resumed && i.hasActivePrompt) {
+    if (i.clickNotReceived === true && i.localWaitState === "gerando_cobranca") {
+      // Cedo demais para afirmar que não chegou: segue esperando (o poll repete).
+      return (i.msSinceClick ?? 0) >= PAY_NOT_SENT_MIN_MS ? "settle_idle_not_sent" : "none"
+    }
+    return "settle_idle"
+  }
   return "none"
 }
 
