@@ -202,5 +202,16 @@ describe("QA rodada 6 — Pagar abortado: erro aposentado, Negociar completo, ha
     expect(body).toMatchObject({ ok: true, transferred: true })
     expect(body.outcome?.stage).toBe("handoff")
     expect(body.outcome?.text).toMatch(/Registramos o seu pedido de atendimento\./)
+    // Q5r5-04: o outcome leva o prompt do clique — o eco que chega depois pelo
+    // poll é recolocado ANTES da resposta (placeEchoBeforeReply).
+    expect(body.outcome?.prompt_id).toBe(menu.id)
+  })
+
+  it("Q5r5-04: eco do [99] que chega depois da resposta do corpo entra antes dela", async () => {
+    const { placeEchoBeforeReply } = await import("@/components/journey/chat-display")
+    const reply = { id: "r1", from: "assistant" as const, text: "Certo. Registramos o seu pedido de atendimento.", action: null, promptId: "p1", stage: "handoff" }
+    const echo = { id: "e1", from: "customer" as const, text: "Falar com atendimento", action: null, promptId: "p1", buttonId: 99 }
+    const list = placeEchoBeforeReply([reply], echo)
+    expect(list.map((m) => m.id)).toEqual(["e1", "r1"])
   })
 })
