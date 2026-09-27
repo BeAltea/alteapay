@@ -122,13 +122,13 @@ async function withChargeWaitState<T extends { ok: boolean }>(
  * stage 'handoff') para o client renderizar a confirmação na hora, sem depender
  * de um último poll antes de encerrar.
  */
-async function handoffBody(ctx: SessionCtx, buttonId: number): Promise<Record<string, unknown>> {
+async function handoffBody(ctx: SessionCtx, buttonId: number, promptId: string): Promise<Record<string, unknown>> {
   const out = await transferToHumanWithOutcome(ctx, "handoff_button", "customer")
   return {
     ok: true, transferred: true, button_id: buttonId,
-    outcome: out.messageId && out.reply
-      ? { id: out.messageId, text: out.reply, stage: HANDOFF_STAGE, created_at: new Date().toISOString() }
-      : null,
+    // QA rodada 5 (Q5r5-04): prompt_id do clique, como nos demais outcomes
+    // (outcomeOf) — o eco que chega depois pelo poll entra ANTES da resposta.
+    outcome: outcomeOf(out.messageId && out.reply ? out.messageId : null, out.reply ?? "", HANDOFF_STAGE, promptId),
     prompt: null,
     state_time: new Date().toISOString(),
   }
@@ -411,7 +411,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
 
       // --- ATENDIMENTO [99] → handoff. ---------------------------------------
       if (buttonId === BTN_HANDOFF) {
-        return NextResponse.json(await handoffBody(ctx, buttonId))
+        return NextResponse.json(await handoffBody(ctx, buttonId, promptId))
       }
 
       // --- ESCOLHA DE UMA OFERTA [2..N] --------------------------------------
@@ -520,7 +520,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
       }
       if (buttonId === BTN_HANDOFF) {
-        return NextResponse.json(await handoffBody(ctx, buttonId))
+        return NextResponse.json(await handoffBody(ctx, buttonId, promptId))
       }
       return NextResponse.json({ ok: true, button_id: buttonId })
     } catch (err) {
@@ -796,7 +796,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
       }
       if (buttonId === BTN_HANDOFF) {
-        return NextResponse.json(await handoffBody(ctx, buttonId))
+        return NextResponse.json(await handoffBody(ctx, buttonId, promptId))
       }
       return NextResponse.json({ ok: true, button_id: buttonId })
     } catch (err) {
@@ -883,7 +883,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
     }
 
     if (buttonId === BTN_HANDOFF) {
-      return NextResponse.json(await handoffBody(ctx, buttonId))
+      return NextResponse.json(await handoffBody(ctx, buttonId, promptId))
     }
 
     // Botão fora do catálogo esperado do debt_consult: já respondido, sem efeito.
@@ -1004,7 +1004,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
       if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
       return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
     }
-    return NextResponse.json(await handoffBody(ctx, buttonId))
+    return NextResponse.json(await handoffBody(ctx, buttonId, promptId))
   }
 
   // Demais prompts (criados pelo n8n): responde (marca answered + grava a mensagem
