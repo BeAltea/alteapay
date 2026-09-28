@@ -318,18 +318,32 @@ async function chatSendCore(
   // dedupe por event_id acima não pega, e a tela mostrava a msg repetida. Se uma
   // mensagem de assistente IDÊNTICA já foi gravada nesta sessão nos últimos 15min,
   // não re-insere. Só para mensagem pura de texto (menus/prompts nunca deduplicam).
+  // Exceção: se o devedor escreveu DEPOIS da mensagem idêntica, a nova é resposta a
+  // um turno novo (ex.: o fluxo repete o texto de contestação a cada pergunta) e
+  // precisa aparecer — senão o turno fica só com "Só um instante…".
   if (text && !args.prompt) {
     const since = new Date(Date.now() - 15 * 60_000).toISOString()
     const { data: dup } = await supabase
       .from("chat_messages")
-      .select("id")
+      .select("id, created_at")
       .eq("session_id", ctx.sessionId)
       .eq("role", "assistant")
       .eq("text", text)
       .gte("created_at", since)
+      .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
-    if (dup?.id) return { ok: true, message_id: dup.id, duplicate: true }
+    if (dup?.id) {
+      const { data: newerTurn } = await supabase
+        .from("chat_messages")
+        .select("id")
+        .eq("session_id", ctx.sessionId)
+        .eq("role", "customer")
+        .gt("created_at", dup.created_at)
+        .limit(1)
+        .maybeSingle()
+      if (!newerTurn?.id) return { ok: true, message_id: dup.id, duplicate: true }
+    }
   }
 
   // §C3: composição com o placeholder "trabalhando" (chat-turn.recordWorkingPlaceholder,
