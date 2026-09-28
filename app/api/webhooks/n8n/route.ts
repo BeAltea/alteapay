@@ -36,6 +36,7 @@ import {
   N8N_TIMESTAMP_HEADER,
   cacheTurnResult,
   getCachedTurnResult,
+  isAllowedN8nCallbackUrl,
   markEventSeen,
   verifyN8nRequest,
 } from "@/lib/negotiation/n8n"
@@ -351,7 +352,10 @@ async function handleMessage(input: z.infer<typeof messageSchema>) {
 
   if (input.mode === "async") {
     if (!input.callback_url) return jsonError(422, "callback_url é obrigatório no modo async")
-    if (!/^https?:\/\//.test(input.callback_url)) return jsonError(422, "callback_url inválido")
+    // ---- [callback_url: só host n8n configurado] — isAllowedN8nCallbackUrl (lib/negotiation/n8n.ts)
+    if (!isAllowedN8nCallbackUrl(input.callback_url)) {
+      return jsonError(422, "callback_url fora do host n8n configurado", { code: "callback_url_not_allowed" })
+    }
     const job = await n8nQueue.add(`n8n-${input.event_id ?? session.id}-${Date.now()}`, {
       session_id: session.id,
       message,
@@ -582,8 +586,16 @@ export async function POST(request: Request) {
     switch (parsed.data.action) {
       case "ping":
         return NextResponse.json({ success: true, service: "alteapay-chatbot", engine: await engineHealth() })
-      case "session.create":
+      case "session.create": {
+        // ---- [session.create gate] início — lib/negotiation/n8n-session-create.ts
+        // (N8N_SESSION_CREATE_ENABLED, default OFF: nenhum fluxo usa a ação)
+        const { n8nSessionCreateEnabled, SESSION_CREATE_DISABLED_CODE } = await import("@/lib/negotiation/n8n-session-create")
+        if (!n8nSessionCreateEnabled()) {
+          return jsonError(403, "session.create desabilitado", { code: SESSION_CREATE_DISABLED_CODE })
+        }
+        // ---- [session.create gate] fim
         return await handleCreate(parsed.data)
+      }
       case "session.message":
         return await handleMessage(parsed.data)
       case "session.record":

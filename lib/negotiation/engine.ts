@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { z } from "zod"
 
 import type { Button } from "@/lib/journey/buttons"
-import { maskDocument } from "@/lib/journey/document"
+import { maskDocument, normalizeDocument } from "@/lib/journey/document"
 import { agentChat, agentHealth, agentSessionInit, type AgentSessionInit } from "./agent-client"
 import { closeAgreement } from "./close-agreement"
 import { buildN8nOutboundHeaders, newEventId, n8nWebhookSecret, scrubN8nSecrets } from "./n8n"
@@ -627,6 +627,23 @@ export async function engineChat(input: EngineTurnInput): Promise<EngineTurnResu
 }
 
 /**
+ * Corpo do `session.init` legado para o n8n (só com N8N_SESSION_FLOW_URL), com a
+ * mesma minimização de PII dos demais eventos: 1º nome, documento mascarado +
+ * hash (sha256 dos dígitos). Nome completo e documento em claro nunca saem. O
+ * AgentSessionInit completo continua indo só ao engine `agent` (self-hosted).
+ */
+export function buildSessionInitPayload(payload: AgentSessionInit): Record<string, unknown> {
+  const { customer_name, document, ...rest } = payload
+  return {
+    type: "session.init",
+    ...rest,
+    first_name: (customer_name ?? "").trim().split(/\s+/)[0] ?? "",
+    document_masked: maskDocument(document),
+    document_hash: createHash("sha256").update(normalizeDocument(document)).digest("hex"),
+  }
+}
+
+/**
  * Semeia o contexto da sessão no engine. No n8n é opcional: o contexto viaja
  * em todo turno; se N8N_SESSION_FLOW_URL estiver configurado, notifica o fluxo
  * (ex.: para pré-carregar memória/boas-vindas). Nunca falha o handoff por isso.
@@ -639,7 +656,7 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
   const url = sessionFlowUrl()
   if (!url) return
   try {
-    await callN8nFlow(url, { type: "session.init", ...payload }, 15_000)
+    await callN8nFlow(url, buildSessionInitPayload(payload), 15_000)
   } catch (err) {
     console.warn("[engine:n8n] session.init flow falhou (não-fatal):", err instanceof Error ? err.message : err)
   }
