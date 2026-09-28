@@ -40,6 +40,28 @@ describe("chatSend", () => {
     expect(db.chat_messages.length).toBe(1) // sem duplicar
   })
 
+  it("dedupe por conteúdo: mesmo texto com event_id novo e sem turno novo do devedor não repete", async () => {
+    const { chatSend } = await import("@/lib/journey/chat-send")
+    await chatSend(ctx, { text: "Registramos a contestação." }, "evt-c1")
+    const b = await chatSend(ctx, { text: "Registramos a contestação." }, "evt-c2")
+    expect(b.ok && b.duplicate).toBe(true)
+    expect(db.chat_messages.filter((m) => m.role === "assistant").length).toBe(1)
+  })
+
+  it("dedupe por conteúdo não engole a resposta a um turno novo do devedor", async () => {
+    const { chatSend } = await import("@/lib/journey/chat-send")
+    await chatSend(ctx, { text: "Registramos a contestação." }, "evt-d1")
+    const first = db.chat_messages[0]
+    db.chat_messages.push({
+      id: "cust-turn", session_id: ctx.sessionId, company_id: CO, role: "customer", text: "já paguei",
+      created_at: new Date(new Date(first.created_at).getTime() + 1000).toISOString(),
+    })
+    const b = await chatSend(ctx, { text: "Registramos a contestação." }, "evt-d2")
+    expect(b.ok).toBe(true)
+    if (b.ok) expect(b.duplicate).toBeFalsy()
+    expect(db.chat_messages.filter((m) => m.role === "assistant").length).toBe(2)
+  })
+
   it("cria prompt embutido (botões válidos) e vincula à mensagem", async () => {
     const { chatSend } = await import("@/lib/journey/chat-send")
     const r = await chatSend(ctx, {
