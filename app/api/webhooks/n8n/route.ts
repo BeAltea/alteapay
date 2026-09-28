@@ -564,10 +564,14 @@ export async function POST(request: Request) {
   // ---- N8N-16: correlação do callback com um evento enviado pela plataforma ----
   // Regras e flag (N8N_REQUIRE_EVENT_CORRELATION, default OFF) em
   // lib/negotiation/n8n-correlation.ts. OFF só registra telemetria.
+  // N87-07: o instante em que a plataforma enviou o evento de origem segue até o
+  // chat.send/prompt.ask (prompt de negociação abandonada não troca o menu).
+  let originSentAt: string | null = null
   {
     const { enforceN8nCorrelation } = await import("@/lib/negotiation/n8n-correlation")
     const gate = await enforceN8nCorrelation(parsed.data as { action: string; session_id?: string; event_id?: string }, json)
     if (gate.reject) return jsonError(gate.status, gate.error, { code: gate.code })
+    originSentAt = gate.origin?.sentAt ?? null
   }
   // ---- fim N8N-16 ----
 
@@ -595,7 +599,7 @@ export async function POST(request: Request) {
       case "session.status":
         return await handleStatus(parsed.data)
       default:
-        return await handleJourneyAction(parsed.data as z.infer<typeof journeySchema>)
+        return await handleJourneyAction(parsed.data as z.infer<typeof journeySchema>, { originSentAt })
     }
   } catch (err) {
     console.error("[webhooks:n8n] erro:", err instanceof Error ? err.message : err)
@@ -607,7 +611,10 @@ export async function POST(request: Request) {
 // ---------- Ações de domínio da JORNADA (papel B ampliado) ----------
 // Mesma segurança (HMAC/anti-replay) do POST; validação da matriz no servidor;
 // erros de validação retornam 4xx com código estável.
-async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
+async function handleJourneyAction(
+  input: z.infer<typeof journeySchema>,
+  correlation: { originSentAt: string | null } = { originSentAt: null },
+) {
   const { loadSessionCtx, debtSummary, listOffers, proposeOffer, rejectOffer,
     registerDispute, registerPaymentClaim, transferToHuman, closeSession } =
     await import("@/lib/journey/actions")
@@ -740,7 +747,7 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
     case "chat.send": {
       // onda R: empurra mensagem (+opcional prompt +payment_ref) ao chat.
       const { chatSend } = await import("@/lib/journey/chat-send")
-      const r = await chatSend(ctx, args as unknown as ChatSendArgs, input.event_id)
+      const r = await chatSend(ctx, args as unknown as ChatSendArgs, input.event_id, { originSentAt: correlation.originSentAt })
       // N8N-6: recusa do guard de texto → 422 { code:"text_rejected", reason }.
       if (!r.ok) {
         return jsonError(r.status, r.message, {
@@ -758,8 +765,12 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
     }
     case "prompt.ask": {
       const { promptAsk } = await import("@/lib/journey/chat-send")
-      const r = await promptAsk(ctx, args as unknown as { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string })
-      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
+      const r = await promptAsk(
+        ctx,
+        args as unknown as { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string },
+        { originSentAt: correlation.originSentAt },
+      )
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code, ...(r.reason ? { reason: r.reason } : {}) })
       return NextResponse.json({ ok: true, prompt_id: r.prompt_id })
     }
     case "prompt.close": {

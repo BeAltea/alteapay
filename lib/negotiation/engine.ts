@@ -920,7 +920,7 @@ export function parseKickoffReply(body: unknown): KickoffReply | null {
  * falha (contexto ausente, botões inválidos, erro de escrita) só gera um warn de
  * rótulo curto — NUNCA derruba o clique. Sem log do corpo cru/URL/segredo/PII.
  */
-async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): Promise<void> {
+async function persistKickoffReply(p: NegotiationStartPayload, body: unknown, sentAt?: string): Promise<void> {
   try {
     const parsed = parseKickoffReply(body)
     if (!parsed) return
@@ -932,6 +932,9 @@ async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): P
       ctx,
       { text: parsed.text, prompt: parsed.prompt, n8n_execution_id: parsed.n8n_execution_id },
       p.event_id,
+      // N87-07: se o devedor reabriu o menu enquanto o kickoff respondia, o
+      // prompt síncrono é de uma negociação abandonada (não troca o menu).
+      { originSentAt: sentAt ?? null },
     )
     // D2/M11: a 1ª resposta SÍNCRONA do motor já entrou no histórico → a sessão
     // saiu de 'aguardando_motor' para 'negociando'. Limpa a espera no servidor
@@ -1021,6 +1024,7 @@ export async function emitNegotiationStart(
     await enqueueNegotiationStart(payload) // 1) durável, idempotente
     // N8N-16: ledger de saída ANTES do POST (o callback async correlaciona por aqui).
     const { recordN8nOutbound } = await import("./n8n-correlation")
+    const sentAt = new Date().toISOString() // N87-07: instante do envio (antes do ledger)
     await recordN8nOutbound({
       eventId: payload.event_id, sessionId: payload.session_id, companyId: payload.company_id, event: "negotiation.start",
     })
@@ -1029,7 +1033,7 @@ export async function emitNegotiationStart(
     // 4) RENDER SYNC (best-effort, NUNCA lança): se o corpo trouxer texto/prompt
     //    AUTORADO pelo n8n, persiste via chatSend com o MESMO event_id (dedupe
     //    compartilhado SYNC↔ASYNC). Corpo vazio/async → não persiste (placeholder).
-    await persistKickoffReply(payload, body).catch(() => {})
+    await persistKickoffReply(payload, body, sentAt).catch(() => {})
     return { ok: true, delivered: true, event_id: eventId }
   } catch (err) {
     // POST falhou/estourou → a linha do outbox fica 'pending' e SERÁ reentregue

@@ -748,20 +748,24 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
           companyId: ctx.companyId, sessionId: ctx.sessionId,
           customerId: ctx.customerId, debtId: ctx.debtId,
         })
-        // Confirmação NOSSA imediata (T2 / R-26 — a MESMA constante da bolha otimista
-        // do client e da pergunta das parcelas: A4/S7, NEGOTIATION_PENDING_TEXT em
-        // lib/journey/wait-machine.ts) — escrita já em curso, ANTES do resultado da
-        // matriz (latência A2). Sem parcelas, a máquina de espera (D2: d3/d4) narra
-        // a sequência na tela; a frase sem dois-pontos (NEGOTIATION_SEARCHING_TEXT)
-        // é dos ramos legados, onde nada vem depois (A4 r2, B3-F2).
-        const reply = NEGOTIATION_PENDING_TEXT
+        // Confirmação NOSSA (T2 / R-26). N87-10: a frase depende de haver parcelas.
+        //  - com parcelas: NEGOTIATION_PENDING_TEXT ("…disponíveis para você:", a
+        //    MESMA constante da bolha otimista do client e da pergunta das parcelas,
+        //    A4/S7) — gravada como precedingWrite, logo antes da pergunta;
+        //  - sem parcelas (espera/degradação na sequência): NEGOTIATION_SEARCHING_TEXT
+        //    ("Vou buscar as condições…", sem dois-pontos — não promete uma lista que
+        //    não vem; A4 r2, B3-F2), gravada quando a matriz respondeu sem faixa.
+        // Uma escrita só por clique (memoizada), com a época já lida no contexto.
         // N8N-7: a confirmação é a resposta DESTE clique — sem o dedup de conteúdo
         // de 15 min. Deduplicada, a última bolha do assistente seguia sendo a de um
         // desfecho anterior (ex.: o handoff): sem parcelas não há prompt ativo e o
         // client lia "atendimento pedido + nenhum menu" como conversa encerrada.
-        const ackWrite = persistAssistantMessage({
-          companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply, skipContentDedup: true,
-        })
+        let ackWrite: Promise<string | null> | null = null
+        const writeAck = (text: string) =>
+          (ackWrite ??= persistAssistantMessage({
+            companyId: ctx.companyId, sessionId: ctx.sessionId, text, skipContentDedup: true,
+            ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
+          }))
         let presented: PresentMatrixOffersResult | null = null
         const [, pres] = await Promise.all([
           // Reconhecimento IMPLÍCITO (M4) — clicar negociar reconhece a dívida.
@@ -775,17 +779,21 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
           presentMatrixOffers({
             companyId: ctx.companyId, sessionId: ctx.sessionId,
             customerId: ctx.customerId, debtId: ctx.debtId,
-            precedingWrite: () => ackWrite,
+            precedingWrite: () => writeAck(NEGOTIATION_PENDING_TEXT),
           }).catch((err: Error) => {
             console.warn("[chat:button] presentMatrixOffers falhou (cai na espera D2):", err.message)
             return null
           }),
         ])
         presented = pres
-        await ackWrite
         const presentedOffers = !!presented && presented.ok && presented.presented === true
-        // N8N-7: sem parcelas, a espera nasce ANTES de aguardar o kickoff.
-        if (!presentedOffers) await markWaitingForEngine(ctx.sessionId)
+        const reply = presentedOffers ? NEGOTIATION_PENDING_TEXT : NEGOTIATION_SEARCHING_TEXT
+        // N8N-7: sem parcelas, a espera nasce ANTES de aguardar o kickoff (em
+        // paralelo com a confirmação: tabelas distintas, nenhuma lê a outra).
+        await Promise.all([
+          writeAck(reply),
+          presentedOffers ? Promise.resolve() : markWaitingForEngine(ctx.sessionId),
+        ])
 
         // Kickoff: com as PARCELAS prontas a resposta NÃO espera o disparo — QA
         // round 2 (QAA2-02): o Promise.race de 2,5 s era consumido inteiro em 7/8

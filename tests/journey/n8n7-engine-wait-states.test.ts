@@ -483,7 +483,7 @@ describe("N8N-7 — Negociar sem parcelas depois de um handoff nunca vira 'conve
 
   it("a confirmação do clique é gravada de novo (sem dedup de 15 min) e passa a ser a última bolha do assistente", async () => {
     mode = "hang"
-    const { NEGOTIATION_PENDING_TEXT } = await import("@/lib/journey/wait-machine")
+    const { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } = await import("@/lib/journey/wait-machine")
     const { isHandoffTerminal } = await import("@/lib/journey/display-class")
     const old = new Date(Date.now() - 5 * 60_000).toISOString()
     // histórico: Negociar anterior (confirmação < 15 min) → espera → atendimento pedido
@@ -496,7 +496,8 @@ describe("N8N-7 — Negociar sem parcelas depois de um handoff nunca vira 'conve
     expect(r.body.wait_state).toBe("aguardando_motor")
     const assistants = db.chat_messages.filter((m) => m.role === "assistant").sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
     const last = assistants.at(-1)!
-    expect(last.text).toBe(NEGOTIATION_PENDING_TEXT)
+    // N87-10: sem parcelas a confirmação não promete a lista (frase de busca)
+    expect(last.text).toBe(NEGOTIATION_SEARCHING_TEXT)
     expect(last.id).not.toBe("m-conf-old")
     // regra do client: sem prompt ativo + última bolha = handoff → encerra. Não mais.
     expect(isHandoffTerminal(last.stage ?? null, activePrompts().length > 0)).toBe(false)

@@ -155,6 +155,9 @@ const TICK_MS = 250 // granularidade da troca de copy (menor que o poll de 2500m
 const PAY_ABORT_MS = 45_000
 const PAY_LONG_WAIT_MS = 8_000
 const CLICK_ABORT_MS = 8_000
+// N87-09: id local do clique "Pagar agora"/"Pagar à vista" da espera do motor
+// (o menu é reaberto no servidor; o id real só vem na resposta).
+const PAY_NOW_CLICK_ID = "wait-pay-now"
 
 /** A4/N-D5-2 (R-23): TODO elemento preenchido com a marca usa a cor de texto
  *  ADAPTATIVA (--brand-secondary-fg, preto/branco por luminância — contrast.ts),
@@ -1090,6 +1093,9 @@ export function JourneyChat() {
     promptId: string,
     buttonId: number,
     buttonLabel: string,
+    // N87-09: "Pagar agora"/"Pagar à vista" na espera do motor, sem menu ativo —
+    // o servidor reabre o menu e segue pelo MESMO clique do Pagar (um toque só).
+    opts: { payNow?: boolean } = {},
   ): Promise<PromptClickResult> {
     resetIdle()
     // QA round 4 (R-11/R-21): todo o bloco de ações fica inerte logo após o
@@ -1162,12 +1168,19 @@ export function JourneyChat() {
     setPromptNotice(null)
     setProcessingNotice(null)
     try {
-      const res = await fetch("/api/chat/button", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt_id: promptId, button_id: buttonId }),
-        signal: controller.signal,
-      })
+      const res = opts.payNow
+        ? await fetch("/api/chat/reopen", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "pay_now" }),
+            signal: controller.signal,
+          })
+        : await fetch("/api/chat/button", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt_id: promptId, button_id: buttonId }),
+            signal: controller.signal,
+          })
       // Sessão do chat expirada/ausente → MODAL de reautenticação (não redireciona
       // sozinho). Com TTL de 30 dias isto praticamente não ocorre.
       if (res.status === 401) {
@@ -1227,6 +1240,15 @@ export function JourneyChat() {
       // corpo do clique (com HTTP 200 mesmo em erro de negócio). Renderizamos o
       // resultado (link/processando/erro) aqui, sem depender do poll. O guard de
       // cobrança e a idempotência são do servidor; o client só exibe a copy §5.
+      // N87-09: o servidor não cobrou (a espera já tinha acabado lá, ou a dívida
+      // foi quitada) e devolveu o estado atual (menu reaberto / quitado): sai do
+      // "gerando" e aplica esse estado, como o "Tentar as opções de novo".
+      if (opts.payNow && res.ok && data && data.action !== "pay" && data.ignored !== "double_tap" && data.duplicate !== true) {
+        resetWaitToIdle()
+        applyActionBody(data)
+        await pollMessages()
+        return { ok: true }
+      }
       if (isPay && data && data.action === "pay") {
         applyPayResult(data)
         // O menu de 3 opções já foi respondido; o poll traz a bolha do link
@@ -1273,6 +1295,14 @@ export function JourneyChat() {
             // compat: servidor antigo sem `prompt` no corpo → o poll traz as parcelas.
             clearPendingNegotiation()
           } else if (negotiateWaitOnResponse(data)) {
+            // N87-10: sem parcelas a confirmação do servidor não promete a lista
+            // ("Vou buscar as condições…") — a bolha otimista passa a dizer o
+            // mesmo até a persistida chegar pelo poll (que a substitui).
+            const confirmText = typeof data?.reply === "string" && data.reply ? (data.reply as string) : null
+            const optimisticId = pendingNegotiationRef.current
+            if (confirmText && optimisticId) {
+              setMessages((prev) => prev.map((m) => (m.id === optimisticId ? { ...m, text: confirmText } : m)))
+            }
             // Sem parcelas (sem faixa de matriz / falha): SÓ AGORA arma a espera
             // D2, ancorada no instante do clique (degraus corretos); as saídas do
             // bloco nascem inertes (arming) e o handoff só existe a partir de d3.
@@ -1732,6 +1762,14 @@ export function JourneyChat() {
     const pid = payActiveButtonId()
     if (activePrompt && pid != null) {
       await clickButton(activePrompt.id, pid, "Pagar")
+      return
+    }
+    // N87-09: na espera do motor (menu consumido pelo Negociar) "Pagar agora" /
+    // "Pagar à vista" cobram direto: o servidor reabre o menu e segue pelo clique
+    // do Pagar dele (mesma oferta, guard duplo e idempotência). Um toque só.
+    const local = waitStateRef.current
+    if (local === "aguardando_motor" || local === "menu_degradado") {
+      await clickButton(PAY_NOW_CLICK_ID, 4, "Pagar", { payNow: true })
       return
     }
     // Sem botão PAGAR ativo (menu consumido): re-emite o menu payável (M10) — não
