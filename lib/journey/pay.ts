@@ -185,6 +185,10 @@ export async function publishPostPaymentLinkPrompt(
     /** Latência: escrita que precisa ficar ANTES da pergunta do pós-link no
      *  histórico (a bolha do link, gravada em paralelo pelo chamador). */
     precedingWrite?: () => Promise<unknown>
+    /** Latência (14-latencia-pagar): devolve o prompt assim que ele é gravado; a
+     *  bolha da pergunta (ligada a ele) vai em `onPending` e o chamador a aguarda
+     *  antes de responder. */
+    onPending?: (p: Promise<unknown>) => void
   },
 ): Promise<PromptRow | null> {
   if (!input.link) return null
@@ -211,16 +215,24 @@ export async function publishPostPaymentLinkPrompt(
       ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
     })
     if (!created.ok) return null
-    if (input.precedingWrite) await input.precedingWrite().catch(() => {})
-    await persistAssistantMessage({
-      companyId: ctx.companyId,
-      sessionId: ctx.sessionId,
-      text: REOPEN_MENU_QUESTION,
-      promptId: created.prompt.id,
-      skipContentDedup: true,
-      freshPrompt: true,
-      ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
-    })
+    const question = (async () => {
+      if (input.precedingWrite) await input.precedingWrite().catch(() => {})
+      await persistAssistantMessage({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        text: REOPEN_MENU_QUESTION,
+        promptId: created.prompt.id,
+        skipContentDedup: true,
+        freshPrompt: true,
+        ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
+      })
+    })()
+    if (input.onPending) {
+      question.catch(() => {})
+      input.onPending(question)
+    } else {
+      await question
+    }
     return created.prompt
   } catch (err) {
     console.warn("[journey] publishPostPaymentLinkPrompt falhou (não fatal):", (err as Error).message)
@@ -415,6 +427,8 @@ export async function deliverPaymentOutcome(
     valor: number | null
     debtIds: string[]
     primaryDebtId?: string | null
+    /** ver publishPostPaymentLinkPrompt.onPending */
+    onPending?: (p: Promise<unknown>) => void
   },
 ): Promise<DeliveredPaymentOutcome> {
   const resolved = await resolveLiveChargeLink(ctx, input.payment)
@@ -440,6 +454,7 @@ export async function deliverPaymentOutcome(
         debtIds: input.debtIds,
         primaryDebtId: input.primaryDebtId ?? ctx.debtId,
         precedingWrite: () => linkMessageP,
+        ...(input.onPending ? { onPending: input.onPending } : {}),
       }),
     ])
     return {
@@ -507,6 +522,8 @@ export interface PayServiceOk {
   /** QA round 1 (QAA1-02): prompt ATIVO após a entrega (pós-link ou menu curto),
    *  no shape do GET — o client renderiza na hora. null só em 'processing'. */
   prompt?: PromptView | null
+  /** Latência: escrita final ainda em curso (só com opts.returnPending). */
+  pending?: Promise<unknown>
 }
 
 export interface PayServiceErr {
@@ -874,8 +891,12 @@ export async function payService(
     /** Latência (14-latencia-pagar): leituras da oferta integral já em curso
      *  (prefetchIntegralOffer, disparadas pela rota). */
     prefetch?: IntegralOfferPrefetch
+    /** Latência: a última escrita da entrega (pergunta do pós-link) volta em
+     *  `pending` para o chamador aguardá-la junto com a marca final. */
+    returnPending?: boolean
   },
 ): Promise<PayServiceResult> {
+  let lastWrite: Promise<unknown> | null = null
   const eventId = opts?.eventId
   // Conjunto de dívidas cobradas = o MESMO do rótulo do botão (D3 ALTO). Sem
   // debt_ids explícitos, cai na dívida primária (single-debt path).
@@ -992,6 +1013,7 @@ export async function payService(
       valor: alreadyCharged ? (payment?.total_value ?? offer.valor) : offer.valor,
       debtIds,
       primaryDebtId: opts?.primaryDebtId ?? ctx.debtId,
+      ...(opts?.returnPending ? { onPending: (p: Promise<unknown>) => { lastWrite = p } } : {}),
     }),
   ]))
 
@@ -1006,6 +1028,7 @@ export async function payService(
     post_prompt_id: delivered.postPromptId,
     prompt: delivered.prompt,
     link_message_id: delivered.linkMessageId ?? null,
+    ...(lastWrite ? { pending: lastWrite } : {}),
   }
 }
 

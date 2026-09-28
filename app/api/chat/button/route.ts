@@ -160,7 +160,14 @@ async function withChargeWaitState<T extends { ok: boolean }>(
     : processing
       ? "gerando_cobranca"
       : null
-  if (next !== "gerando_cobranca") await setSessionWaitState(sessionId, next)
+  // Latência (14-latencia-pagar): a última escrita do serviço (a pergunta do
+  // prompt pós-link, `pending`) termina junto com a marca final — as duas antes
+  // da resposta.
+  const pending = (result as { pending?: Promise<unknown> }).pending
+  await Promise.all([
+    next !== "gerando_cobranca" ? setSessionWaitState(sessionId, next) : Promise.resolve(),
+    pending ? pending.catch(() => {}) : Promise.resolve(),
+  ])
   return { result, wait_state: next }
 }
 
@@ -682,6 +689,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
           try {
             return await payService(ctx, {
               debtIds, primaryDebtId, requestStartedAt, beforeCharge: recognized, beforeDeliver: echoWrite,
+              returnPending: true,
               // só vale para o MESMO conjunto de dívidas (re-alvejamento pode trocar o prompt)
               ...(payPrefetch && payPrefetchDebtIds && payPrefetchDebtIds.join(",") === debtIds.join(",")
                 ? { prefetch: payPrefetch }
