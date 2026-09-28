@@ -12,27 +12,8 @@ const EXT_REF = `journey_${SESSION}_${OFFER}`
 
 let db: FakeDb = {}
 
-// A rota legada chama `.catch()` direto no builder (erro de tipo pré-existente:
-// o builder real do supabase-js não tem `.catch`). Só para exercitar a guarda nova
-// dela, o fake ganha um `.catch` quando `legacyCatch` está ligado.
-let legacyCatch = false
 vi.mock("@supabase/supabase-js", () => ({
-  createClient: () => ({
-    from: (t: string) => {
-      const qb: any = makeFakeSupabase(db).from(t)
-      if (legacyCatch) {
-        for (const m of ["insert", "update"]) {
-          const orig = qb[m].bind(qb)
-          qb[m] = (...a: unknown[]) => {
-            const b = orig(...a)
-            b.catch = () => Promise.resolve(new Promise((r) => b.then(r)))
-            return b
-          }
-        }
-      }
-      return qb
-    },
-  }),
+  createClient: () => ({ from: (t: string) => makeFakeSupabase(db).from(t) }),
 }))
 vi.mock("@/lib/supabase/url", () => ({ getServerSupabaseUrl: () => "http://fake" }))
 // ASAAS indisponível para o parcelamento (null): a decisão fica com a contagem
@@ -142,10 +123,9 @@ describe("QA rodada 6 — webhook de parcelas (Q4r2-03)", () => {
     expect(db.debts[0].status).toBe("pending")
   })
 
-  it("rota legada /api/webhooks/asaas também não quita na parcela 1 de 3", async () => {
+  it("rota legada /api/webhooks/asaas (delega à canônica) também não quita na parcela 1 de 3", async () => {
     const { POST } = await import("@/app/api/webhooks/asaas/route")
-    legacyCatch = true
-    const res = await POST(webhook("PAYMENT_RECEIVED", parcel(1))).finally(() => { legacyCatch = false })
+    const res = await POST(webhook("PAYMENT_RECEIVED", parcel(1)))
     expect(res.status).toBe(200)
     expect(ag().status).toBe("active")
     expect(db.debts[0].status).toBe("in_agreement")

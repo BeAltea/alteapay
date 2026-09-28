@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
 import { effectiveAsaasStatusFromWebhook } from "@/lib/asaas-idempotency"
-import { isPaymentStatusRegression, PAID_AGREEMENT_STATUSES } from "@/lib/constants/payment-status"
+import { PAID_AGREEMENT_STATUSES, paymentStatusesRankedAbove } from "@/lib/constants/payment-status"
 import {
   checkInstallmentHold,
   fetchInstallmentPayments,
@@ -91,6 +91,15 @@ const INFORMATIVE_EVENTS: ReadonlySet<string> = new Set([
   "PAYMENT_VIEWED",
   "PAYMENT_RESTORED",
 ])
+
+/** Valor da notificação in-app ("250.00"); cai no 2º valor se o 1º não for número. */
+function formatNotificationAmount(...values: unknown[]): string {
+  for (const v of values) {
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN
+    if (Number.isFinite(n)) return n.toFixed(2)
+  }
+  return "—"
+}
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
@@ -462,39 +471,53 @@ export async function POST(request: NextRequest) {
     // 9b. Demais eventos, ou PAGO de um acordo já quitado: atualiza detalhes sem
     // mexer no status do acordo e sem regredir o status do pagamento.
     if (!settledNow) {
-      let current: { payment_status?: string | null; asaas_status?: string | null; payment_received_at?: string | null } = agreement
-      if (settlingEvent) {
-        // Perdeu o portão: quem quitou já gravou tudo no mesmo UPDATE — relê para
-        // comparar com o estado vencedor (não com o snapshot do passo 5).
-        const { data: fresh } = await supabase
-          .from("agreements")
-          .select("payment_status, asaas_status, payment_received_at")
-          .eq("id", agreement.id)
-          .eq("company_id", agreement.company_id)
-          .maybeSingle()
-        if (fresh) current = fresh
-        delete agreementUpdate.status
-      }
-      if (isPaymentStatusRegression(current.payment_status, agreementUpdate.payment_status)) {
-        delete agreementUpdate.payment_status
-      }
-      if (isPaymentStatusRegression(current.asaas_status, agreementUpdate.asaas_status)) {
-        delete agreementUpdate.asaas_status
+      // Perdeu o portão: o status do acordo é de quem quitou.
+      if (settlingEvent) delete agreementUpdate.status
+
+      // F8-01 (corrida): payment_status/asaas_status nunca regridem. Antes era
+      // "relê e depois grava" (não atômico): dois PAGOs tardios simultâneos liam
+      // o mesmo estado e o CONFIRMED podia gravar por cima do RECEIVED. Agora
+      // cada um é um UPDATE condicional cujo WHERE exclui os status de posto
+      // MAIOR (mesma escada de isPaymentStatusRegression) — o Postgres reavalia
+      // o WHERE na linha travada, então quem chega depois de um RECEIVED não
+      // casa. NULL casa explicitamente (NULL NOT IN (...) não casaria).
+      const guardedStatus: Array<{ col: "payment_status" | "asaas_status"; value: string; above: string[] }> = []
+      for (const col of ["payment_status", "asaas_status"] as const) {
+        const value = agreementUpdate[col]
+        const above = paymentStatusesRankedAbove(value)
+        if (typeof value === "string" && above.length > 0) {
+          guardedStatus.push({ col, value, above })
+          delete agreementUpdate[col]
+        }
       }
 
       const { error: updateError } = await supabase
         .from("agreements")
         .update(agreementUpdate)
         .eq("id", agreement.id)
+        .eq("company_id", agreement.company_id)
 
       if (updateError) {
         console.error("[ASAAS Webhook] Error updating agreement:", updateError)
         throw updateError
       }
 
+      for (const { col, value, above } of guardedStatus) {
+        const { error: statusError } = await supabase
+          .from("agreements")
+          .update({ [col]: value })
+          .eq("id", agreement.id)
+          .eq("company_id", agreement.company_id)
+          .or(`${col}.is.null,${col}.not.in.(${above.join(",")})`)
+        if (statusError) {
+          console.error(`[ASAAS Webhook] Error updating agreement ${col}:`, statusError)
+          throw statusError
+        }
+      }
+
       // Acordo pago por outro caminho (sync/manual) sem data de recebimento:
-      // preenche uma única vez.
-      if (settlingEvent && !current.payment_received_at) {
+      // preenche uma única vez (condicional: nunca reescreve).
+      if (settlingEvent) {
         await supabase
           .from("agreements")
           .update({ payment_received_at: new Date().toISOString() })
@@ -544,37 +567,35 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // 12. Create notification for payment events
-    if (agreement.user_id && (
-      event === "PAYMENT_RECEIVED" ||
-      event === "PAYMENT_CONFIRMED" ||
-      event === "PAYMENT_OVERDUE"
-    )) {
-      const notificationConfig: Record<string, { title: string; description: string }> = {
-        PAYMENT_RECEIVED: {
-          title: "Pagamento Confirmado",
-          description: `Seu pagamento de R$ ${payment.value?.toFixed(2)} foi confirmado com sucesso!`
-        },
-        PAYMENT_CONFIRMED: {
-          title: "Pagamento em Processamento",
-          description: `Seu pagamento de R$ ${payment.value?.toFixed(2)} está sendo processado.`
-        },
-        PAYMENT_OVERDUE: {
-          title: "Pagamento em Atraso",
-          description: `Seu pagamento de R$ ${payment.value?.toFixed(2)} está em atraso. Por favor, regularize.`
-        }
-      }
-
-      const notification = notificationConfig[event]
-      if (notification) {
-        await supabase.from("notifications").insert({
-          user_id: agreement.user_id,
-          company_id: agreement.company_id,
-          type: "payment",
-          title: notification.title,
-          description: notification.description,
-        })
-      }
+    // 12. Notificação in-app ao devedor.
+    // PAGO: UMA por acordo — só o evento que venceu o portão da quitação
+    // (settledNow). O cartão manda CONFIRMED e depois RECEIVED (dois eventos
+    // PAGOS); parcela que não é a última (holdInstallment) não quita e não
+    // notifica; PAGO tardio de acordo já quitado perde o portão e não notifica.
+    // Atraso (OVERDUE) continua por evento.
+    const notification: { title: string; description: string } | null =
+      settlingEvent && settledNow
+        ? {
+            title: "Pagamento Confirmado",
+            description: `Seu pagamento de R$ ${formatNotificationAmount(
+              Number(agreement.installments) > 1 ? agreement.agreed_amount : payment.value,
+              payment.value,
+            )} foi confirmado com sucesso!`,
+          }
+        : event === "PAYMENT_OVERDUE"
+          ? {
+              title: "Pagamento em Atraso",
+              description: `Seu pagamento de R$ ${formatNotificationAmount(payment.value)} está em atraso. Por favor, regularize.`,
+            }
+          : null
+    if (agreement.user_id && notification) {
+      await supabase.from("notifications").insert({
+        user_id: agreement.user_id,
+        company_id: agreement.company_id,
+        type: "payment",
+        title: notification.title,
+        description: notification.description,
+      })
     }
 
     // 13. Mark webhook event as processed
