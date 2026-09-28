@@ -50,8 +50,8 @@ export interface PaymentDetails {
 }
 
 export type PaymentCreateResult =
-  | { ok: true; status: "created"; idempotent: boolean; payment: PaymentDetails }
-  | { ok: true; status: "processing"; idempotent: boolean; agreement_id: string; poll_after_ms: number }
+  | { ok: true; status: "created"; idempotent: boolean; payment: PaymentDetails; pending?: Promise<unknown> }
+  | { ok: true; status: "processing"; idempotent: boolean; agreement_id: string; poll_after_ms: number; pending?: Promise<unknown> }
   | { ok: false; status: number; code: string; message: string }
 
 async function loadTenantPaymentOrigin(companyId: string): Promise<"platform" | "n8n"> {
@@ -183,6 +183,12 @@ export interface PaymentCreateOpts {
   /** QA rodada 5 (Q2-01): prazo (epoch ms) para a cobrança COMEÇAR — ver
    *  confirmAccept. Ausente = sem prazo (n8n/worker). */
   chargeNotAfter?: number | null
+  /** Latência (14-latencia-pagar): consulta do guard ASAAS já em curso (ver
+   *  readConfirmGuards). Continua obrigatória e avaliada antes de fechar/cobrar. */
+  asaasGuard?: Promise<{ id: string | null; payments: unknown[] | null }>
+  /** Latência: devolve a auditoria do fechamento em `pending` (o chamador a
+   *  aguarda antes de responder) em vez de segurar a entrega do link. */
+  returnPending?: boolean
 }
 
 export async function paymentCreate(
@@ -204,7 +210,7 @@ export async function paymentCreate(
   // confirmAccept faz as leituras do guard ele mesmo, como antes.
   let guardP: Promise<Awaited<ReturnType<typeof readConfirmGuards>> | undefined>
   try {
-    guardP = readConfirmGuards(ctx, offerId)
+    guardP = readConfirmGuards(ctx, offerId, opts?.asaasGuard ? { asaas: opts.asaasGuard } : undefined)
   } catch {
     guardP = Promise.resolve(undefined)
   }
@@ -315,20 +321,23 @@ export async function paymentCreate(
   // Latência: a linha do acordo gravada pelo write-back inline já traz as colunas
   // do link (mesmo shape de fetchPaymentDetails); sem ela, relê como antes. A
   // auditoria do fechamento termina em paralelo.
+  const audit = result.pending ?? Promise.resolve()
+  if (opts?.returnPending) audit.catch(() => {}) // aguardado pelo chamador
   const [details] = await Promise.all([
     result.chargeRow && result.chargeRow.id === result.agreementId
       ? Promise.resolve(paymentDetailsFromRow(result.agreementId, result.chargeRow))
       : fetchPaymentDetails(result.agreementId, ctx.companyId),
-    result.pending ?? Promise.resolve(),
+    opts?.returnPending ? Promise.resolve() : audit,
   ])
+  const pendingField = opts?.returnPending ? { pending: audit } : {}
   // CHARGE_MODE='inline': closeAgreement já criou a cobrança e gravou as URLs de
   // forma síncrona → payment_id presente → devolvemos 'created' com o link agora.
   // CHARGE_MODE='queue' (Workers 0/0, D5): sem link ainda → 'processing'; a UI/n8n
   // faz polling até o worker gravar as URLs.
   if (!details.payment_id) {
-    return { ok: true, status: "processing", idempotent: false, agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS }
+    return { ok: true, status: "processing", idempotent: false, agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS, ...pendingField }
   }
-  return { ok: true, status: "created", idempotent: false, payment: details }
+  return { ok: true, status: "created", idempotent: false, payment: details, ...pendingField }
 }
 
 export type PaymentCreateOrLink =

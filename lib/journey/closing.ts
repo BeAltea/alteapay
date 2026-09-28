@@ -87,7 +87,14 @@ export interface ConfirmGuardReads {
   preloaded: { debt: Record<string, any> | null; customer: Record<string, any> | null } | null
 }
 
-export async function readConfirmGuards(ctx: SessionCtx, offerId: string): Promise<ConfirmGuardReads> {
+export async function readConfirmGuards(
+  ctx: SessionCtx,
+  offerId: string,
+  /** Latência: consulta do guard ASAAS já disparada nesta request, depois do
+   *  clique travado (payService) — mesma leitura (customer ASAAS conhecido →
+   *  cobranças do cliente). Ausente → lida aqui. */
+  opts?: { asaas?: Promise<{ id: string | null; payments: unknown[] | null }> },
+): Promise<ConfirmGuardReads> {
   const supabase = createServiceClient()
   const knownP = supabase
     .from("agreements")
@@ -97,7 +104,7 @@ export async function readConfirmGuards(ctx: SessionCtx, offerId: string): Promi
     .limit(1)
   // guard ASAAS começa assim que o customer ASAAS é conhecido (em paralelo com
   // o guard local e com as demais leituras da leva).
-  const asaasP = (async () => {
+  const asaasP = opts?.asaas ?? (async () => {
     const { data: known } = await knownP
     const id = ((known as Array<{ asaas_customer_id?: string | null }> | null)?.[0]?.asaas_customer_id) ?? null
     if (!id) return { id: null as string | null, payments: null as unknown[] | null }

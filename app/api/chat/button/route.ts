@@ -52,7 +52,7 @@ import {
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { checkEffectDoubleTap, isDoubleTapHandoff, isDuplicateClick, lastCustomerClick } from "@/lib/journey/double-tap"
-import { payChargeStartBudgetMs, payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
+import { payChargeStartBudgetMs, payService, POST_PAYMENT_LINK_KIND, prefetchIntegralOffer } from "@/lib/journey/pay"
 import { setSessionWaitState } from "@/lib/journey/session-wait"
 import { createServiceClient } from "@/lib/supabase/service"
 import { settledButtonBody } from "@/lib/journey/settled-state"
@@ -379,6 +379,11 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
       ? readLatestAckAppend(ctx.sessionId, ctx.debtId)
       : null
   payLatestAck?.catch(() => {}) // aguardado no reconhecimento (ou descartado)
+  // Idem para as LEITURAS da oferta integral (valor, ofertas/aceites da sessão,
+  // matriz, acordos e customer ASAAS do cliente): só leitura, nada é gravado
+  // antes da integridade do clique. Descartadas se o clique não seguir.
+  const payPrefetchDebtIds = payLatestAck ? debtIdsOf(prompt, ctx.debtId).debtIds : null
+  const payPrefetch = payPrefetchDebtIds ? prefetchIntegralOffer(ctx, payPrefetchDebtIds, { eager: true }) : null
 
   // F8-02: dívida quitada depois que a página carregou — o clique defasado é
   // respondido com o estado de quitado (nunca cobrança, menu ou caso novo).
@@ -677,6 +682,10 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
           try {
             return await payService(ctx, {
               debtIds, primaryDebtId, requestStartedAt, beforeCharge: recognized, beforeDeliver: echoWrite,
+              // só vale para o MESMO conjunto de dívidas (re-alvejamento pode trocar o prompt)
+              ...(payPrefetch && payPrefetchDebtIds && payPrefetchDebtIds.join(",") === debtIds.join(",")
+                ? { prefetch: payPrefetch }
+                : {}),
             })
           } finally {
             // eco + auditoria do reconhecimento: concluídos antes da resposta.
