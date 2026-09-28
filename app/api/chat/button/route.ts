@@ -18,6 +18,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { formatServerTiming, runWithTimings } from "@/lib/journey/server-timing"
+import { afterResponseMode } from "@/lib/journey/after-response"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { HANDOFF_STAGE, loadSessionCtx, registerDispute, transferToHuman, transferToHumanWithOutcome, type SessionCtx } from "@/lib/journey/actions"
 import {
@@ -26,6 +27,7 @@ import {
   getPrompt,
   promptView,
   type PromptRow,
+  type PromptView,
 } from "@/lib/journey/prompts"
 import {
   buildAckContext,
@@ -48,9 +50,11 @@ import {
   type PresentMatrixOffersResult,
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
-import { checkEffectDoubleTap, isDoubleTapHandoff, isDuplicateClick } from "@/lib/journey/double-tap"
+import { checkEffectDoubleTap, isDoubleTapHandoff, isDuplicateClick, lastCustomerClick } from "@/lib/journey/double-tap"
 import { payChargeStartBudgetMs, payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
 import { setSessionWaitState } from "@/lib/journey/session-wait"
+import { createServiceClient } from "@/lib/supabase/service"
+import { settledButtonBody } from "@/lib/journey/settled-state"
 import { engineName } from "@/lib/negotiation/engine"
 import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"
 import {
@@ -64,6 +68,7 @@ import {
   findButton,
   type Button,
 } from "@/lib/journey/buttons"
+import { samePromptThread } from "@/lib/journey/thread-epoch" // N8N-9
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -83,6 +88,42 @@ async function markWaitingForEngine(sessionId: string): Promise<void> {
 }
 
 /**
+ * N8N-7 — Negociar SEM parcelas: estado da espera DEPOIS do deadline do kickoff.
+ * A espera é gravada ANTES de aguardar o kickoff (o fallback do fluxo, guard
+ * N8N-6, precisa vê-la para degradar a sessão em vez de reabrir o menu em
+ * silêncio). Dentro do deadline o motor pode ter:
+ *  - publicado um prompt (chatSend → createPrompt aposenta a espera) → devolve
+ *    o prompt, sem espera (se uma corrida regravou a espera, ela é limpa);
+ *  - falhado com texto de fallback → sessão em 'menu_degradado';
+ *  - nada ainda → 'aguardando_motor' (regravada se algo a limpou sem prompt).
+ * Nunca deixa a espera pendurada no servidor junto de um prompt (F5 com dois
+ * menus) nem um clique sem próximo passo.
+ */
+async function engineWaitAfterKickoff(
+  sessionId: string,
+): Promise<{ wait_state: "aguardando_motor" | "menu_degradado" | null; prompt: PromptView | null }> {
+  const live = await getActivePrompt(sessionId).catch(() => null)
+  let waitState: string | null = null
+  try {
+    const { data } = await createServiceClient()
+      .from("negotiation_sessions")
+      .select("wait_state")
+      .eq("id", sessionId)
+      .maybeSingle()
+    waitState = (data as { wait_state?: string | null } | null)?.wait_state ?? null
+  } catch {
+    /* defensivo: sem a leitura, segue pelo prompt/espera como antes */
+  }
+  if (live) {
+    if (waitState === "aguardando_motor" || waitState === "menu_degradado") await setSessionWaitState(sessionId, null)
+    return { wait_state: null, prompt: promptView(live) }
+  }
+  if (waitState === "menu_degradado") return { wait_state: "menu_degradado", prompt: null }
+  if (waitState !== "aguardando_motor") await markWaitingForEngine(sessionId)
+  return { wait_state: "aguardando_motor", prompt: null }
+}
+
+/**
  * QA round 2 (QAB1-H1, ALTO) — a COBRANÇA persiste o seu estado na sessão: grava
  * 'gerando_cobranca' ANTES de chamar o serviço de pagamento e, ao final, limpa
  * (link entregue → o prompt pós-link já existe; já-cobrado sem link → o menu
@@ -97,14 +138,20 @@ async function withChargeWaitState<T extends { ok: boolean }>(
   sessionId: string,
   run: () => Promise<T>,
 ): Promise<{ result: T; wait_state: "gerando_cobranca" | "erro_cobranca" | null }> {
-  await setSessionWaitState(sessionId, "gerando_cobranca")
+  // Latência (10-latencia.md): a marca 'gerando_cobranca' é gravada EM PARALELO
+  // com o início do serviço (o serviço não lê wait_state) e sempre termina antes
+  // da marca final — a ordem das escritas no estado da sessão é a mesma.
+  const marked = setSessionWaitState(sessionId, "gerando_cobranca")
+  marked.catch(() => {}) // aguardado abaixo (antes da marca final)
   let result: T
   try {
     result = await run()
   } catch (err) {
+    await marked
     await setSessionWaitState(sessionId, "erro_cobranca")
     throw err
   }
+  await marked
   const r = result as { ok: boolean; processing?: boolean; status?: string }
   const processing = r.ok === true && (r.processing === true || r.status === "processing")
   const next: "gerando_cobranca" | "erro_cobranca" | null = !r.ok
@@ -276,7 +323,9 @@ export async function POST(req: NextRequest) {
   const steps = formatServerTiming(timings)
   res.headers.set(
     "Server-Timing",
-    [prev, steps, `total;dur=${Date.now() - t0}`].filter(Boolean).join(", "),
+    // after_<modo>: como o trabalho pós-resposta rodou (wait_until|background|inline)
+    // — prova em produção de que o waitUntil da plataforma está ativo.
+    [prev, steps, `total;dur=${Date.now() - t0}`, `after_${afterResponseMode()};dur=0`].filter(Boolean).join(", "),
   )
   return res
 }
@@ -295,18 +344,35 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
   const claims = cookie ? verifyChatJwt(cookie) : null
   if (!claims) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
 
-  const ctx = await loadSessionCtx(claims.sid)
-  if (!ctx) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
-
   const body = await req.json().catch(() => ({} as Record<string, unknown>))
   let promptId = String(body.prompt_id ?? "")
   const buttonId = Number(body.button_id)
-  if (!promptId || !Number.isInteger(buttonId)) {
+
+  // Latência (10-latencia.md): contexto da sessão, prompt clicado e — nos
+  // controles de efeito (Não reconheço/Pagar) — o último clique do guard de toque
+  // múltiplo dependem só do sid do cookie → UMA leva paralela (antes: 3 idas em
+  // série). O sid do cookie É o session_id do contexto (loadSessionCtx(claims.sid)).
+  const validBody = !!promptId && Number.isInteger(buttonId)
+  const lastClickAt = Date.now()
+  const lastClickP =
+    validBody && (buttonId === BTN_NO || buttonId === BTN_PAY) ? lastCustomerClick(claims.sid) : null
+  const [ctx, fetchedPrompt] = await Promise.all([
+    loadSessionCtx(claims.sid),
+    validBody ? getPrompt(promptId, claims.sid) : Promise.resolve(null),
+  ])
+  if (!ctx) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+
+  if (!validBody) {
     return NextResponse.json({ error: "prompt_id e button_id obrigatórios" }, { status: 422 })
   }
 
-  let prompt = await getPrompt(promptId, ctx.sessionId)
+  let prompt = fetchedPrompt
   if (!prompt) return NextResponse.json({ error: "prompt não encontrado", code: "prompt_not_found" }, { status: 404 })
+
+  // F8-02: dívida quitada depois que a página carregou — o clique defasado é
+  // respondido com o estado de quitado (nunca cobrança, menu ou caso novo).
+  const settled = await settledButtonBody(ctx, prompt, buttonId)
+  if (settled) return NextResponse.json(settled)
 
   // A1 — RE-ALVEJAMENTO (N-D3-3): prompt clicado já não está ativo (respondido/
   // substituído: 2ª aba, poll atrasado, clique duplo tardio). Se o prompt ATIVO
@@ -344,6 +410,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
     const dt = await checkEffectDoubleTap({
       sessionId: ctx.sessionId, companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
       buttonId, promptId: prompt.id, source: "button", recheckAfterMs: buttonId === BTN_NO ? 250 : 0,
+      ...(lastClickP ? { prefetchedLast: await lastClickP, prefetchedAtMs: lastClickAt } : {}),
     })
     if (dt.doubleTap) {
       const active = await getActivePrompt(ctx.sessionId).catch(() => null)
@@ -360,7 +427,9 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
     const active = await getActivePrompt(ctx.sessionId)
     const staleBtn = findButton(prompt.buttons ?? [], buttonId)
     const liveBtn = active && active.kind === prompt.kind ? findButton(active.buttons ?? [], buttonId) : null
-    if (active && staleBtn && liveBtn && sameButton(staleBtn, liveBtn)) {
+    // N8N-9: nunca re-alveja através do reset de 24h — o prompt clicado tem de ser
+    // da MESMA thread (época, não arquivado) do ativo; senão 409 prompt_stale.
+    if (active && staleBtn && liveBtn && sameButton(staleBtn, liveBtn) && samePromptThread(prompt, active)) {
       retargetedFrom = prompt.id
       prompt = active
       promptId = active.id
@@ -374,7 +443,13 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
 
   const ip = clientIp(req)
   const userAgent = req.headers.get("user-agent")
-  const answerInput = { sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId, retargetedFrom }
+  // Latência: o prompt JÁ lido (ou o ativo re-alvejado) e a época do contexto vão
+  // para answerPrompt — a transição condicional status='active' segue sendo a
+  // garantia contra cliques concorrentes.
+  const answerInput = {
+    sessionId: ctx.sessionId, companyId: ctx.companyId, promptId, buttonId, retargetedFrom,
+    knownPrompt: prompt, threadEpoch: ctx.threadEpoch,
+  }
 
   // R1 — ESCOLHA DE PARCELA (kind 'offer_choice'): o devedor escolheu uma das
   // OPÇÕES DE PARCELAMENTO DETERMINÍSTICAS da matriz (apresentadas no fallback
@@ -401,12 +476,16 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
       if (buttonId === BTN_BACK) {
         const back = await reopenThreeOptions({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-          debtIds, primaryDebtId,
+          debtIds, primaryDebtId, threadEpoch: ctx.threadEpoch,
         })
         if (!back.ok) {
           return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
         }
-        return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
+        // Latência: o menu reaberto já volta de reopenThreeOptions (sem reler o ativo).
+        return NextResponse.json(await withState({
+          ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply,
+          ...(back.prompt ? { prompt: promptView(back.prompt) } : {}),
+        }, ctx.sessionId))
       }
 
       // --- ATENDIMENTO [99] → handoff. ---------------------------------------
@@ -512,12 +591,16 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
       if (buttonId === BTN_BACK) {
         const back = await reopenThreeOptions({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-          debtIds, primaryDebtId,
+          debtIds, primaryDebtId, threadEpoch: ctx.threadEpoch,
         })
         if (!back.ok) {
           return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
         }
-        return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
+        // Latência: o menu reaberto já volta de reopenThreeOptions (sem reler o ativo).
+        return NextResponse.json(await withState({
+          ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply,
+          ...(back.prompt ? { prompt: promptView(back.prompt) } : {}),
+        }, ctx.sessionId))
       }
       if (buttonId === BTN_HANDOFF) {
         return NextResponse.json(await handoffBody(ctx, buttonId, promptId))
@@ -556,12 +639,15 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
           if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
-        // Reconhecimento IMPLÍCITO ANTES do payService (M4): destrava o guard D18.
-        // A1 (N-D1-5): NÃO regrava se a sessão já reconheceu (clique repetido).
-        await recognizeImplicitOnce({
+        // Reconhecimento IMPLÍCITO ANTES do payment.create (M4): destrava o guard
+        // D18. A1 (N-D1-5): NÃO regrava se a sessão já reconheceu (clique repetido).
+        // Latência (10-latencia.md): corre em paralelo com a oferta integral e o
+        // payService o aguarda ANTES da cobrança (o guard lê o reconhecimento).
+        const recognized = recognizeImplicitOnce({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtId: ctx.debtId, promptId, buttonId, source: "chat_three_options_pay", ip, userAgent,
         })
+        recognized.catch(() => {}) // aguardado dentro do payService
         // payService (trilha D3): oferta integral 0% → link ASAAS canônico. NUNCA
         // 2ª cobrança; NUNCA declara pago. Persiste a bolha do link (outcome) e o
         // prompt pós-link ANTES de responder. Passamos os MESMOS debtIds que
@@ -571,7 +657,7 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         // (reload durante a cobrança reidrata a espera); limpo/'erro_cobranca' ao final.
         const tCharge = Date.now()
         const { result: pay, wait_state: payWait } = await withChargeWaitState(ctx.sessionId, () =>
-          payService(ctx, { debtIds, primaryDebtId, requestStartedAt }),
+          payService(ctx, { debtIds, primaryDebtId, requestStartedAt, beforeCharge: recognized }),
         )
         const chargeMs = Date.now() - tCharge
         if (!pay.ok) {
@@ -625,7 +711,13 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         // a sequência na tela; a frase sem dois-pontos (NEGOTIATION_SEARCHING_TEXT)
         // é dos ramos legados, onde nada vem depois (A4 r2, B3-F2).
         const reply = NEGOTIATION_PENDING_TEXT
-        const ackWrite = persistAssistantMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply })
+        // N8N-7: a confirmação é a resposta DESTE clique — sem o dedup de conteúdo
+        // de 15 min. Deduplicada, a última bolha do assistente seguia sendo a de um
+        // desfecho anterior (ex.: o handoff): sem parcelas não há prompt ativo e o
+        // client lia "atendimento pedido + nenhum menu" como conversa encerrada.
+        const ackWrite = persistAssistantMessage({
+          companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply, skipContentDedup: true,
+        })
         let presented: PresentMatrixOffersResult | null = null
         const [, pres] = await Promise.all([
           // Reconhecimento IMPLÍCITO (M4) — clicar negociar reconhece a dívida.
@@ -648,6 +740,8 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         presented = pres
         await ackWrite
         const presentedOffers = !!presented && presented.ok && presented.presented === true
+        // N8N-7: sem parcelas, a espera nasce ANTES de aguardar o kickoff.
+        if (!presentedOffers) await markWaitingForEngine(ctx.sessionId)
 
         // Kickoff: com as PARCELAS prontas a resposta NÃO espera o disparo — QA
         // round 2 (QAA2-02): o Promise.race de 2,5 s era consumido inteiro em 7/8
@@ -665,10 +759,11 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         // devedor vê a espera e, aos 15s, o menu de degradação (M10). Com as
         // parcelas na tela, não há spinner — a ação está imediatamente disponível.
         if (!presentedOffers || !presented || !presented.ok || !presented.presented) {
-          await markWaitingForEngine(ctx.sessionId)
+          const wait = await engineWaitAfterKickoff(ctx.sessionId)
           return NextResponse.json({
             ok: true, button_id: buttonId, action: "negotiate", acknowledged: true,
-            wait_state: "aguardando_motor", engine_owner: kick.owner, kickoff: kick.status, reply,
+            ...(wait.wait_state ? { wait_state: wait.wait_state } : { prompt: wait.prompt }),
+            engine_owner: kick.owner, kickoff: kick.status, reply,
             ...(retargetedFrom ? { retargeted_from: retargetedFrom } : {}),
           })
         }
@@ -701,47 +796,51 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         })
         const reopened = await reopenThreeOptions({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-          debtIds, primaryDebtId, ackCtx,
+          debtIds, primaryDebtId, ackCtx, threadEpoch: ctx.threadEpoch,
         })
         return NextResponse.json(await withState({
           ok: true, button_id: buttonId, action: "consult", acknowledged: false, reply,
           ...(retargetedFrom ? { retargeted_from: retargetedFrom } : {}),
           prompt_id: reopened.ok ? reopened.promptId : null,
           outcome: outcomeOf(detailId, reply, "detail", promptId),
+          // Latência: o menu reaberto já volta de reopenThreeOptions (sem reler).
+          ...(reopened.ok && reopened.prompt ? { prompt: promptView(reopened.prompt) } : {}),
         }, ctx.sessionId))
       }
 
       // --- NÃO RECONHEÇO [0] -------------------------------------------------
       if (buttonId === BTN_NO) {
+        // Latência (10-latencia.md): a copy do cedente (config do canal + contexto
+        // do débito) só LÊ e não depende do clique → começa JÁ, em paralelo com a
+        // integridade do clique. Nada é gravado antes de answerPrompt converter o
+        // prompt (a garantia contra clique concorrente continua a mesma).
+        const channelP = resolveCreditorChannel({
+          companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+        })
+        channelP.catch(() => {})
         const answered = await answerPrompt(answerInput)
         if (!answered.ok) {
           if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
         }
-        const out = await handleDebtNotRecognized({
+        // Latência (10-latencia.md): o registro do "não reconheço" (append-log +
+        // evento) não muda a copy nem o menu-volta → corre EM PARALELO com a
+        // gravação da resposta e do menu (abaixo) e termina antes da resposta; uma
+        // falha dele continua virando o 500 do ramo (catch), como antes.
+        const handledP = handleDebtNotRecognized({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtId: ctx.debtId, promptId, buttonId, ip, userAgent,
         })
-        if (out.onNotRecognized === "dispute") {
-          await registerDispute(ctx, { source: "debt_not_recognized" }, "customer")
-        } else if (out.onNotRecognized === "human") {
-          await transferToHuman(ctx, "debt_not_recognized", "customer")
-        }
+        handledP.catch(() => {}) // aguardado no Promise.all abaixo
+        const current = await getActivePrompt(ctx.sessionId).catch(() => null)
         // Copy do cedente com FALLBACK SEGURO (§6.2/M6, incidente GNLink): nunca
         // vazio/"null"/outro cedente. Emite alerta de config quando o label é NULL.
-        const channel = await resolveCreditorChannel({
-          companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-        })
+        const channel = await channelP
         if (!channel.hasConfig) {
           // Alerta operacional (sem PII): tenant sem official_channel_label semeado.
           console.warn(`[chat:button] GNLink: official_channel_label ausente (company=${ctx.companyId}); usando fallback seguro`)
         }
         const reply = notRecognizedReply(channel)
-        // A1: resultado da ação como OUTCOME (ligado ao clique) ANTES do menu-volta.
-        const nrId = await persistAssistantMessage({
-          companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply,
-          promptId, stage: "not_recognized",
-        })
         // Botão de VOLTA (M7): [98] reabre o menu de 3 opções. Só um botão-link de
         // ação; a UI (D2) o renderiza. Persistido como prompt para a re-entrada.
         // QA round 4 (R-12): um login concorrente pode já ter publicado o
@@ -749,25 +848,46 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         // supersede (a outra aba nunca recebe 409 por isso).
         const { createPrompt } = await import("@/lib/journey/prompts")
         const { backToOptionsButtons } = await import("@/lib/journey/acknowledgement")
-        const current = await getActivePrompt(ctx.sessionId).catch(() => null)
         const alreadyBack =
           !!current &&
           current.kind === "debt_three_options" &&
           (current.context as { stage?: unknown } | null)?.stage === "not_recognized_back"
-        if (!alreadyBack) {
-          await createPrompt({
-            companyId: ctx.companyId, sessionId: ctx.sessionId, kind: "debt_three_options",
-            // A4/S12: sem pergunta — o rótulo "Voltar às opções" basta.
-            question: "",
-            buttons: backToOptionsButtons(),
-            context: { primary_debt_id: primaryDebtId, debt_ids: debtIds, stage: "not_recognized_back" },
-            createdBy: "platform",
-          })
+        // A1: resultado da ação como OUTCOME (ligado ao clique). O menu-volta não
+        // tem pergunta (nenhuma bolha nova) — a bolha do resultado e o prompt são
+        // gravados em PARALELO (latência); o prompt ativo vai no corpo.
+        const [out, nrId, created] = await Promise.all([
+          handledP,
+          persistAssistantMessage({
+            companyId: ctx.companyId, sessionId: ctx.sessionId, text: reply,
+            promptId, stage: "not_recognized",
+            ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
+          }),
+          (async () => {
+            if (!alreadyBack) {
+              return createPrompt({
+                companyId: ctx.companyId, sessionId: ctx.sessionId, kind: "debt_three_options",
+                // A4/S12: sem pergunta — o rótulo "Voltar às opções" basta.
+                question: "",
+                buttons: backToOptionsButtons(),
+                context: { primary_debt_id: primaryDebtId, debt_ids: debtIds, stage: "not_recognized_back" },
+                createdBy: "platform",
+                ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
+              })
+            }
+            return null
+          })(),
+        ])
+        if (out.onNotRecognized === "dispute") {
+          await registerDispute(ctx, { source: "debt_not_recognized" }, "customer")
+        } else if (out.onNotRecognized === "human") {
+          await transferToHuman(ctx, "debt_not_recognized", "customer")
         }
+        const backPrompt = alreadyBack ? current : created && created.ok ? created.prompt : null
         return NextResponse.json(await withState({
           ok: true, button_id: buttonId, action: "not_recognized", acknowledged: false,
           on_not_recognized: out.onNotRecognized, has_channel_config: channel.hasConfig, reply,
           outcome: outcomeOf(nrId, reply, "not_recognized", promptId),
+          ...(backPrompt ? { prompt: promptView(backPrompt) } : {}),
         }, ctx.sessionId))
       }
 
@@ -780,12 +900,16 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         }
         const back = await reopenThreeOptions({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
-          debtIds, primaryDebtId,
+          debtIds, primaryDebtId, threadEpoch: ctx.threadEpoch,
         })
         if (!back.ok) {
           return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
         }
-        return NextResponse.json(await withState({ ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply }, ctx.sessionId))
+        // Latência: o menu reaberto já volta de reopenThreeOptions (sem reler o ativo).
+        return NextResponse.json(await withState({
+          ok: true, button_id: buttonId, action: "back_to_options", reply: back.reply,
+          ...(back.prompt ? { prompt: promptView(back.prompt) } : {}),
+        }, ctx.sessionId))
       }
 
       // --- ATENDIMENTO [99] --------------------------------------------------
@@ -845,13 +969,15 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
         debtId: ctx.debtId, debtIds, promptId, buttonId, ip, userAgent,
       })
-      if (!out.offersPresented) await markWaitingForEngine(ctx.sessionId)
+      const wait = out.offersPresented ? null : await engineWaitAfterKickoff(ctx.sessionId)
       return NextResponse.json({
         ok: true, button_id: buttonId, action: "negotiate",
         acknowledged: true, engine_owner: out.engineOwner, kickoff: out.kickoff, reply: out.reply,
         ...(out.offersPresented && out.prompt
           ? { offers_presented: true, prompt: out.prompt }
-          : { wait_state: "aguardando_motor" }),
+          : wait?.wait_state
+            ? { wait_state: wait.wait_state }
+            : { prompt: wait?.prompt ?? null }),
       })
     }
 

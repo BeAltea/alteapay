@@ -110,35 +110,40 @@ export async function buildAckContext(input: {
   debtIds: string[]
 }): Promise<AckContext> {
   const supabase = createServiceClient()
-  const { data: company } = await supabase
-    .from("companies")
-    .select("name")
-    .eq("id", input.companyId)
-    .maybeSingle()
-  const { data: cfg } = await supabase
-    .from("tenant_chat_config")
-    .select("branding")
-    .eq("company_id", input.companyId)
-    .maybeSingle()
+  // Latência (10-latencia.md): credor, branding, dívidas e cliente são leituras
+  // INDEPENDENTES → em paralelo; só as faturas dependem do documento (antes: 5
+  // idas ao banco em série, ~750 ms em produção, em todo login/menu/card fixo).
+  const [{ data: company }, { data: cfg }, { data: debts }, { data: customer }] = await Promise.all([
+    supabase
+      .from("companies")
+      .select("name")
+      .eq("id", input.companyId)
+      .maybeSingle(),
+    supabase
+      .from("tenant_chat_config")
+      .select("branding")
+      .eq("company_id", input.companyId)
+      .maybeSingle(),
+    supabase
+      .from("debts")
+      .select("id, amount, due_date")
+      .eq("company_id", input.companyId)
+      .in("id", input.debtIds),
+    supabase
+      .from("customers")
+      .select("name, document")
+      .eq("id", input.customerId)
+      .maybeSingle(),
+  ])
   const branding = (cfg?.branding ?? {}) as Record<string, unknown>
   const creditorName =
     (typeof branding.brand_name === "string" && branding.brand_name) || company?.name || "Credor"
 
-  const { data: debts } = await supabase
-    .from("debts")
-    .select("id, amount, due_date")
-    .eq("company_id", input.companyId)
-    .in("id", input.debtIds)
   const updatedValue = (debts ?? []).reduce(
     (s, d) => s + Number(d.amount ?? 0),
     0,
   )
 
-  const { data: customer } = await supabase
-    .from("customers")
-    .select("name, document")
-    .eq("id", input.customerId)
-    .maybeSingle()
   const firstName = firstNameOf(customer?.name, customer?.document) ?? ""
   const doc = (customer?.document ?? "").replace(/\D/g, "")
   const { data: invoices } = await supabase
@@ -321,23 +326,22 @@ export async function resolveCreditorChannel(input: {
   debtId: string
 }): Promise<CreditorChannel> {
   const supabase = createServiceClient()
-  const { data: cfg } = await supabase
-    .from("tenant_chat_config")
-    .select("official_channel_label, official_channel_url")
-    .eq("company_id", input.companyId)
-    .maybeSingle()
   // {credor} SEMPRE da fonte canônica (buildAckContext), nunca do label do canal.
-  let creditorName = "empresa credora"
-  try {
-    const ackCtx = await buildAckContext({
+  // Latência: a config do canal e o contexto são independentes → em paralelo.
+  const [{ data: cfg }, ackCtx] = await Promise.all([
+    supabase
+      .from("tenant_chat_config")
+      .select("official_channel_label, official_channel_url")
+      .eq("company_id", input.companyId)
+      .maybeSingle(),
+    buildAckContext({
       companyId: input.companyId,
       customerId: input.customerId,
       debtIds: [input.debtId],
-    })
-    creditorName = ackCtx.creditorName
-  } catch {
-    /* fallback silencioso: mantém o genérico */
-  }
+    }).catch(() => null),
+  ])
+  let creditorName = "empresa credora"
+  if (ackCtx) creditorName = ackCtx.creditorName
   const rawLabel = typeof cfg?.official_channel_label === "string" ? cfg.official_channel_label.trim() : ""
   const rawUrl = typeof cfg?.official_channel_url === "string" ? cfg.official_channel_url.trim() : ""
   const hasConfig = rawLabel.length > 0
@@ -407,24 +411,35 @@ export const GREETING_STAGE = "greeting"
  * Idempotente por (sessão, época, stage): re-login/reopen NÃO empilham. Best-
  * effort: NUNCA lança.
  */
+type RecentAssistantRow = { id: string; offers_snapshot?: unknown; thread_epoch?: number | null; archived_at?: string | null }
+
+/** Bolhas recentes do assistente (não arquivadas) — base da idempotência da saudação. */
+async function readRecentAssistantRows(sessionId: string): Promise<RecentAssistantRow[] | null> {
+  const supabase = createServiceClient()
+  const { data } = await supabase
+    .from("chat_messages")
+    .select("id, offers_snapshot, thread_epoch, archived_at")
+    .eq("session_id", sessionId)
+    .eq("role", "assistant")
+    .is("archived_at", null)
+    .order("created_at", { ascending: false })
+    .limit(200)
+  return (data as RecentAssistantRow[] | null) ?? null
+}
+
 export async function ensureGreetingMessage(input: {
   companyId: string
   sessionId: string
   text: string
   threadEpoch?: number
+  /** Latência: bolhas recentes já lidas pelo chamador NESTA request (mesma
+   *  consulta de readRecentAssistantRows). null/ausente → lê aqui. */
+  prefetchedRows?: RecentAssistantRow[] | null
 }): Promise<string | null> {
   try {
-    const supabase = createServiceClient()
     const epoch =
       typeof input.threadEpoch === "number" ? input.threadEpoch : await getCurrentThreadEpoch(input.sessionId)
-    const { data: rows } = await supabase
-      .from("chat_messages")
-      .select("id, offers_snapshot, thread_epoch, archived_at")
-      .eq("session_id", input.sessionId)
-      .eq("role", "assistant")
-      .is("archived_at", null)
-      .order("created_at", { ascending: false })
-      .limit(200)
+    const rows = input.prefetchedRows ?? (await readRecentAssistantRows(input.sessionId))
     const existing = (rows ?? []).find((r) => {
       const row = r as { offers_snapshot?: { stage?: unknown } | null; thread_epoch?: number | null }
       const stage = row.offers_snapshot && typeof row.offers_snapshot === "object" ? row.offers_snapshot.stage : null
@@ -543,10 +558,30 @@ export async function bootstrapThreeOptionsPrompt(input: {
   question?: string
   mode?: ThreeOptionsMenuMode
   ackCtx?: AckContext
+  /** Latência: época já lida pelo chamador (evita 1 ida ao banco). */
+  threadEpoch?: number
+  /** Latência: escrita do chamador que precisa ficar ANTES da pergunta do menu
+   *  no histórico (ex.: a resposta do "Já paguei" gravada em paralelo). */
+  precedingWrite?: () => Promise<unknown>
+  /** Latência (login): rotação de thread de 24h (resetStaleChatIfInactive). As
+   *  leituras do menu correm JUNTO com ela; se a thread foi rotacionada (raro),
+   *  são refeitas depois — o resultado é o mesmo de rodar a rotação antes. */
+  resetFirst?: () => Promise<boolean>
 }): Promise<BootstrapThreeOptionsResult> {
   const supabase = createServiceClient()
   const mode: ThreeOptionsMenuMode = input.mode ?? "initial"
-  const [{ data: cfg }, { data: existingRaw }, threadEpoch] = await Promise.all([
+  // Latência (10-latencia.md): o contexto do débito (5 leituras) não depende da
+  // config nem do prompt ativo → começa JÁ, em paralelo com a 1ª leva. Só é
+  // descartado no tenant com reconhecimento desligado (sem efeito colateral).
+  const ackCtxPromise: Promise<AckContext> = input.ackCtx
+    ? Promise.resolve(input.ackCtx)
+    : buildAckContext({
+        companyId: input.companyId,
+        customerId: input.customerId,
+        debtIds: input.debtIds,
+      })
+  ackCtxPromise.catch(() => {}) // evita rejeição não tratada no retorno antecipado
+  const readMenuState = () => Promise.all([
     supabase
       .from("tenant_chat_config")
       .select("acknowledgement_enabled, show_handoff_button")
@@ -561,28 +596,33 @@ export async function bootstrapThreeOptionsPrompt(input: {
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle(),
-    getCurrentThreadEpoch(input.sessionId),
+    typeof input.threadEpoch === "number"
+      ? Promise.resolve(input.threadEpoch)
+      : getCurrentThreadEpoch(input.sessionId),
+    // saudação 1x por thread (modo inicial): as bolhas recentes são lidas junto.
+    mode === "initial" ? readRecentAssistantRows(input.sessionId) : Promise.resolve(null),
   ])
+  let menuState = readMenuState()
+  menuState.catch(() => {})
+  if (input.resetFirst) {
+    const rotated = await input.resetFirst().catch(() => false)
+    if (rotated) menuState = readMenuState() // thread nova: relê depois da rotação
+  }
+  const [{ data: cfg }, { data: existingRaw }, threadEpoch, recentAssistant] = await menuState
   if (cfg?.acknowledgement_enabled === false) {
     return { ok: true, created: false, reason: "disabled" }
   }
   const showHandoff = cfg?.show_handoff_button === true
   const existing = (existingRaw as PromptRow | null) ?? null
 
-  const ackCtx =
-    input.ackCtx ??
-    (await buildAckContext({
-      companyId: input.companyId,
-      customerId: input.customerId,
-      debtIds: input.debtIds,
-    }))
+  const ackCtx = await ackCtxPromise
   const greeting = threeOptionsSummary(ackCtx)
 
   if (existing) {
     // Saudação 1x por thread: garantida também na re-entrada com menu vivo (a
     // thread pode ter nascido antes desta regra, sem bolha de saudação).
     if (mode === "initial") {
-      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch, prefetchedRows: recentAssistant })
     }
     // N-D5-7: copy atual no prompt ativo (só o menu payável de 3 opções).
     const ctx = (existing.context ?? {}) as { stage?: unknown; menu_mode?: unknown }
@@ -630,7 +670,7 @@ export async function bootstrapThreeOptionsPrompt(input: {
     const { lastCustomerClick } = await import("./double-tap")
     const last = await lastCustomerClick(input.sessionId)
     if (last.buttonId === BTN_NO) {
-      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+      await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch, prefetchedRows: recentAssistant })
       const back = await createPrompt({
         companyId: input.companyId,
         sessionId: input.sessionId,
@@ -649,7 +689,7 @@ export async function bootstrapThreeOptionsPrompt(input: {
   // Saudação ANTES do menu (ordem cronológica na tela): só no modo inicial e só
   // uma vez por thread.
   if (mode === "initial") {
-    await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch })
+    await ensureGreetingMessage({ companyId: input.companyId, sessionId: input.sessionId, text: greeting, threadEpoch, prefetchedRows: recentAssistant })
   }
 
   const question = input.question ?? menuQuestion(mode)
@@ -667,6 +707,8 @@ export async function bootstrapThreeOptionsPrompt(input: {
 
   // A pergunta do menu (quando houver) fica ligada ao prompt (histórico/painel);
   // no modo inicial a pergunta é vazia → nada a persistir (a saudação já está).
+  // A escrita do chamador que precede o menu (resultado da ação) entra antes.
+  if (input.precedingWrite) await input.precedingWrite().catch(() => {})
   await persistAssistantMessage({
     companyId: input.companyId,
     sessionId: input.sessionId,
@@ -783,14 +825,16 @@ export async function bootstrapThreeOptionsSafe(input: {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") return
   if (!input.primaryDebtId || input.debtIds.length === 0) return
   try {
-    // 24h sem interação → apaga o histórico e recomeça (antes de (re)publicar o menu).
-    await resetStaleChatIfInactive(input.sessionId, input.companyId)
+    // 24h sem interação → arquiva a thread e recomeça (antes de (re)publicar o
+    // menu). Latência: as leituras do menu correm junto e são refeitas se a
+    // rotação acontecer (resetFirst).
     await bootstrapThreeOptionsPrompt({
       companyId: input.companyId,
       sessionId: input.sessionId,
       customerId: input.customerId,
       debtIds: input.debtIds,
       primaryDebtId: input.primaryDebtId,
+      resetFirst: () => resetStaleChatIfInactive(input.sessionId, input.companyId),
     })
   } catch (err) {
     console.warn("[journey] bootstrap 3 opções falhou:", (err as Error).message)
@@ -812,10 +856,13 @@ export async function reopenThreeOptions(input: {
   debtIds: string[]
   primaryDebtId: string
   ackCtx?: AckContext
-}): Promise<{ ok: true; reply: string; promptId: string | null } | { ok: false; error: string }> {
+  threadEpoch?: number
+  precedingWrite?: () => Promise<unknown>
+}): Promise<{ ok: true; reply: string; promptId: string | null; prompt: PromptRow | null } | { ok: false; error: string }> {
   const res = await bootstrapThreeOptionsPrompt({ ...input, mode: "reopen" })
   if (!res.ok) return res
-  return { ok: true, reply: REOPEN_MENU_QUESTION, promptId: res.prompt?.id ?? null }
+  // Latência: o prompt ativo resultante volta ao chamador (evita reler o ativo).
+  return { ok: true, reply: REOPEN_MENU_QUESTION, promptId: res.prompt?.id ?? null, prompt: res.prompt ?? null }
 }
 
 // ============================================================================
@@ -1361,6 +1408,9 @@ export async function persistAssistantMessage(input: {
   threadEpoch?: number
   /** pula o dedup de conteúdo de 15min (bolhas únicas por natureza, ex.: saudação). */
   skipContentDedup?: boolean
+  /** Latência: o `promptId` acabou de ser criado nesta request — não pode haver
+   *  bolha dele ainda, a leitura de idempotência por (prompt, stage) é dispensada. */
+  freshPrompt?: boolean
 }): Promise<string | null> {
   const text = (input.text ?? "").trim()
   if (!text) return null
@@ -1376,7 +1426,7 @@ export async function persistAssistantMessage(input: {
     // (prompt_id, stage), dedup por conteúdo (15min) e época corrente.
     const since = new Date(Date.now() - 15 * 60_000).toISOString()
     const [byPrompt, byContent, epoch] = await Promise.all([
-      input.promptId
+      input.promptId && !input.freshPrompt
         ? supabase
             .from("chat_messages")
             .select("id, offers_snapshot")
@@ -1553,24 +1603,26 @@ export async function persistDebtRecognition(input: {
     throw new Error(`debt_acknowledgements insert falhou: ${ackInsertError.message}`)
   }
 
-  // 2) journey_events (debt.acknowledged | debt.not_recognized)
-  await recordEvent({
-    companyId: input.companyId,
-    customerId: input.customerId,
-    debtId: input.debtId,
-    sessionId: input.sessionId,
-    type: input.acknowledged ? "debt.acknowledged" : "debt.not_recognized",
-    actor: "customer",
-    payload: { button_id: input.buttonId, prompt_id: input.promptId },
-  })
-
-  // 3) espelho do timestamp na sessão (só quando reconhece)
-  if (input.acknowledged) {
-    await supabase
-      .from("negotiation_sessions")
-      .update({ debt_acknowledged_at: new Date().toISOString() })
-      .eq("id", input.sessionId)
-  }
+  // 2) journey_events (debt.acknowledged | debt.not_recognized) e
+  // 3) espelho do timestamp na sessão (só quando reconhece) — independentes entre
+  //    si, ambos DEPOIS do append-log (latência: em paralelo).
+  await Promise.all([
+    recordEvent({
+      companyId: input.companyId,
+      customerId: input.customerId,
+      debtId: input.debtId,
+      sessionId: input.sessionId,
+      type: input.acknowledged ? "debt.acknowledged" : "debt.not_recognized",
+      actor: "customer",
+      payload: { button_id: input.buttonId, prompt_id: input.promptId },
+    }),
+    input.acknowledged
+      ? supabase
+          .from("negotiation_sessions")
+          .update({ debt_acknowledged_at: new Date().toISOString() })
+          .eq("id", input.sessionId)
+      : Promise.resolve(null),
+  ])
 }
 
 /** Comportamento do tenant no "Não reconheço" (default continue). */
@@ -2051,6 +2103,9 @@ export async function handleDebtNotRecognized(input: {
   ip?: string | null
   userAgent?: string | null
 }): Promise<{ ok: true; onNotRecognized: "continue" | "dispute" | "human" }> {
+  // Latência: a config do tenant é leitura independente do registro → em paralelo.
+  const behaviorP = onNotRecognizedBehavior(input.companyId)
+  behaviorP.catch(() => {})
   await persistDebtRecognition({
     companyId: input.companyId,
     sessionId: input.sessionId,
@@ -2063,7 +2118,7 @@ export async function handleDebtNotRecognized(input: {
     ip: input.ip,
     userAgent: input.userAgent,
   })
-  const onNotRecognized = await onNotRecognizedBehavior(input.companyId)
+  const onNotRecognized = await behaviorP
   return { ok: true, onNotRecognized }
 }
 
@@ -2142,6 +2197,10 @@ export async function assertAcknowledgedForPayment(input: {
   debtId: string
 }): Promise<AckGuard> {
   const supabase = createServiceClient()
+  // Latência (10-latencia.md): config do tenant e último reconhecimento são
+  // leituras independentes → em paralelo (as decisões seguem a mesma ordem).
+  const latestP = getLatestAcknowledgement(input.sessionId, input.debtId)
+  latestP.catch(() => {})
   const { data: cfg } = await supabase
     .from("tenant_chat_config")
     .select("allow_payment_without_acknowledgement, acknowledgement_enabled")
@@ -2152,7 +2211,7 @@ export async function assertAcknowledgedForPayment(input: {
   // reconhecimento desligado no tenant → não bloqueia (nada a reconhecer)
   if (cfg?.acknowledgement_enabled === false) return { ok: true }
 
-  const latest = await getLatestAcknowledgement(input.sessionId, input.debtId)
+  const latest = await latestP
   if (latest?.acknowledged === true) return { ok: true }
   return { ok: false, code: "debt_not_acknowledged" }
 }

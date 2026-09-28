@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { applyJourneyEventToState } from "./negotiation-state"
+import { runAfterResponse, serializeByKey } from "./after-response"
 
 export type JourneyActor = "system" | "customer" | "ai" | "n8n" | "provider" | "admin"
 
@@ -17,9 +18,15 @@ export type JourneyEventType =
   | "auth.attempt" | "auth.failed" | "auth.locked" | "auth.success"
   | "consent.given" | "session.started"
   | "chat.turn.customer" | "chat.turn.assistant" | "chat.engine_error" | "chat.engine_invalid_action"
+  // N8N-2: botões do n8n adaptados/descartados/re-rotulados (lib/negotiation/n8n-buttons.ts).
+  // Payload sem PII: contagens, kind e motivos por índice — nunca rótulos/valores.
+  | "chat.engine_buttons_adapted"
   // QA round 1 (QAA1-01): clique/toque ignorado pelo servidor (toque duplo em
   // handoff). Auditoria da decisão; payload sem PII (ids, janela, instante).
   | "chat.click_ignored"
+  // N8N-6: texto do n8n recusado pelo guard (lib/negotiation/n8n-text-guard.ts).
+  // Payload: motivo, categoria, origem, tamanho e hash curto — nunca o texto cru.
+  | "chat.engine_text_rejected"
   | "debt.viewed"
   | "debt.acknowledged" | "debt.not_recognized"
   | "offer.presented" | "offer.invalid" | "offer.accepted" | "offer.rejected" | "offer.expired"
@@ -47,6 +54,10 @@ export type JourneyEventType =
   // linha (listas super-admin). Aditivo — o payload NUNCA carrega o doc em claro
   // (maskPayload já mascara; registramos ator/motivo/doc mascarado/ids).
   | "document.revealed"
+  // N8N-13: passo do roteador do fluxo n8n (step/status/active/ongoing_agreement),
+  // gravado por flow.state.set e lido por flow.context. Estado interno do fluxo:
+  // gravado SEM customer_id (não move a projeção negotiation_state).
+  | "n8n.flow_step"
 
 export interface RecordEventInput {
   companyId: string
@@ -131,22 +142,32 @@ export async function recordEvent(input: RecordEventInput): Promise<{ ok: boolea
     // pagamento — não só envio). BEST-EFFORT e NÃO-FATAL: a projeção é idempotente
     // e nunca pode derrubar o recordEvent (regra D14). A projeção NÃO chama
     // recordEvent → sem loop.
+    // Latência (10-latencia.md): a projeção são 2 idas ao banco (ler→regravar) que
+    // só alimentam os painéis — roda DEPOIS da resposta ao devedor quando a
+    // plataforma garante a conclusão (waitUntil; senão inline, como antes) e em
+    // SÉRIE por devedor (dois eventos paralelos do mesmo devedor não se
+    // sobrescrevem mais). O rebuild (rebuildNegotiationState) segue a fonte da verdade.
     if (input.companyId && input.customerId) {
-      try {
-        await applyJourneyEventToState({
-          companyId: input.companyId,
-          customerId: input.customerId,
-          event_type: input.type,
-          occurred_at: occurredAt,
-          payload: input.payload ?? null,
-          campaign_id: input.campaignId ?? null,
-          session_id: input.sessionId ?? null,
-          agreement_id: input.agreementId ?? null,
-          channel: typeof input.payload?.channel === "string" ? input.payload.channel : null,
-        })
-      } catch (err) {
-        console.error("[journey] projeção (não-fatal):", (err as Error).message)
+      const projection = {
+        companyId: input.companyId,
+        customerId: input.customerId,
+        event_type: input.type,
+        occurred_at: occurredAt,
+        payload: input.payload ?? null,
+        campaign_id: input.campaignId ?? null,
+        session_id: input.sessionId ?? null,
+        agreement_id: input.agreementId ?? null,
+        channel: typeof input.payload?.channel === "string" ? input.payload.channel : null,
       }
+      await runAfterResponse("projeção negotiation_state", () =>
+        serializeByKey(`projection:${input.companyId}:${input.customerId}`, async () => {
+          try {
+            await applyJourneyEventToState(projection)
+          } catch (err) {
+            console.error("[journey] projeção (não-fatal):", (err as Error).message)
+          }
+        }),
+      )
     }
     return { ok: true, duplicate: false }
   }

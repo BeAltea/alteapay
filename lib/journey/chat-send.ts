@@ -29,6 +29,8 @@ import {
 } from "./prompts"
 import { recordEvent } from "./events"
 import type { SessionCtx } from "./actions"
+import type { ButtonsReport } from "@/lib/negotiation/n8n-buttons"
+import { epochColumn, resolveN8nReplyEpoch, type ThreadEpochStale } from "./thread-epoch"
 
 const DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000
 
@@ -137,6 +139,19 @@ async function guardProtectedActive(
 ): Promise<ProtectedGuard> {
   const active = await getActivePrompt(ctx.sessionId)
   if (!isProtectedPlatformPrompt(active)) return { actionable: true, protectedActive: false }
+  // N8N-8: com o link entregue (pós-link ativo) a sessão está num estado
+  // absorvente (M12) — resposta tardia do motor nunca troca o menu pós-link.
+  if (active!.kind === "post_payment_link") {
+    return {
+      actionable: false,
+      refusal: {
+        ok: false,
+        status: 422,
+        code: "prompt_outside_window",
+        message: "prompt do n8n depois do link de pagamento; o menu pós-link foi preservado",
+      },
+    }
+  }
   // QA round 4 (R-18/R-27, S9 §3): JANELA DO MOTOR — com as parcelas do assistido
   // (offer_choice) na tela, o n8n só as substitui até N8N_TAKEOVER_WINDOW_MS
   // depois de apresentadas. Fora da janela o devedor já está lendo/escolhendo:
@@ -178,8 +193,17 @@ export interface ChatSendArgs {
 }
 
 export type ChatSendResult =
-  | { ok: true; message_id: string; prompt_id?: string; duplicate?: boolean }
-  | { ok: false; status: number; code: string; message: string }
+  | {
+      ok: true
+      message_id: string
+      prompt_id?: string
+      duplicate?: boolean
+      /** N8N-2: relatório do contrato de botões (só quando algo foi adaptado/descartado/re-rotulado). */
+      buttons_report?: ButtonsReport
+      /** N8N-2: nenhum botão utilizável → id do menu determinístico que ficou ativo. */
+      fallback_prompt_id?: string | null
+    }
+  | { ok: false; status: number; code: string; message: string; reason?: string; buttons_report?: ButtonsReport }
 
 /** Dedupe local por event_id em chat_messages (janela 24h). */
 async function findMessageByEventId(sessionId: string, eventId: string): Promise<string | null> {
@@ -206,8 +230,44 @@ export async function chatSend(
   args: ChatSendArgs,
   eventId?: string,
 ): Promise<ChatSendResult> {
-  const text = (args.text ?? "").replace(/<[^>]*>/g, "").trim()
-  if (!text && !args.prompt) {
+  // N8N-2: contrato de botões ANTES de qualquer validação/escrita
+  // (lib/negotiation/n8n-buttons.ts). Sem prompt → caminho inalterado.
+  if (!args?.prompt) return chatSendCore(ctx, args, eventId)
+  const btn = await import("@/lib/negotiation/n8n-buttons")
+  const source = (args as { legacy_envelope?: unknown }).legacy_envelope === true ? "legacy_envelope" : "chat.send"
+  const rawText = (args.text ?? "").replace(/<[^>]*>/g, "").trim()
+  const question = typeof args.prompt.question === "string" ? args.prompt.question.replace(/<[^>]*>/g, "").trim() : ""
+  const prep = await btn.prepareN8nPrompt(ctx, args.prompt, Boolean(rawText || question))
+  if (!prep.ok) {
+    await btn.recordButtonsTelemetry(ctx, prep.report, { source, eventId, status: prep.status })
+    return { ok: false, status: prep.status, code: prep.code, message: prep.message, buttons_report: prep.report }
+  }
+  const fallback = prep.report?.fallback === "assisted_menu"
+  const next: ChatSendArgs = fallback
+    ? { ...args, text: rawText || question, prompt: undefined }
+    : { ...args, prompt: prep.prompt ?? args.prompt }
+  const r = await chatSendCore(ctx, next, eventId)
+  if (!prep.report || (r.ok && r.duplicate)) return r
+  if (!r.ok) {
+    await btn.recordButtonsTelemetry(ctx, prep.report, { source, eventId, status: r.status })
+    return { ...r, buttons_report: prep.report }
+  }
+  // Nenhum botão utilizável: a bolha entrou; a sessão fica com o menu
+  // determinístico (o ativo, ou o de 3 opções reaberto) — nunca beco sem saída.
+  const fallbackPromptId = fallback ? await btn.ensureDeterministicMenu(ctx) : undefined
+  await btn.recordButtonsTelemetry(ctx, prep.report, {
+    source, eventId, promptId: r.prompt_id ?? fallbackPromptId ?? null, messageId: r.message_id,
+  })
+  return { ...r, buttons_report: prep.report, ...(fallback ? { fallback_prompt_id: fallbackPromptId ?? null } : {}) }
+}
+
+async function chatSendCore(
+  ctx: SessionCtx,
+  args: ChatSendArgs,
+  eventId?: string,
+): Promise<ChatSendResult> {
+  const rawText = (args.text ?? "").replace(/<[^>]*>/g, "").trim()
+  if (!rawText && !args.prompt) {
     return { ok: false, status: 422, code: "empty_message", message: "text ou prompt obrigatório" }
   }
 
@@ -230,6 +290,26 @@ export async function chatSend(
     const existing = await findMessageByEventId(ctx.sessionId, eventId)
     if (existing) return { ok: true, message_id: existing, duplicate: true }
   }
+
+  // ---- N8N-9: época (thread) da resposta — lib/journey/thread-epoch.ts ----
+  // A época vem da SESSÃO agora (nunca do n8n). Resposta a algo de uma thread já
+  // encerrada pelo reset de 24h → 409 thread_epoch_stale, nada é gravado.
+  const epochVerdict = await resolveN8nReplyEpoch(ctx.sessionId, { n8nExecutionId: args.n8n_execution_id })
+  if (!epochVerdict.ok) return refuseStaleReply(ctx, epochVerdict, args.n8n_execution_id, eventId)
+  const threadEpoch = epochVerdict.epoch
+  // ---- fim N8N-9 ----
+
+  // ---- N8N-6: guard de texto do n8n (lib/negotiation/n8n-text-guard.ts) ----
+  // Depois das checagens estruturais do prompt, do dedupe e da época (N8N-9:
+  // uma resposta de thread encerrada nunca degrada a thread nova) e antes de
+  // QUALQUER escrita:
+  // texto + pergunta/rótulos do prompt não podem anunciar fato monetário/estado
+  // que o servidor não produziu, nem o fallback/erro do fluxo. Recusa → 422
+  // text_rejected (nada visível ao devedor é gravado).
+  const guarded = await guardChatSendText(ctx, rawText, args.prompt)
+  if (!guarded.ok) return guarded.refusal
+  const text = guarded.text
+  // ---- fim N8N-6 ----
 
   const supabase = createServiceClient()
 
@@ -272,6 +352,7 @@ export async function chatSend(
       createdBy: "n8n",
       n8nExecutionId: args.n8n_execution_id ?? null,
       actionable: promptActionable,
+      threadEpoch, // N8N-9
     })
     if (!created.ok) {
       return { ok: false, status: 422, code: created.error, message: "falha ao criar prompt" }
@@ -291,6 +372,7 @@ export async function chatSend(
       n8n_event_id: eventId ?? null,
       engine: "n8n",
       offers_snapshot: args.payment_ref ? { payment_ref: args.payment_ref } : null,
+      ...epochColumn(threadEpoch), // N8N-9
     })
     .select("id")
     .single()
@@ -312,6 +394,105 @@ export async function chatSend(
   return { ok: true, message_id: message.id, prompt_id: prompt?.id }
 }
 
+/**
+ * N8N-6 — aplica o guard ao chat.send. Fallback/erro do fluxo = falha do engine:
+ * o guard já degradou a sessão para o assistido; aqui, se não houver prompt
+ * ativo, reabre o menu assistido (o devedor nunca fica num beco sem saída).
+ */
+async function guardChatSendText(
+  ctx: SessionCtx,
+  rawText: string,
+  prompt: ChatSendArgs["prompt"],
+): Promise<
+  | { ok: true; text: string }
+  | { ok: false; refusal: { ok: false; status: number; code: string; message: string; reason: string } }
+> {
+  const { guardN8nIngest } = await import("@/lib/negotiation/n8n-text-guard")
+  const extra = prompt
+    ? [String(prompt.question ?? ""), ...(prompt.buttons ?? []).map((b) => String(b?.label ?? ""))]
+    : []
+  if (!rawText && extra.every((e) => !e.trim())) return { ok: true, text: "" }
+  const verdict = await guardN8nIngest(ctx, { text: rawText, extra }, "chat.send")
+  if (verdict.ok) return { ok: true, text: rawText ? verdict.text : "" }
+  if (verdict.category === "fallback") await degradeWaitOrReopenMenu(ctx)
+  return {
+    ok: false,
+    refusal: {
+      ok: false,
+      status: 422,
+      code: "text_rejected",
+      reason: verdict.reason,
+      message: `texto do n8n recusado (${verdict.reason}); nada foi exibido ao devedor`,
+    },
+  }
+}
+
+/**
+ * Fallback do fluxo. N8N-7: se o devedor está na espera do motor
+ * (`aguardando_motor`), a falha é a resposta que ele esperava — a sessão vai
+ * direto para `menu_degradado` (copy + Pagar à vista / Tentar de novo /
+ * Atendimento), em vez de o menu de 3 opções voltar em silêncio por cima da
+ * espera (dois menus). Fora da espera: sem prompt ativo → reemite o menu de 3
+ * opções do assistido. Best-effort.
+ */
+async function degradeWaitOrReopenMenu(ctx: SessionCtx): Promise<void> {
+  try {
+    if (await getActivePrompt(ctx.sessionId)) return
+    const { data: sess } = await createServiceClient()
+      .from("negotiation_sessions")
+      .select("debt_ids, primary_debt_id, wait_state")
+      .eq("id", ctx.sessionId)
+      .maybeSingle()
+    const s = (sess ?? {}) as { debt_ids?: string[] | null; primary_debt_id?: string | null; wait_state?: string | null }
+    if (s.wait_state === "aguardando_motor" || s.wait_state === "menu_degradado") {
+      if (s.wait_state === "aguardando_motor") {
+        const { setSessionWaitState } = await import("./session-wait")
+        await setSessionWaitState(ctx.sessionId, "menu_degradado")
+      }
+      return
+    }
+    const primaryDebtId = s.primary_debt_id ?? ctx.debtId
+    const debtIds = s.debt_ids?.length ? s.debt_ids : [primaryDebtId]
+    const { reopenThreeOptions } = await import("./acknowledgement")
+    await reopenThreeOptions({
+      companyId: ctx.companyId,
+      sessionId: ctx.sessionId,
+      customerId: ctx.customerId,
+      debtIds,
+      primaryDebtId,
+    })
+  } catch (err) {
+    console.warn("[chat-send] reabrir menu assistido (não-fatal):", err instanceof Error ? err.name : "erro")
+  }
+}
+
+/** N8N-9: recusa da resposta atrasada + auditoria (sem texto, sem PII). */
+async function refuseStaleReply(
+  ctx: SessionCtx,
+  verdict: ThreadEpochStale,
+  n8nExecutionId: string | undefined,
+  eventId: string | undefined,
+  action: "chat.send" | "prompt.ask" = "chat.send",
+): Promise<{ ok: false; status: number; code: string; message: string }> {
+  await recordEvent({
+    companyId: ctx.companyId,
+    customerId: ctx.customerId,
+    debtId: ctx.debtId,
+    sessionId: ctx.sessionId,
+    type: "chat.engine_invalid_action",
+    actor: "n8n",
+    eventId: eventId ? `thread_epoch_stale|${eventId}` : undefined,
+    payload: {
+      action,
+      code: verdict.code,
+      reason: verdict.reason,
+      current_epoch: verdict.current_epoch,
+      n8n_execution_id: n8nExecutionId ?? null,
+    },
+  }).catch(() => {})
+  return { ok: false, status: verdict.status, code: verdict.code, message: verdict.message }
+}
+
 export type PromptAskResult =
   | { ok: true; prompt_id: string }
   | { ok: false; status: number; code: string; message: string }
@@ -320,12 +501,22 @@ export type PromptAskResult =
  *  protegido do assistido ativo, só um prompt ACIONÁVEL substitui (senão 422). */
 export async function promptAsk(
   ctx: SessionCtx,
-  args: { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string },
+  argsIn: { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string },
 ): Promise<PromptAskResult> {
+  // N8N-2: contrato de botões (lib/negotiation/n8n-buttons.ts). prompt.ask não
+  // tem texto: sem nenhum botão utilizável → 422 buttons_invalid.
+  const btn = await import("@/lib/negotiation/n8n-buttons")
+  const prep = await btn.prepareN8nPrompt(ctx, argsIn, false)
+  if (prep.report) await btn.recordButtonsTelemetry(ctx, prep.report, { source: "prompt.ask", status: prep.ok ? 200 : prep.status })
+  if (!prep.ok) return { ok: false, status: prep.status, code: prep.code, message: prep.message }
+  const args = prep.prompt ? { ...argsIn, ...prep.prompt } : argsIn
   const verdict = validateButtons(args.buttons)
   if (!verdict.ok) return { ok: false, status: 422, code: verdict.error, message: "botões inválidos" }
   const guard = await guardProtectedActive(ctx, { kind: args.kind, buttons: args.buttons })
   if (!guard.actionable) return guard.refusal
+  // N8N-9: prompt de uma execução da thread encerrada não entra na thread nova.
+  const epochVerdict = await resolveN8nReplyEpoch(ctx.sessionId, { n8nExecutionId: args.n8n_execution_id })
+  if (!epochVerdict.ok) return refuseStaleReply(ctx, epochVerdict, args.n8n_execution_id, undefined, "prompt.ask")
   const created = await createPrompt({
     companyId: ctx.companyId,
     sessionId: ctx.sessionId,
@@ -335,6 +526,7 @@ export async function promptAsk(
     createdBy: "n8n",
     n8nExecutionId: args.n8n_execution_id ?? null,
     actionable: true,
+    threadEpoch: epochVerdict.epoch, // N8N-9
   })
   if (!created.ok) {
     return { ok: false, status: 422, code: created.error, message: "prompt inválido" }

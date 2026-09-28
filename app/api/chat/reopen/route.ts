@@ -30,6 +30,8 @@ import {
 } from "@/lib/journey/double-tap"
 import { getActivePrompt, promptView, type PromptView } from "@/lib/journey/prompts"
 import { createServiceClient } from "@/lib/supabase/service"
+import { settledReopenBody } from "@/lib/journey/settled-state"
+import { afterResponseMode } from "@/lib/journey/after-response"
 
 /** Rótulo do eco do "Já paguei" (o mesmo da afordância na tela). */
 const PAYMENT_CLAIM_LABEL = "Já paguei este valor"
@@ -50,16 +52,21 @@ async function activePromptView(sessionId: string): Promise<PromptView | null> {
 async function persistClaimEcho(ctx: {
   sessionId: string
   companyId: string
+  threadEpoch?: number
 }): Promise<{ id: string; text: string; button_id: number; created_at: string } | null> {
   try {
     const supabase = createServiceClient()
-    const { data: sess } = await supabase
-      .from("negotiation_sessions")
-      .select("thread_epoch")
-      .eq("id", ctx.sessionId)
-      .eq("company_id", ctx.companyId)
-      .maybeSingle()
-    const epoch = Number((sess as { thread_epoch?: number | null } | null)?.thread_epoch ?? 0)
+    // Latência: a época já vem no contexto da sessão (mesma leitura); sem ela, lê.
+    let epoch = ctx.threadEpoch
+    if (typeof epoch !== "number") {
+      const { data: sess } = await supabase
+        .from("negotiation_sessions")
+        .select("thread_epoch")
+        .eq("id", ctx.sessionId)
+        .eq("company_id", ctx.companyId)
+        .maybeSingle()
+      epoch = Number((sess as { thread_epoch?: number | null } | null)?.thread_epoch ?? 0)
+    }
     const row: Record<string, unknown> = {
       company_id: ctx.companyId,
       session_id: ctx.sessionId,
@@ -107,7 +114,15 @@ async function clearWaitState(sessionId: string): Promise<void> {
 async function sessionDebtIds(
   sessionId: string,
   fallbackDebtId: string,
+  ctx?: { debtIds?: string[]; primaryDebtId?: string | null; debtId: string },
 ): Promise<{ debtIds: string[]; primaryDebtId: string }> {
+  // Latência: debt_ids/primary_debt_id já vieram no contexto (mesma leitura da
+  // sessão) → mesma regra, sem nova ida ao banco. ctx.debtId é a coluna debt_id.
+  if (ctx && Array.isArray(ctx.debtIds)) {
+    const primaryDebtId = ctx.primaryDebtId ?? ctx.debtId ?? fallbackDebtId
+    const debtIds = ctx.debtIds.length > 0 ? ctx.debtIds : [primaryDebtId]
+    return { debtIds, primaryDebtId }
+  }
   try {
     const supabase = createServiceClient()
     const { data } = await supabase
@@ -129,7 +144,7 @@ async function sessionDebtIds(
 export async function POST(req: NextRequest) {
   const t0 = Date.now()
   const res = await handleReopen(req)
-  res.headers.set("Server-Timing", `total;dur=${Date.now() - t0}`)
+  res.headers.set("Server-Timing", `total;dur=${Date.now() - t0}, after_${afterResponseMode()};dur=0`)
   return res
 }
 
@@ -141,13 +156,21 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
   const claims = cookie ? verifyChatJwt(cookie) : null
   if (!claims) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
 
-  const ctx = await loadSessionCtx(claims.sid)
-  if (!ctx) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
-
   const body = await req.json().catch(() => ({} as Record<string, unknown>))
   const action = String(body.action ?? "reopen_options")
 
+  // Latência (10-latencia.md): no "Já paguei" o último clique da sessão (guard de
+  // toque múltiplo) só depende do sid do cookie → lido JUNTO com o contexto.
+  const lastClickP = action === "payment_claim" ? lastCustomerClick(claims.sid) : null
+  const ctx = await loadSessionCtx(claims.sid)
+  if (!ctx) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+
   try {
+    // F8-02: dívida quitada → "Já paguei"/"Voltar às opções" de uma página
+    // defasada recebem o estado de quitado (sem caso, sem menu de pagar).
+    const settled = await settledReopenBody(ctx, action)
+    if (settled) return NextResponse.json(settled)
+
     if (action === "handoff") {
       // QA round 1 (QAA1-01): um handoff < 2 s depois de um clique válido na
       // sessão é o 2º toque de um toque duplo (o bloco de espera nascia sob o
@@ -183,16 +206,17 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
       // um clique VÁLIDO de outro controle da sessão é ignorado (nenhum caso);
       // < 2 s depois de outro "Já paguei" é o MESMO pedido (o caso aberto é
       // reusado e nenhuma bolha nova é gravada). Em ambos devolve o estado atual.
-      const last = await lastCustomerClick(ctx.sessionId)
+      const last = lastClickP ? await lastClickP : await lastCustomerClick(ctx.sessionId)
       if (last.buttonId === BTN_PAYMENT_CLAIM && isWithinWindow(last.at, Date.now(), DOUBLE_TAP_WINDOW_MS)) {
         return NextResponse.json({
           ok: true, action: "payment_claim", claim_registered: true, duplicate: true,
           prompt: await activePromptView(ctx.sessionId), state_time: new Date().toISOString(),
         })
       }
+      // Mesmo último clique já lido (este guard não faz releitura) — não relê.
       const dt = await checkEffectDoubleTap({
         sessionId: ctx.sessionId, companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-        buttonId: BTN_PAYMENT_CLAIM, source: "reopen",
+        buttonId: BTN_PAYMENT_CLAIM, source: "reopen", prefetchedLast: last,
       })
       if (dt.doubleTap) {
         return NextResponse.json({
@@ -203,18 +227,29 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
       // Eco do clique (R-11/R-13): a escolha do devedor fica no histórico ANTES
       // do resultado, com button_id 96 — o guard de toque múltiplo do /button a
       // enxerga (um 2º toque que caia em "Não reconheço" é ignorado).
-      const echo = await persistClaimEcho(ctx)
-      const claim = await handlePaymentClaim(ctx, "customer")
-      const { debtIds: cDebtIds, primaryDebtId: cPrimary } = await sessionDebtIds(ctx.sessionId, ctx.debtId)
+      // Latência (10-latencia.md): eco, caso/resultado, menu reaberto e limpeza da
+      // espera correm em PARALELO; a ORDEM do histórico é garantida por
+      // encadeamento — o resultado só é gravado depois do eco, e a pergunta do menu
+      // só depois do resultado.
+      const echoP = persistClaimEcho(ctx)
+      const claimP = handlePaymentClaim(ctx, "customer", undefined, { beforeReply: () => echoP })
+      claimP.catch(() => {}) // aguardado (e o erro propagado) no Promise.all abaixo
+      const { debtIds: cDebtIds, primaryDebtId: cPrimary } = await sessionDebtIds(ctx.sessionId, ctx.debtId, ctx)
       // reabre o menu payável (best-effort — a orientação já foi persistida).
-      await reopenThreeOptions({
+      const reopenP = reopenThreeOptions({
         companyId: ctx.companyId,
         sessionId: ctx.sessionId,
         customerId: ctx.customerId,
         debtIds: cDebtIds,
         primaryDebtId: cPrimary,
+        threadEpoch: ctx.threadEpoch,
+        precedingWrite: () => claimP,
+      }).catch((err: Error) => {
+        console.warn("[chat:reopen] menu após payment_claim falhou (não-fatal):", err.message)
+        return null
       })
-      await clearWaitState(ctx.sessionId)
+      const [echo, claim, reopened] = await Promise.all([echoP, claimP, reopenP, clearWaitState(ctx.sessionId)])
+      const reopenedPrompt = reopened && reopened.ok && reopened.prompt ? promptView(reopened.prompt) : null
       // QA round 4 (R-24/R-13): o corpo É o próximo estado — eco + resultado
       // persistidos (ids reais, o client deduplica com o poll) + o menu ativo.
       return NextResponse.json({
@@ -223,28 +258,34 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
         outcome: claim.messageId
           ? { id: claim.messageId, text: claim.reply, stage: "payment_claim", created_at: new Date().toISOString() }
           : null,
-        prompt: await activePromptView(ctx.sessionId),
+        prompt: reopenedPrompt ?? (await activePromptView(ctx.sessionId)),
         state_time: new Date().toISOString(),
       })
     }
 
     // reopen_options (default): re-publica o menu de 3 opções (payável), M10/M7.
-    const { debtIds, primaryDebtId } = await sessionDebtIds(ctx.sessionId, ctx.debtId)
-    const back = await reopenThreeOptions({
-      companyId: ctx.companyId,
-      sessionId: ctx.sessionId,
-      customerId: ctx.customerId,
-      debtIds,
-      primaryDebtId,
-    })
+    const { debtIds, primaryDebtId } = await sessionDebtIds(ctx.sessionId, ctx.debtId, ctx)
+    // A-02: encerra a espera para não duplicar o menu — em paralelo com o menu
+    // (latência); os dois terminam antes da resposta.
+    const [back] = await Promise.all([
+      reopenThreeOptions({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        customerId: ctx.customerId,
+        debtIds,
+        primaryDebtId,
+        threadEpoch: ctx.threadEpoch,
+      }),
+      clearWaitState(ctx.sessionId),
+    ])
     if (!back.ok) {
       return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
     }
-    await clearWaitState(ctx.sessionId) // A-02: encerra a espera para não duplicar o menu
     // QA round 4 (R-13): o menu reaberto vai no corpo (o client aplica sem esperar o poll).
     return NextResponse.json({
       ok: true, action: "reopen_options", reply: back.reply,
-      prompt: await activePromptView(ctx.sessionId), state_time: new Date().toISOString(),
+      prompt: back.prompt ? promptView(back.prompt) : await activePromptView(ctx.sessionId),
+      state_time: new Date().toISOString(),
     })
   } catch (err) {
     // Nunca deixa a request morrer sem JSON (o front re-habilita a UI e o poll

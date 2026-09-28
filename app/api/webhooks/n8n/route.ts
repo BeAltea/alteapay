@@ -15,10 +15,16 @@
 //   session.redirect — modo B: registra o redirect e devolve a URL oficial do
 //                      tenant (único caminho para obtê-la)
 //   session.status   — funil da sessão + links de pagamento do acordo
+//   flow.context     — (N8N-13) leitura única do fluxo: dívida em centavos,
+//                      1º nome + doc mascarado, matriz, ofertas e o passo do
+//                      roteador. Substitui o banco paralelo do n8n.
+//   flow.state.set   — (N8N-13) o fluxo registra o passo do roteador
+//
+// Demais ações de jornada (debt.summary, offer.*, payment.*, chat.send…) em
+// handleJourneyAction.
 //
 // Documentação completa: docs/N8N_INTEGRATION.md
 
-import { clientIpFromHeaders } from "@/lib/journey/client-ip"
 import { NextResponse } from "next/server"
 import { z } from "zod"
 
@@ -33,8 +39,10 @@ import {
   markEventSeen,
   verifyN8nRequest,
 } from "@/lib/negotiation/n8n"
+import { normalizeLegacyN8nEnvelope } from "@/lib/negotiation/n8n-buttons"
 import { onlyDigits } from "@/lib/negotiation/pii"
 import { LIMITS, rateLimit } from "@/lib/negotiation/rate-limit"
+import { n8nSignedAllowed, n8nUnsignedAllowed } from "@/lib/negotiation/n8n-rate-limit"
 import {
   applyTurnEffects,
   createHandoffSession,
@@ -55,8 +63,6 @@ export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
 export const revalidate = 0
 export const maxDuration = 300
-
-const N8N_IP_LIMIT = { limit: 120, windowSeconds: 60 }
 
 const pingSchema = z.object({ action: z.literal("ping") })
 
@@ -131,7 +137,13 @@ const JOURNEY_ACTIONS = [
   "session.close", "journey.timeline",
   // onda R: o n8n empurra mensagens/prompts para o chat do cliente.
   "chat.send", "prompt.ask", "prompt.close",
+  // N8N-13: o fluxo lê/grava o próprio estado NA PLATAFORMA (nunca num banco paralelo).
+  "flow.context", "flow.state.set",
 ] as const
+
+// N8N-13: limite por sessão das ações de estado do fluxo (várias leituras por
+// turno: Main + 1.x). Soma-se ao limite por cedente do POST (N8N-12).
+const FLOW_PER_SESSION_LIMIT = { limit: 60, windowSeconds: 60 }
 
 const journeySchema = z.object({
   action: z.enum(JOURNEY_ACTIONS),
@@ -528,11 +540,12 @@ export async function POST(request: Request) {
     request.headers.get(N8N_SIGNATURE_HEADER),
     request.headers.get(N8N_TIMESTAMP_HEADER),
   )
-  if (!verdict.ok) return jsonError(verdict.status, verdict.reason)
-
-  const ip = clientIpFromHeaders(request.headers) ?? "unknown"
-  const byIp = await rateLimit(`n8n:ip:${ip}`, N8N_IP_LIMIT.limit, N8N_IP_LIMIT.windowSeconds)
-  if (!byIp.allowed) return jsonError(429, "rate limit excedido")
+  // ---- [N8N-12 rate limit: pré-auth] início — lib/negotiation/n8n-rate-limit.ts
+  if (!verdict.ok) {
+    if (!(await n8nUnsignedAllowed(request.headers)).allowed) return jsonError(429, "rate limit excedido")
+    return jsonError(verdict.status, verdict.reason)
+  }
+  // ---- [N8N-12 rate limit: pré-auth] fim
 
   let json: unknown
   try {
@@ -540,10 +553,30 @@ export async function POST(request: Request) {
   } catch {
     return jsonError(400, "JSON inválido")
   }
+  // N8N-2: envelope legado {sessionId, output, buttons} → chat.send (só com
+  // N8N_LEGACY_BUTTONS_ADAPTER=on; flag off = corpo intacto → 422 do schema).
+  json = normalizeLegacyN8nEnvelope(json, request.headers.get("x-alteapay-event-id"))
   const parsed = bodySchema.safeParse(json)
   if (!parsed.success) {
     return jsonError(422, "corpo inválido", { issues: parsed.error.issues.slice(0, 5) })
   }
+
+  // ---- N8N-16: correlação do callback com um evento enviado pela plataforma ----
+  // Regras e flag (N8N_REQUIRE_EVENT_CORRELATION, default OFF) em
+  // lib/negotiation/n8n-correlation.ts. OFF só registra telemetria.
+  {
+    const { enforceN8nCorrelation } = await import("@/lib/negotiation/n8n-correlation")
+    const gate = await enforceN8nCorrelation(parsed.data as { action: string; session_id?: string; event_id?: string }, json)
+    if (gate.reject) return jsonError(gate.status, gate.error, { code: gate.code })
+  }
+  // ---- fim N8N-16 ----
+
+  // ---- [N8N-12 rate limit: identidade autenticada] início — por sessão/cedente,
+  // nunca pelo IP do salto (lib/negotiation/n8n-rate-limit.ts)
+  if (!(await n8nSignedAllowed(parsed.data, request.headers)).allowed) {
+    return jsonError(429, "rate limit excedido")
+  }
+  // ---- [N8N-12 rate limit: identidade autenticada] fim
 
   try {
     switch (parsed.data.action) {
@@ -657,15 +690,27 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       // SEMPRE + guard de reconhecimento). Exige sessão verificada. Valores
       // monetários da resposta em CENTAVOS (contrato v2, §6.4/Apêndice B.1).
       if (!(await sessionIsVerified(input.session_id))) return jsonError(403, "sessão não verificada")
-      const offerId = args.offer_id as string | undefined
-      if (!offerId) return jsonError(422, "args.offer_id obrigatório")
+      const rawOfferId = args.offer_id as string | undefined
+      if (!rawOfferId) return jsonError(422, "args.offer_id obrigatório")
       const billingType = (args.billing_type as string | undefined) ?? null
+      // --- N8N-15 (a): alias 'avista'/'parc_N' → uuid da oferta ATUAL da sessão
+      // (só-leitura; exatamente uma candidata, senão 409). uuid passa intacto.
+      const { resolveOfferIdForSession } = await import("@/lib/negotiation/offer-alias")
+      const resolved = await resolveOfferIdForSession(ctx, rawOfferId)
+      if (!resolved.ok) return jsonError(resolved.status, resolved.message, { code: resolved.code })
+      const offerId = resolved.offerId
+      // --- fim N8N-15 (a)
       const { paymentCreateOrExistingLink, paymentCreateOrLinkResponseForN8n } = await import("@/lib/journey/payment-actions")
       // Ponto de entrada único: já cobrada (D7/D23) devolve o LINK EXISTENTE via
       // payment.status em vez de recriar — nunca gera 2ª cobrança.
       const r = await paymentCreateOrExistingLink(ctx, offerId, input.event_id)
       if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
-      return NextResponse.json(paymentCreateOrLinkResponseForN8n(r, billingType))
+      // --- N8N-15 (b): PIX copia-e-cola/QR e linha digitável (prazo curto;
+      // falhou → pix_pending + pix_fallback_url). offer_id = uuid resolvido.
+      const { enrichN8nPaymentResponse } = await import("@/lib/journey/payment-instructions")
+      const body = await enrichN8nPaymentResponse(paymentCreateOrLinkResponseForN8n(r, billingType))
+      return NextResponse.json({ ...body, offer_id: offerId, offer_alias: resolved.alias })
+      // --- fim N8N-15 (b)
     }
     case "payment.record": {
       // Papel B (variante B): n8n criou a cobrança e registra aqui. Guard antes;
@@ -686,14 +731,30 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
             total_value: reaisToCents(status.payment.total_value),
           }
         : null
-      return NextResponse.json({ ok: true, ...status, payment })
+      // --- N8N-15 (b): mesmas instruções PIX/boleto do payment.create.
+      const { enrichN8nPaymentObject } = await import("@/lib/journey/payment-instructions")
+      const enriched = await enrichN8nPaymentObject(payment, status.payment_status)
+      return NextResponse.json({ ok: true, ...status, payment: enriched })
+      // --- fim N8N-15 (b)
     }
     case "chat.send": {
       // onda R: empurra mensagem (+opcional prompt +payment_ref) ao chat.
       const { chatSend } = await import("@/lib/journey/chat-send")
       const r = await chatSend(ctx, args as unknown as ChatSendArgs, input.event_id)
-      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
-      return NextResponse.json({ ok: true, message_id: r.message_id, prompt_id: r.prompt_id ?? null, duplicate: r.duplicate ?? false })
+      // N8N-6: recusa do guard de texto → 422 { code:"text_rejected", reason }.
+      if (!r.ok) {
+        return jsonError(r.status, r.message, {
+          code: r.code,
+          ...(r.reason ? { reason: r.reason } : {}),
+          ...(r.buttons_report ? { buttons_report: r.buttons_report } : {}),
+        })
+      }
+      return NextResponse.json({
+        ok: true, message_id: r.message_id, prompt_id: r.prompt_id ?? null, duplicate: r.duplicate ?? false,
+        // N8N-2: relatório do contrato de botões (dropped_buttons, fallback) quando houve adaptação.
+        ...(r.buttons_report ? { buttons_report: r.buttons_report } : {}),
+        ...(r.fallback_prompt_id !== undefined ? { fallback_prompt_id: r.fallback_prompt_id } : {}),
+      })
     }
     case "prompt.ask": {
       const { promptAsk } = await import("@/lib/journey/chat-send")
@@ -721,6 +782,24 @@ async function handleJourneyAction(input: z.infer<typeof journeySchema>) {
       const { getTimeline } = await import("@/lib/journey/events")
       const timeline = await getTimeline({ companyId: ctx.companyId, sessionId: ctx.sessionId, limit: 100 })
       return NextResponse.json({ success: true, timeline })
+    }
+    case "flow.context":
+    case "flow.state.set": {
+      const bySession = await rateLimit(
+        `n8n:flow:s:${ctx.sessionId}`,
+        FLOW_PER_SESSION_LIMIT.limit,
+        FLOW_PER_SESSION_LIMIT.windowSeconds,
+      )
+      if (!bySession.allowed) return jsonError(429, "muitas chamadas de estado para esta sessão")
+      const { flowContext, setFlowState } = await import("@/lib/journey/n8n-flow")
+      if (input.action === "flow.context") {
+        const context = await flowContext(ctx)
+        if (!context) return jsonError(404, "contexto da sessão indisponível")
+        return NextResponse.json({ success: true, ...context })
+      }
+      const r = await setFlowState(ctx, input.args, input.event_id)
+      if (!r.ok) return jsonError(r.status, r.message, { code: r.code })
+      return NextResponse.json({ success: true, flow_state: r.state, duplicate: r.duplicate })
     }
   }
 }

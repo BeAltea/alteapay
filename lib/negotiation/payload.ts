@@ -111,6 +111,29 @@ export function deterministicEventId(parts: EventIdParts): string {
   return createHash("sha256").update(material).digest("hex").slice(0, 32)
 }
 
+/**
+ * UUID DETERMINÍSTICO (formato 8-4-4-4-12, bits de versão 5/variante RFC 4122)
+ * derivado de sha256(material). Mesmo material → mesmo id; aceito por colunas
+ * `uuid` do Postgres do lado do fluxo (o event_id aleatório/32-hex não é).
+ */
+export function deterministicUuid(material: string): string {
+  const h = createHash("sha256").update(material).digest("hex").slice(0, 32).split("")
+  h[12] = "5"
+  h[16] = ((parseInt(h[16], 16) & 0x3) | 0x8).toString(16)
+  const s = h.join("")
+  return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20, 32)}`
+}
+
+/**
+ * N8N-14: event_id do chat.turn, DETERMINÍSTICO por turno. `turnRef` é o id da
+ * mensagem inbound gravada para o turno (conversation_messages.id): um reenvio
+ * do MESMO turno leva o MESMO event_id (idempotência do lado do fluxo); turnos
+ * distintos, ids distintos.
+ */
+export function chatTurnEventId(sessionId: string, turnRef: string): string {
+  return deterministicUuid(`${sessionId}|chat_turn|${turnRef}`)
+}
+
 // ---------------------------------------------------------------------------
 // thread_id ESTÁVEL por sessão, derivado do session_id — NUNCA o UUID cru. Mesmo
 // esquema já usado em createHandoffSession (`web_<session_id>`); centralizado aqui.
@@ -186,6 +209,9 @@ export interface PayloadSessionState {
 }
 
 export interface CanonicalEnvelope {
+  /** Discriminador CANÔNICO (fixo, sem override por tenant) — o fluxo roteia por
+   * `body.event` (09-n8n-routing-handoff §1). `type` segue com o rótulo do tenant. */
+  event: (typeof DEFAULT_EVENT_NAMES)[EventKind]
   type: string
   contract_version: string
   event_id: string
@@ -331,6 +357,7 @@ export function buildEnvelope(input: BuildEnvelopeInput): CanonicalEnvelope {
     : null
 
   return {
+    event: DEFAULT_EVENT_NAMES[input.kind],
     type,
     contract_version: CONTRACT_VERSION,
     event_id: eventId,

@@ -30,19 +30,22 @@ export async function buildAcceptSummary(
   ctx: SessionCtx, offerId: string,
 ): Promise<{ ok: true; summary: AcceptSummary } | { ok: false; error: string }> {
   const supabase = createServiceClient()
-  const { data: offer } = await supabase
-    .from("negotiation_offers")
-    .select("id, terms, valid_until, status")
-    .eq("id", offerId)
-    .eq("session_id", ctx.sessionId)
-    .maybeSingle()
+  // Latência (10-latencia.md): oferta e nome do credor são leituras
+  // independentes → em paralelo (as decisões seguem a mesma ordem).
+  const [{ data: offer }, { data: company }] = await Promise.all([
+    supabase
+      .from("negotiation_offers")
+      .select("id, terms, valid_until, status")
+      .eq("id", offerId)
+      .eq("session_id", ctx.sessionId)
+      .maybeSingle(),
+    supabase.from("companies").select("name").eq("id", ctx.companyId).single(),
+  ])
   if (!offer || offer.status !== "presented") return { ok: false, error: "OFFER_NOT_AVAILABLE" }
   if (offer.valid_until && new Date(offer.valid_until) < new Date()) {
     await supabase.from("negotiation_offers").update({ status: "expired" }).eq("id", offerId)
     return { ok: false, error: "OFFER_EXPIRED" }
   }
-  const { data: company } = await supabase
-    .from("companies").select("name").eq("id", ctx.companyId).single()
   return {
     ok: true,
     summary: {
@@ -69,10 +72,14 @@ export interface ConfirmAcceptInput {
    *  (teto da função). Antes do fechamento → CHARGE_DEFERRED sem escrita; dentro
    *  do inline, antes do POST /payments → acordo desfeito, CHARGE_DEFERRED. */
   chargeNotAfter?: number | null
+  /** Latência (10-latencia.md): devolve a auditoria do fechamento (eventos +
+   *  supersede das demais ofertas) em `pending` em vez de aguardá-la — o
+   *  chamador a aguarda em paralelo com a leitura do link, antes de responder. */
+  returnPendingAudit?: boolean
 }
 
 export type ConfirmAcceptResult =
-  | { ok: true; agreementId: string }
+  | { ok: true; agreementId: string; pending?: Promise<unknown> }
   | { ok: false; error: "OFFER_NOT_AVAILABLE" | "OFFER_EXPIRED" | "TERMS_CHANGED" | "ALREADY_CHARGED" | "CLOSE_FAILED" | "CHARGE_DEFERRED" }
 
 const deadlinePassed = (notAfter: number | null | undefined) =>
@@ -223,7 +230,7 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
     sessionId: ctx.sessionId, agreementId: closed.agreement_id,
   }
   // demais ofertas superseded + eventos em PARALELO (independentes; latência).
-  await timed("close_events", () => Promise.all([
+  const closeAudit = timed("close_events", () => Promise.all([
     supabase.from("negotiation_offers")
       .update({ status: "superseded", responded_at: now })
       .eq("session_id", ctx.sessionId)
@@ -234,6 +241,11 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
     recordEvent({ ...base, type: "agreement.created", actor: "system" }),
     recordEvent({ ...base, type: "payment.generated", actor: "system", payload: { billing_type: pre.summary.terms.billing_type, installments: pre.summary.terms.installments } }),
   ]))
+  if (input.returnPendingAudit) {
+    closeAudit.catch(() => {}) // aguardado pelo chamador
+    return { ok: true, agreementId: closed.agreement_id, pending: closeAudit }
+  }
+  await closeAudit
 
   return { ok: true, agreementId: closed.agreement_id }
 }

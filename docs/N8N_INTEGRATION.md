@@ -64,7 +64,7 @@ Idêntica nos dois sentidos — **HMAC-SHA256 de `${timestamp}.${corpoRaw}`** co
 - Janela anti-replay ±300s; comparação em tempo constante; corpo cru (re-serializar quebra a assinatura).
 - A **plataforma assina** o que envia aos fluxos (chat.turn, session.init, callbacks async) — valide no fluxo (§6.1).
 - Os **fluxos assinam** o que enviam a `/api/webhooks/n8n`.
-- Rate limit inbound: 120 req/min/IP + 20 msg/min/sessão. Idempotência por `event_id` (§7).
+- Rate limit inbound (N8N-12): pela identidade autenticada, depois do HMAC — 60 req/min por sessão (flow.* usam o limite próprio do N8N-13), 3000 req/min por cedente, 300 req/min para chamadas sem sessão (ping); inválidas/sem assinatura: 60/min (balde comum ou por IP confiável). `N8N_RATE_LIMIT_MODE=legacy` volta ao 120/min por IP. Runbook: `ops/negociacao-final/12-rate-limit-e-ip.md`. Idempotência por `event_id` (§7).
 - Invariantes do servidor: descontos SEMPRE de `charge-rules` (buckets de
   aging); URL de canal oficial SEMPRE de `tenant_chat_config`;
   `agreement.close` exige sessão com consentimento + identidade verificada.
@@ -75,6 +75,7 @@ Idêntica nos dois sentidos — **HMAC-SHA256 de `${timestamp}.${corpoRaw}`** co
 |---|---|
 | `NEGOTIATION_ENGINE` | `n8n` (padrão). `agent` só para o rig de treino local legado |
 | `N8N_WEBHOOK_SECRET` | HMAC compartilhado (openssl rand -hex 32) |
+| `N8N_WEBHOOK_SECRET_PREVIOUS` | opcional: segredo anterior aceito **só na entrada** durante a rotação (nunca assina). Remover ao fim da janela. Runbook: `ops/n8n-sync-fix/12-n8n4-segredos-e-rotacao.md` |
 | `N8N_CHAT_FLOW_URL` | URL do Webhook trigger do fluxo-cérebro |
 | `N8N_SESSION_FLOW_URL` | opcional — fluxo notificado em `session.init` |
 | `N8N_FLOW_TIMEOUT_MS` | timeout da chamada ao fluxo (default 60000) |
@@ -84,6 +85,10 @@ Idêntica nos dois sentidos — **HMAC-SHA256 de `${timestamp}.${corpoRaw}`** co
 ## 4. Contrato do fluxo-cérebro (`N8N_CHAT_FLOW_URL`)
 
 ### Request (plataforma → fluxo), tipo `chat.turn`
+
+> **Atualizado em 2026-09-27 (N8N-14):** o corpo real leva também o envelope plano
+> no topo (`event`, `event_id`, `timestamp`/`occurred_at`, `contract_version`,
+> `callback_url`) — ver **§14**. O exemplo abaixo é o contrato v1 mínimo.
 
 ```json
 {
@@ -289,6 +294,10 @@ Adição preparatória. Tudo atrás de flags OFF (produção idêntica). Ver
 
 ### 11.2 Contrato `chat.turn` (plataforma → n8n) — Apêndice A.1
 
+> **Atualizado em 2026-09-27 (N8N-14):** além dos blocos abaixo, o corpo leva no
+> TOPO `event`+`type`, `session_id`, `company_id`, `thread_id`, `channel`,
+> `session_state` e `callback_url` — ver **§14** (forma exata enviada hoje).
+
 Montado **exclusivamente** por `lib/journey/context.ts`. Valores monetários em
 **centavos** (Integer). Documento **mascarado** por padrão; em claro só quando
 `tenant_chat_config.send_document_to_engine=true` **E** `payment_origin='n8n'`.
@@ -321,7 +330,7 @@ ações de pagamento.
 
 | Ação | Efeito | Resposta |
 |---|---|---|
-| `payment.create` | **Variante A (default):** guard SEMPRE → `agreements` → cobrança ASAAS pelo caminho existente (`close-agreement` + chargeQueue) → aceite + eventos | `{agreement_id, payment_id, billing_type, pix_copy_paste, boleto_url, invoice_url, due_date, total_value, installments}` ou `{status:"processing", poll_after_ms:3000}` (worker 0/0) |
+| `payment.create` | **Variante A (default):** `args.offer_id` = uuid de `offer.list` (canônico) ou alias `avista`/`parc_N` (§19) → guard SEMPRE → `agreements` → cobrança ASAAS pelo caminho existente (`close-agreement`, inline ou chargeQueue) → aceite + eventos | resposta **plana** `{ok, idempotent, status:"created"\|"already_charged", agreement_id, asaas_payment_id, billing_type, total_value (centavos), installments, due_date, invoice_url, pix_copy_paste, pix_qr_image, pix_expiration, pix_pending, pix_fallback_url, boleto_url, boleto_line, boleto_barcode?, offer_id, offer_alias}` ou `{status:"processing", poll_after_ms:3000}` (só `CHARGE_MODE=queue`) — ver §19 |
 | `payment.record` | **Variante B (off):** guard antes; registra cobrança PENDING + URLs do n8n; **NUNCA aceita status pago** (D6 → `payment_claim` + `payment.claim_from_engine`) | `{code:"recorded", agreement_id}` \| `{code:"claim", case_id}` |
 | `payment.status` | estado atual da cobrança do acordo (fonte = base local; a verdade do pagamento é o webhook ASAAS) | `{agreement_id, payment, payment_status, asaas_status}` |
 | `negotiation.note` | anota observação estruturada no funil | `{success:true}` |
@@ -429,6 +438,9 @@ foi observado (bloqueado por N-D1-2).
   `N8N_WEBHOOK_SECRET`/`Crypto account` (nada de janela combinada); ao mover para credencial,
   **descartar** o valor de teste exposto (gerar outro só para o ambiente de teste,
   `openssl rand -hex 32`) e não fixar nenhum segredo em `pinData` de novo.
+  **Atualização (2026-09-27, N8N-4):** a rotação de `N8N_WEBHOOK_SECRET` e das credenciais Basic
+  está planejada e pode ser feita sem janela (`N8N_WEBHOOK_SECRET_PREVIOUS`). O runbook é mantido
+  fora deste repositório.
 - **Router por `step` (D3):** o `1. Main` roteia por `Last Agent Interaction.step` e trata
   `negotiation.start` como turno ("Teste"); `DB: Update Negotiation Status` exige
   `notification_id` (nulo em sessões web) → sub-execuções morrem (N-D2-4). Fora de escopo.
@@ -474,4 +486,388 @@ tardia do fluxo entra pelas regras acima (texto → nota; prompt acionável → 
 `negotiation.start` do "Negociar" é disparado em paralelo à apresentação das parcelas e aguardado
 só até `N8N_KICKOFF_DEADLINE_MS` (default 2500 ms; `kickoff: delivered|unavailable|pending` na
 resposta do clique). `engine_outbox` continua ausente em produção: a "entrega durável" é um no-op
+explícito (log único por processo) até a migration ser aplicada (ver §17).
+
+## 14. 2026-09-27 — Envelope plano nos eventos de saída (N8N-14)
+
+**Problema:** o `chat.turn` do caminho rico (`buildSessionContext`) saía só com
+`type:"chat.turn"` e os ids aninhados (`session.id`, `tenant.id`), sem `event`,
+`event_id`, `session_id` ou `company_id` no topo — contra o
+`ops/n8n-sync-fix/09-n8n-routing-handoff.md` §1(B). No `1. Main`, `body.session_id`
+virava nulo e "Fetch debt data" quebrava com uuid `"undefined"`; o turno se perdia.
+
+**Agora** todo POST de saída leva, no TOPO do corpo, `event` (discriminador canônico
+fixo — o fluxo roteia por aqui) **e** `type` (rótulo do tenant, `n8n_event_names`).
+Os blocos aninhados continuam iguais (mudança aditiva). O header
+`x-alteapay-event-id` é o MESMO `event_id` do corpo. A assinatura continua
+`sha256=HMAC(N8N_WEBHOOK_SECRET, "${x-alteapay-timestamp}.${corpo exato}")`.
+
+| Evento | Chaves de topo |
+|---|---|
+| `chat.turn` | `event`, `type`, `contract_version`, `event_id`, `timestamp`, `occurred_at`, `session_id`, `company_id`, `thread_id`, `channel`, `message`, `session_state`, `callback_url`, `available_actions` + aninhados `session`, `tenant`, `customer`, `debt`, `matrix`, `offers`, `debt_acknowledgement`, `active_prompt`, `agreement` |
+| `chat.turn` (fallback, contexto irresolvível) | o mesmo envelope + `debt_acknowledgement`, `debtor`, `debt`, `tenant` mínimos |
+| `negotiation.start` | `event`, `type`, `contract_version`, `event_id`, `timestamp`, `occurred_at`, `session_id`, `company_id`, `thread_id`, `channel`, `callback_url` + `session`, `tenant`, `customer`, `debt`, `acknowledgement`, `matrix`, `offers`, `available_actions` |
+| `session.start` (outbox) | ganhou `event` (antes só `type`); resto inalterado |
+
+- **`event_id` do `chat.turn`** é determinístico por turno: UUID derivado de
+  `session_id` + id da mensagem inbound gravada (`conversation_messages.id`). O mesmo
+  turno reenviado leva o mesmo id; turnos distintos, ids distintos. O do
+  `negotiation.start` é o uuid do clique, reusado na reentrega pelo outbox.
+- `company_id` vem sempre da sessão. Documento continua mascarado + hash (claro só
+  com as 2 flags do tenant); só o primeiro nome viaja.
+- `message` de um clique em prompt do n8n continua sendo o **rótulo** do botão (o
+  `button.id` do clique ainda não viaja no `chat.turn`; ver pendências no relatório
+  N8N-14).
+
+
+## 15. 2026-09-27 — Fonte de dados do fluxo = plataforma (N8N-13)
+
+**Problema:** o `1. Main`, os `1.x`, o `4. Send Msg & Update` e o `6. DB Data Fetch` liam
+devedor, dívida, régua e o estado do roteador de **outro projeto Supabase** (credencial n8n
+"Supabase account", ≠ produção), com schema próprio (`n8n_conversation_messages`,
+`debts.original_amount`, `collection_rules.conditions`, `companies.is_active`,
+`notifications.negotiation_details`). Devedor não espelhado caía em "não conseguimos encontrar
+histórico"; o usuário de teste aparecia com vencimento 2026-02-15 (faixa até 25%) contra
+2026-08-15 (5%) em produção. O dinheiro seguia protegido pela revalidação da matriz.
+
+**Decisão:** o n8n **não** recebe a service-role de produção (N8N-4: execuções guardam dados em
+claro). Ele lê e grava o próprio estado pela API assinada:
+
+| Ação | O que faz |
+|---|---|
+| `flow.context` | leitura única: sessão (company_id da sessão), cedente, 1º nome + doc mascarado, dívida em **centavos** com `status`/`open`/`due_date`/aging, matriz da faixa, ofertas vigentes, reconhecimento, prompt ativo, `flow_state` e `bootstrap_step` |
+| `flow.state.set` | grava `{step, status, active, ongoing_agreement}` do roteador em `journey_events` (`event_type='n8n.flow_step'`, `actor='n8n'`, **sem** `customer_id` → não move `negotiation_state`). Idempotente por (sessão, `event_id`, step, status) |
+
+- Código: `lib/journey/n8n-flow.ts`; roteamento em `app/api/webhooks/n8n/route.ts`; limite de
+  60/min por sessão além do limite por IP. Sem migration.
+- Sem histórico de mensagens: o roteador só usa o último passo do agente; o texto já está em
+  `conversation_messages`.
+- `bootstrap_step`: sem `flow_state` e com a dívida reconhecida na plataforma →
+  `debt_recognition` (o `negotiation.start` com `acknowledgement.button_id=1` leva à oferta L1).
+- Workflows corrigidos (não aplicados) e o passo a passo: `ops/n8n-sync-fix/n8n13/` e
+  `ops/n8n-sync-fix/10-n8n13-fonte-de-dados.md`.
+
+## 16. 2026-09-27 — `1. Main` roteia por `body.event` (N8N-1)
+
+**Problema:** o `Router` do `1. Main` decidia pelo `step` da última mensagem do agente, não por
+`body.event`, e chamava nós que exigem `notification_id` (nulo na web): 52 de 100 execuções no
+fallback "opções válidas", 38 com uuid `"null"`, nenhuma nos `1.3`–`1.7` desde 23–25/09.
+
+**Agora (não aplicado; `ops/n8n-sync-fix/n8n1/`, handoff `ops/n8n-sync-fix/13-n8n1-roteamento.md`):**
+- Switch em `body.event` logo depois da normalização: `session.start` → 2xx sem mensagem;
+  `negotiation.start`/`chat.turn` web → `flow.context` → roteamento por `flow_state.step` →
+  `bootstrap_step`; evento desconhecido → 2xx e nada. O canal `whatsapp` segue no roteador legado.
+- Resposta ao webhook: **sempre `202 {accepted, event, event_id, duplicate}`**; a resposta ao
+  devedor vai por `chat.send` assinado com `origin_event_id` (N8N-16). Dedupe por `event_id`.
+- Botões no formato do N8N-2 (ofertas do servidor, `value` = `offer_id`, rótulo sem valor); nenhum
+  valor/percentual/parcela em texto; o clique numa oferta é executado pela plataforma.
+- Sem mudança no app. Geração: n8n13 → `build_n8n1.py` → `build_n8n16.py` → `build_n8n1.py --after-n16`.
+
+## 17. 2026-09-27 — Kickoff confiável pelo `engine_outbox` (N8N-10)
+
+**Problema:** o `session.start` do login nunca chegava ao n8n (9 logins, 0 execuções). O
+evento só é enviado depois de gravado no `engine_outbox`, e a tabela não existe em produção
+(`PGRST205`): `enqueueEvent` virava no-op explícito e não havia POST. A migration
+`supabase/migrations/20260930_engine_outbox.sql` existia e nunca foi aplicada. Além disso,
+com a tabela presente o login ficaria esperando o POST ao n8n (até 2,5 s).
+
+**Agora:**
+
+| Evento | Grava no outbox | 1ª tentativa | Reentrega |
+|---|---|---|---|
+| `session.start` (login, só abertura nova) | sim, `pending` (idempotente por `event_id` determinístico) | fora da resposta (`waitUntil` do runtime; sem ele, solta). O login **não** espera o n8n | drenos |
+| `negotiation.start` (clique Negociar) | sim, `pending` **sob lease** (`next_attempt_at = agora + ENGINE_OUTBOX_LEASE_MS`) | POST curto do clique (`N8N_KICKOFF_TIMEOUT_MS`), aguardado só até `N8N_KICKOFF_DEADLINE_MS`; sucesso marca `sent` | drenos, depois do lease |
+
+Drenos (todos usam `flushOutbox`; entrega at-least-once, o fluxo deduplica por `event_id`):
+
+1. **Rota** `POST|GET /api/cron/flush-engine-outbox` (`Authorization: Bearer ${CRON_SECRET}`),
+   chamada a cada minuto pela scheduled function `netlify/functions/engine-outbox-drain.mjs`.
+   **Não depende do worker Fargate.**
+2. **Worker Fargate** (`lib/queue/workers/engine-outbox.drainer.ts`, iniciado em
+   `start-workers.ts`) a cada `ENGINE_OUTBOX_DRAIN_INTERVAL_MS`. Só liga com
+   `NEGOTIATION_ENGINE=n8n` + `N8N_CHAT_FLOW_URL` no ambiente do worker.
+3. **Próximo turno** da sessão (`chat-turn.ts`), agendado fora da resposta.
+4. `scripts/ops/flush-engine-outbox.ts` (manual).
+
+Cada envio reivindica a linha antes (compare-and-set em `attempts` + lease em
+`next_attempt_at`), então dois drenos simultâneos não postam a mesma linha. Backoff
+exponencial (`base × 2^(n-1)`, teto de 6 h) e teto de tentativas → `failed`. 4xx
+permanente (exceto 408/429) → `failed` na hora. A URL é a mesma do `negotiation.start`:
+`N8N_EVENT_FLOW_URL` → `tenant_chat_config.n8n_chat_flow_url` → `N8N_CHAT_FLOW_URL`.
+Corpo = `stableStringify(payload)`, com a mesma assinatura HMAC + Basic de sempre.
+
+Sem a tabela, nada muda: no-op explícito (log 1x) e o processo revê a tabela a cada
+`ENGINE_OUTBOX_RECHECK_MS`. Aplicar a migration liga a entrega sem redeploy.
+
+**Flags que existem** (todas opcionais, com default):
+
+| Env | Default | Efeito |
+|---|---|---|
+| `N8N_KICKOFF_TIMEOUT_MS` | 2500 | timeout do POST do `negotiation.start` no clique |
+| `N8N_KICKOFF_DEADLINE_MS` | 2500 | quanto o clique espera o desfecho do kickoff |
+| `ENGINE_OUTBOX_TIMEOUT_MS` | 2500 | timeout de cada POST do dreno |
+| `ENGINE_OUTBOX_MAX_ATTEMPTS` | 6 | teto de tentativas por linha |
+| `ENGINE_OUTBOX_BACKOFF_BASE_MS` | 30000 | base do backoff exponencial |
+| `ENGINE_OUTBOX_LEASE_MS` | 60000 | lease de uma linha reivindicada / do `negotiation.start` recém-criado |
+| `ENGINE_OUTBOX_RECHECK_MS` | 300000 | prazo para rever a tabela depois de vê-la ausente |
+| `ENGINE_OUTBOX_DRAIN_BUDGET_MS` | 8000 | orçamento por chamada da rota de cron |
+| `ENGINE_OUTBOX_DRAIN_INTERVAL_MS` | 15000 | intervalo do dreno no worker (0 desliga) |
+
+**`N8N_KICKOFF_MODE` não existe no código.** Foi proposto (`inline` × `queue`, job
+`negotiation_start` na fila `alteapay-n8n`) e nunca implementado; relatórios que dizem
+que "ligar `N8N_KICKOFF_MODE=queue` exige o rebuild do worker" estão desatualizados. A
+fila `alteapay-n8n` é do sentido n8n → app (turno assíncrono `mode:"async"` do
+`/api/webhooks/n8n`) e não participa do kickoff.
+
+## 18. 2026-09-27 — Correlação dos callbacks do n8n (N8N-16)
+
+**Problema:** o webhook do `1. Main` aceita POST sem assinatura; os subfluxos assinam com
+o segredo real e postam `chat.send` para o `session_id` recebido. A assinatura correta do
+callback não prova que a plataforma pediu aquela resposta.
+
+**Defesa da plataforma** (`lib/negotiation/n8n-correlation.ts`, gancho no início do
+`POST /api/webhooks/n8n`): uma ação com efeito só é aceita quando ecoa um evento que a
+plataforma enviou ao n8n para a MESMA sessão/empresa, dentro da janela, e dentro do teto
+de respostas por evento.
+
+- **Id ecoado:** `origin_event_id` no topo do corpo do callback; na falta dele, o próprio
+  `event_id` do callback (compatível com o handoff 09 §3, "ecoar o event_id").
+- **Registros usados (nenhuma tabela nova):** `chat.turn` → id determinístico recalculado a
+  partir das mensagens inbound da sessão (`conversation_messages`, §14); `negotiation.start`
+  → linha `n8n_out:<event_id>` em `journey_events` gravada ANTES do POST (também valem as
+  linhas legadas `neg_start:`/`neg_start_unavailable:`); `session.start` → `engine_outbox`
+  (ausente em produção). Teto: linhas `n8n_reply:<origin>:<k>` em `journey_events`.
+- **Ações cobertas:** `chat.send`, `prompt.ask`, `prompt.close`, `payment.create`,
+  `payment.record`, `offer.propose`, `offer.accept`, `offer.reject`, `agreement.close`,
+  `dispute.register`, `payment_claim.register`, `human.transfer`, `negotiation.note`,
+  `session.close`, `session.message`, `session.record`, `session.redirect` e
+  `flow.state.set` (este sem consumir o teto). Leituras (`ping`, `session.status`,
+  `debt.summary`, `offer.list`, `payment.status`, `journey.timeline`, `flow.context`) e
+  `session.create` não são cobertas.
+- **Replay** do mesmo callback (mesma ação + mesmo `event_id`) reusa o slot; a idempotência
+  de cada ação (ex.: `payment.create` por sessão+oferta) segue igual.
+
+| Env | Default | Efeito |
+|---|---|---|
+| `N8N_REQUIRE_EVENT_CORRELATION` | OFF | OFF: só telemetria `journey_events.n8n.correlation_miss` (sem PII: ação + código). ON: recusa |
+| `N8N_CORRELATION_WINDOW_SECONDS` | `900` | janela entre o envio do evento e o callback |
+| `N8N_CORRELATION_MAX_REPLIES` | `12` | callbacks com efeito por evento de origem |
+
+Códigos (flag ON): `403 n8n_origin_missing | n8n_origin_unknown | n8n_origin_wrong_session |
+n8n_origin_wrong_company`, `409 n8n_origin_expired | n8n_reply_cap`,
+`503 n8n_correlation_unavailable`.
+
+> **Não ligar a flag antes dos fluxos ecoarem o evento.** Hoje nenhum subfluxo manda
+> `origin_event_id` (o `5.`/`4.` geram um `event_id` novo por callback), então com a flag ON
+> todo `chat.send`/`payment.create` do n8n seria recusado. Ordem e patches dos fluxos:
+> `ops/n8n-sync-fix/11-n8n16-autenticacao.md` e `ops/n8n-sync-fix/n8n16/`.
+
+## 19. 2026-09-27 — `payment.create`: aliases de oferta e instruções PIX/boleto (N8N-15)
+
+**Problema (QA `ops/qa-e2e/10-n8n-api-personas.md`, persona c #9/#10):**
+(a) o `docs/CONTRATO_N8N_PAYMENT_CREATE.json` v1.0 mandava `args.offer_id = 'avista' | 'parc_N'`,
+mas o servidor só aceitava o uuid de `offer.list` (`'avista'` → `409 OFFER_NOT_AVAILABLE`);
+(b) na resposta `created` de uma cobrança PIX, `pix_copy_paste` e `pix_qr_code_url` vinham `null`.
+
+### 19.1 (a) Aliases — decisão: ACEITAR, com resolução estrita no servidor
+
+`args.offer_id` aceita o **uuid** de `offer.list` (canônico, sem mudança) **ou** um alias:
+
+| Alias | Resolve para |
+|---|---|
+| `avista` | a oferta `presented`, não vencida, de **1 parcela** desta sessão |
+| `parc_N` (2 ≤ N ≤ 60) | a oferta `presented`, não vencida, de **N parcelas** desta sessão |
+
+Por que é seguro (regra de ouro — o servidor decide valores):
+- a resolução é **só-leitura** (`lib/negotiation/offer-alias.ts`): o alias só **seleciona** uma
+  oferta que o servidor já gerou e apresentou na sessão (isolada por `session_id` + `company_id`);
+  nunca gera oferta nem monta termos. Sem ofertas → `409 OFFER_ALIAS_NOT_FOUND` (chame `offer.list`);
+- resolve só com **exatamente uma** candidata. Duas ou mais (ex.: um `offer.propose` do fluxo além
+  da oferta da matriz) → `409 OFFER_ALIAS_AMBIGUOUS` — o servidor nunca "adivinha" e cobra um valor
+  diferente do que o fluxo disse ao devedor. Só vencidas → `409 OFFER_EXPIRED`;
+- a oferta integral do botão Pagar (0%/1x) nunca conta como `avista`;
+- depois do resolve o caminho é **idêntico** ao do uuid (reconhecimento, matriz vigente, guard
+  duplo de `lib/asaas-idempotency.ts`, idempotência por `(session_id, offer_id)`);
+- **idempotência alias ↔ uuid:** após o 1º `payment.create` a oferta vira `accepted` (irmãs
+  `superseded`); sem candidata `presented`, o alias cai na oferta `accepted` do mesmo tipo → mesma
+  oferta → mesmo acordo → mesma cobrança (`idempotent:true`). Se um `offer.list` posterior gerar um
+  conjunto novo, o alias resolve para a oferta nova e o guard devolve `already_charged` com o link
+  existente — nunca 2ª cobrança.
+
+A resposta passa a trazer `offer_id` (uuid resolvido) e `offer_alias` (alias usado ou `null`).
+`agreement.close` (ação legada) continua com a semântica própria de `avista`/`parc_N` do
+`close-agreement` (desconto por faixa de aging) — não confundir com o `payment.create`.
+
+### 19.2 (b) PIX nulo — causa e correção
+
+**Causa:** o objeto de pagamento do ASAAS (`POST`/`GET /payments`) **não tem** copia-e-cola nem QR.
+O write-back (`charge-inline.ts`, worker, `send-payment-link`) gravava `asaas_pix_qrcode_url` a
+partir de `asaasPayment.pixQrCodeUrl` — campo que só o **mock** devolve; em produção é sempre
+`null`. A borda n8n mapeava `pix_copy_paste` (e `pix_qr_code_url`) dessa coluna. O PIX só existe em
+`GET /payments/{id}/pixQrCode` (`payload`, `encodedImage`, `expirationDate`), que ninguém chamava.
+O web chat não sofre disso: manda o devedor ao `invoice_url` (checkout ASAAS com PIX/boleto).
+
+**Correção** (`lib/journey/payment-instructions.ts`, só na borda n8n; web chat intocado):
+- `payment.create` (`created`/`already_charged`) e `payment.status` (objeto `payment`, cobrança
+  não paga) consultam o ASAAS sob demanda, com prazo de **2,5 s**:
+  - **PIX:** `pix_copy_paste` (BR Code), `pix_qr_image` (`data:image/png;base64,…`),
+    `pix_expiration`, `pix_pending:false`, `pix_fallback_url:null`;
+  - estourou o prazo / erro ASAAS → `pix_pending:true` + `pix_fallback_url` (= `invoice_url`). A
+    cobrança existe; só as instruções não vieram — mande o link ou repita `payment.status`;
+  - **BOLETO:** `GET /payments/{id}/identificationField` → `boleto_line` (linha digitável),
+    `boleto_barcode`, `boleto_pending`; `boleto_url` (PDF, `bankSlipUrl`) continua da base;
+  - cartão: nada extra (`invoice_url`).
+- Nada é persistido; o payload PIX/QR/linha **nunca** é logado (só `paymentId` + `timeout`/`erro`).
+- `pix_qr_code_url` fica **deprecado** (coluna legada, `null` em produção) — use `pix_qr_image`.
+- O mock ASAAS (`MOCK_MODE`) ganhou `pixQrCode` e `identificationField`.
+
+### 19.3 Forma da resposta (chaves)
+
+- **Antes:** `ok, idempotent, status, agreement_id, asaas_payment_id, billing_type, total_value,
+  installments, due_date, invoice_url, pix_copy_paste (null), pix_qr_code_url (null), boleto_url,
+  boleto_line (null)`.
+- **Depois (PIX):** as mesmas + `pix_qr_image, pix_expiration, pix_pending, pix_fallback_url,
+  offer_id, offer_alias` (`pix_copy_paste` preenchido).
+- **Depois (BOLETO):** as mesmas + `boleto_barcode, boleto_pending, offer_id, offer_alias`
+  (`boleto_line` preenchido).
+
+Erros reais do `payment.create`: `403` sessão não verificada · `409 debt_not_acknowledged` ·
+`409 OFFER_NOT_AVAILABLE` (uuid inexistente/consumido) · `409 OFFER_EXPIRED` ·
+`409 OFFER_ALIAS_NOT_FOUND` · `409 OFFER_ALIAS_AMBIGUOUS` · `422 offer_outside_matrix` /
+`no_matrix_row` · `501 not_implemented` · `503 charge_deferred`. `already_charged` é **200**
+(`status:"already_charged"` + link existente), não erro. Contrato completo:
+`docs/CONTRATO_N8N_PAYMENT_CREATE.json` v1.1.
+
+## 20. 2026-09-27 — Contrato de botões n8n → chat (N8N-2)
+
+**Problema:** nenhum botão do n8n era aceito. O `4. Send Msg & Update` mandava o envelope
+`{sessionId, output, buttons}` (422 "corpo inválido") e, desde 25/09, `chat.send` com
+`id: Number(b.id)` (métodos `PIX`/`CARTAO` viram `null` → 422 `button_id_invalid`) e parcelas
+`offer_choice` sem `offer_id`, com valor calculado pelo n8n (422 `prompt_not_actionable`, ou
+beco sem saída no clique). Especificação completa para o fluxo:
+`ops/n8n-sync-fix/14-n8n2-botoes.md`.
+
+**Forma canônica** (inalterada): `chat.send` com
+`args.prompt = {kind, question, buttons:[{id:<int>, label, value?, order?}]}`. Oferta =
+`kind:"offer_choice"` + `value` = `offer_id` vigente (de `offer.list`); método =
+`payment_method_choice` + `value` ∈ `PIX|BOLETO|CREDIT_CARD`; `1/0` Sim/Não
+(`debt_acknowledgement` executa o reconhecimento na plataforma); `96` Já paguei; `98` Voltar;
+`99` Atendimento (handoff pela plataforma em qualquer prompt).
+
+**Sempre ligado:** botão cujo `value` é uma oferta vigente da sessão tem o **rótulo regenerado
+pela oferta do servidor** — o devedor nunca vê um valor escrito pelo n8n num botão que cobra a
+oferta do servidor. O que é aceito não muda.
+
+**Adaptador legado** (`N8N_LEGACY_BUTTONS_ADAPTER=on`, default **off**;
+`lib/negotiation/n8n-buttons.ts`): converte ids string, `text`→`label`, métodos por id ou pelo
+início do rótulo, `offer_id`, tokens de ação (`nao_reconheco`, `ja_paguei`, `atendimento`,
+`voltar`…) e o envelope `{sessionId, output, buttons}`. Oferta só entra se resolver para uma
+oferta vigente (por id, ou casamento exato de parcelas+valor com uma única oferta da matriz);
+o resto é descartado com motivo. Sem nenhum botão válido, o texto entra como bolha e a sessão
+fica com o menu determinístico (nunca beco sem saída); sem nada para exibir → 422
+`buttons_invalid`. Resposta ganha `buttons_report` (`dropped_buttons`, `fallback`,
+`relabeled`) e, no fallback, `fallback_prompt_id`. Telemetria:
+`journey_events.chat.engine_buttons_adapted` (sem PII). Invariantes mantidas: 1 prompt ativo,
+`thread_epoch`, janela do N8N-8 (`prompt_outside_window`), idempotência por `event_id`.
+
+**Síncrono:** a resposta síncrona do `negotiation.start` passa pelo mesmo caminho; a do
+`chat.turn` só lê `reply` (botões ignorados) — para botões num turno, 202 + `chat.send`.
+
 explícito (log único por processo) até a migration ser aplicada.
+
+## 21. 2026-09-27 — Guard de texto do n8n (N8N-6)
+
+Todo texto do n8n que pode chegar ao devedor passa por um guard **no servidor**
+(`lib/negotiation/n8n-text-guard.ts`) antes de ser gravado: `chat.send` (`args.text`,
+`args.prompt.question` e rótulos dos botões), a resposta síncrona do kickoff
+(`negotiation.start`, que usa o mesmo `chatSend`) e o `reply` síncrono do `chat.turn` (papel A).
+O GET `/api/chat/messages` e o `/api/chat/history` aplicam o mesmo filtro na leitura, então
+linhas antigas e o fallback do fluxo não saem pela API. O filtro do client web continua como
+defesa em profundidade.
+
+**Normalização (sempre):** HTML removido; link markdown `[rótulo](url)` vira o rótulo; URL fora
+do domínio da plataforma (`alteapay.com` e o host de `NEXT_PUBLIC_APP_URL`) é removida;
+espaços normalizados; corte em 2000 caracteres. Link de pagamento se entrega por
+`payment.create`/`payment_ref`, não por URL no texto.
+
+**O texto PODE conter:** empatia, orientação e perguntas ("desconto" sem número é permitido);
+valores, percentuais, número de parcelas e datas **idênticos** a um fato do servidor para a
+sessão. Os fatos aceitos são: as ofertas vigentes (`offer.list`: total, parcela, entrada,
+desconto em R$ e %, `first_due_date`, `valid_until`), o prompt ativo da plataforma, o valor e o
+vencimento da dívida, e os acordos do devedor. Os valores são comparados em centavos, em
+qualquer formato brasileiro (`R$ 1.234,56`, `R$1234,56`, `1.234,56 reais`). `1x` e "à vista"
+sempre passam.
+
+**O texto NÃO PODE conter:**
+- número monetário que o servidor não gerou (`R$`/reais, `%` de desconto, `Nx`/`N parcelas`,
+  data `dd/mm/aaaa` ou `dd/mm` com contexto de prazo);
+- concessão de desconto ("desconto aprovado/concedido/liberado", "dívida perdoada");
+- estado que a plataforma não tem: "pagamento confirmado/recebido", "dívida quitada/paga" (só
+  com pagamento confirmado), "acordo fechado/firmado" (só com acordo) e "negociação/atendimento
+  encerrado" (só com a sessão encerrada);
+- fallback/erro do fluxo: "selecione uma das opções válidas", "canal de atendimento
+  automático", "não conseguimos encontrar histórico", "opção inválida", menção a
+  n8n/workflow/webhook, uuid, `null`/`undefined`/`NaN`, `{{ }}`/`$json` e stack traces.
+
+**Resposta à recusa (`chat.send`):** **422**
+`{success:false, code:"text_rejected", reason:<motivo>, error:"…"}`. Nada visível ao devedor é
+gravado, nem o prompt. Motivos (`reason`):
+
+| reason | categoria |
+|---|---|
+| `unverified_amount`, `unverified_percent`, `unverified_installments`, `unverified_date`, `discount_claim` | money |
+| `state_claim_paid`, `state_claim_agreement`, `state_claim_closed` | state |
+| `engine_fallback_text`, `internal_leak` | fallback |
+| `empty_after_sanitize` | empty |
+
+As checagens estruturais do prompt (`validateButtons`, `prompt_not_actionable`,
+`prompt_outside_window`) rodam antes e mantêm os códigos da §13.
+
+A categoria **fallback** conta como falha do engine, como o timeout/5xx da §5: a sessão cai no
+assistido (`engine='disabled'`, a menos que `NEGOTIATION_ENGINE_FALLBACK=off`) e, se não houver
+prompt ativo, o menu de 3 opções é reaberto. No papel A (`reply` síncrono), qualquer recusa
+troca o texto pelo reply determinístico do assistido. Os efeitos do turno (ação/acordo) são
+mantidos e `events` recebe `n8n_text_rejected`.
+
+Toda recusa grava `journey_events.event_type='chat.engine_text_rejected'` (ator `n8n`) com o
+payload `{reason, category, source, text_len, text_hash}`, sem texto cru e sem PII.
+
+## 22. 2026-09-27 — Thread (época) das mensagens do n8n e o reset de 24h (N8N-9)
+
+Depois de 24 h sem mensagem, a autenticação encerra a thread do chat: arquiva as linhas
+(`archived_at`) e faz `negotiation_sessions.thread_epoch + 1`. O GET `/api/chat/messages` e o
+recap mostram só a época corrente (`thread_epoch` NULL = época 0). O histórico
+(`/api/chat/history`) mostra todas e devolve `thread_epoch` por mensagem.
+
+- `chat.send`, `prompt.ask` (e o `chat.turn` síncrono/assíncrono) gravam a época **corrente da
+  sessão, lida no servidor no momento da escrita** (`lib/journey/thread-epoch.ts`). O n8n não
+  informa nem pode alterar a época; um `thread_epoch` no corpo é ignorado.
+- Resposta atrasada: se `args.n8n_execution_id` já gravou linhas **só** na thread encerrada (a
+  execução começou antes do reset), `chat.send`/`prompt.ask` devolvem **409**
+  `{code:'thread_epoch_stale'}` e nada é gravado (nem texto nem prompt). Auditoria:
+  `chat.engine_invalid_action` com `payload.code='thread_epoch_stale'` (sem texto). Não re-tentar.
+  O fluxo deve mandar `n8n_execution_id` (`$execution.id`) em todo `chat.send`/`prompt.ask`.
+- Clique num prompt da thread encerrada (aba aberta desde antes do reset) nunca é re-alvejado ao
+  menu da thread nova: **409** `prompt_stale` com o prompt ativo (o client re-hidrata).
+
+## 23. 2026-09-28 — Integração (branch `integration/n8n-latency-2026-09-28`)
+
+As seções 14–22 foram escritas em branches paralelas e renumeradas aqui (antes havia três §15 e
+dois §14). Mapa: §14 N8N-14 · §15 N8N-13 · §16 N8N-1 · §17 N8N-10 · §18 N8N-16 · §19 N8N-15 ·
+§20 N8N-2 · §21 N8N-6 · §22 N8N-9. Decisões de integração que valem para todas:
+
+- **Ordem dentro de `POST /api/webhooks/n8n`:** rate limit pré-auth (só para requisição sem
+  assinatura válida, N8N-12) → HMAC com segredo atual ou `N8N_WEBHOOK_SECRET_PREVIOUS` (N8N-4) →
+  parse → adaptador do envelope legado (N8N-2) → correlação (N8N-16) → rate limit por identidade
+  (N8N-12) → ação. No `chat.send`: contrato de botões (rótulo do servidor) → dedupe por `event_id`
+  → época da thread (N8N-9) → guard de texto (N8N-6, que vê o rótulo do servidor) → escrita. No
+  `payment.create`: alias (N8N-15) → efeito → instruções PIX/boleto. Teste:
+  `tests/webhooks/n8n.route-order.integration.test.ts`.
+- **Saída assina só com o segredo atual** (`N8N_WEBHOOK_SECRET`); `_PREVIOUS` só é aceito na entrada.
+- **`session.start`:** um só mecanismo — INSERT no `engine_outbox` (fora do caminho do login quando
+  há `waitUntil`) e entrega pela `deferDelivery`, que registra no `waitUntil` de
+  `lib/journey/after-response.ts` e nunca é aguardada: o login nunca espera o n8n.
+- **Fluxos n8n:** compor só com `ops/n8n-sync-fix/n8n5/compose_chain.py` e aplicar só com
+  `ops/n8n-sync-fix/tools/apply-workflow.mjs`, na ordem `2 → 3 → 5 → 7 → 4 → 1.1…1.7 → 1. Main → 6`.
+  O `1. Main` do N8N-16 não responde mais `200 "Workflow was started"` antes do roteamento.
+- Plano de implantação: `ops/negociacao-final/13-plano-rollout-integracao.md`.

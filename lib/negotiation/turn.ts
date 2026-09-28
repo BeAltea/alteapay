@@ -26,7 +26,7 @@ export async function runChatbotTurn(
     loadTenantConfig(session.company_id),
   ])
 
-  await recordMessage({
+  const inbound = await recordMessage({
     session,
     channel,
     direction: "inbound",
@@ -34,7 +34,8 @@ export async function runChatbotTurn(
     content: message,
   })
 
-  const result = await engineChat({ session, message, channel, debtor, tenant })
+  // N8N-14: o id da mensagem inbound ancora o event_id determinístico do chat.turn.
+  const result = await engineChat({ session, message, channel, debtor, tenant, turnRef: inbound?.id ?? null })
 
   await recordMessage({
     session,

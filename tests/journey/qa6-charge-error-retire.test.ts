@@ -50,9 +50,12 @@ describe("QA rodada 6 — erro de cobrança nunca coexiste com o menu (Q2r2-02)"
     expect(db.negotiation_sessions[0].wait_started_at).toBeNull()
   })
 
-  it("servidor: createPrompt NÃO limpa outros estados (gerando_cobranca / aguardando_motor)", async () => {
+  // N8N-7: 'aguardando_motor'/'menu_degradado' agora SÃO aposentados por um
+  // prompt novo (tests/journey/n8n7-engine-wait-states.test.ts); o Pagar em voo
+  // e o link entregue continuam intocados.
+  it("servidor: createPrompt NÃO limpa os estados do Pagar (gerando_cobranca / link_entregue)", async () => {
     const { createPrompt } = await import("@/lib/journey/prompts")
-    for (const st of ["gerando_cobranca", "aguardando_motor"]) {
+    for (const st of ["gerando_cobranca", "link_entregue"]) {
       db.negotiation_sessions[0].wait_state = st
       await createPrompt({ companyId: "co", sessionId: "s1", kind: "offer_choice", question: "q", buttons: [{ id: 98, label: "Voltar às opções", order: 0 }] })
       expect(db.negotiation_sessions[0].wait_state).toBe(st)

@@ -641,6 +641,12 @@ export function JourneyChat() {
         pinnedDebtJsonRef.current = null
         setPinnedDebt(null)
       }
+      // F8-02: dívida quitada no servidor → nenhum estado LOCAL de pagamento
+      // (gerando/link/erro) nem a bolha "preparando negociação" sobrevive.
+      if (data?.settled === true) {
+        clearPendingNegotiation()
+        clearLinkLocalState()
+      }
       // D2 — RECAP (C7): só o 1º poll (retomada) traz recap != null. Guardamos para
       // renderizar o bloco acima do log no lugar da repetição integral.
       if (data?.recap && typeof data.recap === "object" && typeof data.recap.text === "string") {

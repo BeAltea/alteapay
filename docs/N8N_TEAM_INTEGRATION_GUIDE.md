@@ -338,6 +338,8 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
 
 `POST https://alteapay.com/api/webhooks/n8n` — assinado (§3). Envelope: `{ "action", "session_id", "event_id", "args" }`. `event_id` (uuid por ação) garante idempotência.
 
+**Eco do evento de origem (N8N-16):** toda ação com efeito (`chat.send`, `prompt.*`, `payment.*`, `offer.propose/accept/reject`, `dispute.register`, `payment_claim.register`, `human.transfer`, `negotiation.note`, `session.close`, `flow.state.set`) deve levar no TOPO `"origin_event_id": "<event_id do chat.turn/negotiation.start recebido>"`. A plataforma confere que enviou aquele evento para a mesma sessão/empresa, há no máximo 15 min, e limita as respostas por evento. Com `N8N_REQUIRE_EVENT_CORRELATION` ligado, callback sem eco válido recebe `403`/`409` com `code` (`docs/N8N_INTEGRATION.md` §18).
+
 ### 7.1 `debt.summary`
 - **Request:** `{ "action":"debt.summary", "session_id":"uuid" }`
 - **Response:** `{ "success":true, "summary": { "creditorName", "originalValue", "agingDays", "oldestDueDate", "invoices":[...] } }`
@@ -364,15 +366,18 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
 - **Response:** `{ "success":true }`
 
 ### 7.6 `payment.create` — o principal (variante A)
-- **Request:** `{ "action":"payment.create", "session_id":"uuid", "event_id":"uuid", "args":{ "offer_id":"uuid", "billing_type":"PIX" } }`
-- **Response (cobrança pronta):** ver §8 (valores em **centavos**, `idempotent`, links).
-- **Response (worker off):** `{ "ok":true, "status":"processing", "agreement_id", "poll_after_ms":3000 }` → consulte `payment.status` até obter o link.
-- **Erros:** `409 debt_not_acknowledged` (cliente não reconheceu), `409 already_charged`, `422` (oferta inválida contra a matriz vigente), `501 not_implemented` (`payment_origin != 'platform'`).
-- **Ao cliente:** mande o link (PIX copia-e-cola / boleto / `invoice_url`).
+- **Request:** `{ "action":"payment.create", "session_id":"uuid", "event_id":"uuid", "args":{ "offer_id":"uuid" | "avista" | "parc_N", "billing_type":"PIX" } }`
+- **`offer_id`:** o `id` (uuid) de `offer.list` é o canônico. Também aceita o alias `avista` (oferta de 1 parcela) ou `parc_N` (N parcelas, ex.: `parc_3`): o servidor resolve para a oferta **apresentada e vigente** daquele tipo **nesta sessão** — só se houver exatamente uma. Chame `offer.list` antes (é ele que gera as ofertas). Se você fez `offer.propose` de um à vista próprio, `avista` fica ambíguo → use o uuid. A resposta traz `offer_id` (uuid resolvido) e `offer_alias`.
+- **`billing_type`:** informativo; a forma de pagamento vem da oferta (à vista = PIX quando a matriz permite; parcelado = boleto/cartão).
+- **Response (cobrança pronta):** ver §8 — resposta **plana** (sem objeto `payment`), valores em **centavos**, `idempotent`, links e instruções PIX/boleto.
+- **Response (`CHARGE_MODE=queue`):** `{ "ok":true, "status":"processing", "agreement_id", "poll_after_ms":3000 }` → consulte `payment.status` até obter o link. Produção usa `inline` e responde `created`.
+- **Já cobrada:** **HTTP 200** `{ "ok":true, "status":"already_charged", "idempotent":true, ...link existente }` — reenvie esse link.
+- **Erros:** `409 debt_not_acknowledged`, `409 OFFER_NOT_AVAILABLE` (uuid inexistente/consumido), `409 OFFER_EXPIRED`, `409 OFFER_ALIAS_NOT_FOUND`, `409 OFFER_ALIAS_AMBIGUOUS`, `422 offer_outside_matrix`/`no_matrix_row`, `501 not_implemented`, `503 charge_deferred` (repita).
+- **Ao cliente:** PIX → `pix_copy_paste` (e/ou `pix_qr_image`); se `pix_pending:true`, mande `pix_fallback_url` (= `invoice_url`). Boleto → `boleto_line` e/ou `boleto_url`. Sempre pode mandar `invoice_url`.
 
 ### 7.7 `payment.status`
 - **Request:** `{ "action":"payment.status", "session_id":"uuid" }`
-- **Response:** `{ "ok":true, "agreement_id", "payment": { ..., "total_value":<centavos>, "invoice_url", "pix_copy_paste", "boleto_url" }, "payment_status", "asaas_status", "from_live_charge?": true }`
+- **Response:** `{ "ok":true, "agreement_id", "payment": { ..., "payment_id", "total_value":<centavos>, "invoice_url", "pix_copy_paste", "pix_qr_image", "pix_expiration", "pix_pending", "pix_fallback_url", "boleto_url", "boleto_line", "boleto_barcode", "boleto_pending" }, "payment_status", "asaas_status", "from_live_charge?": true }` (instruções PIX/boleto só para cobrança não paga).
 - **Reenvio no `already_charged` (§8):** quando `payment.create` devolveu `409 already_charged`, chame `payment.status`. Se a dívida já tinha uma **cobrança viva** (mesmo que não vinculada a esta sessão), a resposta traz `from_live_charge: true` e as **URLs do acordo existente** — **reenvie esse link** (`invoice_url`/`pix_copy_paste`/`boleto_url`) em vez de gerar cobrança nova.
 - **Modo `processing`:** quando `payment.create` devolveu `processing` (worker ainda gerando a cobrança), faça polling em `payment.status` a cada `poll_after_ms` até `payment.payment_id` (e as URLs) aparecerem.
 - **NUNCA** aceita status vindo do fluxo — a fonte é o ASAAS.
@@ -410,6 +415,19 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
 - **Request:** `{ "action":"session.close", "session_id":"uuid", "args":{ "outcome":"closed_by_flow" } }`
 - **Response:** `{ "success":true }`
 
+### 7.16 `flow.context` — a ÚNICA fonte de dados do fluxo (N8N-13)
+- **Request:** `{ "action":"flow.context", "session_id":"uuid", "event_id":"uuid" }`
+- **Response:** `{ "success":true, "session":{ "id","company_id","status","outcome","verified","consent","engine","channel" }, "creditor":{ "name" }, "customer":{ "id","first_name","document_type","document_masked" }, "debt":{ "id","ids","status","open","original_value","updated_value","due_date","oldest_due_date","aging_days","invoice_count" }, "matrix":{…}|null, "offers":[…], "debt_acknowledgement":{ "answered","acknowledged","answered_at" }, "active_prompt":{ "id","kind" }|null, "flow_state":{ "step","status","active","ongoing_agreement","updated_at" }|null, "bootstrap_step":"debt_recognition"|null }`
+- Valores em **centavos**. `debt.open` = dívida em aberto (`pending`/`in_negotiation`). `company_id` sai da sessão.
+- **Substitui** toda leitura de banco do fluxo (`6. DB Data Fetch`, "Get Customer Interaction", "Get latest offer from agent"). O fluxo **nunca** lê um banco Supabase próprio.
+- Limite: 60 chamadas/min por sessão (`429`).
+
+### 7.17 `flow.state.set` — grava o passo do roteador (N8N-13)
+- **Request:** `{ "action":"flow.state.set", "session_id":"uuid", "event_id":"uuid", "args":{ "step":"negotiation_l1", "status":"pending", "active":true, "ongoing_agreement":{…}|null } }`
+- `step` ∈ `identity_verification | debt_recognition | negotiation_l1 | negotiation_l2 | payment_method | payment_terms | agreement_confirmation`; `status` = `[a-z_]{1,32}`; `ongoing_agreement` ≤ 4 KB, sem CPF/telefone.
+- **Response:** `{ "success":true, "flow_state":{…}, "duplicate":false }` · inválido: `422 { "code":"FLOW_STATE_INVALID"|"FLOW_STATE_TOO_LARGE"|"PII_NOT_ALLOWED" }`
+- O `ongoing_agreement` é rascunho do fluxo: a cobrança continua saindo só de `offer_id` (matriz).
+
 ---
 
 ## 8. Sequência de pagamento passo a passo
@@ -430,10 +448,19 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
      "billing_type": "PIX", "total_value": 36184, "installments": 1,
      "due_date": "2026-09-28",
      "invoice_url": "https://www.asaas.com/i/...",
-     "pix_copy_paste": "00020126...", "pix_qr_code_url": "00020126...",
-     "boleto_url": null, "boleto_line": null
+     "pix_copy_paste": "00020101021226...",
+     "pix_qr_image": "data:image/png;base64,iVBORw0K...",
+     "pix_expiration": "2026-09-28 23:59:59",
+     "pix_pending": false, "pix_fallback_url": null,
+     "pix_qr_code_url": null,
+     "boleto_url": null, "boleto_line": null,
+     "offer_id": "uuid", "offer_alias": "avista"
    }
    ```
+   - `pix_pending: true` → o ASAAS não devolveu o PIX a tempo (~2,5 s): a cobrança existe; mande `pix_fallback_url` (= `invoice_url`) ou repita `payment.status` em alguns segundos.
+   - **Boleto** (ex.: parcelado): sem `pix_*`; `boleto_url` (PDF), `boleto_line` (linha digitável), `boleto_barcode`, `boleto_pending`.
+   - `pix_qr_code_url` está **deprecado** (sempre `null` em produção).
+   - **Nunca** registre `pix_copy_paste`/`pix_qr_image` em logs do n8n.
 5. Fluxo → `chat.send` com o link (PIX copia-e-cola / boleto / `invoice_url`).
 6. **Se o worker estiver desligado**, o passo 4 devolve:
    ```json
@@ -446,7 +473,7 @@ O servidor valida o catálogo: ids inteiros, **únicos**, labels não-vazios. Er
    ```
 8. Cliente paga → **ASAAS webhook** confirma → a AlteaPay atualiza o acordo. O fluxo não declara pagamento.
 
-**Caso `already_charged` (dívida já tinha cobrança viva):** o passo 3/4 devolve `409 { code: "already_charged" }`. Não é erro fatal — chame `payment.status` (§7.7): se vier `from_live_charge: true` + URLs, **reenvie o link existente** ao cliente. Nunca tente forçar uma cobrança nova.
+**Caso `already_charged` (dívida já tinha cobrança viva):** o passo 4 devolve **HTTP 200** `{ "ok":true, "status":"already_charged", ... }` já com o link existente (mesmos campos, inclusive `pix_*`/`boleto_*`). **Reenvie esse link** ao cliente; `payment.status` (§7.7) devolve o mesmo (`from_live_charge: true`). Nunca tente forçar uma cobrança nova.
 
 ---
 
@@ -460,7 +487,13 @@ Sempre `{ "ok":false, "code", "message" }` (ou `{ "success":false, "error", "cod
 | `403` | — | Sessão não verificada (exigida p/ pagamento) | "Preciso confirmar sua identidade primeiro." |
 | `404` | `prompt_not_found` | Prompt inexistente/de outra sessão | (recarregar estado) |
 | `404` | — | Sessão inexistente/fechada | "Sua sessão expirou. Abra o link novamente." |
-| `409` | `already_charged` | Dívida já tem cobrança viva | "Já existe uma cobrança em aberto para essa dívida — te reenvio o link." |
+| `200` | `status: already_charged` | Dívida já tem cobrança viva (`payment.create` devolve o link existente) | "Já existe uma cobrança em aberto para essa dívida — te reenvio o link." |
+| `409` | `OFFER_NOT_AVAILABLE` | `offer_id` (uuid) inexistente nesta sessão ou já consumido | (chame `offer.list` e reapresente) |
+| `409` | `OFFER_EXPIRED` | A oferta venceu | "Essa condição venceu; seguem as atuais." (chame `offer.list`) |
+| `409` | `OFFER_ALIAS_NOT_FOUND` | Alias `avista`/`parc_N` sem oferta apresentada desse tipo | (chame `offer.list`; ofereça o que existe) |
+| `409` | `OFFER_ALIAS_AMBIGUOUS` | Mais de uma oferta desse tipo na sessão | (use o uuid da oferta escolhida) |
+| `422` | `offer_outside_matrix` / `no_matrix_row` | A oferta não cabe mais na matriz vigente | "Essa condição não está mais disponível; posso oferecer estas." |
+| `503` | `charge_deferred` | Cobrança não iniciada por prazo | (repita o `payment.create`) |
 | `409` | `debt_not_acknowledged` | Cliente não reconheceu a dívida | "Antes de gerar o pagamento, preciso que você confirme que reconhece esta cobrança." |
 | `409` | `prompt_not_active` | Clique em prompt já respondido/superseded | "Essa opção não está mais disponível; veja as atualizadas." |
 | `422` | `DISCOUNT_ABOVE_MAX` | Desconto acima do permitido pela matriz | "Essa condição não está disponível; posso oferecer estas." |
@@ -536,7 +569,7 @@ Sempre `{ "ok":false, "code", "message" }` (ou `{ "success":false, "error", "cod
 - **Assíncrono:** para respostas longas, use o modo com `callback_url` (assinado) — o servidor entrega a resposta ao cliente quando ela chega.
 - **Validade da proposta:** definida pela matriz (`proposal_validity_days`); ofertas expiram e não podem ser aceitas depois.
 - **TTL da sessão:** `session_ttl_minutes` (padrão 60). Depois disso, o cliente reautentica.
-- **Rate limit:** 120 req/min por IP no `/api/webhooks/n8n`; limites por sessão nas mensagens.
+- **Rate limit:** no `/api/webhooks/n8n`, 60 req/min por sessão e 3000 req/min por cedente (não por IP; N8N-12); limites por sessão nas mensagens.
 - **Polling da UI:** `GET /api/chat/messages?since=` a cada ~2,5 s, para em `visibilitychange`, teto 20 min.
 - **Worker de cobrança:** `payment.create` depende do worker (Fargate) para gerar o link no ASAAS. **Chat ligado exige worker ligado**; sem ele, o `payment.create` fica em `processing`.
 
@@ -547,6 +580,7 @@ Sempre `{ "ok":false, "code", "message" }` (ou `{ "success":false, "error", "cod
 **Glossário:** *tenant/credor* (empresa, isolada por `company_id`) · *cliente/devedor* · *dívida/fatura* · *sessão* (`thread_id` = memória) · *oferta* (da matriz) · *matriz* (regras do tenant) · *acordo* (oferta fechada) · *cobrança* (pagamento ASAAS) · *reconhecimento* (Sim/Não append-only) · *prompt* (pergunta com botões) · *guard* (proteção de idempotência da cobrança) · *variante A* (AlteaPay executa a cobrança — único caminho desta onda).
 
 **Changelog do contrato:**
+- **2026-09-27 (N8N-15):** `payment.create` aceita `offer_id` = uuid de `offer.list` (canônico) **ou** alias `avista`/`parc_N`, resolvido pelo servidor para a oferta vigente da sessão (exatamente uma; senão `409 OFFER_ALIAS_NOT_FOUND`/`OFFER_ALIAS_AMBIGUOUS`/`OFFER_EXPIRED`); resposta traz `offer_id`/`offer_alias`. PIX: `pix_copy_paste`, `pix_qr_image`, `pix_expiration` via `GET /payments/{id}/pixQrCode` (antes sempre `null`); fallback `pix_pending`+`pix_fallback_url`. Boleto: `boleto_line`, `boleto_barcode`, `boleto_pending`. `already_charged` documentado como 200. Ver `docs/N8N_INTEGRATION.md` §19 e `docs/CONTRATO_N8N_PAYMENT_CREATE.json` v1.1.
 - **2026-09-25 (D2/D4):** o fluxo `1.7` deixou de criar cobrança no ASAAS e passou a chamar `offer.list` + `payment.create`; URL singular corrigida em `1.5`/`1.6`. Ver `docs/N8N_INTEGRATION.md` §12.
 - **v2.1 — 2026-09-21 (Hub/link único, H7–H9) — VERSÃO ATUAL:**
   - Evento **`negotiation.start`** (§4.1): emitido no clique "Sim" do reconhecimento; passa a sessão para `engine_owner='n8n'`. Payload = contrato do Apêndice B (session/tenant/customer/debt/acknowledgement/matrix/offers/available_actions), centavos, doc mascarado.

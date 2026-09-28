@@ -27,6 +27,10 @@ export interface JourneyPaymentEvent {
   /** Correção B10 (M4): DELETED/REFUNDED de uma parcela com outra já paga — o
    *  acordo é mantido e o caso fica para conciliação (evento próprio). */
   partialInstallmentCancel?: boolean
+  /** F8-01: resultado do portão atômico de quitação do webhook. `false` = o
+   *  acordo já estava quitado (evento PAGO tardio/concorrente da mesma cobrança):
+   *  nada de fechar sessão, recibo, e-mail ao credor, supressão ou revogação. */
+  settled?: boolean
 }
 
 export function journeyEnabled(): boolean {
@@ -77,6 +81,8 @@ export async function journeyOnPaymentEvent(ev: JourneyPaymentEvent): Promise<vo
         eventId: `journey-paid-${ev.paymentId}`,
         payload: { installment_index: ev.installmentIndex ?? null },
       })
+      // Acordo já quitado por outro evento: os efeitos de quitação já rodaram.
+      if (ev.settled === false) return
       // primeiro pagamento fecha a negociação. O CHECK de negotiation_sessions
       // (migration 20260702) só admite 'agreement_closed' — 'agreement_paid'
       // violava a constraint e a sessão nunca fechava (erro engolido pelo

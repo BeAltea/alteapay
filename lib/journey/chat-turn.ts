@@ -13,6 +13,8 @@ import { runChatbotTurn } from "@/lib/negotiation/turn"
 import type { NegotiationSession } from "@/lib/negotiation/types"
 import { listOffers, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
+import { currentThreadEpoch } from "./prompts"
+import { epochColumn } from "./thread-epoch"
 
 // Safety-net externo: o engine n8n já aplica seu próprio N8N_TIMEOUT_MS (default
 // 20000) por turno e devolve um resultado NEUTRO (n8n_mode='async'|'fallback')
@@ -36,9 +38,12 @@ async function recordChatMessage(input: {
   n8nExecutionId?: string | null
   engine?: string | null
   latencyMs?: number | null
+  /** N8N-9: época (thread) corrente da sessão, lida pelo turno. */
+  threadEpoch?: number
 }): Promise<void> {
   const supabase = createServiceClient()
   await supabase.from("chat_messages").insert({
+    ...epochColumn(input.threadEpoch ?? 0), // N8N-9
     company_id: input.companyId,
     session_id: input.sessionId,
     role: input.role,
@@ -92,7 +97,9 @@ export async function recordWorkingPlaceholder(input: {
       .limit(1)
       .maybeSingle()
     if (dup?.id) return // dedup — mantém só um
+    const epoch = await currentThreadEpoch(input.sessionId) // N8N-9
     await supabase.from("chat_messages").insert({
+      ...epochColumn(epoch), // N8N-9
       company_id: input.companyId,
       session_id: input.sessionId,
       role: "assistant",
@@ -116,13 +123,17 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
 
   const engine = engineName()
 
-  // D1/Frente A: flush do outbox ANTES do turno — entrega o session.start
-  // pendente (ordem preservada) que o POST no login não conseguiu enviar. Gated
-  // ('skipped_engine_disabled') não é elegível. Best-effort e não-fatal.
-  await flushOutboxSafe(ctx.sessionId)
+  // D1/Frente A: flush do outbox da sessão — entrega o session.start pendente que
+  // o login não conseguiu enviar. N8N-10: FORA do caminho da resposta (o turno
+  // nunca espera o n8n por causa do outbox); a cron e o worker também drenam.
+  // Gated ('skipped_engine_disabled') não é elegível. Best-effort e não-fatal.
+  flushOutboxSafe(ctx.sessionId)
+  // N8N-9: época (thread) corrente, lida uma vez por turno e carimbada em toda
+  // linha que o turno grava (cliente, resposta do motor, notas de sistema).
+  const threadEpoch = await currentThreadEpoch(ctx.sessionId)
 
   // 1) grava a mensagem do cliente + evento
-  await recordChatMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, role: "customer", text, engine })
+  await recordChatMessage({ companyId: ctx.companyId, sessionId: ctx.sessionId, role: "customer", text, engine, threadEpoch })
   await recordEvent({
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
     sessionId: ctx.sessionId, type: "chat.turn.customer", actor: "customer",
@@ -155,7 +166,7 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
       // Safety-net: engine travou por completo → modo assíncrono neutro.
       await recordChatMessage({
         companyId: ctx.companyId, sessionId: ctx.sessionId, role: "system",
-        text: "engine timeout — modo assíncrono", engine, latencyMs: Date.now() - t0,
+        text: "engine timeout — modo assíncrono", engine, latencyMs: Date.now() - t0, threadEpoch,
       })
       // §5: degrada a sessão para o assistido nos próximos turnos (se != off).
       await degradeToAssisted(ctx.sessionId)
@@ -176,7 +187,7 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
     await recordChatMessage({
       companyId: ctx.companyId, sessionId: ctx.sessionId, role: "assistant",
       text: result.reply, n8nExecutionId: result.n8n_execution_id ?? null,
-      engine: engineUsed, latencyMs: latency,
+      engine: engineUsed, latencyMs: latency, threadEpoch,
     })
     await recordEvent({
       companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
@@ -192,7 +203,7 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
   if (result.n8n_mode === "fallback") {
     await recordChatMessage({
       companyId: ctx.companyId, sessionId: ctx.sessionId, role: "assistant",
-      text: result.reply, engine: engineUsed, latencyMs: latency,
+      text: result.reply, engine: engineUsed, latencyMs: latency, threadEpoch,
     })
     await recordEvent({
       companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
@@ -209,7 +220,7 @@ export async function runJourneyTurn(ctx: SessionCtx, rawText: string): Promise<
     companyId: ctx.companyId, sessionId: ctx.sessionId, role: "assistant",
     text: result.reply, offersSnapshot: offers.length ? offers : null,
     n8nExecutionId: result.n8n_execution_id ?? null,
-    engine: engineUsed, latencyMs: latency,
+    engine: engineUsed, latencyMs: latency, threadEpoch,
   })
   await recordEvent({
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
@@ -238,17 +249,18 @@ async function degradeToAssisted(sessionId: string): Promise<void> {
 
 /**
  * D1/Frente A: flush do outbox da sessão no próximo turno. Entrega os eventos
- * 'pending' na ORDEM de criação (session.start antes do 1º chat.turn). Best-effort
- * e não-fatal: nunca derruba o turno. Gated ('skipped_engine_disabled') não é
- * elegível (o flush só pega 'pending').
+ * 'pending' da sessão na ORDEM de criação. N8N-10: agendado fora da resposta
+ * (deferDelivery) e NÃO aguardado — por isso não garante mais que um session.start
+ * atrasado chegue antes do chat.turn deste turno (o fluxo deduplica por event_id
+ * e o POST inline do login já é a via normal). Best-effort e não-fatal: nunca
+ * derruba o turno. Gated ('skipped_engine_disabled') não é elegível.
  */
-async function flushOutboxSafe(sessionId: string): Promise<void> {
-  try {
-    const { flushOutbox } = await import("@/lib/negotiation/outbox")
-    await flushOutbox({ sessionId })
-  } catch (err) {
-    console.warn("[chat-turn] flush do outbox falhou (não-fatal):", (err as Error).message)
-  }
+function flushOutboxSafe(sessionId: string): void {
+  import("@/lib/negotiation/outbox")
+    .then(({ deferDelivery, flushOutbox }) => deferDelivery("turn flush", () => flushOutbox({ sessionId, limit: 10 })))
+    .catch((err) => {
+      console.warn("[chat-turn] flush do outbox falhou (não-fatal):", (err as Error).message)
+    })
 }
 
 class TimeoutError extends Error {}

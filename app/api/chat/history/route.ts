@@ -4,6 +4,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { customerHistory } from "@/lib/journey/history"
+import { filterN8nRowsForRead } from "@/lib/negotiation/n8n-text-guard"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -18,5 +19,7 @@ export async function GET(req: NextRequest) {
   if (!claims) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
 
   const history = await customerHistory(claims.sid, claims.cid)
-  return NextResponse.json({ ok: true, ...history })
+  // N8N-6 (API-06): mesmo filtro de leitura do GET /api/chat/messages.
+  const messages = await filterN8nRowsForRead(history.messages, { sessionId: claims.sid, companyId: claims.cid })
+  return NextResponse.json({ ok: true, ...history, messages })
 }

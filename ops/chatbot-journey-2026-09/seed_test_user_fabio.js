@@ -16,10 +16,12 @@ const get = (k) => (env.split("\n").find((l) => l.startsWith(k + "=")) || "").sl
 const u = new URL(get("POSTGRES_URL_NON_POOLING")); u.searchParams.delete("sslmode"); u.searchParams.delete("uselibpqcompat")
 
 const VMAX = "1f7729ee-a537-43fc-a27f-5747c177988d"
-const DOC = "41719010811"           // 417.190.108-11 (DV válido)
+// Documento e telefone do usuário de teste vêm do ambiente (nunca no repositório).
+const DOC = (process.env.QA_TEST_DOCUMENT || "").replace(/\D/g, "")
+if (DOC.length !== 11 && DOC.length !== 14) { console.error("defina QA_TEST_DOCUMENT (CPF/CNPJ do usuário de teste)"); process.exit(2) }
 const NAME = "Fabio Moura Barros"
 const EMAIL = "fabiofmb71@gmail.com"
-const PHONE = "11974602123"
+const PHONE = (process.env.QA_TEST_PHONE || "").replace(/\D/g, "") || null
 const TAG = "TEST_FABIO"
 const AMOUNT = 250.0
 const DUE = "2026-08-15"            // vencida (para simular cobrança em aberto)
@@ -82,7 +84,7 @@ const REMOVE = process.argv.includes("--remove")
   console.log("contato derivado (trigger):", JSON.stringify(chk.rows[0]))
   const open = await c.query("select count(*) n, coalesce(sum(amount),0) total from debts where customer_id=$1 and status in ('pending','in_negotiation')", [customerId])
   console.log("dívidas ABERTAS do teste:", open.rows[0].n, "| total R$", Number(open.rows[0].total).toFixed(2))
-  console.log("→ testar no chat: https://alteapay.com/n/k7Qm3Xb9Rt  (CPF 417.190.108-11)")
+  console.log("→ testar no chat: https://alteapay.com/n/k7Qm3Xb9Rt  (documento em QA_TEST_DOCUMENT)")
   console.log("→ remover depois: node ops/chatbot-journey-2026-09/seed_test_user_fabio.js --remove")
   await c.end()
 })().catch((e) => { console.error("ERR", e.message); process.exit(1) })

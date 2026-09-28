@@ -11,11 +11,9 @@
 import type { Job } from 'bullmq';
 
 import {
-  N8N_SIGNATURE_HEADER,
-  N8N_TIMESTAMP_HEADER,
+  buildN8nCallbackHeaders,
   cacheTurnResult,
   getCachedTurnResult,
-  signN8nPayload,
 } from '@/lib/negotiation/n8n';
 import { runChatbotTurn, type EngineTurnResult } from '@/lib/negotiation/turn';
 import { createServiceClient } from '@/lib/supabase/service';
@@ -70,21 +68,19 @@ export const n8nWorker = WorkerManager.registerWorker<N8nJobData>(
       metadata: metadata ?? null,
       ...result,
     });
-    const timestamp = String(Math.floor(Date.now() / 1000));
+    // HMAC + timestamp + Event-Id estável entre retries (+ Basic só no host n8n configurado).
+    const { headers } = buildN8nCallbackHeaders(callback_url, payload, event_id ?? `job-${job.id}`);
 
     const resp = await fetch(callback_url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        [N8N_SIGNATURE_HEADER]: signN8nPayload(payload, timestamp),
-        [N8N_TIMESTAMP_HEADER]: timestamp,
-      },
+      headers,
       body: payload,
       signal: AbortSignal.timeout(CALLBACK_TIMEOUT_MS),
     });
     if (!resp.ok) {
       // turno já cacheado — o retry do BullMQ só re-tenta esta entrega
-      throw new Error(`callback ${callback_url} retornou ${resp.status}`);
+      // sem a URL: o callback do n8n carrega o caminho secreto do webhook.
+      throw new Error(`callback n8n retornou ${resp.status}`);
     }
 
     return { delivered: true, cached: Boolean(event_id) };

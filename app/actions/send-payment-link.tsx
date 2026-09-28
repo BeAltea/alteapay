@@ -134,7 +134,8 @@ export async function sendPaymentLink(
       billingType,
       value: installments > 1 ? installmentAmount : agreement.agreed_amount,
       dueDate: agreement.due_date,
-      description: `Acordo de negociacao - ${customerName}${installments > 1 ? ` (Parcela 1/${installments})` : ""}`,
+      // Parcelado: o ASAAS prefixa "Parcela N de M." em cada parcela; sem sufixo fixo "1/N".
+      description: `Acordo de negociacao - ${customerName}`,
       externalReference: `agreement_${agreementId}`,
       postalService: false,
     }

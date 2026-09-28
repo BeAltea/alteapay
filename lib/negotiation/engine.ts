@@ -16,7 +16,7 @@
 // URL de canal oficial são operações do SERVIDOR (close-agreement/charge-rules
 // e tenant_chat_config) — o fluxo/LLM apenas sinaliza a intenção.
 
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import { z } from "zod"
 
@@ -24,8 +24,8 @@ import type { Button } from "@/lib/journey/buttons"
 import { maskDocument } from "@/lib/journey/document"
 import { agentChat, agentHealth, agentSessionInit, type AgentSessionInit } from "./agent-client"
 import { closeAgreement } from "./close-agreement"
-import { buildN8nOutboundHeaders, newEventId, n8nWebhookSecret } from "./n8n"
-import type { CanonicalEnvelope } from "./payload"
+import { buildN8nOutboundHeaders, newEventId, n8nWebhookSecret, scrubN8nSecrets } from "./n8n"
+import { CONTRACT_VERSION, chatTurnEventId, mapChannel, threadIdOf, type CanonicalEnvelope } from "./payload"
 import type { SessionDebtContext } from "./sessions"
 import type { NegotiationSession, TenantChatConfig } from "./types"
 
@@ -206,6 +206,12 @@ export interface EngineTurnInput {
   channel: "webchat" | "whatsapp" | "n8n"
   debtor: SessionDebtContext | null
   tenant: TenantChatConfig | null
+  /**
+   * N8N-14: referência estável do turno (id da mensagem inbound gravada em
+   * conversation_messages) — base do event_id determinístico do chat.turn.
+   * Opcional: ausente, o event_id é aleatório (ainda único por envio).
+   */
+  turnRef?: string | null
 }
 
 // Ações de "redirect" legadas (contrato v1: o fluxo pede um redirect/handoff).
@@ -242,7 +248,7 @@ const flowResponseSchema = z.object({
  */
 export async function callN8nFlow(url: string, payload: unknown, timeoutMs = flowTimeoutMs()): Promise<unknown> {
   const body = JSON.stringify(payload)
-  const { headers } = buildN8nOutboundHeaders(body)
+  const { headers } = buildN8nOutboundHeaders(body, bodyEventId(payload))
   const resp = await fetch(url, {
     method: "POST",
     headers,
@@ -250,9 +256,20 @@ export async function callN8nFlow(url: string, payload: unknown, timeoutMs = flo
     signal: AbortSignal.timeout(timeoutMs),
   })
   if (!resp.ok) {
-    throw new Error(`fluxo n8n retornou ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
+    // O 404 do n8n ecoa o caminho do webhook (= segredo de acesso ao fluxo): redigir.
+    const snippet = scrubN8nSecrets((await resp.text().catch(() => "")).slice(0, 400), [url]).slice(0, 200)
+    throw new Error(`fluxo n8n retornou ${resp.status}: ${snippet}`)
   }
   return resp.json()
+}
+
+/**
+ * N8N-14: o header `x-alteapay-event-id` é o MESMO `event_id` do corpo (antes era
+ * um uuid novo por request, divergindo do corpo). Corpo sem event_id → uuid novo.
+ */
+function bodyEventId(payload: unknown): string {
+  const id = payload && typeof payload === "object" ? (payload as { event_id?: unknown }).event_id : undefined
+  return typeof id === "string" && id ? id : newEventId()
 }
 
 /**
@@ -268,7 +285,7 @@ type N8nCallOutcome =
 /** Uma tentativa (sem retry) do turno papel A. Não lança: classifica o desfecho. */
 async function postChatTurn(url: string, payload: unknown, timeoutMs: number): Promise<N8nCallOutcome> {
   const body = JSON.stringify(payload)
-  const { headers } = buildN8nOutboundHeaders(body)
+  const { headers } = buildN8nOutboundHeaders(body, bodyEventId(payload))
   const t0 = Date.now()
   try {
     const resp = await fetch(url, {
@@ -312,17 +329,33 @@ export const N8N_AVAILABLE_ACTIONS = [
   "dispute.register", "payment_claim.register", "human.transfer", "negotiation.note", "session.close",
 ] as const
 
-export function buildTurnPayload(input: EngineTurnInput) {
-  const { session, debtor, tenant } = input
-  // Documento em CLARO só viaja com as 2 flags (send_document_to_engine=true E
-  // payment_origin='n8n'). Por padrão, o fluxo recebe só máscara + hash.
-  const sendPlainDoc =
-    tenant?.send_document_to_engine === true && tenant?.payment_origin === "n8n"
+/**
+ * N8N-14: envelope PLANO do chat.turn, no TOPO do corpo — o mesmo padrão do
+ * negotiation.start (09-n8n-routing-handoff §1): o fluxo roteia por
+ * `body.event` e lê `body.session_id`/`body.company_id`/`body.event_id` sem
+ * descer em `session`/`tenant`. Antes o caminho rico mandava só
+ * `{type, session:{…}, tenant:{…}}` e o `1. Main` quebrava com uuid "undefined".
+ * `company_id` vem SEMPRE da sessão (escopo do tenant); sem PII aqui.
+ */
+export function chatTurnEnvelope(
+  input: EngineTurnInput,
+  opts: { eventId?: string; occurredAt?: string } = {},
+) {
+  const { session, tenant } = input
+  const eventId =
+    opts.eventId ?? (input.turnRef ? chatTurnEventId(session.id, input.turnRef) : randomUUID())
+  const occurredAt = opts.occurredAt ?? new Date().toISOString()
+  const callbackUrl = n8nCallbackUrl()
   return {
+    event: "chat.turn" as const,
     type: "chat.turn",
-    thread_id: session.thread_id,
+    contract_version: CONTRACT_VERSION,
+    event_id: eventId,
+    timestamp: occurredAt,
+    occurred_at: occurredAt,
     session_id: session.id,
     company_id: session.company_id,
+    thread_id: threadIdOf(session.id, session.thread_id),
     channel: input.channel,
     message: input.message,
     session_state: {
@@ -331,6 +364,22 @@ export function buildTurnPayload(input: EngineTurnInput) {
       fulfillment_mode: session.fulfillment_mode ?? tenant?.fulfillment_mode ?? "A",
       outcome: session.outcome,
     },
+    // p/ onde o fluxo responde no modo ASSÍNCRONO (202 + chat.send), como no start.
+    ...(callbackUrl ? { callback_url: callbackUrl } : {}),
+  }
+}
+
+export function buildTurnPayload(
+  input: EngineTurnInput,
+  opts: { eventId?: string; occurredAt?: string } = {},
+) {
+  const { session, debtor, tenant } = input
+  // Documento em CLARO só viaja com as 2 flags (send_document_to_engine=true E
+  // payment_origin='n8n'). Por padrão, o fluxo recebe só máscara + hash.
+  const sendPlainDoc =
+    tenant?.send_document_to_engine === true && tenant?.payment_origin === "n8n"
+  return {
+    ...chatTurnEnvelope(input, opts),
     // Reconhecimento da dívida (onda R): o fluxo sabe se o cliente já respondeu.
     // O detalhe fino (button_id, prompt_id, active_prompt) vive em
     // buildSessionContext (context.ts); aqui viaja o mínimo do turno.
@@ -414,20 +463,31 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
   // documentado: first_name, doc mascarado com flag-gate, offers, matrix,
   // active_prompt, debt_acknowledgement — tudo em centavos). O `buildTurnPayload`
   // fica só como fallback se o contexto não resolver.
+  // N8N-14: UM envelope por turno (event_id/timestamp fixos), reusado pelos dois
+  // caminhos — o corpo leva `event`+`type` e os ids no TOPO (09 §1(B)); os blocos
+  // aninhados (session/tenant/…) seguem iguais (aditivo, compat).
+  const envelope = chatTurnEnvelope(input)
+  const envOpts = { eventId: envelope.event_id, occurredAt: envelope.occurred_at }
+  // N8N-16: sem turnRef o event_id é aleatório (não derivável da mensagem inbound)
+  // → registra no ledger de saída para o callback poder correlacionar.
+  if (!input.turnRef) {
+    const { recordN8nOutbound } = await import("./n8n-correlation")
+    await recordN8nOutbound({
+      eventId: envelope.event_id, sessionId: input.session.id, companyId: input.session.company_id, event: "chat.turn",
+    })
+  }
   let payload: unknown
   try {
     const { buildSessionContext } = await import("@/lib/journey/context")
     const ctx = await buildSessionContext(input.session.id)
-    // D1: o envelope canônico usa `type` (não `event`) — alinhado ao Apêndice A e
-    // ao buildTurnPayload (que já usa `type`). Antes este caminho mandava `event`.
     payload = ctx
-      ? { type: "chat.turn", ...ctx, message: input.message, available_actions: N8N_AVAILABLE_ACTIONS }
-      : buildTurnPayload(input)
+      ? { ...envelope, ...ctx, message: input.message, available_actions: N8N_AVAILABLE_ACTIONS }
+      : buildTurnPayload(input, envOpts)
   } catch (err) {
     // Resiliência: se o contexto rico não montar, manda o payload mínimo
     // (mascarado, first_name) em vez de derrubar o turno.
     console.warn("[engine:n8n] buildSessionContext falhou, usando fallback:", (err as Error).message)
-    payload = buildTurnPayload(input)
+    payload = buildTurnPayload(input, envOpts)
   }
 
   // §2: UMA tentativa (sem retry) com timeout N8N_TIMEOUT_MS (fallback FLOW_TIMEOUT_MS).
@@ -491,8 +551,39 @@ async function n8nEngineChat(input: EngineTurnInput): Promise<EngineTurnResult> 
     }
   }
 
+  // ---- N8N-6: guard de texto do reply síncrono (lib/negotiation/n8n-text-guard.ts) ----
+  // Depois do fechamento delegado (os fatos já refletem o acordo deste turno).
+  // Recusa → o devedor recebe o reply determinístico do ASSISTIDO (nunca o texto
+  // do fluxo); efeitos do turno (ação/acordo) são preservados.
+  let reply = flow.reply
+  {
+    const { guardN8nIngest } = await import("./n8n-text-guard")
+    const verdict = await guardN8nIngest(
+      {
+        sessionId: input.session.id,
+        companyId: input.session.company_id,
+        customerId: input.session.customer_id,
+        debtId: input.session.debt_id,
+      },
+      { text: flow.reply },
+      "chat.turn",
+    )
+    if (verdict.ok) {
+      reply = verdict.text
+    } else {
+      try {
+        const { assistedChat } = await import("./assisted")
+        reply = (await assistedChat(input)).reply
+      } catch {
+        reply = NEUTRAL_REPLY
+      }
+      events.push("n8n_text_rejected")
+    }
+  }
+  // ---- fim N8N-6 ----
+
   return {
-    reply: flow.reply,
+    reply,
     tool_calls: flow.tool_calls.map((t) => ({ name: t.name, args: t.args ?? null })),
     events,
     prompt_version: flow.prompt_version,
@@ -573,7 +664,7 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
  * para "" (engine_unavailable) mesmo com os turnos indo ao n8n. A URL resolvida
  * é um segredo operacional — nunca logar.
  */
-async function resolveEventFlowUrl(companyId: string): Promise<string> {
+export async function resolveEventFlowUrl(companyId: string): Promise<string> {
   // endpoint de eventos dedicado sempre vence, se configurado.
   const dedicated = process.env.N8N_EVENT_FLOW_URL
   if (dedicated && dedicated.trim()) return dedicated.trim()
@@ -601,8 +692,13 @@ export interface NegotiationStartPayload {
   event: "negotiation.start"
   contract_version: string
   event_id: string
+  /** Instante do evento (ISO). `timestamp` = alias de `occurred_at` (§11.2). */
+  timestamp: string
+  occurred_at: string
   session_id: string
   company_id: string
+  thread_id: string
+  channel: string
   session: unknown
   tenant: unknown
   customer: unknown
@@ -652,7 +748,7 @@ export async function buildNegotiationStartPayload(
   eventId: string,
 ): Promise<NegotiationStartPayload | null> {
   const { buildSessionContext } = await import("@/lib/journey/context")
-  const { resolveEventName, CONTRACT_VERSION } = await import("./payload")
+  const { resolveEventName } = await import("./payload")
   const ctx = await buildSessionContext(sessionId)
   if (!ctx) return null
 
@@ -666,13 +762,18 @@ export async function buildNegotiationStartPayload(
   const type = resolveEventName("negotiation_start", (cfg?.n8n_event_names ?? null) as never)
 
   const callbackUrl = n8nCallbackUrl()
+  const occurredAt = new Date().toISOString()
   return {
     type,
     event: "negotiation.start",
     contract_version: CONTRACT_VERSION,
     event_id: eventId,
+    timestamp: occurredAt,
+    occurred_at: occurredAt,
     session_id: sessionId,
     company_id: ctx.tenant.id,
+    thread_id: ctx.thread_id,
+    channel: mapChannel(ctx.session.channel),
     session: ctx.session,
     tenant: ctx.tenant,
     customer: ctx.customer,
@@ -704,7 +805,7 @@ export async function buildNegotiationStartPayload(
  */
 async function enqueueNegotiationStart(p: NegotiationStartPayload): Promise<void> {
   const { createServiceClient } = await import("@/lib/supabase/service")
-  const { isOutboxUnavailableError, noteOutboxUnavailable, outboxKnownUnavailable } = await import("./outbox")
+  const { isOutboxUnavailableError, noteOutboxUnavailable, outboxKnownUnavailable, outboxLeaseMs } = await import("./outbox")
   if (outboxKnownUnavailable()) return // no-op explícito (já logado 1x)
   const supabase = createServiceClient()
   // idempotente por event_id (UNIQUE) — reentrada não duplica.
@@ -729,7 +830,9 @@ async function enqueueNegotiationStart(p: NegotiationStartPayload): Promise<void
     payload: p,
     status: "pending",
     attempts: 0,
-    next_attempt_at: new Date().toISOString(),
+    // N8N-10: nasce SOB LEASE — o POST curto do clique é a 1ª tentativa; os drenos
+    // (turno/cron/worker) só a pegam se ele não a marcar 'sent' até o lease vencer.
+    next_attempt_at: new Date(Date.now() + outboxLeaseMs()).toISOString(),
   })
   if (insErr && isOutboxUnavailableError(insErr)) noteOutboxUnavailable("enqueueNegotiationStart")
 }
@@ -835,7 +938,10 @@ async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): P
     // para que um reload NÃO restaure o spinner (o degrau seria derivado de um
     // wait_started_at obsoleto). Só limpa se a mensagem foi de fato persistida
     // (inclui a variante duplicate, que também significa "o motor já respondeu").
-    if (sent.ok) await clearWaitStateOnEngineReply(p.session_id)
+    // N8N-7: só um PROMPT resolve a espera (mesma regra do client: texto do
+    // motor sem botões não é condução). Limpar num texto solto tirava o devedor
+    // da espera sem nenhum menu na tela (nem espera, nem degradação).
+    if (sent.ok && sent.prompt_id) await clearWaitStateOnEngineReply(p.session_id)
   } catch (err) {
     // rótulo curto — sem corpo cru/URL/segredo/PII.
     const label = err instanceof Error ? err.name : "persist_error"
@@ -913,6 +1019,11 @@ export async function emitNegotiationStart(
     // para não dominar o clique. A entrega NÃO depende deste único disparo:
     const kickoffTimeoutMs = Number(process.env.N8N_KICKOFF_TIMEOUT_MS || "2500")
     await enqueueNegotiationStart(payload) // 1) durável, idempotente
+    // N8N-16: ledger de saída ANTES do POST (o callback async correlaciona por aqui).
+    const { recordN8nOutbound } = await import("./n8n-correlation")
+    await recordN8nOutbound({
+      eventId: payload.event_id, sessionId: payload.session_id, companyId: payload.company_id, event: "negotiation.start",
+    })
     const body = await callN8nFlow(url, payload, kickoffTimeoutMs) // 2) captura o corpo SYNC
     await markOutboxSent(payload.event_id) // 3) entrega confirmada ANTES da persistência
     // 4) RENDER SYNC (best-effort, NUNCA lança): se o corpo trouxer texto/prompt
@@ -1094,27 +1205,31 @@ export type EmitSessionStartResult =
   | { ok: true; enqueued: false; reason: "context_unresolved" }
 
 /**
- * Grava o session.start no outbox (idempotente) e, se não gated, dispara ao n8n
- * best-effort (o chamador usa Promise.allSettled p/ não somar na resposta).
+ * Grava o session.start no outbox (idempotente) e, se não gated, agenda a 1ª
+ * entrega ao n8n SEM aguardá-la (deferDelivery) — resolve assim que a linha está
+ * gravada; a latência do n8n nunca soma na resposta do login.
  * RESILIENTE: nunca lança; falha de contexto → enqueued:false.
  */
 export async function emitSessionStart(input: SessionStartInput): Promise<EmitSessionStartResult> {
   const envelope = await buildSessionStartEnvelope(input).catch(() => null)
   if (!envelope) return { ok: true, enqueued: false, reason: "context_unresolved" }
 
-  const { enqueueEvent, dispatchOutboxRow } = await import("./outbox")
+  const { enqueueEvent, dispatchOutboxRow, deferDelivery } = await import("./outbox")
   const enq = await enqueueEvent({
     sessionId: input.sessionId,
     companyId: input.companyId,
     envelope,
   })
+  // Tabela ausente (migration pendente) → no-op explícito (N-D2-7), sem POST.
   if (!enq.ok) return { ok: true, enqueued: false, reason: "context_unresolved" }
 
-  // Gated → não envia. Recém-criado e não gated → dispara agora (best-effort).
+  // Gated → não envia. Recém-criado e não gated → 1ª tentativa FORA do caminho
+  // da resposta (N8N-10): o login NUNCA aguarda o n8n. Se a função congelar ou o
+  // n8n falhar, a linha segue 'pending' e um dos drenos (turno/cron/worker)
+  // reentrega — at-least-once, dedup por event_id.
   if (enq.status === "pending" && enq.created) {
-    // não await no caminho crítico do chamador — mas aqui devolvemos a Promise
-    // já resolvida; o chamador (login) embrulha em Promise.allSettled.
-    await dispatchOutboxRow({ id: enq.id, payload: envelope, attempts: 0, status: "pending" }).catch(() => "pending")
+    const row = { id: enq.id, company_id: input.companyId, payload: envelope, attempts: 0, status: "pending" as const }
+    deferDelivery("session.start", () => dispatchOutboxRow(row))
   }
   return {
     ok: true,

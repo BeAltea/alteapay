@@ -1,3 +1,4 @@
+import { applyEdgeClientIp } from "@/lib/http/client-ip-edge"
 import { journeyGate, updateSession } from "@/lib/supabase/middleware"
 import type { NextRequest } from "next/server"
 import { NextResponse } from "next/server"
@@ -28,9 +29,16 @@ async function embedFrameAncestors(request: NextRequest): Promise<string> {
 export async function middleware(request: NextRequest) {
   const currentPath = request.nextUrl.pathname
 
+  // ---- [F-4 IP confiável] início — inerte sem "edge" em TRUSTED_CLIENT_IP_SOURCE.
+  // Saneia e assina x-alteapay-client-ip a partir de request.ip (= context.ip da
+  // Edge Function da Netlify). Rotas /api recebem os headers pelo override
+  // abaixo; páginas/server actions via NextResponse.next({ request }) do
+  // updateSession (lib/http/client-ip-edge.ts).
+  const edgeIp = await applyEdgeClientIp(request)
   if (currentPath.startsWith("/api/")) {
-    return NextResponse.next()
+    return edgeIp ? NextResponse.next({ request: { headers: request.headers } }) : NextResponse.next()
   }
+  // ---- [F-4 IP confiável] fim
 
   // Páginas legais públicas: sem auth, sem redirect (exigência Meta/ANPD)
   if (currentPath === "/politica-de-privacidade" || currentPath === "/termos-de-uso") {

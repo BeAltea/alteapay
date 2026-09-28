@@ -147,7 +147,11 @@ export function negotiateWaitOnResponse(data: NegotiateResponseLike | null | und
   if (!data || data.ok !== true) return false
   if (data.action !== "negotiate") return false
   if (data.offers_presented === true) return false
-  return data.wait_state === "aguardando_motor"
+  // N8N-7: o motor pode já ter falhado dentro do deadline do clique (fallback do
+  // fluxo → sessão em 'menu_degradado'). O client arma a espera do mesmo jeito e
+  // o poll seguinte a reidrata direto para o menu de degradação — nunca uma tela
+  // sem botão entre o clique e o poll.
+  return data.wait_state === "aguardando_motor" || data.wait_state === "menu_degradado"
 }
 
 // ---------------------------------------------------------------------------

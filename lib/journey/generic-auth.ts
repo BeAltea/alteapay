@@ -18,6 +18,7 @@ import { createHash } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { signChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { recordEvent } from "./events"
+import { runAfterResponse } from "./after-response"
 import { GENERIC_AUTH_MESSAGE } from "./auth"
 import { isAcceptableDocument, normalizeDocument } from "./document"
 import { resolveByDocument, type ResolvedDebtor, type SettledDebtor } from "./resolver"
@@ -275,9 +276,12 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
   let sessionId: string
   const reopened = reusable !== null
 
+  // Latência (10-latencia.md): no REUSO, o bump da sessão (reopenSession) é
+  // independente do menu/eventos → corre em paralelo com eles (abaixo).
+  let reopenWrite: Promise<unknown> = Promise.resolve()
   if (reusable) {
     sessionId = reusable.id
-    await reopenSession({
+    reopenWrite = reopenSession({
       sessionId,
       channel: input.channel,
       userAgent: input.userAgent,
@@ -331,15 +335,24 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
   }
 
   const base = { companyId: input.companyId, customerId, debtId: primaryDebtId ?? undefined, sessionId }
-  if (reopened) {
-    // Reuso: registra a reabertura (auditoria da consolidação) + auth.success.
-    await recordEvent({ ...base, type: "session.reopened" as unknown as Parameters<typeof recordEvent>[0]["type"], actor: "system", payload: { channel: input.channel } })
-    await recordEvent({ ...base, type: "auth.success", actor: "customer" })
-  } else {
-    await recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } })
-    await recordEvent({ ...base, type: "auth.success", actor: "customer" })
-    await recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } })
-  }
+  // Latência (10-latencia.md): os eventos de auditoria do login (inserts
+  // independentes, cada um com seu event_id) correm EM PARALELO entre si e com a
+  // 1ª mensagem do chat (abaixo) — todos terminam antes da resposta.
+  const auditEvents: Promise<unknown> = reopened
+    ? // Reuso: registra a reabertura (auditoria da consolidação) + auth.success.
+      Promise.all([
+        recordEvent({ ...base, type: "session.reopened" as unknown as Parameters<typeof recordEvent>[0]["type"], actor: "system", payload: { channel: input.channel } }),
+        recordEvent({ ...base, type: "auth.success", actor: "customer" }),
+      ])
+    : Promise.all([
+        recordEvent({ ...base, type: "consent.given", actor: "customer", payload: { version: "journey-v1" } }),
+        recordEvent({ ...base, type: "auth.success", actor: "customer" }),
+        recordEvent({ ...base, type: "session.started", actor: "system", payload: { channel: input.channel } }),
+      ])
+  // aguardados (e com erro propagado) mais abaixo; o handler só evita a
+  // rejeição "não tratada" enquanto o menu é publicado.
+  auditEvents.catch(() => {})
+  reopenWrite.catch(() => {})
 
   if (resolved.kind === "open") {
     // onda "3 opções" (§6.1, M1/M2): menu pós-login (Pagar › Negociar › Não
@@ -365,6 +378,7 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
       paidAt: resolved.debtor.paidAt,
     })
   }
+  await Promise.all([auditEvents, reopenWrite])
 
   // D1/Frente A: session.start (plataforma → n8n) SÓ numa abertura FRESCA (não no
   // reuso/reopen — a reentrada da MESMA abertura não re-dispara). Grava no outbox
@@ -372,8 +386,13 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
   // ao n8n NÃO soma na resposta ao devedor: o reconhecimento (nossos dados) já
   // rodou acima e a equalização de ~600ms é feita pela rota. Gated
   // (NEGOTIATION_ENGINE=disabled) → outbox nasce 'skipped_engine_disabled'.
+  // Mecanismo ÚNICO (integração N8N-10 × latência): o n8n só é chamado pela
+  // entrega do engine_outbox (deferDelivery → deferAfterResponse), nunca
+  // aguardada — o login NUNCA espera o n8n. Aqui só a montagem do envelope +
+  // INSERT no outbox (nossos dados) sai do caminho quando a plataforma garante a
+  // conclusão (waitUntil); sem waitUntil roda inline (espera só o INSERT).
   if (!reopened) {
-    await emitSessionStartSafe({
+    const startInput = {
       companyId: input.companyId,
       sessionId,
       customerId,
@@ -381,7 +400,8 @@ async function establishSession(input: EstablishSessionInput): Promise<SessionSu
       debtIds,
       channel: input.channel,
       settled: resolved.kind === "settled",
-    })
+    }
+    await runAfterResponse("session.start (outbox)", () => emitSessionStartSafe(startInput))
   }
 
   const ttlSeconds = input.sessionTtlMinutes * 60
@@ -509,21 +529,29 @@ export async function authenticateByPublicLink(
     return { ok: false, reason: "blocked", message: PUBLIC_BLOCKED_MESSAGE }
   }
 
-  await recordEvent({ companyId: input.companyId, type: "auth.attempt", actor: "customer", payload: { doc_hash: dHash } })
-
+  // Latência (10-latencia.md): o evento da tentativa, a config do tenant e o
+  // rate-limit são leituras/escritas independentes → UMA leva paralela (antes: 3+
+  // idas em série). A ORDEM DAS DECISÕES é a mesma (formato/consent → locks →
+  // captcha → resolução); o rate-limit só é consultado com documento válido.
+  const attemptEvent = recordEvent({ companyId: input.companyId, type: "auth.attempt", actor: "customer", payload: { doc_hash: dHash } })
   // config do tenant (TTL da sessão; default 30min no link público).
-  const { data: cfg } = await supabase
+  const cfgP = supabase
     .from("tenant_chat_config")
     .select("session_ttl_minutes")
     .eq("company_id", input.companyId)
     .maybeSingle()
 
   // 1) formato + DV (CPF e CNPJ). consent também é pré-condição de negócio.
+  const formatOk = input.consent && isAcceptableDocument(doc)
+  const decisionP = formatOk
+    ? evaluatePublicRateLimit({ companyId: input.companyId, docHash: dHash, ipHash: ipH })
+    : null
+  const [, { data: cfg }, decisionOrNull] = await Promise.all([attemptEvent, cfgP, decisionP])
   if (!input.consent) return invalid("consent_missing")
   if (!isAcceptableDocument(doc)) return invalid("doc_invalid")
 
   // teto do cedente/hora → modo DEGRADADO: exige captcha SEMPRE (mesmo desligado).
-  const decision = await evaluatePublicRateLimit({ companyId: input.companyId, docHash: dHash, ipHash: ipH })
+  const decision = decisionOrNull!
   if (decision.blocked) return blocked(decision.scope)
 
   // 2) captcha (se ligado) — no modo degradado, exigido mesmo com a flag OFF.
@@ -550,8 +578,11 @@ export async function authenticateByPublicLink(
   }
 
   // sucesso (aberta OU quitada): registra e consolida sessão (reuso do helper do /t/).
-  await registerPublicAttempt({ companyId: input.companyId, docHash: dHash, ipHash: ipH, success: true, reason: "ok" })
-  return establishSession({
+  // Latência: o registro da tentativa (auditoria/teto) corre em paralelo com a
+  // consolidação da sessão; os dois terminam antes da resposta.
+  const [, session] = await Promise.all([
+    registerPublicAttempt({ companyId: input.companyId, docHash: dHash, ipHash: ipH, success: true, reason: "ok" }),
+    establishSession({
     supabase,
     companyId: input.companyId,
     resolved,
@@ -560,5 +591,7 @@ export async function authenticateByPublicLink(
     userAgent: input.userAgent,
     ipHash: ipH,
     sessionTtlMinutes: cfg?.session_ttl_minutes ?? 30,
-  })
+    }),
+  ])
+  return session
 }

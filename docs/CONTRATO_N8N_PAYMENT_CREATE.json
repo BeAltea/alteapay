@@ -1,15 +1,13 @@
 {
   "titulo": "Contrato n8n -> AlteaPay (papel B): solicitar/criar link de pagamento ASAAS",
-  "versao": "1.0",
-  "data": "2026-09-23",
+  "versao": "1.1",
+  "data": "2026-09-27",
   "descricao": "Como o fluxo n8n chama a AlteaPay para criar (ou obter) a cobranca ASAAS e receber o link. O valor do segredo N8N_WEBHOOK_SECRET e enviado separadamente.",
-
   "endpoint": {
     "url": "https://alteapay.com/api/webhooks/n8n",
     "metodo": "POST",
     "content_type": "application/json"
   },
-
   "autenticacao": {
     "tipo": "HMAC-SHA256",
     "observacao_importante": "O inbound (n8n -> AlteaPay) valida SOMENTE HMAC. NAO use Basic Auth nesta direcao (o Basic Auth so vale no sentido oposto, AlteaPay -> n8n).",
@@ -44,60 +42,93 @@
       "// No no HTTP Request seguinte: Method POST, URL do endpoint, Body = {{$json.body}} como RAW (nao re-serialize), Headers = {{$json.headers}}."
     ]
   },
-
   "acoes": {
     "payment.create": {
-      "descricao": "Cria a cobranca ASAAS (ou, se ja existir, devolve o link existente) e retorna o link.",
+      "descricao": "Converte UMA oferta gerada pelo servidor em cobranca ASAAS (ou, se a divida ja tem cobranca viva, devolve o link existente). O servidor decide valores; o n8n so escolhe a oferta.",
       "precondicoes": [
         "sessao VERIFICADA (identity_verified_at preenchido) - senao 403",
-        "divida RECONHECIDA (debt_acknowledged) - senao 409",
-        "oferta DENTRO da matriz de negociacao vigente - senao 422"
+        "divida RECONHECIDA (debt_acknowledged) - senao 409 debt_not_acknowledged",
+        "oferta APRESENTADA nesta sessao e nao vencida - senao 409 OFFER_NOT_AVAILABLE / OFFER_EXPIRED",
+        "termos da oferta DENTRO da matriz vigente - senao 422 offer_outside_matrix / no_matrix_row"
       ],
       "request_body": {
         "action": "payment.create",
         "session_id": "<uuid da sessao de negociacao>",
         "event_id": "<uuid unico desta requisicao>",
         "args": {
-          "offer_id": "avista",
+          "offer_id": "<uuid de offer.list> | 'avista' | 'parc_N'",
           "billing_type": "PIX"
         }
       },
       "campos_args": {
-        "offer_id": "'avista' (a vista) ou 'parc_N' onde N = numero de parcelas (ex.: 'parc_3')",
-        "billing_type": "OPCIONAL: 'PIX' | 'BOLETO' | 'CREDIT_CARD'"
+        "offer_id": "CANONICO: o 'id' (uuid) de uma oferta devolvida por offer.list. ALIAS aceito: 'avista' (oferta de 1 parcela) ou 'parc_N' (oferta de N parcelas, 2 <= N <= 60, ex.: 'parc_3').",
+        "regras_do_alias": [
+          "O alias so SELECIONA uma oferta ja gerada e apresentada pelo servidor nesta sessao. Nao gera oferta, nao monta termos: chame offer.list antes (ele gera o conjunto da matriz).",
+          "Resolve so se houver EXATAMENTE UMA oferta 'presented' e nao vencida daquele tipo. Nenhuma -> 409 OFFER_ALIAS_NOT_FOUND. Mais de uma (ex.: um offer.propose seu alem da oferta da matriz) -> 409 OFFER_ALIAS_AMBIGUOUS: use o uuid. So vencidas -> 409 OFFER_EXPIRED.",
+          "A oferta integral do botao Pagar do chat (0%/1x) nunca conta como 'avista'.",
+          "Depois do 1o payment.create a oferta vira 'accepted'; o mesmo alias resolve para ela e devolve a MESMA cobranca (idempotent:true). Alias e uuid da mesma oferta sao intercambiaveis.",
+          "A resposta traz offer_id (uuid resolvido) e offer_alias (o alias usado, ou null)."
+        ],
+        "billing_type": "OPCIONAL e so informativo: a forma de pagamento vem dos termos da oferta (a vista da matriz = PIX quando permitido; parcelado = BOLETO/CREDIT_CARD). O valor enviado aqui so e ecoado se a cobranca nao tiver billing_type."
       },
       "response_sucesso_created": {
         "ok": true,
-        "status": "created",
         "idempotent": false,
-        "payment": {
-          "agreement_id": "<uuid do acordo>",
-          "payment_id": "pay_xxxxxxxx",
-          "billing_type": "PIX",
-          "invoice_url": "https://www.asaas.com/i/xxxxxxxx",
-          "pix_copy_paste": "00020126...",
-          "boleto_url": "https://www.asaas.com/b/pdf/xxxxxxxx",
-          "boleto_line": null,
-          "due_date": "2026-08-15",
-          "total_value": 25000,
-          "installments": 1
-        }
+        "status": "created",
+        "agreement_id": "<uuid do acordo>",
+        "asaas_payment_id": "pay_xxxxxxxx",
+        "billing_type": "PIX",
+        "total_value": 17100,
+        "installments": 1,
+        "due_date": "2026-10-04",
+        "invoice_url": "https://www.asaas.com/i/xxxxxxxx",
+        "pix_copy_paste": "00020101021226...  (BR Code copia-e-cola)",
+        "pix_qr_image": "data:image/png;base64,iVBORw0K...",
+        "pix_expiration": "2026-10-04 23:59:59",
+        "pix_pending": false,
+        "pix_fallback_url": null,
+        "pix_qr_code_url": null,
+        "boleto_url": null,
+        "boleto_line": null,
+        "offer_id": "<uuid da oferta resolvida>",
+        "offer_alias": "avista"
       },
-      "ONDE_ESTA_O_LINK": "payment.invoice_url (link principal do ASAAS). Para PIX use tambem payment.pix_copy_paste; para boleto use payment.boleto_url.",
+      "ONDE_ESTA_O_LINK": "invoice_url (checkout ASAAS: mostra PIX, boleto e cartao) sempre. PIX: mande pix_copy_paste (e, se quiser, pix_qr_image). Se pix_pending:true o ASAAS nao devolveu o PIX a tempo: mande pix_fallback_url (= invoice_url) ou consulte payment.status em alguns segundos. Boleto: boleto_line e/ou boleto_url.",
       "response_ja_cobrada": {
         "ok": true,
+        "idempotent": true,
         "status": "already_charged",
-        "descricao": "a divida ja possui cobranca viva; devolve o LINK EXISTENTE via payment (mesma estrutura acima). NUNCA cria 2a cobranca."
+        "payment_status": "pending",
+        "descricao": "HTTP 200. A divida ja possui cobranca viva: devolve o LINK EXISTENTE com os mesmos campos planos acima (inclusive pix_* / boleto_*). NUNCA cria 2a cobranca."
       },
       "response_processando": {
         "ok": true,
+        "idempotent": false,
         "status": "processing",
         "agreement_id": "<uuid>",
         "poll_after_ms": 3000,
-        "descricao": "cobranca ainda sendo criada. Repita a MESMA chamada (mesmo event_id) apos poll_after_ms."
+        "offer_id": "<uuid>",
+        "offer_alias": null,
+        "descricao": "so com CHARGE_MODE=queue (producao usa inline e devolve 'created'). Consulte payment.status apos poll_after_ms."
+      },
+      "response_created_boleto": {
+        "descricao": "billing_type BOLETO (ex.: parcelado): sem campos pix_*; boleto_url = PDF da 1a parcela; boleto_line = linha digitavel; boleto_barcode = codigo de barras; boleto_pending:true se a linha nao veio a tempo (use boleto_url/invoice_url).",
+        "billing_type": "BOLETO",
+        "boleto_url": "https://www.asaas.com/b/pdf/xxxxxxxx",
+        "boleto_line": "00190000090281913600966281313172600000000017100",
+        "boleto_barcode": "00190000000000171000000002819136006628131317",
+        "boleto_pending": false
+      },
+      "FORMATO": "A resposta e PLANA: os campos da cobranca ficam no topo (nao ha objeto 'payment'). Valores em CENTAVOS. O id da cobranca e asaas_payment_id.",
+      "campos_pix": {
+        "pix_copy_paste": "BR Code copia-e-cola (payload de GET /payments/{id}/pixQrCode). Nunca logue este valor.",
+        "pix_qr_image": "PNG do QR Code como data URI base64.",
+        "pix_expiration": "expiracao do QR informada pelo ASAAS ('YYYY-MM-DD HH:mm:ss').",
+        "pix_pending": "true quando o PIX nao pode ser obtido agora (timeout ~2,5 s ou erro no ASAAS). A cobranca EXISTE; so as instrucoes nao vieram.",
+        "pix_fallback_url": "invoice_url quando pix_pending:true; senao null.",
+        "pix_qr_code_url": "DEPRECADO: coluna legada, null em producao. Use pix_qr_image."
       }
     },
-
     "chat.send": {
       "descricao": "O fluxo n8n EMPURRA uma mensagem para o chat do devedor (papel B). E o que o n8n usa para CONDUZIR a negociacao: depois do negotiation.start, o n8n conduz e a AlteaPay so EXIBE o que o n8n manda. Suporta markdown **negrito** e quebras de linha (\\n).",
       "request_body": {
@@ -107,16 +138,22 @@
         "args": {
           "text": "Ola! Posso te oferecer 10% de desconto a vista. Topa?",
           "n8n_execution_id": "<id da execucao n8n (opcional, correlacao)>",
-          "payment_ref": { "agreement_id": "<uuid (opcional)>", "asaas_payment_id": "<pay_xxx (opcional)>" }
+          "payment_ref": {
+            "agreement_id": "<uuid (opcional)>",
+            "asaas_payment_id": "<pay_xxx (opcional)>"
+          }
         }
       },
-      "response": { "ok": true, "message_id": "<uuid>", "duplicate": false },
+      "response": {
+        "ok": true,
+        "message_id": "<uuid>",
+        "duplicate": false
+      },
       "notas": [
         "Idempotencia DUPLA: por event_id (janela 24h) E por CONTEUDO identico na sessao (15min) — reenviar a mesma mensagem NAO duplica na tela do devedor.",
         "So texto -> so mensagem. Para PERGUNTA com botoes, use prompt.ask."
       ]
     },
-
     "prompt.ask": {
       "descricao": "O fluxo n8n EMPURRA uma PERGUNTA com botoes para o chat do devedor. Quando o devedor CLICA num botao, a AlteaPay RELAYA o clique de volta ao n8n como um chat.turn (o n8n continua conduzindo) — a AlteaPay NAO trata a resposta.",
       "request_body": {
@@ -127,20 +164,28 @@
           "kind": "negotiation",
           "question": "Como prefere pagar?",
           "buttons": [
-            { "id": 10, "label": "A vista (10% off)" },
-            { "id": 11, "label": "Parcelar em 3x" }
+            {
+              "id": 10,
+              "label": "A vista (10% off)"
+            },
+            {
+              "id": 11,
+              "label": "Parcelar em 3x"
+            }
           ],
           "n8n_execution_id": "<id da execucao n8n (opcional)>"
         }
       },
       "campos_buttons": "Cada botao: { id: number, label: string }. Use id 2..97 para itens de lista (0/1/99 sao RESERVADOS: 0=Nao reconheco, 1=Sim, 99=atendente humano). O `id` clicado volta ao n8n via chat.turn.",
-      "response": { "ok": true, "prompt_id": "<uuid>" },
+      "response": {
+        "ok": true,
+        "prompt_id": "<uuid>"
+      },
       "notas": [
         "So UM prompt ATIVO por sessao: o proximo prompt.ask fecha o anterior automaticamente.",
         "O clique chega ao n8n como chat.turn (com button.id) — o fluxo decide o proximo passo."
       ]
     },
-
     "payment.status": {
       "descricao": "Apenas CONSULTA o link existente, sem criar nada.",
       "request_body": {
@@ -148,28 +193,34 @@
         "session_id": "<uuid da sessao>",
         "event_id": "<uuid unico>"
       },
-      "response": "mesma estrutura de 'payment' acima (invoice_url, pix_copy_paste, boleto_url, total_value em centavos, ...), ou payment: null se nao houver cobranca."
+      "response": "{ ok, agreement_id, payment: { agreement_id, payment_id, billing_type, invoice_url, total_value (centavos), installments, due_date, boleto_url, pix_copy_paste, pix_qr_image, pix_expiration, pix_pending, pix_fallback_url | boleto_line, boleto_barcode, boleto_pending }, payment_status, asaas_status, from_live_charge? } ou payment: null se nao houver cobranca. Cobranca ja paga nao consulta PIX."
     }
   },
-
   "erros": {
+    "formato": "{ success:false, error:<mensagem>, code:<codigo estavel> } sem PII",
     "401": "assinatura/timestamp ausentes, assinatura invalida, ou timestamp fora da janela +/- 300s",
     "403": "sessao nao verificada (identity_verified)",
-    "409": "divida nao reconhecida, ou ja cobrada (code: already_charged)",
-    "422": "offer_id ausente, ou oferta fora da matriz (code: OFFER_INVALID)",
-    "429": "rate-limit por IP (120 req/s)",
+    "404": "sessao nao encontrada",
+    "409 debt_not_acknowledged": "divida nao reconhecida",
+    "409 OFFER_NOT_AVAILABLE": "offer_id (uuid) inexistente nesta sessao, ja superseded/rejeitada, ou valor que nao e uuid nem alias",
+    "409 OFFER_EXPIRED": "a oferta venceu (valid_until) — chame offer.list",
+    "409 OFFER_ALIAS_NOT_FOUND": "alias sem oferta apresentada daquele tipo — chame offer.list",
+    "409 OFFER_ALIAS_AMBIGUOUS": "mais de uma oferta daquele tipo — use o uuid",
+    "422": "args.offer_id ausente; ou oferta fora da matriz vigente (code: offer_outside_matrix / no_matrix_row)",
+    "429": "rate-limit por IP (120 req/min)",
+    "501 not_implemented": "payment_origin != 'platform'",
+    "503 charge_deferred": "cobranca nao iniciada por prazo da funcao; repita",
     "503": "N8N_WEBHOOK_SECRET nao configurado no servidor AlteaPay"
   },
-
   "notas_importantes": {
     "valores_em_centavos": "Todos os valores monetarios na borda n8n sao em CENTAVOS inteiros (ex.: total_value: 25000 = R$ 250,00). NAO em reais.",
     "corpo_para_assinar": "A assinatura HMAC deve cobrir exatamente a string do corpo enviada. Assine e envie a MESMA string.",
-    "idempotencia": "Sempre gere um event_id novo por intencao. Retry (rede/timeout) deve reusar o MESMO event_id para nao duplicar.",
-    "engine": "A AlteaPay precisa estar com NEGOTIATION_ENGINE=n8n para o fluxo n8n conduzir a conversa; o endpoint payment.create funciona independente disso."
+    "idempotencia": "Sempre gere um event_id novo por intencao. Retry (rede/timeout) deve reusar o MESMO event_id. Alem disso o servidor e idempotente por (session_id, oferta): repetir payment.create da mesma oferta (por uuid OU alias) devolve a MESMA cobranca com idempotent:true.",
+    "engine": "A AlteaPay precisa estar com NEGOTIATION_ENGINE=n8n para o fluxo n8n conduzir a conversa; o endpoint payment.create funciona independente disso.",
+    "pix_log": "Nunca registre pix_copy_paste/pix_qr_image em logs do n8n (e meio de pagamento)."
   },
-
   "exemplo_pronto_para_assinar": {
-    "comentario": "Preencha session_id/event_id, assine este _corpo com o N8N_WEBHOOK_SECRET conforme a secao autenticacao, e envie.",
+    "comentario": "Preencha session_id/event_id, assine este _corpo com o N8N_WEBHOOK_SECRET conforme a secao autenticacao, e envie. Chame offer.list antes (gera as ofertas); 'avista' pode ser trocado pelo uuid da oferta.",
     "url": "https://alteapay.com/api/webhooks/n8n",
     "metodo": "POST",
     "headers": {
@@ -187,5 +238,9 @@
         "billing_type": "PIX"
       }
     }
-  }
+  },
+  "changelog": [
+    "1.1 (2026-09-27, N8N-15): args.offer_id aceita o uuid de offer.list (CANONICO) ou os aliases 'avista'/'parc_N', resolvidos pelo servidor para a oferta ATUAL da sessao (so se houver exatamente uma; senao 409). Resposta e PLANA (sem objeto 'payment'), com offer_id/offer_alias. PIX: pix_copy_paste/pix_qr_image/pix_expiration vem de GET /payments/{id}/pixQrCode; se nao vier a tempo, pix_pending:true + pix_fallback_url. Boleto: boleto_line/boleto_barcode. Codigos de erro reais.",
+    "1.0 (2026-09-23): versao inicial (dizia que 'avista'/'parc_N' funcionavam e que a resposta vinha em 'payment' — nao era verdade no servidor)."
+  ]
 }

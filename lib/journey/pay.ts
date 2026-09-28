@@ -60,6 +60,7 @@ import { PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import { isPendingCharge } from "./charge-reconcile"
 import { timed } from "./server-timing"
+import { runAfterResponse } from "./after-response"
 import {
   PAY_INTEGRAL_PURPOSE,
   persistOffer,
@@ -147,6 +148,7 @@ export async function persistPaymentLinkMessage(
     return await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
+      ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
       text: payLinkMessageText(input),
       stage: PAYMENT_LINK_STAGE,
       action: paymentLinkAction(input.link),
@@ -174,7 +176,15 @@ export async function persistPaymentLinkMessage(
  */
 export async function publishPostPaymentLinkPrompt(
   ctx: SessionCtx,
-  input: { link: string | null; agreementId: string | null; debtIds: string[]; primaryDebtId?: string | null },
+  input: {
+    link: string | null
+    agreementId: string | null
+    debtIds: string[]
+    primaryDebtId?: string | null
+    /** Latência: escrita que precisa ficar ANTES da pergunta do pós-link no
+     *  histórico (a bolha do link, gravada em paralelo pelo chamador). */
+    precedingWrite?: () => Promise<unknown>
+  },
 ): Promise<PromptRow | null> {
   if (!input.link) return null
   try {
@@ -197,14 +207,18 @@ export async function publishPostPaymentLinkPrompt(
         primary_debt_id: input.primaryDebtId ?? ctx.debtId,
       },
       createdBy: "platform",
+      ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
     })
     if (!created.ok) return null
+    if (input.precedingWrite) await input.precedingWrite().catch(() => {})
     await persistAssistantMessage({
       companyId: ctx.companyId,
       sessionId: ctx.sessionId,
       text: REOPEN_MENU_QUESTION,
       promptId: created.prompt.id,
       skipContentDedup: true,
+      freshPrompt: true,
+      ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
     })
     return created.prompt
   } catch (err) {
@@ -405,7 +419,10 @@ export async function deliverPaymentOutcome(
   const resolved = await resolveLiveChargeLink(ctx, input.payment)
   const agreementId = input.payment?.agreement_id ?? null
   if (resolved.link) {
-    const linkMessageId = await persistPaymentLinkMessage(ctx, {
+    // Latência (10-latencia.md): a bolha do link e o prompt pós-link são gravados
+    // em PARALELO; a ORDEM do histórico é garantida por encadeamento — a pergunta
+    // do pós-link só é gravada depois da bolha do link.
+    const linkMessageP = persistPaymentLinkMessage(ctx, {
       link: resolved.link,
       valor: resolved.total ?? input.valor,
       vencimentoLink: resolved.dueDate,
@@ -414,12 +431,16 @@ export async function deliverPaymentOutcome(
       installments: input.payment?.installments ?? null,
       installmentValue: input.payment?.installment_value ?? null,
     })
-    const post = await publishPostPaymentLinkPrompt(ctx, {
-      link: resolved.link,
-      agreementId,
-      debtIds: input.debtIds,
-      primaryDebtId: input.primaryDebtId ?? ctx.debtId,
-    })
+    const [linkMessageId, post] = await Promise.all([
+      linkMessageP,
+      publishPostPaymentLinkPrompt(ctx, {
+        link: resolved.link,
+        agreementId,
+        debtIds: input.debtIds,
+        primaryDebtId: input.primaryDebtId ?? ctx.debtId,
+        precedingWrite: () => linkMessageP,
+      }),
+    ])
     return {
       link: resolved.link,
       vencimentoLink: resolved.dueDate,
@@ -560,7 +581,7 @@ export async function ensureIntegralOffer(
   ctx: SessionCtx,
   debtIds: string[],
 ): Promise<
-  | { ok: true; offerId: string; valor: number; summary?: DebtSummary }
+  | { ok: true; offerId: string; valor: number; summary?: DebtSummary; pending?: Promise<unknown> }
   | { ok: false; error: string }
 > {
   // Valor canônico (fonte única do rótulo do botão e do e-mail — D39/D41). O
@@ -577,8 +598,18 @@ export async function ensureIntegralOffer(
   //   rodada 2 (só se houver integral aceita): os acordos NÃO cancelados dessas
   //            integrais numa leitura `in(id)` — acordos cancelados nem voltam.
   const supabase = createServiceClient()
+  // Latência (10-latencia.md): o resumo do débito (aging) e a faixa da matriz só
+  // LEEM e não dependem do reuso → começam JÁ, em paralelo com a rodada 1. O
+  // evento debt.viewed continua gravado só quando o resumo é usado (abaixo).
+  const ackP = buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds })
+  const summaryP = debtSummary(ctx, { recordView: false })
+  const rowP = Promise.all([summaryP, ackP]).then(([s, a]) =>
+    resolveMatrixRow({ companyId: ctx.companyId, agingDays: s.agingDays, debtValue: round2(a.updatedValue) }),
+  )
+  summaryP.catch(() => {})
+  rowP.catch(() => {}) // aguardados só no caminho que os usa
   const [ack, { data: candidates }, { data: acceptances }] = await Promise.all([
-    buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds }),
+    ackP,
     supabase
       .from("negotiation_offers")
       .select("id, terms, status, valid_until, created_at")
@@ -637,12 +668,14 @@ export async function ensureIntegralOffer(
   // linha de matriz → sem billing permitido conhecido → rótulo curto (a UI cai
   // no menu com atendimento). debtValue = `valor` (valor efetivamente cobrado =
   // updatedValue consolidado), consistente com o rótulo do botão.
-  const summary = await debtSummary(ctx)
-  const row = await resolveMatrixRow({
-    companyId: ctx.companyId,
-    agingDays: summary.agingDays,
-    debtValue: valor,
-  })
+  const [summary, row] = await Promise.all([
+    summaryP,
+    rowP,
+    recordEvent({
+      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+      sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
+    }),
+  ])
   if (!row) return { ok: false, error: "no_matrix_row" }
 
   const firstDue = dueDatePlus(payLinkDueDays())
@@ -680,7 +713,9 @@ export async function ensureIntegralOffer(
     terms,
     validUntil,
   })
-  await recordEvent({
+  // Latência: a auditoria da oferta apresentada não bloqueia a cobrança — o
+  // chamador (payService) a aguarda antes de responder.
+  const pending = recordEvent({
     companyId: ctx.companyId,
     customerId: ctx.customerId,
     debtId: ctx.debtId,
@@ -689,7 +724,7 @@ export async function ensureIntegralOffer(
     actor: "system",
     payload: { offer_id: offerId, integral: true, installments: 1, discount_pct: 0 },
   })
-  return { ok: true, offerId, valor, summary }
+  return { ok: true, offerId, valor, summary, pending }
 }
 
 /**
@@ -717,6 +752,11 @@ export async function payService(
     /** QA rodada 5 (Q2-01): início da request do clique (epoch ms). Com ele, a
      *  cobrança só COMEÇA dentro de payChargeStartBudgetMs(). */
     requestStartedAt?: number
+    /** Latência (10-latencia.md): escrita do chamador que TEM de terminar antes
+     *  do payment.create (o reconhecimento implícito que destrava o guard D18) —
+     *  corre em paralelo com a oferta integral e é aguardada antes da cobrança.
+     *  Uma falha dela propaga (nenhuma cobrança é tentada). */
+    beforeCharge?: Promise<unknown>
   },
 ): Promise<PayServiceResult> {
   const eventId = opts?.eventId
@@ -725,23 +765,33 @@ export async function payService(
   const debtIds =
     opts?.debtIds && opts.debtIds.length > 0 ? opts.debtIds : [ctx.debtId]
 
-  // Telemetria (clique PAGAR chegou) em PARALELO com a oferta integral.
+  // Telemetria (clique PAGAR chegou): depois da resposta quando a plataforma
+  // garante a conclusão (latência, 10-latencia.md); senão em PARALELO com a oferta.
   const [, offer] = await Promise.all([
-    recordEvent({
-      companyId: ctx.companyId,
-      customerId: ctx.customerId,
-      debtId: ctx.debtId,
-      sessionId: ctx.sessionId,
-      type: "pay.requested",
-      actor: "customer",
-      payload: { option: "pagar" },
-    }).catch(() => ({ ok: false, duplicate: false })),
+    runAfterResponse("evento pay.requested", () =>
+      recordEvent({
+        companyId: ctx.companyId,
+        customerId: ctx.customerId,
+        debtId: ctx.debtId,
+        sessionId: ctx.sessionId,
+        type: "pay.requested",
+        actor: "customer",
+        payload: { option: "pagar" },
+      }),
+    ),
     timed("offer", () => ensureIntegralOffer(ctx, debtIds)),
   ])
   if (!offer.ok) {
+    if (opts?.beforeCharge) await opts.beforeCharge
     await emitPayFailed(ctx, offer.error)
     return { ok: false, error: offer.error }
   }
+  // A pré-condição do chamador (reconhecimento) termina ANTES da cobrança; a
+  // auditoria da oferta (offer.presented) corre em paralelo e termina antes da
+  // resposta.
+  if (opts?.beforeCharge) await opts.beforeCharge
+  const offerAudit = offer.pending ?? Promise.resolve()
+  offerAudit.catch(() => {}) // aguardado (e o erro propagado) após a cobrança
 
   const chargeNotAfter =
     typeof opts?.requestStartedAt === "number" ? opts.requestStartedAt + payChargeStartBudgetMs() : null
@@ -749,6 +799,7 @@ export async function payService(
     paymentCreateOrExistingLink(ctx, offer.offerId, eventId, { summary: offer.summary, chargeNotAfter }),
   )
 
+  await offerAudit
   if (!r.ok) {
     // Rótulo curto e estável (a copy humana é da UI, §5.4). NUNCA a mensagem
     // crua do ASAAS/HTTP/"n8n". Guards conhecidos (409/422) e erro genérico.
@@ -828,7 +879,8 @@ async function emitPayLinkReady(
   payment: PaymentDetails | null,
   opts: { already_charged: boolean },
 ): Promise<void> {
-  await recordEvent({
+  // Telemetria: depois da resposta quando seguro (latência); senão inline.
+  await runAfterResponse("evento pay.link_ready", () => recordEvent({
     companyId: ctx.companyId,
     customerId: ctx.customerId,
     debtId: ctx.debtId,
@@ -841,7 +893,7 @@ async function emitPayLinkReady(
       billing_type: payment?.billing_type ?? null,
       has_link: Boolean(linkOf(payment)),
     },
-  }).catch(() => {})
+  }))
 }
 
 async function emitPayFailed(ctx: SessionCtx, code: string): Promise<void> {

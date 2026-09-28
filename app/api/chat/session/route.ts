@@ -16,6 +16,7 @@ import {
 } from "@/lib/journey/actions"
 import { buildAcceptSummary } from "@/lib/journey/closing"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
+import { detectCustomerSettlement } from "@/lib/journey/settled-state"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -48,6 +49,11 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as Record<string, unknown>))
   const action = String(body.action ?? "")
   const ip = clientIp(req)
+
+  // F8-02: dívida quitada → aceite/confirmação/"já paguei" não seguem.
+  if ((action === "accept" || action === "confirm" || action === "payment_claim") && (await detectCustomerSettlement(ctx))) {
+    return NextResponse.json({ ok: false, error: "DEBT_SETTLED", code: "debt_settled" }, { status: 409 })
+  }
 
   switch (action) {
     case "message": {

@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import { getServerSupabaseUrl } from "@/lib/supabase/url"
 import { effectiveAsaasStatusFromWebhook } from "@/lib/asaas-idempotency"
+import { isPaymentStatusRegression, PAID_AGREEMENT_STATUSES } from "@/lib/constants/payment-status"
 import {
   checkInstallmentHold,
   fetchInstallmentPayments,
@@ -373,6 +374,11 @@ export async function POST(request: NextRequest) {
       ? agreement.status
       : AGREEMENT_STATUS_MAP[event] ?? agreement.status
     const newDebtStatus = holdInstallment ? null : DEBT_STATUS_MAP[event]
+    // F8-01: um PAGO que quita o acordo. A quitação (status completed,
+    // payment_received_at, dívida/VMAX pagas, efeitos da jornada) roda UMA vez por
+    // acordo: o UPDATE condicional do passo 9 é o portão atômico — só o evento que
+    // de fato tira o acordo de um status não-pago executa os efeitos.
+    const settlingEvent = PAID_ASAAS_EVENTS.has(event) && !holdInstallment
 
     // 8. Build the update object for agreement
     // N-D1-2: o ASAAS mantém status=PENDING numa cobrança deletada (só liga
@@ -420,12 +426,6 @@ export async function POST(request: NextRequest) {
       agreementUpdate.due_date = payment.dueDate
     }
 
-    // Set payment_received_at for received/confirmed events (todos os pagos) —
-    // no parcelado, só na ÚLTIMA parcela.
-    if (PAID_ASAAS_EVENTS.has(event) && !partialInstallmentPaid) {
-      agreementUpdate.payment_received_at = new Date().toISOString()
-    }
-
     // Handle notification/payment viewed events
     if (event === "PAYMENT_CHECKOUT_VIEWED" || event === "PAYMENT_VIEWED") {
       agreementUpdate.notification_viewed = true
@@ -435,18 +435,80 @@ export async function POST(request: NextRequest) {
     }
 
     // 9. Update the agreement
-    const { error: updateError } = await supabase
-      .from("agreements")
-      .update(agreementUpdate)
-      .eq("id", agreement.id)
-
-    if (updateError) {
-      console.error("[ASAAS Webhook] Error updating agreement:", updateError)
-      throw updateError
+    // 9a. Portão da quitação (F8-01): UPDATE condicional que só casa enquanto o
+    // acordo NÃO está pago e devolve as linhas alteradas. Webhooks concorrentes ou
+    // tardios do mesmo acordo (CONFIRMED + RECEIVED do cartão, parcela repetida)
+    // perdem o portão e não refazem a quitação. payment_received_at nasce aqui e
+    // nunca é reescrito.
+    let settledNow = false
+    if (settlingEvent) {
+      const now = new Date().toISOString()
+      let gate = supabase
+        .from("agreements")
+        .update({ ...agreementUpdate, status: newAgreementStatus, payment_received_at: now })
+        .eq("id", agreement.id)
+        .eq("company_id", agreement.company_id)
+      gate = agreement.status == null
+        ? gate.is("status", null)
+        : gate.not("status", "in", `(${PAID_AGREEMENT_STATUSES.join(",")})`)
+      const { data: settledRows, error: gateError } = await gate.select("id")
+      if (gateError) {
+        console.error("[ASAAS Webhook] Error settling agreement:", gateError)
+        throw gateError
+      }
+      settledNow = (settledRows?.length ?? 0) > 0
     }
 
+    // 9b. Demais eventos, ou PAGO de um acordo já quitado: atualiza detalhes sem
+    // mexer no status do acordo e sem regredir o status do pagamento.
+    if (!settledNow) {
+      let current: { payment_status?: string | null; asaas_status?: string | null; payment_received_at?: string | null } = agreement
+      if (settlingEvent) {
+        // Perdeu o portão: quem quitou já gravou tudo no mesmo UPDATE — relê para
+        // comparar com o estado vencedor (não com o snapshot do passo 5).
+        const { data: fresh } = await supabase
+          .from("agreements")
+          .select("payment_status, asaas_status, payment_received_at")
+          .eq("id", agreement.id)
+          .eq("company_id", agreement.company_id)
+          .maybeSingle()
+        if (fresh) current = fresh
+        delete agreementUpdate.status
+      }
+      if (isPaymentStatusRegression(current.payment_status, agreementUpdate.payment_status)) {
+        delete agreementUpdate.payment_status
+      }
+      if (isPaymentStatusRegression(current.asaas_status, agreementUpdate.asaas_status)) {
+        delete agreementUpdate.asaas_status
+      }
+
+      const { error: updateError } = await supabase
+        .from("agreements")
+        .update(agreementUpdate)
+        .eq("id", agreement.id)
+
+      if (updateError) {
+        console.error("[ASAAS Webhook] Error updating agreement:", updateError)
+        throw updateError
+      }
+
+      // Acordo pago por outro caminho (sync/manual) sem data de recebimento:
+      // preenche uma única vez.
+      if (settlingEvent && !current.payment_received_at) {
+        await supabase
+          .from("agreements")
+          .update({ payment_received_at: new Date().toISOString() })
+          .eq("id", agreement.id)
+          .eq("company_id", agreement.company_id)
+          .is("payment_received_at", null)
+      }
+    }
+
+    // Dívida/VMAX: no PAGO, só quem venceu o portão grava "paid"/"PAGO".
+    const applyDebtStatus = !!newDebtStatus && (!settlingEvent || settledNow)
+
     // 10. Update debt status if needed
-    if (newDebtStatus && agreement.debt_id) {
+    if (applyDebtStatus && agreement.debt_id) {
       await supabase
         .from("debts")
         .update({
@@ -457,7 +519,7 @@ export async function POST(request: NextRequest) {
     }
 
     // 11. Update VMAX record if linked via debt
-    if (newDebtStatus && agreement.debt_id) {
+    if (applyDebtStatus && agreement.debt_id) {
       // Get the debt to find VMAX external_id
       const { data: debt } = await supabase
         .from("debts")
@@ -545,6 +607,8 @@ export async function POST(request: NextRequest) {
           // QA rodada 6 (Q4r2-03): parcela paga que não quita o acordo.
           partialInstallmentPaid,
           partialInstallmentCancel,
+          // F8-01: só o evento que quitou roda os efeitos de quitação da jornada.
+          settled: settlingEvent ? settledNow : undefined,
         })
       } catch (journeyErr) {
         console.error("[ASAAS Webhook] journey hook error (isolado):", (journeyErr as Error).message)
@@ -558,6 +622,7 @@ export async function POST(request: NextRequest) {
       searchMethod,
       partialInstallmentPaid,
       partialInstallmentCancel,
+      settledNow,
       paymentStatus: newPaymentStatus,
       agreementStatus: newAgreementStatus,
     })

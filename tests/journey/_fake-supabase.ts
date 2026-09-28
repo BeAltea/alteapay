@@ -12,7 +12,7 @@ export interface FakeDb {
 }
 
 interface Filter {
-  op: "eq" | "neq" | "in" | "gt" | "gte" | "lt" | "notNull" | "isNull" | "filterEq"
+  op: "eq" | "neq" | "in" | "notIn" | "gt" | "gte" | "lt" | "notNull" | "isNull" | "filterEq"
   col: string
   val?: any
 }
@@ -27,6 +27,9 @@ function matches(row: Row, f: Filter): boolean {
       return v !== f.val
     case "in":
       return Array.isArray(f.val) && f.val.includes(v)
+    case "notIn":
+      // SQL: NULL NOT IN (...) não casa.
+      return v != null && !f.val.includes(v)
     case "gt":
       return v != null && v > f.val
     case "gte":
@@ -86,7 +89,12 @@ class QueryBuilder {
     this.filters.push({ op: "lt", col, val })
     return this
   }
-  not(col: string, _op: string, _val: any) {
+  not(col: string, op: string, val: any) {
+    if (op === "in") {
+      const list = String(val).replace(/^\(|\)$/g, "").split(",").map((x) => x.trim())
+      this.filters.push({ op: "notIn", col, val: list })
+      return this
+    }
     this.filters.push({ op: "notNull", col })
     return this
   }

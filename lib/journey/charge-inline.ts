@@ -71,6 +71,15 @@ export interface InlineChargeOpts {
    *  pula a busca por CPF/CNPJ (1 chamada ASAAS a menos). O update de supressão
    *  de notificações continua (cliente legado pode ter notificação ligada). */
   knownAsaasCustomerId?: string | null
+  /** Latência (10-latencia.md): o acordo foi INSERIDO nesta mesma request pelo
+   *  chamador (closeAgreement) e ainda não tem cobrança — a releitura de
+   *  idempotência é dispensável (ninguém mais grava cobrança nele: a conciliação
+   *  só vincula/cancela). O guard D7 (local + ASAAS) do confirmAccept segue antes. */
+  freshAgreement?: boolean
+  /** Latência: o reforço de supressão (PUT /customers) do customer conhecido já
+   *  foi disparado pelo chamador em paralelo com a gravação do acordo. É
+   *  AGUARDADO aqui, antes do POST /payments (mesma ordem de antes). */
+  customerUpdate?: Promise<unknown> | null
 }
 
 const deadlinePassed = (notAfter: number | null | undefined) =>
@@ -98,12 +107,14 @@ export async function createAsaasChargeInline(
   const supabase = createAdminClient()
 
   // ---- Idempotência: agreement já tem cobrança viva? devolve a existente.
-  const { data: existing, error: existingError } = await supabase
-    .from("agreements")
-    .select("id, asaas_payment_id, asaas_invoice_url, asaas_payment_url, payment_status, asaas_status, status")
-    .eq("id", agreementId)
-    .eq("company_id", metadata.companyId)
-    .maybeSingle()
+  const { data: existing, error: existingError } = opts.freshAgreement
+    ? { data: null, error: null }
+    : await supabase
+        .from("agreements")
+        .select("id, asaas_payment_id, asaas_invoice_url, asaas_payment_url, payment_status, asaas_status, status")
+        .eq("id", agreementId)
+        .eq("company_id", metadata.companyId)
+        .maybeSingle()
 
   if (existingError) {
     console.warn(`[CHARGE-INLINE] Failed to read agreement ${agreementId}:`, existingError.message)
@@ -131,11 +142,15 @@ export async function createAsaasChargeInline(
     const found = known ? { id: known } : await timed("asaas_customer_lookup", () => getAsaasCustomerByCpfCnpj(cpfCnpj))
     if (found?.id) {
       asaasCustomerId = found.id
-      await timed("asaas_customer_update", () => updateAsaasCustomer(asaasCustomerId, {
-        name: customer.name,
-        email: customer.email,
-        mobilePhone: customer.mobilePhone,
-      }))
+      if (known && opts.customerUpdate) {
+        await timed("asaas_customer_update_wait", async () => { await opts.customerUpdate })
+      } else {
+        await timed("asaas_customer_update", () => updateAsaasCustomer(asaasCustomerId, {
+          name: customer.name,
+          email: customer.email,
+          mobilePhone: customer.mobilePhone,
+        }))
+      }
     } else {
       const created = await timed("asaas_customer_create", () => createAsaasCustomer({
         name: customer.name || "Cliente",
