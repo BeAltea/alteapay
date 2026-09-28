@@ -871,3 +871,24 @@ dois §14). Mapa: §14 N8N-14 · §15 N8N-13 · §16 N8N-1 · §17 N8N-10 · §1
   `ops/n8n-sync-fix/tools/apply-workflow.mjs`, na ordem `2 → 3 → 5 → 7 → 4 → 1.1…1.7 → 1. Main → 6`.
   O `1. Main` do N8N-16 não responde mais `200 "Workflow was started"` antes do roteamento.
 - Plano de implantação: `ops/negociacao-final/13-plano-rollout-integracao.md`.
+
+## 24. 2026-09-28 — Prompt de negociação abandonada (N87-07)
+
+Quando o devedor sai da conversa com o motor (**"Tentar as opções de novo"**, **"Já paguei"**
+ou **"Pagar agora"/"Pagar à vista"** na espera), a plataforma grava
+`journey_events.chat.engine_superseded` (sem PII). Um `chat.send` com `args.prompt` ou um
+`prompt.ask` cujo evento de origem (correlação §18) foi enviado **antes** dessa marca responde a
+uma negociação abandonada:
+
+- **422** `{code:'prompt_outside_window', reason:'engine_wait_superseded'}` — mesmo código do
+  N8N-8, **não re-tentar**. Nada é gravado (nem o texto: a pergunta sem os botões ficaria sem
+  resposta acima do menu reaberto). Auditoria `chat.engine_invalid_action` com o mesmo `reason`.
+- Resposta a um evento enviado **depois** da marca (ex.: o devedor clicou Negociar de novo)
+  segue as regras de sempre. Texto sem botões não é afetado (continua nota, §13).
+- Vale também para o corpo síncrono do `negotiation.start` (instante do envio = antes do POST).
+- Sem o instante do evento de origem (correlação desligada/sem registro), nada muda.
+
+"Pagar agora"/"Pagar à vista" na espera (N87-09) usam `POST /api/chat/reopen {action:'pay_now'}`:
+reabre o menu e segue pelo mesmo clique do Pagar (`/api/chat/button`, id 4). Só um toque sai da
+espera (update condicional para `gerando_cobranca`); o outro recebe `duplicate:true`. Fora da
+espera, `pay_now` = `reopen_options`.
