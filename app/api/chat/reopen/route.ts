@@ -10,12 +10,18 @@
 // opções de novo" sempre tenham botão real; e faz o handoff direto para "Falar com
 // atendimento". Sem prompt_id/button_id — a sessão vem do cookie JWT.
 //
-// Body: { action: 'reopen_options' | 'handoff' }.
+// Body: { action: 'reopen_options' | 'handoff' | 'payment_claim' | 'pay_now' }.
 //   - reopen_options → reopenThreeOptions(sessão) → { ok:true, action:'reopen_options', reply }
 //   - handoff        → transferToHuman(sessão)     → { ok:true, action:'handoff', transferred:true }
+//   - pay_now        → N87-09: "Pagar agora"/"Pagar à vista" na espera do motor
+//                      (aguardando_motor/menu_degradado): reabre o menu e segue
+//                      pelo MESMO clique do Pagar do menu (POST /api/chat/button,
+//                      button_id 4) — mesma oferta integral, guard duplo e
+//                      idempotência. Fora da espera = reopen_options (sem cobrar).
 //
 // Idempotente: reopenThreeOptions reusa bootstrapThreeOptionsPrompt (não duplica o
-// menu se já houver um prompt ativo). NUNCA declara pago, NUNCA cobra aqui.
+// menu se já houver um prompt ativo). NUNCA declara pago; a única cobrança possível
+// aqui é a do pay_now, e ela é o próprio caminho do Pagar do menu.
 import { NextRequest, NextResponse } from "next/server"
 import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { HANDOFF_STAGE, handlePaymentClaim, loadSessionCtx, transferToHumanWithOutcome } from "@/lib/journey/actions"
@@ -29,6 +35,8 @@ import {
   lastCustomerClick,
 } from "@/lib/journey/double-tap"
 import { getActivePrompt, promptView, type PromptView } from "@/lib/journey/prompts"
+import { BTN_PAY, findButton } from "@/lib/journey/buttons"
+import { markEngineSuperseded } from "@/lib/journey/engine-supersede"
 import { createServiceClient } from "@/lib/supabase/service"
 import { settledReopenBody } from "@/lib/journey/settled-state"
 import { afterResponseMode } from "@/lib/journey/after-response"
@@ -144,8 +152,63 @@ async function sessionDebtIds(
 export async function POST(req: NextRequest) {
   const t0 = Date.now()
   const res = await handleReopen(req)
-  res.headers.set("Server-Timing", `total;dur=${Date.now() - t0}, after_${afterResponseMode()};dur=0`)
+  // pay_now devolve a resposta do /api/chat/button: preserva as etapas da cobrança.
+  const prev = res.headers.get("Server-Timing")
+  res.headers.set("Server-Timing", [prev, `total;dur=${Date.now() - t0}, after_${afterResponseMode()};dur=0`].filter(Boolean).join(", "))
   return res
+}
+
+/**
+ * N87-09 — reivindica a saída da espera do motor para o pay_now: update
+ * condicional aguardando_motor|menu_degradado → gerando_cobranca (uma linha só
+ * vence). "claimed" = este toque cobra; "busy" = outro toque já está cobrando;
+ * "none" = a sessão não está na espera do motor (pay_now vira reopen_options).
+ * Nunca lança (erro → "none": nenhuma cobrança, só o menu).
+ */
+async function claimEngineWaitForPay(sessionId: string, companyId: string): Promise<"claimed" | "busy" | "none"> {
+  try {
+    const { data, error } = await createServiceClient()
+      .from("negotiation_sessions")
+      .update({ wait_state: "gerando_cobranca", wait_started_at: new Date().toISOString() })
+      .eq("id", sessionId)
+      .eq("company_id", companyId)
+      .in("wait_state", ["aguardando_motor", "menu_degradado"])
+      .select("id")
+    if (error) return "none"
+    if (Array.isArray(data) && data.length > 0) return "claimed"
+    return (await readWaitState(sessionId, companyId)) === "gerando_cobranca" ? "busy" : "none"
+  } catch {
+    return "none"
+  }
+}
+
+/** Desfaz a reivindicação quando o clique não chegou à cobrança. Nunca lança. */
+async function releasePayClaim(sessionId: string, companyId: string): Promise<void> {
+  try {
+    await createServiceClient()
+      .from("negotiation_sessions")
+      .update({ wait_state: null, wait_started_at: null })
+      .eq("id", sessionId)
+      .eq("company_id", companyId)
+      .eq("wait_state", "gerando_cobranca")
+  } catch {
+    /* defensivo: o poll/decidePayResume reconciliam */
+  }
+}
+
+/** wait_state persistido da sessão (null se ausente/erro). Nunca lança. */
+async function readWaitState(sessionId: string, companyId: string): Promise<string | null> {
+  try {
+    const { data } = await createServiceClient()
+      .from("negotiation_sessions")
+      .select("wait_state")
+      .eq("id", sessionId)
+      .eq("company_id", companyId)
+      .maybeSingle()
+    return (data as { wait_state?: string | null } | null)?.wait_state ?? null
+  } catch {
+    return null
+  }
 }
 
 async function handleReopen(req: NextRequest): Promise<NextResponse> {
@@ -248,7 +311,11 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
         console.warn("[chat:reopen] menu após payment_claim falhou (não-fatal):", err.message)
         return null
       })
-      const [echo, claim, reopened] = await Promise.all([echoP, claimP, reopenP, clearWaitState(ctx.sessionId)])
+      const [echo, claim, reopened] = await Promise.all([
+        echoP, claimP, reopenP, clearWaitState(ctx.sessionId),
+        // N87-07: prompt tardio do motor não troca o menu reaberto.
+        markEngineSuperseded({ companyId: ctx.companyId, sessionId: ctx.sessionId, reason: "payment_claim" }),
+      ])
       const reopenedPrompt = reopened && reopened.ok && reopened.prompt ? promptView(reopened.prompt) : null
       // QA round 4 (R-24/R-13): o corpo É o próximo estado — eco + resultado
       // persistidos (ids reais, o client deduplica com o poll) + o menu ativo.
@@ -264,9 +331,23 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
     }
 
     // reopen_options (default): re-publica o menu de 3 opções (payável), M10/M7.
+    // N87-09: pay_now só cobra saindo da espera do motor, e só UM toque sai dela:
+    // a transição aguardando_motor|menu_degradado → gerando_cobranca é um update
+    // condicional (atômico no Postgres). O perdedor de um toque duplo recebe
+    // `duplicate` (o client acompanha a cobrança do vencedor pelo poll).
+    const payNow = action === "pay_now"
+    const payClaim = payNow ? await claimEngineWaitForPay(ctx.sessionId, ctx.companyId) : "none"
+    if (payClaim === "busy") {
+      return NextResponse.json({
+        ok: true, action: "pay_now", duplicate: true,
+        prompt: await activePromptView(ctx.sessionId), state_time: new Date().toISOString(),
+      })
+    }
+    const payClaimed = payClaim === "claimed"
     const { debtIds, primaryDebtId } = await sessionDebtIds(ctx.sessionId, ctx.debtId, ctx)
     // A-02: encerra a espera para não duplicar o menu — em paralelo com o menu
-    // (latência); os dois terminam antes da resposta.
+    // (latência); todos terminam antes da resposta. No pay_now reivindicado a
+    // espera já virou 'gerando_cobranca' (a cobrança governa o estado daqui).
     const [back] = await Promise.all([
       reopenThreeOptions({
         companyId: ctx.companyId,
@@ -276,10 +357,36 @@ async function handleReopen(req: NextRequest): Promise<NextResponse> {
         primaryDebtId,
         threadEpoch: ctx.threadEpoch,
       }),
-      clearWaitState(ctx.sessionId),
+      payClaimed ? Promise.resolve() : clearWaitState(ctx.sessionId),
+      // N87-07: o devedor saiu da conversa com o motor — um prompt do n8n que
+      // responde a um evento anterior não troca este menu (chat-send.ts).
+      markEngineSuperseded({ companyId: ctx.companyId, sessionId: ctx.sessionId, reason: payNow ? "pay_now" : "reopen_options" }),
     ])
     if (!back.ok) {
+      if (payClaimed) await releasePayClaim(ctx.sessionId, ctx.companyId)
       return NextResponse.json({ ok: false, code: "reopen_failed", error: "reopen_failed" }, { status: 500 })
+    }
+    if (payClaimed) {
+      const menu = back.prompt ?? (await getActivePrompt(ctx.sessionId).catch(() => null))
+      if (menu && menu.status === "active" && menu.kind === "debt_three_options" && findButton(menu.buttons ?? [], BTN_PAY)) {
+        // O MESMO clique do Pagar do menu (rota /api/chat/button, button_id 4):
+        // toque múltiplo, oferta integral do servidor, guard duplo
+        // (lib/asaas-idempotency.ts), idempotência e wait_state da cobrança são
+        // os dela. Só o corpo do clique muda (o menu acabou de ser reaberto).
+        const { POST: clickButton } = await import("@/app/api/chat/button/route")
+        const forwarded = {
+          cookies: req.cookies,
+          headers: req.headers,
+          json: async () => ({ prompt_id: menu.id, button_id: BTN_PAY }),
+        } as unknown as NextRequest
+        const res = await clickButton(forwarded)
+        // Clique sem cobrança (obsoleto/ignorado/quitado): devolve a espera
+        // reivindicada — nunca um 'gerando_cobranca' pendurado.
+        const out = (await res.clone().json().catch(() => null)) as { action?: unknown } | null
+        if (out?.action !== "pay") await releasePayClaim(ctx.sessionId, ctx.companyId)
+        return res
+      }
+      await releasePayClaim(ctx.sessionId, ctx.companyId)
     }
     // QA round 4 (R-13): o menu reaberto vai no corpo (o client aplica sem esperar o poll).
     return NextResponse.json({

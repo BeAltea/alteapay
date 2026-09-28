@@ -65,7 +65,15 @@ export type CorrelationCode =
 
 export type CorrelationVerdict =
   | { ok: true; covered: false }
-  | { ok: true; covered: true; origin: string; source: OutboundSource; replay: boolean }
+  | {
+      ok: true
+      covered: true
+      origin: string
+      source: OutboundSource
+      replay: boolean
+      /** N87-07: quando a plataforma enviou o evento de origem (null = desconhecido). */
+      sentAt: string | null
+    }
   | { ok: false; status: number; code: CorrelationCode; message: string }
 
 export type OutboundSource = "ledger" | "chat_turn" | "outbox"
@@ -89,6 +97,9 @@ export interface CorrelationStore {
   findLedger(eventIds: string[]): Promise<OutboundRecord[]>
   /** ids das mensagens inbound da sessão/empresa desde `sinceIso`. */
   recentInboundIds(sessionId: string, companyId: string, sinceIso: string): Promise<string[]>
+  /** N87-07 (opcional): as mesmas mensagens com o instante de gravação — dá o
+   *  `sentAt` de um chat.turn. Sem ele, o `sentAt` do chat.turn fica null. */
+  recentInbound?(sessionId: string, companyId: string, sinceIso: string): Promise<Array<{ id: string; created_at: string | null }>>
   /** Linha do engine_outbox com esse event_id (null se ausente ou tabela ausente). */
   findOutbox(eventId: string): Promise<OutboundRecord | null>
   listReplySlots(slotIds: string[]): Promise<ReplySlot[]>
@@ -201,6 +212,19 @@ export const supabaseCorrelationStore: CorrelationStore = {
     if (error) throw new Error(`inbound:${error.code ?? "err"}`)
     return ((data ?? []) as { id: string }[]).map((r) => r.id)
   },
+  async recentInbound(sessionId, companyId, sinceIso) {
+    const { data, error } = await (await supabase())
+      .from("conversation_messages")
+      .select("id, created_at")
+      .eq("session_id", sessionId)
+      .eq("company_id", companyId)
+      .eq("direction", "inbound")
+      .gte("created_at", sinceIso)
+      .order("created_at", { ascending: false })
+      .limit(200)
+    if (error) throw new Error(`inbound:${error.code ?? "err"}`)
+    return (data ?? []) as Array<{ id: string; created_at: string | null }>
+  },
   async findOutbox(eventId) {
     try {
       const { data, error } = await (await supabase())
@@ -298,7 +322,7 @@ export async function recordN8nOutbound(row: {
 // Verificação
 
 type FindResult =
-  | { found: true; source: OutboundSource; record: OutboundRecord }
+  | { found: true; source: OutboundSource; record: OutboundRecord; sentAt: string | null }
   | { found: false; code: "n8n_origin_unknown" | "n8n_origin_wrong_session" | "n8n_origin_wrong_company" | "n8n_origin_expired" }
 
 async function findOutbound(
@@ -316,7 +340,7 @@ async function findOutbound(
     if (rec.company_id !== session.company_id) return { found: false, code: "n8n_origin_wrong_company" }
     const at = Date.parse(rec.occurred_at)
     if (!Number.isFinite(at) || at < sinceMs || at > nowMs + 60_000) return { found: false, code: "n8n_origin_expired" }
-    return { found: true, source, record: rec }
+    return { found: true, source, record: rec, sentAt: rec.occurred_at }
   }
 
   // 1) ledger em journey_events (negotiation.start e afins)
@@ -331,12 +355,17 @@ async function findOutbound(
   // 2) chat.turn: id determinístico a partir das mensagens inbound da sessão
   if (DETERMINISTIC_UUID_RE.test(origin)) {
     const since = new Date(sinceMs).toISOString()
-    const ids = await store.recentInboundIds(session.id, session.company_id, since)
-    if (ids.some((id) => chatTurnEventId(session.id, id) === origin)) {
+    // N87-07: com o instante da mensagem inbound, o chat.turn também tem sentAt.
+    const rows = store.recentInbound
+      ? await store.recentInbound(session.id, session.company_id, since)
+      : (await store.recentInboundIds(session.id, session.company_id, since)).map((id) => ({ id, created_at: null }))
+    const hit = rows.find((r) => chatTurnEventId(session.id, r.id) === origin)
+    if (hit) {
       return {
         found: true,
         source: "chat_turn",
         record: { event_id: origin, session_id: session.id, company_id: session.company_id, occurred_at: new Date(nowMs).toISOString() },
+        sentAt: typeof hit.created_at === "string" ? hit.created_at : null,
       }
     }
   }
@@ -411,8 +440,9 @@ export async function checkN8nCorrelation(
   }
   if (!found.found) return { ...fail(found.code), session }
 
+  const sentAt = found.sentAt
   if (CAP_EXEMPT_ACTIONS.has(body.action)) {
-    return { ok: true, covered: true, origin, source: found.source, replay: false, session }
+    return { ok: true, covered: true, origin, source: found.source, replay: false, sentAt, session }
   }
 
   // Teto de respostas por evento de origem, com replay idempotente.
@@ -421,7 +451,7 @@ export async function checkN8nCorrelation(
   try {
     const taken = await store.listReplySlots(slotIds)
     if (key && taken.some((s) => s.callback_key === key)) {
-      return { ok: true, covered: true, origin, source: found.source, replay: true, session }
+      return { ok: true, covered: true, origin, source: found.source, replay: true, sentAt, session }
     }
     const takenIds = new Set(taken.map((s) => s.event_id))
     for (const slotId of slotIds) {
@@ -430,7 +460,7 @@ export async function checkN8nCorrelation(
         slotId, sessionId: session.id, companyId: session.company_id,
         action: body.action, origin, callbackKey: key,
       })
-      if (claimed) return { ok: true, covered: true, origin, source: found.source, replay: false, session }
+      if (claimed) return { ok: true, covered: true, origin, source: found.source, replay: false, sentAt, session }
     }
   } catch {
     return { ...fail("n8n_correlation_unavailable"), session }
@@ -439,7 +469,11 @@ export async function checkN8nCorrelation(
 }
 
 export type CorrelationGate =
-  | { reject: false }
+  | {
+      reject: false
+      /** N87-07: evento de origem correlacionado (só com veredito positivo e coberto). */
+      origin?: { eventId: string; sentAt: string | null }
+    }
   | { reject: true; status: number; code: CorrelationCode; error: string }
 
 /**
@@ -461,7 +495,9 @@ export async function enforceN8nCorrelation(
   } catch {
     verdict = fail("n8n_correlation_unavailable")
   }
-  if (verdict.ok) return { reject: false }
+  if (verdict.ok) {
+    return verdict.covered ? { reject: false, origin: { eventId: verdict.origin, sentAt: verdict.sentAt } } : { reject: false }
+  }
 
   console.warn(`[n8n-correlation] ${required ? "recusado" : "seria recusado"}: action=${body.action} code=${verdict.code}`)
   if (verdict.session) {

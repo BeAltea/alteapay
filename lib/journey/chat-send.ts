@@ -181,6 +181,57 @@ async function guardProtectedActive(
   }
 }
 
+/**
+ * N87-07 — o devedor saiu da conversa com o motor ("Tentar as opções de novo",
+ * "Já paguei", Pagar a partir da espera) DEPOIS de a plataforma enviar o evento
+ * que este prompt responde: é um prompt da negociação abandonada. Recusa com o
+ * mesmo código do N8N-8 (`prompt_outside_window`, o fluxo já trata como "não
+ * re-tentar") e `reason:'engine_wait_superseded'`; nada é gravado — a pergunta
+ * sem os seus botões seria um beco acima do menu reaberto. Sem o instante do
+ * evento de origem (correlação desligada ou sem registro) → não recusa.
+ */
+async function refuseIfEngineSuperseded(
+  ctx: SessionCtx,
+  originSentAt: string | null | undefined,
+  action: "chat.send" | "prompt.ask",
+  n8nExecutionId: string | undefined,
+  eventId: string | undefined,
+): Promise<{ ok: false; status: 422; code: string; message: string; reason: string } | null> {
+  if (!originSentAt) return null
+  const { engineSupersededSince } = await import("./engine-supersede")
+  const supersededAt = await engineSupersededSince(ctx.sessionId, ctx.companyId, originSentAt)
+  if (!supersededAt) return null
+  await recordEvent({
+    companyId: ctx.companyId,
+    customerId: ctx.customerId,
+    debtId: ctx.debtId,
+    sessionId: ctx.sessionId,
+    type: "chat.engine_invalid_action",
+    actor: "n8n",
+    eventId: eventId ? `engine_wait_superseded|${action}|${eventId}` : undefined,
+    payload: {
+      action,
+      code: "prompt_outside_window",
+      reason: "engine_wait_superseded",
+      origin_sent_at: originSentAt,
+      superseded_at: supersededAt,
+      n8n_execution_id: n8nExecutionId ?? null,
+    },
+  }).catch(() => {})
+  return {
+    ok: false,
+    status: 422,
+    code: "prompt_outside_window",
+    reason: "engine_wait_superseded",
+    message: "prompt do n8n responde a um evento anterior à reabertura do menu pelo devedor; o menu da plataforma foi preservado",
+  }
+}
+
+/** N87-07: contexto da correlação N8N-16 do callback (quando a plataforma enviou o evento de origem). */
+export interface ChatSendOpts {
+  originSentAt?: string | null
+}
+
 export interface ChatSendArgs {
   text: string
   prompt?: {
@@ -229,10 +280,11 @@ export async function chatSend(
   ctx: SessionCtx,
   args: ChatSendArgs,
   eventId?: string,
+  opts: ChatSendOpts = {},
 ): Promise<ChatSendResult> {
   // N8N-2: contrato de botões ANTES de qualquer validação/escrita
   // (lib/negotiation/n8n-buttons.ts). Sem prompt → caminho inalterado.
-  if (!args?.prompt) return chatSendCore(ctx, args, eventId)
+  if (!args?.prompt) return chatSendCore(ctx, args, eventId, opts)
   const btn = await import("@/lib/negotiation/n8n-buttons")
   const source = (args as { legacy_envelope?: unknown }).legacy_envelope === true ? "legacy_envelope" : "chat.send"
   const rawText = (args.text ?? "").replace(/<[^>]*>/g, "").trim()
@@ -246,7 +298,7 @@ export async function chatSend(
   const next: ChatSendArgs = fallback
     ? { ...args, text: rawText || question, prompt: undefined }
     : { ...args, prompt: prep.prompt ?? args.prompt }
-  const r = await chatSendCore(ctx, next, eventId)
+  const r = await chatSendCore(ctx, next, eventId, opts)
   if (!prep.report || (r.ok && r.duplicate)) return r
   if (!r.ok) {
     await btn.recordButtonsTelemetry(ctx, prep.report, { source, eventId, status: r.status })
@@ -265,6 +317,7 @@ async function chatSendCore(
   ctx: SessionCtx,
   args: ChatSendArgs,
   eventId?: string,
+  opts: ChatSendOpts = {},
 ): Promise<ChatSendResult> {
   const rawText = (args.text ?? "").replace(/<[^>]*>/g, "").trim()
   if (!rawText && !args.prompt) {
@@ -278,6 +331,10 @@ async function chatSendCore(
     if (!verdict.ok) {
       return { ok: false, status: 422, code: verdict.error, message: "botões inválidos" }
     }
+    // N87-07: prompt de uma negociação que o devedor abandonou (menu reaberto
+    // depois do evento de origem) nunca troca o menu da plataforma.
+    const superseded = await refuseIfEngineSuperseded(ctx, opts.originSentAt, "chat.send", args.n8n_execution_id, eventId)
+    if (superseded) return superseded
     // A2 (N-D2-5): com um menu protegido do assistido ATIVO, o prompt só entra se
     // for acionável (422 caso contrário — nada é gravado; o assistido fica).
     const guard = await guardProtectedActive(ctx, args.prompt)
@@ -509,13 +566,14 @@ async function refuseStaleReply(
 
 export type PromptAskResult =
   | { ok: true; prompt_id: string }
-  | { ok: false; status: number; code: string; message: string }
+  | { ok: false; status: number; code: string; message: string; reason?: string }
 
 /** prompt.ask (papel B): cria só um prompt (sem mensagem). A2: com um menu
  *  protegido do assistido ativo, só um prompt ACIONÁVEL substitui (senão 422). */
 export async function promptAsk(
   ctx: SessionCtx,
   argsIn: { kind: string; question: string; buttons: Button[]; n8n_execution_id?: string },
+  opts: ChatSendOpts = {},
 ): Promise<PromptAskResult> {
   // N8N-2: contrato de botões (lib/negotiation/n8n-buttons.ts). prompt.ask não
   // tem texto: sem nenhum botão utilizável → 422 buttons_invalid.
@@ -526,6 +584,9 @@ export async function promptAsk(
   const args = prep.prompt ? { ...argsIn, ...prep.prompt } : argsIn
   const verdict = validateButtons(args.buttons)
   if (!verdict.ok) return { ok: false, status: 422, code: verdict.error, message: "botões inválidos" }
+  // N87-07: idem ao chat.send.
+  const superseded = await refuseIfEngineSuperseded(ctx, opts.originSentAt, "prompt.ask", args.n8n_execution_id, undefined)
+  if (superseded) return superseded
   const guard = await guardProtectedActive(ctx, { kind: args.kind, buttons: args.buttons })
   if (!guard.actionable) return guard.refusal
   // N8N-9: prompt de uma execução da thread encerrada não entra na thread nova.
