@@ -426,18 +426,46 @@ export async function getAsaasPaymentViewingInfo(
 }
 
 /**
+ * A consulta das cobranças do cliente no ASAAS (guard de idempotência, fonte da
+ * verdade) falhou ou voltou num formato inesperado. Quem cria cobrança NUNCA
+ * trata isso como "sem cobranças": para e devolve um resultado retentável.
+ */
+export class AsaasGuardUnavailableError extends Error {
+  readonly code = "ASAAS_GUARD_UNAVAILABLE"
+  constructor(customerId: string, cause?: string) {
+    super(`ASAAS guard indisponível para ${customerId}${cause ? `: ${cause}` : ""}`)
+    this.name = "AsaasGuardUnavailableError"
+  }
+}
+
+export function isAsaasGuardUnavailable(err: unknown): err is AsaasGuardUnavailableError {
+  return err instanceof AsaasGuardUnavailableError ||
+    (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ASAAS_GUARD_UNAVAILABLE")
+}
+
+/**
  * Get payments for a customer from ASAAS.
+ *
+ * Fail-closed: erro do ASAAS (ou resposta sem `data` em array) LANÇA
+ * AsaasGuardUnavailableError. Antes devolvia [] e o guard ASAAS deixava a
+ * cobrança passar no escuro. Consumidores só-leitura (ex.: resolver link) já
+ * tratam a exceção como "não achei".
  */
 export async function getAsaasPaymentsForCustomer(
   customerId: string
 ): Promise<AsaasPayment[]> {
+  let data: any
   try {
-    const data = await asaasRequest(`/payments?customer=${customerId}`, "GET")
-    return data.data || []
+    data = await asaasRequest(`/payments?customer=${customerId}`, "GET")
   } catch (error: any) {
-    console.error(`[ASAAS] Error fetching payments for customer ${customerId}:`, error.message)
-    return []
+    console.error(`[ASAAS] Error fetching payments for customer ${customerId}:`, error?.message)
+    throw new AsaasGuardUnavailableError(customerId, error?.message)
   }
+  if (!Array.isArray(data?.data)) {
+    console.error(`[ASAAS] Unexpected payments list for customer ${customerId}`)
+    throw new AsaasGuardUnavailableError(customerId, "resposta sem lista de cobranças")
+  }
+  return data.data
 }
 
 /**
