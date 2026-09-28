@@ -200,4 +200,28 @@ describe("getAsaasPaymentsForCustomer (real) — lança em vez de devolver []", 
     withFetch(async () => json(200, { data: [{ id: "pay_1", status: "PENDING" }] }))
     await expect(real.getAsaasPaymentsForCustomer("cus_x")).resolves.toEqual([{ id: "pay_1", status: "PENDING" }])
   })
+
+  it("pagina: cobrança viva na 2ª página entra na lista (limit=100 + offset)", async () => {
+    process.env.ASAAS_API_KEY = "test-key"
+    const real = await vi.importActual<typeof import("@/lib/asaas")>("@/lib/asaas")
+    const urls: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (u: string) => {
+      urls.push(String(u))
+      const first = String(u).includes("offset=0")
+      return json(200, first
+        ? { data: Array.from({ length: 100 }, (_, i) => ({ id: `pay_old_${i}`, status: "RECEIVED" })), hasMore: true }
+        : { data: [{ id: "pay_live", status: "PENDING" }], hasMore: false })
+    }))
+    const list = await real.getAsaasPaymentsForCustomer("cus_x")
+    expect(list).toHaveLength(101)
+    expect(list.some((p) => p.id === "pay_live")).toBe(true)
+    expect(urls.every((u) => u.includes("limit=100"))).toBe(true)
+  })
+
+  it("acima do teto de páginas → falha fechado", async () => {
+    process.env.ASAAS_API_KEY = "test-key"
+    const real = await vi.importActual<typeof import("@/lib/asaas")>("@/lib/asaas")
+    withFetch(async () => json(200, { data: [{ id: "pay", status: "RECEIVED" }], hasMore: true }))
+    await expect(real.getAsaasPaymentsForCustomer("cus_x")).rejects.toMatchObject({ code: "ASAAS_GUARD_UNAVAILABLE" })
+  })
 })

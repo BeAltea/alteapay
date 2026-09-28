@@ -454,18 +454,28 @@ export function isAsaasGuardUnavailable(err: unknown): err is AsaasGuardUnavaila
 export async function getAsaasPaymentsForCustomer(
   customerId: string
 ): Promise<AsaasPayment[]> {
-  let data: any
-  try {
-    data = await asaasRequest(`/payments?customer=${customerId}`, "GET")
-  } catch (error: any) {
-    console.error(`[ASAAS] Error fetching payments for customer ${customerId}:`, error?.message)
-    throw new AsaasGuardUnavailableError(customerId, error?.message)
+  // O ASAAS pagina (default 10 por página): sem paginar, uma cobrança viva na 2ª
+  // página passaria despercebida pelo guard. Lê tudo, 100 por página; acima do teto
+  // o guard falha fechado (nunca "sem cobranças" com lista incompleta).
+  const PAGE = 100
+  const MAX_PAGES = 10
+  const all: AsaasPayment[] = []
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let data: any
+    try {
+      data = await asaasRequest(`/payments?customer=${customerId}&limit=${PAGE}&offset=${page * PAGE}`, "GET")
+    } catch (error: any) {
+      console.error(`[ASAAS] Error fetching payments for customer ${customerId}:`, error?.message)
+      throw new AsaasGuardUnavailableError(customerId, error?.message)
+    }
+    if (!Array.isArray(data?.data)) {
+      console.error(`[ASAAS] Unexpected payments list for customer ${customerId}`)
+      throw new AsaasGuardUnavailableError(customerId, "resposta sem lista de cobranças")
+    }
+    all.push(...data.data)
+    if (data.hasMore !== true) return all
   }
-  if (!Array.isArray(data?.data)) {
-    console.error(`[ASAAS] Unexpected payments list for customer ${customerId}`)
-    throw new AsaasGuardUnavailableError(customerId, "resposta sem lista de cobranças")
-  }
-  return data.data
+  throw new AsaasGuardUnavailableError(customerId, `mais de ${PAGE * MAX_PAGES} cobranças`)
 }
 
 /**
