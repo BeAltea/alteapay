@@ -30,6 +30,7 @@ import {
   type PromptView,
 } from "@/lib/journey/prompts"
 import {
+  readLatestAckAppend,
   buildAckContext,
   debtConsultReply,
   handleDebtConsult,
@@ -51,7 +52,7 @@ import {
 } from "@/lib/journey/acknowledgement"
 import { acceptMatrixCondition } from "@/lib/journey/assisted"
 import { checkEffectDoubleTap, isDoubleTapHandoff, isDuplicateClick, lastCustomerClick } from "@/lib/journey/double-tap"
-import { payChargeStartBudgetMs, payService, POST_PAYMENT_LINK_KIND } from "@/lib/journey/pay"
+import { payChargeStartBudgetMs, payService, POST_PAYMENT_LINK_KIND, prefetchIntegralOffer } from "@/lib/journey/pay"
 import { setSessionWaitState } from "@/lib/journey/session-wait"
 import { createServiceClient } from "@/lib/supabase/service"
 import { settledButtonBody } from "@/lib/journey/settled-state"
@@ -159,7 +160,14 @@ async function withChargeWaitState<T extends { ok: boolean }>(
     : processing
       ? "gerando_cobranca"
       : null
-  if (next !== "gerando_cobranca") await setSessionWaitState(sessionId, next)
+  // Latência (14-latencia-pagar): a última escrita do serviço (a pergunta do
+  // prompt pós-link, `pending`) termina junto com a marca final — as duas antes
+  // da resposta.
+  const pending = (result as { pending?: Promise<unknown> }).pending
+  await Promise.all([
+    next !== "gerando_cobranca" ? setSessionWaitState(sessionId, next) : Promise.resolve(),
+    pending ? pending.catch(() => {}) : Promise.resolve(),
+  ])
   return { result, wait_state: next }
 }
 
@@ -368,6 +376,21 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
 
   let prompt = fetchedPrompt
   if (!prompt) return NextResponse.json({ error: "prompt não encontrado", code: "prompt_not_found" }, { status: 404 })
+
+  // Latência (14-latencia-pagar): no Pagar do menu de 3 opções, a última linha
+  // do reconhecimento (sessão, dívida) — que o reconhecimento implícito lê — é
+  // lida JÁ, junto com a checagem de quitação (só leitura; nada é gravado antes
+  // da integridade do clique).
+  const payLatestAck =
+    buttonId === BTN_PAY && prompt.kind === "debt_three_options"
+      ? readLatestAckAppend(ctx.sessionId, ctx.debtId)
+      : null
+  payLatestAck?.catch(() => {}) // aguardado no reconhecimento (ou descartado)
+  // Idem para as LEITURAS da oferta integral (valor, ofertas/aceites da sessão,
+  // matriz, acordos e customer ASAAS do cliente): só leitura, nada é gravado
+  // antes da integridade do clique. Descartadas se o clique não seguir.
+  const payPrefetchDebtIds = payLatestAck ? debtIdsOf(prompt, ctx.debtId).debtIds : null
+  const payPrefetch = payPrefetchDebtIds ? prefetchIntegralOffer(ctx, payPrefetchDebtIds, { eager: true }) : null
 
   // F8-02: dívida quitada depois que a página carregou — o clique defasado é
   // respondido com o estado de quitado (nunca cobrança, menu ou caso novo).
@@ -633,8 +656,10 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
 
       // --- PAGAR [4] ---------------------------------------------------------
       if (buttonId === BTN_PAY) {
-        // 1) integridade do clique + eco + evento.
-        const answered = await answerPrompt(answerInput)
+        // 1) integridade do clique (a transição condicional do prompt é a trava);
+        //    eco + evento seguem em paralelo (latência) e são aguardados antes da
+        //    bolha do link e da resposta.
+        const answered = await answerPrompt({ ...answerInput, deferEcho: true })
         if (!answered.ok) {
           if (answered.code === "prompt_not_active") return staleOrDuplicate(ctx.sessionId, promptId, buttonId)
           return NextResponse.json({ error: answered.code, code: answered.code }, { status: answered.status })
@@ -643,10 +668,14 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         // D18. A1 (N-D1-5): NÃO regrava se a sessão já reconheceu (clique repetido).
         // Latência (10-latencia.md): corre em paralelo com a oferta integral e o
         // payService o aguarda ANTES da cobrança (o guard lê o reconhecimento).
+        // Latência: o payService só espera o APPEND-LOG (o que o guard lê); o
+        // evento/espelho da sessão terminam antes da resposta.
+        const echoWrite = answered.pending ?? Promise.resolve()
         const recognized = recognizeImplicitOnce({
           companyId: ctx.companyId, sessionId: ctx.sessionId, customerId: ctx.customerId,
           debtId: ctx.debtId, promptId, buttonId, source: "chat_three_options_pay", ip, userAgent,
-        })
+          returnPending: true,
+        }, payLatestAck && prompt.id === promptId ? { latest: payLatestAck } : undefined)
         recognized.catch(() => {}) // aguardado dentro do payService
         // payService (trilha D3): oferta integral 0% → link ASAAS canônico. NUNCA
         // 2ª cobrança; NUNCA declara pago. Persiste a bolha do link (outcome) e o
@@ -656,9 +685,24 @@ async function handleButton(req: NextRequest, requestStartedAt: number = Date.no
         // QA round 2 (QAB1-H1): wait_state='gerando_cobranca' ANTES do payService
         // (reload durante a cobrança reidrata a espera); limpo/'erro_cobranca' ao final.
         const tCharge = Date.now()
-        const { result: pay, wait_state: payWait } = await withChargeWaitState(ctx.sessionId, () =>
-          payService(ctx, { debtIds, primaryDebtId, requestStartedAt, beforeCharge: recognized }),
-        )
+        const { result: pay, wait_state: payWait } = await withChargeWaitState(ctx.sessionId, async () => {
+          try {
+            return await payService(ctx, {
+              debtIds, primaryDebtId, requestStartedAt, beforeCharge: recognized, beforeDeliver: echoWrite,
+              returnPending: true,
+              // só vale para o MESMO conjunto de dívidas (re-alvejamento pode trocar o prompt)
+              ...(payPrefetch && payPrefetchDebtIds && payPrefetchDebtIds.join(",") === debtIds.join(",")
+                ? { prefetch: payPrefetch }
+                : {}),
+            })
+          } finally {
+            // eco + auditoria do reconhecimento: concluídos antes da resposta.
+            await Promise.all([
+              echoWrite.catch(() => {}),
+              recognized.then((r) => r.pending, () => undefined).then(() => {}, () => {}),
+            ])
+          }
+        })
         const chargeMs = Date.now() - tCharge
         if (!pay.ok) {
           return withChargeTiming(NextResponse.json(

@@ -262,7 +262,7 @@ export async function getPrompt(promptId: string, sessionId: string): Promise<Pr
 }
 
 export type AnswerPromptResult =
-  | { ok: true; prompt: PromptRow; button: Button }
+  | { ok: true; prompt: PromptRow; button: Button; pending?: Promise<unknown> }
   | { ok: false; status: number; code: string }
 
 /**
@@ -291,6 +291,10 @@ export async function answerPrompt(input: {
   knownPrompt?: PromptRow | null
   /** Latência: época já lida pelo chamador. */
   threadEpoch?: number
+  /** Latência (14-latencia-pagar): responde logo após a transição (a trava do
+   *  clique) e devolve em `pending` o eco + evento — o chamador os aguarda antes
+   *  de gravar a próxima bolha e antes de responder. */
+  deferEcho?: boolean
 }): Promise<AnswerPromptResult> {
   const supabase = createServiceClient()
   const known =
@@ -343,7 +347,7 @@ export async function answerPrompt(input: {
   if (clickEpoch > 0) clickRow.thread_epoch = clickEpoch
   // eco do clique + auditoria em PARALELO (independentes). O evento é dedupado
   // por (prompt, botão) — um prompt só é respondido uma vez.
-  await Promise.all([
+  const echo = Promise.all([
     supabase.from("chat_messages").insert(clickRow),
     recordEvent({
       companyId: input.companyId,
@@ -361,6 +365,11 @@ export async function answerPrompt(input: {
   ])
 
   const answeredRow = Array.isArray(updated) ? (updated[0] as PromptRow) : (updated as PromptRow)
+  if (input.deferEcho) {
+    echo.catch(() => {}) // aguardado pelo chamador
+    return { ok: true, prompt: answeredRow, button, pending: echo }
+  }
+  await echo
   return { ok: true, prompt: answeredRow, button }
 }
 

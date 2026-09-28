@@ -57,9 +57,10 @@ import { payLinkMessageText } from "./pay-poll"
 import { createServiceClient } from "@/lib/supabase/service"
 import { isBlockingAgreement, isBlockingPayment } from "@/lib/asaas-idempotency"
 import { PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
-import { resolveMatrixRow } from "@/lib/negotiation/matrix"
+import { loadActiveMatrixRows, resolveMatrixRow } from "@/lib/negotiation/matrix"
 import { isPendingCharge } from "./charge-reconcile"
 import { timed } from "./server-timing"
+import { getAsaasPaymentsForCustomer } from "@/lib/asaas"
 import { runAfterResponse } from "./after-response"
 import {
   PAY_INTEGRAL_PURPOSE,
@@ -184,6 +185,10 @@ export async function publishPostPaymentLinkPrompt(
     /** Latência: escrita que precisa ficar ANTES da pergunta do pós-link no
      *  histórico (a bolha do link, gravada em paralelo pelo chamador). */
     precedingWrite?: () => Promise<unknown>
+    /** Latência (14-latencia-pagar): devolve o prompt assim que ele é gravado; a
+     *  bolha da pergunta (ligada a ele) vai em `onPending` e o chamador a aguarda
+     *  antes de responder. */
+    onPending?: (p: Promise<unknown>) => void
   },
 ): Promise<PromptRow | null> {
   if (!input.link) return null
@@ -210,16 +215,24 @@ export async function publishPostPaymentLinkPrompt(
       ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
     })
     if (!created.ok) return null
-    if (input.precedingWrite) await input.precedingWrite().catch(() => {})
-    await persistAssistantMessage({
-      companyId: ctx.companyId,
-      sessionId: ctx.sessionId,
-      text: REOPEN_MENU_QUESTION,
-      promptId: created.prompt.id,
-      skipContentDedup: true,
-      freshPrompt: true,
-      ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
-    })
+    const question = (async () => {
+      if (input.precedingWrite) await input.precedingWrite().catch(() => {})
+      await persistAssistantMessage({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        text: REOPEN_MENU_QUESTION,
+        promptId: created.prompt.id,
+        skipContentDedup: true,
+        freshPrompt: true,
+        ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
+      })
+    })()
+    if (input.onPending) {
+      question.catch(() => {})
+      input.onPending(question)
+    } else {
+      await question
+    }
     return created.prompt
   } catch (err) {
     console.warn("[journey] publishPostPaymentLinkPrompt falhou (não fatal):", (err as Error).message)
@@ -414,6 +427,8 @@ export async function deliverPaymentOutcome(
     valor: number | null
     debtIds: string[]
     primaryDebtId?: string | null
+    /** ver publishPostPaymentLinkPrompt.onPending */
+    onPending?: (p: Promise<unknown>) => void
   },
 ): Promise<DeliveredPaymentOutcome> {
   const resolved = await resolveLiveChargeLink(ctx, input.payment)
@@ -439,6 +454,7 @@ export async function deliverPaymentOutcome(
         debtIds: input.debtIds,
         primaryDebtId: input.primaryDebtId ?? ctx.debtId,
         precedingWrite: () => linkMessageP,
+        ...(input.onPending ? { onPending: input.onPending } : {}),
       }),
     ])
     return {
@@ -506,6 +522,8 @@ export interface PayServiceOk {
   /** QA round 1 (QAA1-02): prompt ATIVO após a entrega (pós-link ou menu curto),
    *  no shape do GET — o client renderiza na hora. null só em 'processing'. */
   prompt?: PromptView | null
+  /** Latência: escrita final ainda em curso (só com opts.returnPending). */
+  pending?: Promise<unknown>
 }
 
 export interface PayServiceErr {
@@ -577,9 +595,92 @@ export function pickReusableIntegralOffer(
  * Uma oferta aceita cujo acordo foi cancelado/deletado NÃO é reusada: o clique
  * gera oferta nova → cobrança nova (runbook Q3.5).
  */
+/**
+ * Latência (14-latencia-pagar) — LEITURAS da oferta integral do Pagar, que só
+ * dependem da sessão e do conjunto de dívidas: podem começar antes da
+ * integridade do clique (a rota as dispara junto com a checagem de quitação).
+ * Nada é gravado aqui. Inclui os acordos NÃO cancelados do cliente nesta
+ * empresa (para o reuso da integral aceita, sem a 2ª rodada `in(id)`) e o
+ * customer ASAAS conhecido (para o guard ASAAS começar cedo, no payService).
+ */
+export interface IntegralOfferPrefetch {
+  ack: Promise<Awaited<ReturnType<typeof buildAckContext>>>
+  summary: Promise<DebtSummary>
+  matrixRows?: ReturnType<typeof loadActiveMatrixRows>
+  candidates: Promise<{ data: unknown[] | null }>
+  acceptances: Promise<{ data: unknown[] | null }>
+  /** acordos do cliente nesta empresa (todos os status) — lidos sob demanda
+   *  (só quando há integral aceita), ou já em curso no modo `eager`. */
+  customerAgreements: () => Promise<Array<Record<string, any>> | null>
+  knownAsaasCustomerId: Promise<string | null>
+}
+
+/** Memoiza um disparo (e dispara já quando `now`). */
+function once<T>(fn: () => Promise<T>, now: boolean): () => Promise<T> {
+  let p: Promise<T> | null = null
+  const get = () => (p ??= fn())
+  if (now) get()
+  return get
+}
+
+const LIVE_AGREEMENT_COLUMNS = "id, asaas_payment_id, payment_status, asaas_status, status, origin, offer_id, negotiation_session_id"
+
+export function prefetchIntegralOffer(
+  ctx: SessionCtx,
+  debtIds: string[],
+  /** `eager` (rota do Pagar): acordos e customer ASAAS já em curso. Sem ele,
+   *  os acordos só são lidos se precisar e o customer ASAAS não é lido. */
+  opts?: { eager?: boolean },
+): IntegralOfferPrefetch {
+  const supabase = createServiceClient()
+  const quiet = <T,>(p: Promise<T>): Promise<T> => { p.catch(() => {}); return p }
+  let matrixRows: ReturnType<typeof loadActiveMatrixRows> | undefined
+  try {
+    matrixRows = quiet(loadActiveMatrixRows(ctx.companyId))
+  } catch {
+    matrixRows = undefined // defensivo: resolveMatrixRow lê as linhas ele mesmo
+  }
+  return {
+    ack: quiet(buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds })),
+    summary: quiet(debtSummary(ctx, { recordView: false })),
+    matrixRows,
+    candidates: quiet(Promise.resolve(
+      supabase
+        .from("negotiation_offers")
+        .select("id, terms, status, valid_until, created_at")
+        .eq("session_id", ctx.sessionId)
+        .in("status", ["presented", "accepted"]),
+    ) as Promise<{ data: unknown[] | null }>),
+    acceptances: quiet(Promise.resolve(
+      supabase
+        .from("negotiation_acceptances")
+        .select("offer_id, agreement_id")
+        .eq("session_id", ctx.sessionId),
+    ) as Promise<{ data: unknown[] | null }>),
+    customerAgreements: once(() => quiet((async () => {
+      const { data, error } = await supabase
+        .from("agreements")
+        .select(LIVE_AGREEMENT_COLUMNS)
+        .eq("customer_id", ctx.customerId)
+        .eq("company_id", ctx.companyId)
+      return error ? null : ((data ?? []) as Array<Record<string, any>>)
+    })()), opts?.eager === true),
+    knownAsaasCustomerId: !opts?.eager ? Promise.resolve(null) : quiet((async () => {
+      const { data } = await supabase
+        .from("agreements")
+        .select("asaas_customer_id")
+        .eq("customer_id", ctx.customerId)
+        .not("asaas_customer_id", "is", null)
+        .limit(1)
+      return ((data as Array<{ asaas_customer_id?: string | null }> | null)?.[0]?.asaas_customer_id) ?? null
+    })()),
+  }
+}
+
 export async function ensureIntegralOffer(
   ctx: SessionCtx,
   debtIds: string[],
+  prefetched?: IntegralOfferPrefetch,
 ): Promise<
   | { ok: true; offerId: string; valor: number; summary?: DebtSummary; pending?: Promise<unknown> }
   | { ok: false; error: string }
@@ -598,27 +699,29 @@ export async function ensureIntegralOffer(
   //   rodada 2 (só se houver integral aceita): os acordos NÃO cancelados dessas
   //            integrais numa leitura `in(id)` — acordos cancelados nem voltam.
   const supabase = createServiceClient()
-  // Latência (10-latencia.md): o resumo do débito (aging) e a faixa da matriz só
-  // LEEM e não dependem do reuso → começam JÁ, em paralelo com a rodada 1. O
-  // evento debt.viewed continua gravado só quando o resumo é usado (abaixo).
-  const ackP = buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds })
-  const summaryP = debtSummary(ctx, { recordView: false })
+  // Latência (10-latencia.md / 14-latencia-pagar): o resumo do débito (aging),
+  // a faixa da matriz e os acordos do cliente só LEEM e não dependem do reuso →
+  // começam JÁ (ou vieram prontos da rota), em paralelo com a rodada 1. O evento
+  // debt.viewed continua gravado só quando o resumo é usado (abaixo).
+  const pre = prefetched ?? prefetchIntegralOffer(ctx, debtIds)
+  const ackP = pre.ack
+  const summaryP = pre.summary
+  // Latência (14-latencia-pagar): as linhas ativas da matriz também são lidas na
+  // rodada 1; a faixa é escolhida quando o aging chega (mesma regra de
+  // resolveMatrixRow), sem outra ida ao banco depois dele.
+  const matrixRowsP = pre.matrixRows
   const rowP = Promise.all([summaryP, ackP]).then(([s, a]) =>
-    resolveMatrixRow({ companyId: ctx.companyId, agingDays: s.agingDays, debtValue: round2(a.updatedValue) }),
+    resolveMatrixRow({
+      companyId: ctx.companyId, agingDays: s.agingDays, debtValue: round2(a.updatedValue),
+      ...(matrixRowsP ? { rows: matrixRowsP } : {}),
+    }),
   )
   summaryP.catch(() => {})
   rowP.catch(() => {}) // aguardados só no caminho que os usa
   const [ack, { data: candidates }, { data: acceptances }] = await Promise.all([
     ackP,
-    supabase
-      .from("negotiation_offers")
-      .select("id, terms, status, valid_until, created_at")
-      .eq("session_id", ctx.sessionId)
-      .in("status", ["presented", "accepted"]),
-    supabase
-      .from("negotiation_acceptances")
-      .select("offer_id, agreement_id")
-      .eq("session_id", ctx.sessionId),
+    pre.candidates,
+    pre.acceptances,
   ])
   const valor = round2(ack.updatedValue)
   if (!(valor > 0)) return { ok: false, error: "no_open_amount" }
@@ -640,12 +743,27 @@ export async function ensureIntegralOffer(
       ...new Set(reuse.acceptedIds.map((id) => agreementByOffer.get(id)).filter((v): v is string => !!v)),
     ]
     if (agreementIds.length > 0) {
-      const { data: ags } = await supabase
-        .from("agreements")
-        .select("id, asaas_payment_id, payment_status, asaas_status, status, origin, offer_id, negotiation_session_id")
-        .in("id", agreementIds)
-        .eq("company_id", ctx.companyId)
-        .neq("status", "cancelled")
+      // Latência: os acordos não cancelados do cliente já vieram na rodada 1; só
+      // os ids que não estão nela (acordo de outro cliente, raro) são lidos
+      // aqui — mesmo filtro (company_id, não cancelado) de antes.
+      const known = await pre.customerAgreements()
+      // mesmo filtro de antes (não cancelado), aplicado em memória
+      const byId = new Map(
+        (known ?? []).filter((a) => a.status != null && a.status !== "cancelled").map((a) => [a.id as string, a]),
+      )
+      const allIds = new Set((known ?? []).map((a) => a.id as string))
+      const missing = known ? agreementIds.filter((id) => !allIds.has(id)) : agreementIds
+      let extra: Array<Record<string, any>> = []
+      if (missing.length > 0) {
+        const { data } = await supabase
+          .from("agreements")
+          .select(LIVE_AGREEMENT_COLUMNS)
+          .in("id", missing)
+          .eq("company_id", ctx.companyId)
+          .neq("status", "cancelled")
+        extra = (data ?? []) as Array<Record<string, any>>
+      }
+      const ags = [...agreementIds.map((id) => byId.get(id)).filter(Boolean), ...extra]
       // QA rodada 5 (Q2-01): acordo pending_charge (espelho gravado antes do
       // ASAAS, função morta no meio) também é reusado — o clique repetido cai na
       // idempotência (session, offer) → 'processing' → o poll reconcilia. NUNCA
@@ -668,15 +786,21 @@ export async function ensureIntegralOffer(
   // linha de matriz → sem billing permitido conhecido → rótulo curto (a UI cai
   // no menu com atendimento). debtValue = `valor` (valor efetivamente cobrado =
   // updatedValue consolidado), consistente com o rótulo do botão.
-  const [summary, row] = await Promise.all([
-    summaryP,
-    rowP,
-    recordEvent({
-      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-      sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
-    }),
-  ])
-  if (!row) return { ok: false, error: "no_matrix_row" }
+  // debt.viewed (auditoria do resumo usado) segue gravado, mas não segura a
+  // oferta: termina junto com a auditoria da oferta, antes da resposta.
+  const viewedEvent = recordEvent({
+    companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+    sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
+  })
+  viewedEvent.catch(() => {})
+  const [summary, row] = await Promise.all([summaryP, rowP]).catch(async (err) => {
+    await viewedEvent.catch(() => {})
+    throw err
+  })
+  if (!row) {
+    await viewedEvent
+    return { ok: false, error: "no_matrix_row" }
+  }
 
   const firstDue = dueDatePlus(payLinkDueDays())
   const terms: OfferTerms = {
@@ -697,7 +821,10 @@ export async function ensureIntegralOffer(
   // Sanidade: a oferta integral 0%/1x tem que caber na matriz vigente (cabe
   // sempre — 0% <= max_discount_pct, 1 parcela não dispara checks de entrada).
   const verdict = validateProposedTerms(terms, row)
-  if (!verdict.ok) return { ok: false, error: "offer_outside_matrix" }
+  if (!verdict.ok) {
+    await viewedEvent
+    return { ok: false, error: "offer_outside_matrix" }
+  }
 
   const validUntil = new Date(
     Date.now() + row.proposal_validity_days * 86400_000,
@@ -715,7 +842,7 @@ export async function ensureIntegralOffer(
   })
   // Latência: a auditoria da oferta apresentada não bloqueia a cobrança — o
   // chamador (payService) a aguarda antes de responder.
-  const pending = recordEvent({
+  const presentedEvent = recordEvent({
     companyId: ctx.companyId,
     customerId: ctx.customerId,
     debtId: ctx.debtId,
@@ -724,6 +851,7 @@ export async function ensureIntegralOffer(
     actor: "system",
     payload: { offer_id: offerId, integral: true, installments: 1, discount_pct: 0 },
   })
+  const pending = Promise.all([viewedEvent, presentedEvent])
   return { ok: true, offerId, valor, summary, pending }
 }
 
@@ -757,13 +885,37 @@ export async function payService(
      *  corre em paralelo com a oferta integral e é aguardada antes da cobrança.
      *  Uma falha dela propaga (nenhuma cobrança é tentada). */
     beforeCharge?: Promise<unknown>
+    /** Latência: escrita do chamador que precisa ficar ANTES da bolha do link
+     *  no histórico (o eco do clique) — aguardada antes da entrega. */
+    beforeDeliver?: Promise<unknown>
+    /** Latência (14-latencia-pagar): leituras da oferta integral já em curso
+     *  (prefetchIntegralOffer, disparadas pela rota). */
+    prefetch?: IntegralOfferPrefetch
+    /** Latência: a última escrita da entrega (pergunta do pós-link) volta em
+     *  `pending` para o chamador aguardá-la junto com a marca final. */
+    returnPending?: boolean
   },
 ): Promise<PayServiceResult> {
+  let lastWrite: Promise<unknown> | null = null
   const eventId = opts?.eventId
   // Conjunto de dívidas cobradas = o MESMO do rótulo do botão (D3 ALTO). Sem
   // debt_ids explícitos, cai na dívida primária (single-debt path).
   const debtIds =
     opts?.debtIds && opts.debtIds.length > 0 ? opts.debtIds : [ctx.debtId]
+
+  // Latência (14-latencia-pagar): o guard ASAAS (cobranças do cliente — fonte da
+  // verdade do D7) começa JÁ, com o clique travado, em paralelo com a oferta; é
+  // concluído e avaliado dentro do confirmAccept ANTES de fechar/cobrar, como
+  // antes. Só com o customer ASAAS conhecido lido na mesma request.
+  let asaasGuard: Promise<{ id: string | null; payments: unknown[] | null }> | undefined
+  if (opts?.prefetch) {
+    asaasGuard = opts.prefetch.knownAsaasCustomerId.then(async (id) => {
+      if (!id) return { id: null, payments: null }
+      const payments = await timed("guard_asaas", () => getAsaasPaymentsForCustomer(id))
+      return { id, payments: payments as unknown[] }
+    })
+    asaasGuard.catch(() => {}) // falha → confirmAccept relê (readConfirmGuards)
+  }
 
   // Telemetria (clique PAGAR chegou): depois da resposta quando a plataforma
   // garante a conclusão (latência, 10-latencia.md); senão em PARALELO com a oferta.
@@ -779,7 +931,7 @@ export async function payService(
         payload: { option: "pagar" },
       }),
     ),
-    timed("offer", () => ensureIntegralOffer(ctx, debtIds)),
+    timed("offer", () => ensureIntegralOffer(ctx, debtIds, opts?.prefetch)),
   ])
   if (!offer.ok) {
     if (opts?.beforeCharge) await opts.beforeCharge
@@ -796,10 +948,17 @@ export async function payService(
   const chargeNotAfter =
     typeof opts?.requestStartedAt === "number" ? opts.requestStartedAt + payChargeStartBudgetMs() : null
   const r = await timed("payment_create", () =>
-    paymentCreateOrExistingLink(ctx, offer.offerId, eventId, { summary: offer.summary, chargeNotAfter }),
+    paymentCreateOrExistingLink(ctx, offer.offerId, eventId, {
+      summary: offer.summary, chargeNotAfter, asaasGuard, returnPending: true,
+    }),
   )
 
   await offerAudit
+  // auditoria do fechamento (offer.accepted / agreement.created /
+  // payment.generated + supersede): corre em paralelo com a entrega e termina
+  // antes da resposta.
+  const closeAudit: Promise<unknown> = (r.ok ? (r as { pending?: Promise<unknown> }).pending : undefined) ?? Promise.resolve()
+  closeAudit.catch(() => {})
   if (!r.ok) {
     // Rótulo curto e estável (a copy humana é da UI, §5.4). NUNCA a mensagem
     // crua do ASAAS/HTTP/"n8n". Guards conhecidos (409/422) e erro genérico.
@@ -820,6 +979,7 @@ export async function payService(
       actor: "system",
       payload: { poll_after_ms: r.poll_after_ms },
     }).catch(() => {})
+    await closeAudit
     return {
       ok: true,
       link: null,
@@ -843,7 +1003,9 @@ export async function payService(
   // + menu curto. Telemetria em paralelo. Na cobrança já existente, o valor da
   // copy é o da COBRANÇA (um acordo 3x cobra o total com desconto, não o rótulo
   // "Pagar R$ X" do menu).
-  const [, delivered] = await timed("deliver", () => Promise.all([
+  if (opts?.beforeDeliver) await opts.beforeDeliver.catch(() => {})
+  const [, , delivered] = await timed("deliver", () => Promise.all([
+    closeAudit,
     emitPayLinkReady(ctx, payment, { already_charged: alreadyCharged }),
     deliverPaymentOutcome(ctx, {
       payment,
@@ -851,6 +1013,7 @@ export async function payService(
       valor: alreadyCharged ? (payment?.total_value ?? offer.valor) : offer.valor,
       debtIds,
       primaryDebtId: opts?.primaryDebtId ?? ctx.debtId,
+      ...(opts?.returnPending ? { onPending: (p: Promise<unknown>) => { lastWrite = p } } : {}),
     }),
   ]))
 
@@ -865,6 +1028,7 @@ export async function payService(
     post_prompt_id: delivered.postPromptId,
     prompt: delivered.prompt,
     link_message_id: delivered.linkMessageId ?? null,
+    ...(lastWrite ? { pending: lastWrite } : {}),
   }
 }
 

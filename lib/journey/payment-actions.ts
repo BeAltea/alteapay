@@ -21,7 +21,7 @@ import { findBlockingAgreement, findBlockingPayment, isTerminalAgreement } from 
 import { getAsaasPaymentsForCustomer } from "@/lib/asaas"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
 import { validateProposedTerms, type OfferTerms } from "@/lib/negotiation/offers"
-import { buildAcceptSummary, confirmAccept } from "./closing"
+import { applyOfferExpiry, buildAcceptSummary, confirmAccept, readConfirmGuards } from "./closing"
 import { debtSummary, registerPaymentClaim, rejectOffer, type DebtSummary, type SessionCtx } from "./actions"
 import { recordEvent } from "./events"
 import { assertAcknowledgedForPayment } from "./acknowledgement"
@@ -50,8 +50,8 @@ export interface PaymentDetails {
 }
 
 export type PaymentCreateResult =
-  | { ok: true; status: "created"; idempotent: boolean; payment: PaymentDetails }
-  | { ok: true; status: "processing"; idempotent: boolean; agreement_id: string; poll_after_ms: number }
+  | { ok: true; status: "created"; idempotent: boolean; payment: PaymentDetails; pending?: Promise<unknown> }
+  | { ok: true; status: "processing"; idempotent: boolean; agreement_id: string; poll_after_ms: number; pending?: Promise<unknown> }
   | { ok: false; status: number; code: string; message: string }
 
 async function loadTenantPaymentOrigin(companyId: string): Promise<"platform" | "n8n"> {
@@ -75,6 +75,11 @@ async function fetchPaymentDetails(agreementId: string, companyId: string): Prom
     .eq("id", agreementId)
     .eq("company_id", companyId)
     .maybeSingle()
+  return paymentDetailsFromRow(agreementId, data as Record<string, any> | null)
+}
+
+/** PaymentDetails a partir da linha do acordo (mesmas colunas de fetchPaymentDetails). */
+function paymentDetailsFromRow(agreementId: string, data: Record<string, any> | null): PaymentDetails {
   return {
     agreement_id: agreementId,
     payment_id: data?.asaas_payment_id ?? null,
@@ -178,6 +183,12 @@ export interface PaymentCreateOpts {
   /** QA rodada 5 (Q2-01): prazo (epoch ms) para a cobrança COMEÇAR — ver
    *  confirmAccept. Ausente = sem prazo (n8n/worker). */
   chargeNotAfter?: number | null
+  /** Latência (14-latencia-pagar): consulta do guard ASAAS já em curso (ver
+   *  readConfirmGuards). Continua obrigatória e avaliada antes de fechar/cobrar. */
+  asaasGuard?: Promise<{ id: string | null; payments: unknown[] | null }>
+  /** Latência: devolve a auditoria do fechamento em `pending` (o chamador a
+   *  aguarda antes de responder) em vez de segurar a entrega do link. */
+  returnPending?: boolean
 }
 
 export async function paymentCreate(
@@ -186,9 +197,27 @@ export async function paymentCreate(
   eventId?: string,
   opts?: PaymentCreateOpts,
 ): Promise<PaymentCreateResult> {
-  // QA rodada 5 (latência Q2-01/Q2-02): origem do tenant, idempotência por
-  // (sessão, oferta) e o guard de reconhecimento são LEITURAS independentes —
-  // correm em paralelo. A ordem das DECISÕES é a mesma de antes.
+  // Latência (14-latencia-pagar): TODAS as LEITURAS do payment.create correm
+  // numa leva só — origem do tenant, idempotência (sessão, oferta), guard de
+  // reconhecimento, quitação (F8-02), matriz vigente, resumo do aceite (sem
+  // gravar) e as leituras do guard duplo D7 (local + ASAAS) com a dívida/cliente
+  // do fechamento. Antes: 4 levas em série. As DECISÕES seguem exatamente a ordem
+  // de antes, cada uma sobre o seu dado; nenhuma escrita acontece antes delas, e
+  // os DOIS guards (local E ASAAS) terminam e passam antes do POST /payments.
+  const matrixP = assertOfferWithinMatrix(ctx, offerId, opts?.summary)
+  const preP = buildAcceptSummary(ctx, offerId, { readOnly: true })
+  // Defensivo: sem a leitura antecipada (módulo substituído/indisponível), o
+  // confirmAccept faz as leituras do guard ele mesmo, como antes.
+  let guardP: Promise<Awaited<ReturnType<typeof readConfirmGuards>> | undefined>
+  try {
+    guardP = readConfirmGuards(ctx, offerId, opts?.asaasGuard ? { asaas: opts.asaasGuard } : undefined)
+  } catch {
+    guardP = Promise.resolve(undefined)
+  }
+  // aguardados só no ponto de decisão de cada um (sem rejeição solta até lá).
+  matrixP.catch(() => {})
+  preP.catch(() => {})
+  guardP.catch(() => {})
   const [origin, existingAgreementId, ackGuard, debtPaid] = await timed("pre_checks", () => Promise.all([
     loadTenantPaymentOrigin(ctx.companyId),
     findExistingPaymentForOffer(ctx, offerId),
@@ -245,10 +274,7 @@ export async function paymentCreate(
   // Revalida a oferta contra a matriz VIGENTE (§3): fora da matriz → 422.
   // O servidor decide — se a matriz mudou e a oferta não cabe mais, não cobra.
   // Em paralelo com o resumo do aceite (as duas só LEEM a oferta).
-  const [matrix, pre] = await timed("matrix_summary", () => Promise.all([
-    assertOfferWithinMatrix(ctx, offerId, opts?.summary),
-    buildAcceptSummary(ctx, offerId),
-  ]))
+  const [matrix, pre] = await timed("matrix_summary", () => Promise.all([matrixP, preP]))
   if (!matrix.ok) {
     await rejectOffer(ctx, offerId, "system", matrix.code, eventId)
     return {
@@ -265,14 +291,21 @@ export async function paymentCreate(
   // valida a oferta e termos (passo 1) para obter o termsHash (revalida matriz
   // vigente dentro de confirmAccept → closeAgreement).
   if (!pre.ok) {
+    // leitura antecipada não grava: o 'expired' da oferta vencida é gravado aqui,
+    // no mesmo ponto da decisão de antes.
+    if (pre.expired) await applyOfferExpiry(offerId)
     return { ok: false, status: 409, code: pre.error, message: pre.error }
   }
 
   // `pre` já montado → confirmAccept NÃO refaz buildAcceptSummary (N-D1-1).
+  // Leitura do guard com falha → undefined: o confirmAccept relê (nunca decide
+  // sem os dois guards).
+  const guardReads = await guardP.catch(() => undefined)
   const result = await confirmAccept({
     ctx, offerId, termsHash: pre.summary.termsHash, eventId, pre: pre.summary,
     chargeNotAfter: opts?.chargeNotAfter ?? null,
     returnPendingAudit: true,
+    guardReads,
   })
   if (!result.ok) {
     if (result.error === "ALREADY_CHARGED") {
@@ -285,19 +318,26 @@ export async function paymentCreate(
     return { ok: false, status: 422, code: result.error, message: result.error }
   }
 
-  // Latência: a auditoria do fechamento termina em paralelo com a leitura do link.
+  // Latência: a linha do acordo gravada pelo write-back inline já traz as colunas
+  // do link (mesmo shape de fetchPaymentDetails); sem ela, relê como antes. A
+  // auditoria do fechamento termina em paralelo.
+  const audit = result.pending ?? Promise.resolve()
+  if (opts?.returnPending) audit.catch(() => {}) // aguardado pelo chamador
   const [details] = await Promise.all([
-    fetchPaymentDetails(result.agreementId, ctx.companyId),
-    result.pending ?? Promise.resolve(),
+    result.chargeRow && result.chargeRow.id === result.agreementId
+      ? Promise.resolve(paymentDetailsFromRow(result.agreementId, result.chargeRow))
+      : fetchPaymentDetails(result.agreementId, ctx.companyId),
+    opts?.returnPending ? Promise.resolve() : audit,
   ])
+  const pendingField = opts?.returnPending ? { pending: audit } : {}
   // CHARGE_MODE='inline': closeAgreement já criou a cobrança e gravou as URLs de
   // forma síncrona → payment_id presente → devolvemos 'created' com o link agora.
   // CHARGE_MODE='queue' (Workers 0/0, D5): sem link ainda → 'processing'; a UI/n8n
   // faz polling até o worker gravar as URLs.
   if (!details.payment_id) {
-    return { ok: true, status: "processing", idempotent: false, agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS }
+    return { ok: true, status: "processing", idempotent: false, agreement_id: result.agreementId, poll_after_ms: POLL_AFTER_MS, ...pendingField }
   }
-  return { ok: true, status: "created", idempotent: false, payment: details }
+  return { ok: true, status: "created", idempotent: false, payment: details, ...pendingField }
 }
 
 export type PaymentCreateOrLink =
