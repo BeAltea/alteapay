@@ -91,13 +91,21 @@ export interface CloseAgreementInput {
   /** QA rodada 5: customer_id já conhecido (sessão) — lido em paralelo com a
    *  dívida; conferido contra debts.customer_id (divergência → releitura). */
   customer_id_hint?: string
+  /** Latência (14-latencia-pagar): dívida (lida com company_id) e cliente JÁ
+   *  lidos pelo chamador nesta request. Usados só se a dívida é desta empresa e
+   *  o cliente é o da dívida; senão lê como antes. */
+  preloaded?: { debt: Record<string, any> | null; customer: Record<string, any> | null }
 }
 
 /** Resultado da criação da cobrança no fechamento (inline) ou do enfileiramento. */
 export type CloseChargeStatus = "created" | "failed" | "not_started" | "queued"
 
 export type CloseAgreementResult =
-  | { ok: true; agreement_id: string; message: string; terms: AgreementTerms; charge_status?: CloseChargeStatus }
+  | {
+      ok: true; agreement_id: string; message: string; terms: AgreementTerms; charge_status?: CloseChargeStatus
+      /** linha do acordo gravada pelo write-back inline (colunas de PaymentDetails). */
+      charge_row?: Record<string, unknown> | null
+    }
   | { ok: false; status: number; error: string }
 
 export async function closeAgreement(input: CloseAgreementInput): Promise<CloseAgreementResult> {
@@ -112,10 +120,16 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   const loadCustomer = (id: string) =>
     supabase.from("customers").select("id, name, document, email, phone").eq("id", id).maybeSingle()
   // QA rodada 5: dívida e cliente em paralelo quando a sessão já sabe o cliente.
-  const [{ data: debt, error: debtError }, hinted] = await Promise.all([
-    supabase.from("debts").select("*").eq("id", debt_id).eq("company_id", company_id).maybeSingle(),
-    input.customer_id_hint ? loadCustomer(input.customer_id_hint) : Promise.resolve(null),
-  ])
+  const pre = input.preloaded
+  const usePre =
+    !!pre && !!pre.debt && pre.debt.id === debt_id && pre.debt.company_id === company_id &&
+    !!input.customer_id_hint && !!pre.customer && pre.customer.id === input.customer_id_hint
+  const [{ data: debt, error: debtError }, hinted] = usePre
+    ? [{ data: pre!.debt, error: null }, { data: pre!.customer, error: null }]
+    : await Promise.all([
+        supabase.from("debts").select("*").eq("id", debt_id).eq("company_id", company_id).maybeSingle(),
+        input.customer_id_hint ? loadCustomer(input.customer_id_hint) : Promise.resolve(null),
+      ])
 
   if (debtError) throw debtError
   if (!debt) return { ok: false, status: 404, error: "Dívida não encontrada para esta empresa" }
@@ -269,12 +283,13 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   //  - 'inline': cria a cobrança na PRÓPRIA request (import dinâmico de
   //    charge-inline p/ nunca puxar lib/queue/Redis no caminho inline).
   // Em ambos os modos, falha na cobrança NÃO pode perder o acordo já registrado.
-  const result = (charge_status: CloseChargeStatus) => ({
+  const result = (charge_status: CloseChargeStatus, charge_row: Record<string, unknown> | null = null) => ({
     ok: true as const,
     agreement_id: agreement.id,
     message: `Acordo registrado. Pagamento: ${terms.summary}`,
     terms,
     charge_status,
+    charge_row,
   })
 
   if (mirrorError) {
@@ -294,7 +309,7 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
         console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge failed:", inline.error)
         return result(inline.notStarted ? "not_started" : "failed")
       }
-      return result("created")
+      return result("created", inline.row ?? null)
     } catch (inlineError: any) {
       console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge threw:", inlineError?.message)
       return result("failed")

@@ -57,7 +57,7 @@ import { payLinkMessageText } from "./pay-poll"
 import { createServiceClient } from "@/lib/supabase/service"
 import { isBlockingAgreement, isBlockingPayment } from "@/lib/asaas-idempotency"
 import { PAID_ASAAS_STATUSES } from "@/lib/constants/payment-status"
-import { resolveMatrixRow } from "@/lib/negotiation/matrix"
+import { loadActiveMatrixRows, resolveMatrixRow } from "@/lib/negotiation/matrix"
 import { isPendingCharge } from "./charge-reconcile"
 import { timed } from "./server-timing"
 import { runAfterResponse } from "./after-response"
@@ -603,8 +603,21 @@ export async function ensureIntegralOffer(
   // evento debt.viewed continua gravado só quando o resumo é usado (abaixo).
   const ackP = buildAckContext({ companyId: ctx.companyId, customerId: ctx.customerId, debtIds })
   const summaryP = debtSummary(ctx, { recordView: false })
+  // Latência (14-latencia-pagar): as linhas ativas da matriz também são lidas na
+  // rodada 1; a faixa é escolhida quando o aging chega (mesma regra de
+  // resolveMatrixRow), sem outra ida ao banco depois dele.
+  let matrixRowsP: ReturnType<typeof loadActiveMatrixRows> | undefined
+  try {
+    matrixRowsP = loadActiveMatrixRows(ctx.companyId)
+    matrixRowsP.catch(() => {})
+  } catch {
+    matrixRowsP = undefined // defensivo: resolveMatrixRow lê as linhas ele mesmo
+  }
   const rowP = Promise.all([summaryP, ackP]).then(([s, a]) =>
-    resolveMatrixRow({ companyId: ctx.companyId, agingDays: s.agingDays, debtValue: round2(a.updatedValue) }),
+    resolveMatrixRow({
+      companyId: ctx.companyId, agingDays: s.agingDays, debtValue: round2(a.updatedValue),
+      ...(matrixRowsP ? { rows: matrixRowsP } : {}),
+    }),
   )
   summaryP.catch(() => {})
   rowP.catch(() => {}) // aguardados só no caminho que os usa
@@ -668,15 +681,21 @@ export async function ensureIntegralOffer(
   // linha de matriz → sem billing permitido conhecido → rótulo curto (a UI cai
   // no menu com atendimento). debtValue = `valor` (valor efetivamente cobrado =
   // updatedValue consolidado), consistente com o rótulo do botão.
-  const [summary, row] = await Promise.all([
-    summaryP,
-    rowP,
-    recordEvent({
-      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-      sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
-    }),
-  ])
-  if (!row) return { ok: false, error: "no_matrix_row" }
+  // debt.viewed (auditoria do resumo usado) segue gravado, mas não segura a
+  // oferta: termina junto com a auditoria da oferta, antes da resposta.
+  const viewedEvent = recordEvent({
+    companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+    sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
+  })
+  viewedEvent.catch(() => {})
+  const [summary, row] = await Promise.all([summaryP, rowP]).catch(async (err) => {
+    await viewedEvent.catch(() => {})
+    throw err
+  })
+  if (!row) {
+    await viewedEvent
+    return { ok: false, error: "no_matrix_row" }
+  }
 
   const firstDue = dueDatePlus(payLinkDueDays())
   const terms: OfferTerms = {
@@ -697,7 +716,10 @@ export async function ensureIntegralOffer(
   // Sanidade: a oferta integral 0%/1x tem que caber na matriz vigente (cabe
   // sempre — 0% <= max_discount_pct, 1 parcela não dispara checks de entrada).
   const verdict = validateProposedTerms(terms, row)
-  if (!verdict.ok) return { ok: false, error: "offer_outside_matrix" }
+  if (!verdict.ok) {
+    await viewedEvent
+    return { ok: false, error: "offer_outside_matrix" }
+  }
 
   const validUntil = new Date(
     Date.now() + row.proposal_validity_days * 86400_000,
@@ -715,7 +737,7 @@ export async function ensureIntegralOffer(
   })
   // Latência: a auditoria da oferta apresentada não bloqueia a cobrança — o
   // chamador (payService) a aguarda antes de responder.
-  const pending = recordEvent({
+  const presentedEvent = recordEvent({
     companyId: ctx.companyId,
     customerId: ctx.customerId,
     debtId: ctx.debtId,
@@ -724,6 +746,7 @@ export async function ensureIntegralOffer(
     actor: "system",
     payload: { offer_id: offerId, integral: true, installments: 1, discount_pct: 0 },
   })
+  const pending = Promise.all([viewedEvent, presentedEvent])
   return { ok: true, offerId, valor, summary, pending }
 }
 
@@ -757,6 +780,9 @@ export async function payService(
      *  corre em paralelo com a oferta integral e é aguardada antes da cobrança.
      *  Uma falha dela propaga (nenhuma cobrança é tentada). */
     beforeCharge?: Promise<unknown>
+    /** Latência: escrita do chamador que precisa ficar ANTES da bolha do link
+     *  no histórico (o eco do clique) — aguardada antes da entrega. */
+    beforeDeliver?: Promise<unknown>
   },
 ): Promise<PayServiceResult> {
   const eventId = opts?.eventId
@@ -843,6 +869,7 @@ export async function payService(
   // + menu curto. Telemetria em paralelo. Na cobrança já existente, o valor da
   // copy é o da COBRANÇA (um acordo 3x cobra o total com desconto, não o rótulo
   // "Pagar R$ X" do menu).
+  if (opts?.beforeDeliver) await opts.beforeDeliver.catch(() => {})
   const [, delivered] = await timed("deliver", () => Promise.all([
     emitPayLinkReady(ctx, payment, { already_charged: alreadyCharged }),
     deliverPaymentOutcome(ctx, {

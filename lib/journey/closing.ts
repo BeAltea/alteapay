@@ -28,7 +28,11 @@ const termsHash = (terms: OfferTerms) =>
 /** Passo 1: monta o resumo para a UI (não escreve nada além do evento). */
 export async function buildAcceptSummary(
   ctx: SessionCtx, offerId: string,
-): Promise<{ ok: true; summary: AcceptSummary } | { ok: false; error: string }> {
+  /** Latência (14-latencia-pagar): `readOnly` = leitura antecipada (antes das
+   *  decisões que a precedem). Oferta vencida devolve `expired:true` SEM gravar;
+   *  quem chama grava o 'expired' quando chega à decisão (applyOfferExpiry). */
+  opts?: { readOnly?: boolean },
+): Promise<{ ok: true; summary: AcceptSummary } | { ok: false; error: string; expired?: boolean }> {
   const supabase = createServiceClient()
   // Latência (10-latencia.md): oferta e nome do credor são leituras
   // independentes → em paralelo (as decisões seguem a mesma ordem).
@@ -43,7 +47,8 @@ export async function buildAcceptSummary(
   ])
   if (!offer || offer.status !== "presented") return { ok: false, error: "OFFER_NOT_AVAILABLE" }
   if (offer.valid_until && new Date(offer.valid_until) < new Date()) {
-    await supabase.from("negotiation_offers").update({ status: "expired" }).eq("id", offerId)
+    if (opts?.readOnly) return { ok: false, error: "OFFER_EXPIRED", expired: true }
+    await applyOfferExpiry(offerId)
     return { ok: false, error: "OFFER_EXPIRED" }
   }
   return {
@@ -55,6 +60,74 @@ export async function buildAcceptSummary(
       creditorName: company?.name ?? "",
       termsHash: termsHash(offer.terms as OfferTerms),
     },
+  }
+}
+
+/** Grava o 'expired' de uma oferta vencida (o efeito de buildAcceptSummary). */
+export async function applyOfferExpiry(offerId: string): Promise<void> {
+  await createServiceClient().from("negotiation_offers").update({ status: "expired" }).eq("id", offerId)
+}
+
+/**
+ * Latência (14-latencia-pagar) — LEITURAS do guard duplo D7 feitas numa leva só
+ * (em paralelo com as demais leituras do payment.create): aceite anterior da
+ * oferta, acordos do cliente nesta empresa (guard LOCAL), customer ASAAS
+ * conhecido e — com ele — as cobranças do cliente no ASAAS (guard ASAAS, fonte
+ * da verdade). Também a dívida e o cliente que o fechamento usa. SÓ LÊ: as
+ * DECISÕES continuam em confirmAccept, na mesma ordem, e as duas verificações
+ * (local E ASAAS) terminam e passam ANTES de qualquer escrita/POST /payments.
+ */
+export interface ConfirmGuardReads {
+  prevAcceptAgreementId: string | null
+  agreements: PendingChargeRow[]
+  asaasCustomerId: string | null
+  /** cobranças do cliente no ASAAS (null = sem customer ASAAS conhecido). */
+  asaasPayments: unknown[] | null
+  /** dívida (company_id) e cliente lidos para o fechamento (closeAgreement). */
+  preloaded: { debt: Record<string, any> | null; customer: Record<string, any> | null } | null
+}
+
+export async function readConfirmGuards(ctx: SessionCtx, offerId: string): Promise<ConfirmGuardReads> {
+  const supabase = createServiceClient()
+  const knownP = supabase
+    .from("agreements")
+    .select("asaas_customer_id")
+    .eq("customer_id", ctx.customerId)
+    .not("asaas_customer_id", "is", null)
+    .limit(1)
+  // guard ASAAS começa assim que o customer ASAAS é conhecido (em paralelo com
+  // o guard local e com as demais leituras da leva).
+  const asaasP = (async () => {
+    const { data: known } = await knownP
+    const id = ((known as Array<{ asaas_customer_id?: string | null }> | null)?.[0]?.asaas_customer_id) ?? null
+    if (!id) return { id: null as string | null, payments: null as unknown[] | null }
+    const payments = await timed("guard_asaas", () => getAsaasPaymentsForCustomer(id))
+    return { id, payments: payments as unknown[] }
+  })()
+  const [{ data: prevAccept }, { data: agreements }, asaas, debtRes, customerRes] = await timed("guard_local", () => Promise.all([
+    supabase
+      .from("negotiation_acceptances")
+      .select("agreement_id")
+      .eq("offer_id", offerId)
+      .maybeSingle(),
+    supabase
+      .from("agreements")
+      .select("id, asaas_payment_id, payment_status, asaas_status, status, origin, offer_id, negotiation_session_id, debt_id, created_at")
+      .eq("customer_id", ctx.customerId)
+      .eq("company_id", ctx.companyId),
+    asaasP,
+    supabase.from("debts").select("*").eq("id", ctx.debtId).eq("company_id", ctx.companyId).maybeSingle(),
+    supabase.from("customers").select("id, name, document, email, phone").eq("id", ctx.customerId).maybeSingle(),
+  ]))
+  const preloadOk = !debtRes.error && !customerRes.error
+  return {
+    prevAcceptAgreementId: (prevAccept as { agreement_id?: string | null } | null)?.agreement_id ?? null,
+    agreements: (agreements ?? []) as PendingChargeRow[],
+    asaasCustomerId: asaas.id,
+    asaasPayments: asaas.payments,
+    preloaded: preloadOk
+      ? { debt: (debtRes.data as Record<string, any> | null) ?? null, customer: (customerRes.data as Record<string, any> | null) ?? null }
+      : null,
   }
 }
 
@@ -76,10 +149,13 @@ export interface ConfirmAcceptInput {
    *  supersede das demais ofertas) em `pending` em vez de aguardá-la — o
    *  chamador a aguarda em paralelo com a leitura do link, antes de responder. */
   returnPendingAudit?: boolean
+  /** Latência: leituras do guard duplo já feitas (readConfirmGuards) NESTA
+   *  request, depois da oferta existir. Ausente → lê aqui, como antes. */
+  guardReads?: ConfirmGuardReads
 }
 
 export type ConfirmAcceptResult =
-  | { ok: true; agreementId: string; pending?: Promise<unknown> }
+  | { ok: true; agreementId: string; pending?: Promise<unknown>; chargeRow?: Record<string, unknown> | null }
   | { ok: false; error: "OFFER_NOT_AVAILABLE" | "OFFER_EXPIRED" | "TERMS_CHANGED" | "ALREADY_CHARGED" | "CLOSE_FAILED" | "CHARGE_DEFERRED" }
 
 const deadlinePassed = (notAfter: number | null | undefined) =>
@@ -99,7 +175,15 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
     input.pre && input.pre.offerId === input.offerId && input.pre.termsHash === input.termsHash
       ? ({ ok: true, summary: input.pre } as const)
       : null
-  const [{ data: prevAccept }, preLoaded, { data: agreements }, { data: known }] = await timed("guard_local", () => Promise.all([
+  const g = input.guardReads
+  const [{ data: prevAccept }, preLoaded, { data: agreements }, { data: known }] = g
+    ? [
+        { data: g.prevAcceptAgreementId ? { agreement_id: g.prevAcceptAgreementId } : null },
+        preReady ?? (await buildAcceptSummary(ctx, input.offerId)),
+        { data: g.agreements },
+        { data: g.asaasCustomerId ? [{ asaas_customer_id: g.asaasCustomerId }] : [] },
+      ] as const
+    : await timed("guard_local", () => Promise.all([
     supabase
       .from("negotiation_acceptances")
       .select("agreement_id")
@@ -147,7 +231,11 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
   // ---- guard D7, nível ASAAS (fonte da verdade)
   const asaasCustomerId = (known?.[0]?.asaas_customer_id as string | undefined) ?? null
   if (!blocked && asaasCustomerId) {
-    const payments = await timed("guard_asaas", () => getAsaasPaymentsForCustomer(asaasCustomerId))
+    // lido na leva do guard (readConfirmGuards) ou aqui, como antes — sempre
+    // concluído e avaliado ANTES de fechar/cobrar.
+    const payments = g && g.asaasCustomerId === asaasCustomerId && g.asaasPayments
+      ? (g.asaasPayments as Awaited<ReturnType<typeof getAsaasPaymentsForCustomer>>)
+      : await timed("guard_asaas", () => getAsaasPaymentsForCustomer(asaasCustomerId))
     blocked = Boolean(findBlockingPayment(payments))
   }
   if (blocked) {
@@ -176,6 +264,7 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
     origin: `chat-journey session ${ctx.sessionId}`,
     channel: "journey",
     customer_id_hint: ctx.customerId,
+    ...(g?.preloaded ? { preloaded: g.preloaded } : {}),
     charge: { notAfter: input.chargeNotAfter ?? null, knownAsaasCustomerId: asaasCustomerId },
     journey: {
       session_id: ctx.sessionId,
@@ -243,7 +332,7 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
   ]))
   if (input.returnPendingAudit) {
     closeAudit.catch(() => {}) // aguardado pelo chamador
-    return { ok: true, agreementId: closed.agreement_id, pending: closeAudit }
+    return { ok: true, agreementId: closed.agreement_id, pending: closeAudit, chargeRow: closed.charge_row ?? null }
   }
   await closeAudit
 

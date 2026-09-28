@@ -1571,7 +1571,11 @@ export async function persistDebtRecognition(input: {
   mode?: "explicit" | "implicit"
   ip?: string | null
   userAgent?: string | null
-}): Promise<void> {
+  /** Latência (14-latencia-pagar): resolve assim que o append-log é gravado (é
+   *  o que o guard D18 lê) e devolve em `pending` o evento + espelho da sessão —
+   *  o chamador os aguarda antes de responder. Ausente → aguarda tudo, como antes. */
+  returnPending?: boolean
+}): Promise<{ pending?: Promise<unknown> }> {
   const supabase = createServiceClient()
   const ipHash = input.ip
     ? createHash("sha256").update(input.ip).digest("hex").slice(0, 32)
@@ -1606,7 +1610,7 @@ export async function persistDebtRecognition(input: {
   // 2) journey_events (debt.acknowledged | debt.not_recognized) e
   // 3) espelho do timestamp na sessão (só quando reconhece) — independentes entre
   //    si, ambos DEPOIS do append-log (latência: em paralelo).
-  await Promise.all([
+  const after = Promise.all([
     recordEvent({
       companyId: input.companyId,
       customerId: input.customerId,
@@ -1623,6 +1627,12 @@ export async function persistDebtRecognition(input: {
           .eq("id", input.sessionId)
       : Promise.resolve(null),
   ])
+  if (input.returnPending) {
+    after.catch(() => {}) // aguardado pelo chamador
+    return { pending: after }
+  }
+  await after
+  return {}
 }
 
 /** Comportamento do tenant no "Não reconheço" (default continue). */
@@ -2141,8 +2151,9 @@ export async function recognizeImplicit(input: {
   source: string
   ip?: string | null
   userAgent?: string | null
-}): Promise<void> {
-  await persistDebtRecognition({
+  returnPending?: boolean
+}): Promise<{ pending?: Promise<unknown> }> {
+  return persistDebtRecognition({
     companyId: input.companyId,
     sessionId: input.sessionId,
     customerId: input.customerId,
@@ -2154,6 +2165,7 @@ export async function recognizeImplicit(input: {
     source: input.source,
     ip: input.ip,
     userAgent: input.userAgent,
+    returnPending: input.returnPending,
   })
 }
 
@@ -2165,21 +2177,33 @@ export async function recognizeImplicit(input: {
  */
 export async function recognizeImplicitOnce(
   input: Parameters<typeof recognizeImplicit>[0],
-): Promise<{ recorded: boolean }> {
+  /** Latência (14-latencia-pagar): `latest` = leitura de readLatestAckAppend
+   *  JÁ feita nesta request (mesma consulta); ausente → lê aqui. */
+  opts?: { latest?: Promise<{ acknowledged?: boolean } | null> },
+): Promise<{ recorded: boolean; pending?: Promise<unknown> }> {
   // Lê o APPEND-LOG (fonte da view debt_acknowledgement_latest): a última
   // resposta desta (sessão, dívida). Positiva → nada a regravar.
+  const latest = opts?.latest ? await opts.latest : await readLatestAckAppend(input.sessionId, input.debtId)
+  if (latest?.acknowledged === true) return { recorded: false }
+  const r = await recognizeImplicit(input)
+  return { recorded: true, pending: r.pending }
+}
+
+/** Última linha do append-log de reconhecimento desta (sessão, dívida). */
+export async function readLatestAckAppend(
+  sessionId: string,
+  debtId: string,
+): Promise<{ acknowledged?: boolean } | null> {
   const supabase = createServiceClient()
   const { data: latest } = await supabase
     .from("debt_acknowledgements")
     .select("acknowledged, created_at")
-    .eq("session_id", input.sessionId)
-    .eq("debt_id", input.debtId)
+    .eq("session_id", sessionId)
+    .eq("debt_id", debtId)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle()
-  if ((latest as { acknowledged?: boolean } | null)?.acknowledged === true) return { recorded: false }
-  await recognizeImplicit(input)
-  return { recorded: true }
+  return (latest as { acknowledged?: boolean } | null) ?? null
 }
 
 export type AckGuard =

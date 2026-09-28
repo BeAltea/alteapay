@@ -59,6 +59,9 @@ export interface InlineChargeResult {
    *  enviada ao ASAAS (prazo `notAfter` estourado antes do POST /payments). O
    *  chamador pode cancelar o acordo com segurança: não há cobrança órfã. */
   notStarted?: boolean
+  /** Latência: a linha do acordo devolvida pelo próprio write-back (colunas de
+   *  PaymentDetails) — o chamador não precisa relê-la. null se não gravou. */
+  row?: Record<string, unknown> | null
 }
 
 /** QA rodada 5 (Q2-01) — opções do caminho inline (todas opcionais). */
@@ -81,6 +84,10 @@ export interface InlineChargeOpts {
    *  AGUARDADO aqui, antes do POST /payments (mesma ordem de antes). */
   customerUpdate?: Promise<unknown> | null
 }
+
+/** Colunas do acordo que o payment.create devolve (fetchPaymentDetails). */
+export const WRITEBACK_ROW_COLUMNS =
+  "id, asaas_payment_id, asaas_billing_type, asaas_pix_qrcode_url, asaas_boleto_url, asaas_invoice_url, asaas_payment_url, due_date, agreed_amount, installments, installment_amount"
 
 const deadlinePassed = (notAfter: number | null | undefined) =>
   typeof notAfter === "number" && Date.now() > notAfter
@@ -199,7 +206,7 @@ export async function createAsaasChargeInline(
       })
       .eq("id", agreementId)
       .eq("company_id", metadata.companyId)
-      .select("id"))
+      .select(WRITEBACK_ROW_COLUMNS))
 
     if (updateError || !updated?.length) {
       console.warn(
@@ -212,6 +219,7 @@ export async function createAsaasChargeInline(
       ok: true,
       paymentId: asaasPayment.id,
       invoiceUrl: asaasPayment.invoiceUrl ?? null,
+      row: (Array.isArray(updated) && updated[0] ? (updated[0] as Record<string, unknown>) : null),
     }
   } catch (error: any) {
     console.error(`[CHARGE-INLINE] Failed to create charge for agreement ${agreementId}:`, error?.message)

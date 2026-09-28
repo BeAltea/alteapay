@@ -50,13 +50,22 @@ export async function resolveMatrixRow(input: {
   agingDays: number
   debtValue: number
   at?: Date
+  /** Latência: linhas ativas JÁ em leitura (loadActiveMatrixRows do mesmo
+   *  company_id) — evita uma ida ao banco depois do aging. */
+  rows?: Promise<MatrixRow[]>
 }): Promise<MatrixRow | null> {
+  const rows = input.rows ? await input.rows : await loadActiveMatrixRows(input.companyId)
+  return pickMatrixRow(rows, input.agingDays, input.debtValue, input.at ?? new Date())
+}
+
+/** Linhas ATIVAS da matriz do tenant (a mesma leitura de resolveMatrixRow). */
+export async function loadActiveMatrixRows(companyId: string): Promise<MatrixRow[]> {
   const supabase = createServiceClient()
   const { data, error } = await supabase
     .from("negotiation_condition_matrix")
     .select("*")
-    .eq("company_id", input.companyId)
+    .eq("company_id", companyId)
     .eq("active", true)
   if (error) throw new Error(`resolveMatrixRow: ${error.message}`)
-  return pickMatrixRow((data ?? []) as MatrixRow[], input.agingDays, input.debtValue, input.at ?? new Date())
+  return (data ?? []) as MatrixRow[]
 }
