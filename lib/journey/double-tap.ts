@@ -217,13 +217,22 @@ export async function checkEffectDoubleTap(input: {
   source: "button" | "reopen"
   recheckAfterMs?: number
   nowMs?: number
+  /** Latência: último clique JÁ lido pelo chamador nesta request (evita reler). */
+  prefetchedLast?: { at: string | null; buttonId: number | null }
+  /** instante (epoch ms) em que a leitura prefetchedLast COMEÇOU — base da pausa. */
+  prefetchedAtMs?: number
 }): Promise<DoubleTapCheck> {
   if (!EFFECT_BUTTON_IDS.has(input.buttonId)) return { doubleTap: false, lastClickAt: null }
   const startMs = input.nowMs ?? Date.now()
-  let last = await lastCustomerClick(input.sessionId)
+  const t0 = input.prefetchedAtMs ?? Date.now()
+  let last = input.prefetchedLast ?? (await lastCustomerClick(input.sessionId))
   let doubleTap = isEffectDoubleTap(last, input.buttonId, startMs)
   if (!doubleTap && input.recheckAfterMs && input.recheckAfterMs > 0) {
-    await new Promise((r) => setTimeout(r, input.recheckAfterMs))
+    // Latência: a pausa conta a partir do INÍCIO do exame (a 1ª leitura já
+    // consumiu parte dela) — a releitura continua ≥ recheckAfterMs depois do
+    // início e depois da 1ª leitura, como antes, sem somar a ida ao banco.
+    const rest = input.recheckAfterMs - (Date.now() - t0)
+    if (rest > 0) await new Promise((r) => setTimeout(r, rest))
     last = await lastCustomerClick(input.sessionId)
     // a janela é medida contra o instante em que ESTE clique chegou.
     doubleTap = isEffectDoubleTap(last, input.buttonId, startMs)

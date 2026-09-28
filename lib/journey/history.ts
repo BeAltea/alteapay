@@ -18,6 +18,8 @@ export interface ChatMessageView {
   engine: string | null
   latency_ms: number | null
   created_at: string
+  /** N8N-9: thread (época) da mensagem; NULL = época 0. Só na visão do cliente. */
+  thread_epoch?: number | null
 }
 
 export interface PromptView {
@@ -100,7 +102,7 @@ export async function customerHistory(sessionId: string, companyId: string): Pro
   const supabase = createServiceClient()
   const { data: msgs } = await supabase
     .from("chat_messages")
-    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, latency_ms, created_at")
+    .select("id, role, text, button_id, prompt_id, n8n_execution_id, engine, latency_ms, thread_epoch, created_at")
     .eq("session_id", sessionId)
     .eq("company_id", companyId)
     .order("created_at", { ascending: true })

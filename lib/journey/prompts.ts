@@ -15,6 +15,7 @@ import {
   validateButtons,
 } from "./buttons"
 import { recordEvent } from "./events"
+import { runAfterResponse } from "./after-response"
 
 /**
  * C3 (trilha D2): época (thread) corrente da sessão para carimbar nas inserts de
@@ -192,22 +193,33 @@ export async function createPrompt(input: CreatePromptInput): Promise<CreateProm
     .single()
   if (error || !data) return { ok: false, error: error?.message ?? "prompt_insert_failed" }
 
-  await recordEvent({
-    companyId: input.companyId,
-    sessionId: input.sessionId,
-    type: "chat.turn.assistant",
-    actor: input.createdBy === "n8n" ? "n8n" : "system",
-    payload: { prompt: true, prompt_id: data.id, kind: input.kind, created_at: now },
-    eventId: `prompt.ask|${data.id}`,
-  })
+  // Telemetria do prompt publicado (o próprio chat_prompts é o registro durável):
+  // depois da resposta quando a plataforma garante a conclusão (latência).
+  await runAfterResponse("evento prompt.ask", () =>
+    recordEvent({
+      companyId: input.companyId,
+      sessionId: input.sessionId,
+      type: "chat.turn.assistant",
+      actor: input.createdBy === "n8n" ? "n8n" : "system",
+      payload: { prompt: true, prompt_id: data.id, kind: input.kind, created_at: now },
+      eventId: `prompt.ask|${data.id}`,
+    }),
+  )
   return { ok: true, prompt: data as PromptRow }
 }
 
 /**
- * QA rodada 6 (Q2r2-02) — limpa `wait_state='erro_cobranca'` da sessão (só esse
- * estado). Chamado quando qualquer outra ação/prompt é publicado: o erro de
- * cobrança nunca coexiste com o menu. Defensivo: nunca lança.
+ * QA rodada 6 (Q2r2-02) — limpa `wait_state='erro_cobranca'` da sessão.
+ * Chamado quando qualquer outra ação/prompt é publicado: o erro de cobrança
+ * nunca coexiste com o menu. N8N-7: o mesmo vale para a espera do motor
+ * (`aguardando_motor`/`menu_degradado`) — um prompt novo (resposta do n8n pelo
+ * webhook, menu reaberto pelo guard N8N-6) encerra a espera; sem isso o F5
+ * reidratava o menu de degradação JUNTO do prompt novo (dois menus). Nunca
+ * toca `gerando_cobranca`/`link_entregue`. Uma escrita só. Defensivo: nunca lança.
  */
+/** wait_states que um prompt novo aposenta (N8N-7: inclui a espera do motor). */
+export const RETIRED_BY_NEW_PROMPT: readonly string[] = ["erro_cobranca", "aguardando_motor", "menu_degradado"]
+
 export async function retireChargeError(
   supabase: ReturnType<typeof createServiceClient>,
   sessionId: string,
@@ -217,7 +229,7 @@ export async function retireChargeError(
       .from("negotiation_sessions")
       .update({ wait_state: null, wait_started_at: null })
       .eq("id", sessionId)
-      .eq("wait_state", "erro_cobranca")
+      .in("wait_state", [...RETIRED_BY_NEW_PROMPT])
   } catch (err) {
     console.warn("[journey] retireChargeError falhou (defensivo):", (err as Error).message)
   }
@@ -273,9 +285,19 @@ export async function answerPrompt(input: {
   buttonId: number
   /** id do prompt obsoleto que o devedor clicou (re-alvejado para este). */
   retargetedFrom?: string | null
+  /** Latência: linha do prompt que o chamador ACABOU de ler (mesmo id/sessão) —
+   *  evita reler. A transição condicional (status='active') abaixo continua sendo
+   *  a garantia contra cliques concorrentes. */
+  knownPrompt?: PromptRow | null
+  /** Latência: época já lida pelo chamador. */
+  threadEpoch?: number
 }): Promise<AnswerPromptResult> {
   const supabase = createServiceClient()
-  const prompt = await getPrompt(input.promptId, input.sessionId)
+  const known =
+    input.knownPrompt && input.knownPrompt.id === input.promptId && input.knownPrompt.session_id === input.sessionId
+      ? input.knownPrompt
+      : null
+  const prompt = known ?? (await getPrompt(input.promptId, input.sessionId))
   if (!prompt) return { ok: false, status: 404, code: "prompt_not_found" }
   if (prompt.status !== "active") return { ok: false, status: 409, code: "prompt_not_active" }
 
@@ -283,19 +305,25 @@ export async function answerPrompt(input: {
   if (!button) return { ok: false, status: 409, code: "button_invalid" }
 
   const now = new Date().toISOString()
-  // transição condicional: só converte se ainda estiver 'active' (anti-concorrência)
-  const { data: updated } = await supabase
-    .from("chat_prompts")
-    .update({
-      status: "answered",
-      answered_button_id: button.id,
-      answered_value: button.value ?? null,
-      answered_at: now,
-    })
-    .eq("id", prompt.id)
-    .eq("session_id", input.sessionId)
-    .eq("status", "active")
-    .select("*")
+  // transição condicional: só converte se ainda estiver 'active' (anti-concorrência).
+  // Latência: a época (leitura independente) corre em paralelo com a transição.
+  const [{ data: updated }, clickEpoch] = await Promise.all([
+    supabase
+      .from("chat_prompts")
+      .update({
+        status: "answered",
+        answered_button_id: button.id,
+        answered_value: button.value ?? null,
+        answered_at: now,
+      })
+      .eq("id", prompt.id)
+      .eq("session_id", input.sessionId)
+      .eq("status", "active")
+      .select("*"),
+    typeof input.threadEpoch === "number"
+      ? Promise.resolve(input.threadEpoch)
+      : currentThreadEpoch(input.sessionId),
+  ])
 
   if (!updated || (Array.isArray(updated) && updated.length === 0)) {
     // outro clique já converteu entre a leitura e o update
@@ -304,7 +332,6 @@ export async function answerPrompt(input: {
 
   // o clique também é uma mensagem do cliente (label + button_id + prompt_id).
   // C3: carimba a época corrente para a bolha do clique ficar na thread atual.
-  const clickEpoch = await currentThreadEpoch(input.sessionId)
   const clickRow: Record<string, unknown> = {
     company_id: input.companyId,
     session_id: input.sessionId,

@@ -127,6 +127,21 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolveRes
   //    formatos e confirmamos por dígitos (cobre pontuação parcial dos poucos
   //    casos). company_id SEMPRE restringe (nunca cruza tenant).
   const candidates = documentCandidates(doc)
+  // Latência (10-latencia.md): as faturas VMAX dependem só do documento (e do
+  // tenant) → a leitura começa JÁ, em paralelo com cliente/dívidas; só é usada
+  // (e o erro só é considerado) no desfecho "dívida aberta", como antes.
+  const invoicesP = (async () => {
+    try {
+      return await supabase
+        .from("vmax_invoices")
+        .select("fatura, vencimento, saldo")
+        .eq("id_company", input.companyId)
+        .eq("doc", doc)
+        .order("vencimento", { ascending: true })
+    } catch (err) {
+      return { data: null, error: { message: (err as Error)?.message ?? String(err) } }
+    }
+  })()
   const { data: direct, error: custErr } = await supabase
     .from("customers")
     .select("id, name, document")
@@ -196,12 +211,7 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolveRes
 
   // 3) aging + faturas: vmax_invoices é o detalhe mais fino (por fatura); se não
   //    houver, cai para o due_date mais antigo das dívidas. company_id via id_company.
-  const { data: invoices, error: invErr } = await supabase
-    .from("vmax_invoices")
-    .select("fatura, vencimento, saldo")
-    .eq("id_company", input.companyId)
-    .eq("doc", doc)
-    .order("vencimento", { ascending: true })
+  const { data: invoices, error: invErr } = await invoicesP
   if (invErr) throw new Error(`resolveByDocument/vmax_invoices: ${invErr.message}`)
 
   const oldestInvoiceDue = invoices?.[0]?.vencimento ?? null
@@ -234,11 +244,13 @@ export async function resolveByDocument(input: ResolveInput): Promise<ResolveRes
  * canônica local, gravada pelo fluxo de webhook do ASAAS) › `agreements.asaas_payment_date`
  * (data crua do ASAAS) › `debts.updated_at` (fallback: quando o pagamento foi
  * conciliado a dívida foi marcada 'paid'). Os agreements são casados por debt_id.
+ * Exportado para a retomada de sessão (settled-state.ts): o MESMO contexto de
+ * quitação do login.
  */
-async function consolidateSettled(
+export async function consolidateSettled(
   supabase: ReturnType<typeof createServiceClient>,
   companyId: string,
-  customer: CustomerRow,
+  customer: Pick<CustomerRow, "id" | "name">,
   doc: string,
   paid: DebtRow[],
 ): Promise<SettledDebtor> {

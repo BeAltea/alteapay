@@ -175,6 +175,33 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
     agreementData.proposal_valid_until = input.journey.valid_until
   }
 
+  const cpfCnpj = (customer.document || "").replace(/[^\d]/g, "")
+  const customerPhone = (customer.phone || "").replace(/[^\d]/g, "")
+  const chargeCustomer = {
+    name: customer.name || "Cliente",
+    cpfCnpj,
+    email: customer.email || undefined,
+    mobilePhone: customerPhone || undefined,
+  }
+  const chargeMode = (process.env.CHARGE_MODE || "queue").toLowerCase()
+
+  // Latência (10-latencia.md): no inline com customer ASAAS JÁ conhecido, o
+  // reforço de supressão de notificações (PUT /customers — não é cobrança) começa
+  // JÁ, em paralelo com a gravação do acordo e do espelho; a cobrança (POST
+  // /payments) só sai depois que ele termina, como antes.
+  const knownAsaasCustomerId = input.charge?.knownAsaasCustomerId || null
+  let customerUpdate: Promise<unknown> | null = null
+  if (chargeMode === "inline" && knownAsaasCustomerId) {
+    customerUpdate = import("@/lib/asaas").then(({ updateAsaasCustomer }) =>
+      updateAsaasCustomer(knownAsaasCustomerId, {
+        name: chargeCustomer.name,
+        email: chargeCustomer.email,
+        mobilePhone: chargeCustomer.mobilePhone,
+      }),
+    )
+    customerUpdate.catch(() => {}) // aguardado (e o erro tratado) no charge-inline
+  }
+
   const { data: agreement, error: agreementError } = await supabase
     .from("agreements")
     .insert(agreementData)
@@ -203,21 +230,17 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
     console.warn("[CLOSE-AGREEMENT] Failed to update debt status:", debtUpdateError?.message ?? "0 rows")
   }
 
-  const cpfCnpj = (customer.document || "").replace(/[^\d]/g, "")
-  const customerPhone = (customer.phone || "").replace(/[^\d]/g, "")
+  // Parcelado: o ASAAS já prefixa "Parcela N de M." em cada parcela do
+  // parcelamento (installmentCount) e replica a mesma description em todas —
+  // um sufixo fixo "parcela 1/N" contradizia o prefixo nas parcelas 2..N (F8-03).
   const chargeDescription =
     terms.installments === 1
       ? `Acordo ${agreement.id} - pagamento à vista`
-      : `Acordo ${agreement.id} - parcela 1/${terms.installments}`
+      : `Acordo ${agreement.id}`
 
   // Payload da cobrança — idêntico nos dois modos (fila e inline).
   const chargeJobData = {
-    customer: {
-      name: customer.name || "Cliente",
-      cpfCnpj,
-      email: customer.email || undefined,
-      mobilePhone: customerPhone || undefined,
-    },
+    customer: chargeCustomer,
     payment: {
       billingType: (input.journey ? input.journey.terms.billing_type : "UNDEFINED") as
         | "BOLETO"
@@ -259,11 +282,14 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
     return result("not_started")
   }
 
-  const chargeMode = (process.env.CHARGE_MODE || "queue").toLowerCase()
   if (chargeMode === "inline") {
     try {
       const { createAsaasChargeInline } = await import("@/lib/journey/charge-inline")
-      const inline = await createAsaasChargeInline(chargeJobData, input.charge ?? {})
+      const inline = await createAsaasChargeInline(chargeJobData, {
+        ...(input.charge ?? {}),
+        freshAgreement: true,
+        customerUpdate,
+      })
       if (!inline.ok) {
         console.warn("[CLOSE-AGREEMENT] Inline ASAAS charge failed:", inline.error)
         return result(inline.notStarted ? "not_started" : "failed")

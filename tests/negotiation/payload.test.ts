@@ -68,9 +68,10 @@ describe("buildEnvelope — superset compatível com o Apêndice A", () => {
 
   it("todo campo do exemplo do Apêndice A está presente com o mesmo tipo", () => {
     const env = buildEnvelope(baseInput())
-    // type (string) — NÃO `event`
+    // type (string, rótulo do tenant) + event (discriminador canônico fixo, N8N-14:
+    // o fluxo roteia por body.event — 09-n8n-routing-handoff §1)
     expect(env.type).toBe("chat.turn")
-    expect("event" in env).toBe(false)
+    expect(env.event).toBe("chat.turn")
     // thread_id (string), session_id/company_id (string), channel = webchat
     expect(env.thread_id).toBe(`web_${SID}`)
     expect(env.session_id).toBe(SID)

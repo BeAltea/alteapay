@@ -231,6 +231,30 @@ export function mockAsaasRequest(endpoint: string, method = "GET", body?: unknow
     return { invoiceViewedDate: null, boletoViewedDate: null }
   }
 
+  const pixQrCode = path.match(/^\/payments\/([^/]+)\/pixQrCode$/)
+  if (pixQrCode && m === "GET") {
+    const id = pixQrCode[1]
+    log("payment.pixQrCode", `id=${id}`) // nunca o payload
+    return {
+      success: true,
+      encodedImage: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      payload: `00020101021226MOCK${mockHex(`pix:${id}`)}5204000053039865802BR6304MOCK`,
+      expirationDate: `${today()} 23:59:59`,
+    }
+  }
+
+  const identificationField = path.match(/^\/payments\/([^/]+)\/identificationField$/)
+  if (identificationField && m === "GET") {
+    const id = identificationField[1]
+    log("payment.identificationField", `id=${id}`)
+    const digits = String(parseInt(mockHex(`bol:${id}`, 8), 16)).padStart(10, "0")
+    return {
+      identificationField: `00190000090${digits}000000000000000000000000000`.slice(0, 47),
+      nossoNumero: digits.slice(0, 8),
+      barCode: `0019000000000000000000000000000${digits}`.slice(0, 44),
+    }
+  }
+
   const resendNotification = path.match(/^\/payments\/([^/]+)\/resendNotification$/)
   if (resendNotification && m === "POST") {
     log("payment.resendNotification", `id=${resendNotification[1]}`)

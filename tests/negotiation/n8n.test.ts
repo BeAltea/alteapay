@@ -20,7 +20,7 @@ describe("n8n webhook security", () => {
   it("aceita assinatura válida dentro da janela", () => {
     const ts = String(nowSeconds())
     const sig = signN8nPayload(BODY, ts)
-    expect(verifyN8nRequest(BODY, sig, ts)).toEqual({ ok: true })
+    expect(verifyN8nRequest(BODY, sig, ts)).toEqual({ ok: true, matched: "current" })
   })
 
   it("rejeita corpo adulterado", () => {

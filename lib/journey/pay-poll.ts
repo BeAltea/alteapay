@@ -10,7 +10,7 @@
 /** Shape mínimo da resposta de GET /api/chat/payment que nos interessa. */
 export interface ChatPaymentResponse {
   ok?: boolean
-  status?: string // "generating" | "ready" | "failed" (QA rodada 5)
+  status?: string // "generating" | "ready" | "failed" (QA rodada 5) | "settled" (F8-02: sem link)
   payment?: {
     invoiceUrl?: string | null
     boletoUrl?: string | null

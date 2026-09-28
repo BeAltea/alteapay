@@ -304,6 +304,37 @@ export async function getAsaasPayment(paymentId: string): Promise<AsaasPayment> 
   return asaasRequest(`/payments/${paymentId}`)
 }
 
+/**
+ * PIX da cobrança (`GET /payments/{id}/pixQrCode`). O objeto de pagamento do
+ * ASAAS NÃO traz o copia-e-cola nem o QR: só este endpoint. `payload` é o
+ * copia-e-cola (BR Code) e `encodedImage` o PNG do QR em base64.
+ * NUNCA logar `payload`/`encodedImage` (é um meio de pagamento).
+ */
+export interface AsaasPixQrCode {
+  encodedImage?: string | null
+  payload?: string | null
+  expirationDate?: string | null
+}
+
+export async function getAsaasPixQrCode(paymentId: string): Promise<AsaasPixQrCode> {
+  return asaasRequest(`/payments/${paymentId}/pixQrCode`)
+}
+
+/**
+ * Linha digitável / código de barras do boleto
+ * (`GET /payments/{id}/identificationField`). O objeto de pagamento só traz o
+ * `bankSlipUrl` (PDF); a linha digitável vem deste endpoint.
+ */
+export interface AsaasIdentificationField {
+  identificationField?: string | null
+  nossoNumero?: string | null
+  barCode?: string | null
+}
+
+export async function getAsaasIdentificationField(paymentId: string): Promise<AsaasIdentificationField> {
+  return asaasRequest(`/payments/${paymentId}/identificationField`)
+}
+
 export async function getAsaasPaymentByExternalReference(
   externalReference: string
 ): Promise<AsaasPayment | null> {

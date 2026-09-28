@@ -13,6 +13,7 @@ import { normalizeDocument } from "@/lib/journey/document"
 import { resolveCompanyBySlug } from "@/lib/journey/resolver"
 import { slugAuthAllowed } from "@/lib/journey/slug-gate"
 import { resolvePublicLink } from "@/lib/journey/public-link"
+import { afterResponseMode } from "@/lib/journey/after-response"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -25,7 +26,16 @@ const MIN_RESPONSE_MS = 600
 // nunca do 1º elemento do X-Forwarded-For (forjável pelo cliente).
 const clientIp = (req: NextRequest): string | null => clientIpFromHeaders(req.headers)
 
+// Latência (10-latencia.md): `Server-Timing` (total + modo do pós-resposta) para
+// o QA separar servidor × rede. Sem PII. O padding de timing continua valendo.
 export async function POST(req: NextRequest) {
+  const t0 = Date.now()
+  const res = await handleAuth(req)
+  res.headers.set("Server-Timing", `total;dur=${Date.now() - t0}, after_${afterResponseMode()};dur=0`)
+  return res
+}
+
+async function handleAuth(req: NextRequest): Promise<NextResponse> {
   if (process.env.CHAT_JOURNEY_ENABLED !== "true") {
     return NextResponse.json({ error: "not found" }, { status: 404 })
   }

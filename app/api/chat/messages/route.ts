@@ -10,6 +10,8 @@ import { buildRecap } from "@/lib/journey/recap"
 import { annotateMessageGenerations, type GenerationPromptRow } from "@/lib/journey/display-class"
 import { isTerminalAgreement, type AgreementLike } from "@/lib/asaas-idempotency"
 import { isPromptPending } from "@/lib/journey/poll-order"
+import { filterN8nRowsForRead } from "@/lib/negotiation/n8n-text-guard"
+import { detectSessionSettlement, settledPollBody } from "@/lib/journey/settled-state"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -50,7 +52,28 @@ export async function GET(req: NextRequest) {
     ? base.gt("created_at", since).order("created_at", { ascending: true }).limit(200)
     : base.order("created_at", { ascending: false }).limit(200)
 
-  const [sessRes, msgRes, promptRes, activeRes, pinnedDebt, recap, deadPaymentLinks] = await Promise.all([
+  // Latência (10-latencia.md): a vivacidade dos links (acordos terminais) só
+  // depende das mensagens lidas → começa assim que elas chegam, em paralelo com o
+  // card fixo/recap (antes: uma ida a mais DEPOIS de tudo, em todo poll). Calcula
+  // sobre todas as linhas lidas (superconjunto da thread corrente) — o uso abaixo
+  // continua restrito às linhas da thread.
+  const msgQ = (async () => {
+    const ts = Date.now()
+    const r = await q
+    mark("messages", ts)
+    return r
+  })()
+  const livenessP = msgQ.then(async (r) => {
+    const tDead = Date.now()
+    const dead = await terminalAgreementIds(
+      supabase,
+      claims.cid,
+      ((r.data ?? []) as Array<{ offers_snapshot?: unknown }>),
+    )
+    mark("liveness", tDead)
+    return dead
+  })
+  const [sessRes, msgRes, promptRes, activeRes, pinnedDebt, recap, deadPaymentLinks, deadAgreementIds, settlement] = await Promise.all([
     // C3: época (thread) CORRENTE da sessão — o reset 24h incrementa thread_epoch
     // e ARQUIVA as linhas velhas. Estado de espera (M11): o client reconstrói a
     // máquina de espera a partir de wait_state/wait_started_at. DEFENSIVO: se as
@@ -78,12 +101,7 @@ export async function GET(req: NextRequest) {
         mark("session", ts)
       }
     })(),
-    (async () => {
-      const ts = Date.now()
-      const r = await q
-      mark("messages", ts)
-      return r
-    })(),
+    msgQ,
     // A3 (§2.4 / G4 / N3): GERAÇÃO por mensagem — join EM MEMÓRIA com os
     // chat_prompts da sessão. R-22: answered_at alimenta `prompt_pending`.
     supabase
@@ -118,6 +136,9 @@ export async function GET(req: NextRequest) {
         })(),
     // QA round 1 (QAA1-07): links MORTOS também no poll incremental.
     deadPaymentLinkHrefs(supabase, claims.sid, claims.cid),
+    livenessP,
+    // F8-02: dívida quitada depois que a sessão abriu → estado de quitado do login.
+    detectSessionSettlement({ sessionId: claims.sid, companyId: claims.cid }),
   ])
 
   const sessRow = sessRes
@@ -129,19 +150,21 @@ export async function GET(req: NextRequest) {
   // Filtra a THREAD CORRENTE (C3): época corrente OU null (=época 0, compat) e
   // NÃO-arquivada. As linhas de épocas anteriores ficam preservadas no banco (o
   // painel/recap as leem), mas não voltam à tela da conversa nova.
-  const inCurrentThread = (rawMessages ?? []).filter((m) => {
+  const inCurrentThreadRaw = (rawMessages ?? []).filter((m) => {
     const row = m as { thread_epoch?: number | null; archived_at?: string | null }
     if (row.archived_at != null) return false
     if (row.thread_epoch == null) return currentEpoch === 0
     return Number(row.thread_epoch) === currentEpoch
   })
 
+  // N8N-6 (API-06): texto do n8n que o guard recusaria (fallback do fluxo,
+  // número/estado que o servidor não produziu) não sai pela API — o filtro do
+  // client web (isGenericEngineFallback) fica só como defesa em profundidade.
+  const inCurrentThread = await filterN8nRowsForRead(inCurrentThreadRaw, { sessionId: claims.sid, companyId: claims.cid })
+
   // Anexa o botão-link e o marcador de estágio (offers_snapshot). A1-R1 — LINK
   // MORTO na retomada: a ação de uma bolha cujo acordo já é TERMINAL sai com
   // `live:false` (texto fica como histórico; o client não renderiza Abrir/Copiar).
-  const tDead = Date.now()
-  const deadAgreementIds = await terminalAgreementIds(supabase, claims.cid, inCurrentThread)
-  mark("liveness", tDead)
   const mapped = inCurrentThread.map((m) => {
     const snapshot = m.offers_snapshot as { message_action?: unknown; stage?: unknown; agreement_id?: unknown } | null
     const rawAction =
@@ -178,8 +201,7 @@ export async function GET(req: NextRequest) {
   const waitState: string | null = waitRow?.wait_state ?? null
   const waitStartedAt: string | null = waitRow?.wait_started_at ?? null
 
-  mark("total", t0)
-  const res = NextResponse.json({
+  const body = {
     ok: true,
     messages: messages ?? [],
     active_prompt: activePrompt ?? null,
@@ -193,7 +215,12 @@ export async function GET(req: NextRequest) {
     recap,
     dead_payment_links: deadPaymentLinks,
     server_time: serverTime,
-  })
+  }
+  const finalBody = settlement
+    ? await settledPollBody(body, { companyId: claims.cid, sessionId: claims.sid, settlement })
+    : body
+  mark("total", t0)
+  const res = NextResponse.json(finalBody)
   // QA round 4 (R-16/R-26, S7): etapas nomeadas para o QA separar servidor ×
   // rede × render. Sem PII.
   res.headers.set("Server-Timing", timing.join(", "))

@@ -27,6 +27,7 @@ import {
   bulkNegotiationsQueue,
 } from './queues';
 import { startHealthCheck } from './health';
+import { startEngineOutboxDrainer } from './workers/engine-outbox.drainer';
 
 console.log('==========================================');
 console.log('AlteaPay BullMQ Workers Starting...');
@@ -67,6 +68,9 @@ WorkerManager.startAllWorkers().then(() => {
   console.error('[WORKERS] Failed to start workers:', err);
   process.exit(1);
 });
+
+// N8N-10: dreno do engine_outbox (session.start/negotiation.start → n8n).
+startEngineOutboxDrainer();
 
 // Handle uncaught errors
 process.on('uncaughtException', (err) => console.error('[WORKERS] Uncaught:', err));

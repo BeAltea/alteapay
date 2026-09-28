@@ -19,6 +19,34 @@ export const PAID_ASAAS_STATUSES = ["RECEIVED", "RECEIVED_IN_CASH", "CONFIRMED"]
 // VMAX negotiation statuses that indicate PAID
 export const PAID_VMAX_STATUSES = ["PAGO"] as const
 
+/**
+ * Order of payment progress (payment_status or raw ASAAS status, any case).
+ * RECEIVED/RECEIVED_IN_CASH/DUNNING_RECEIVED > CONFIRMED > PENDING/OVERDUE.
+ * Statuses outside this ladder (REFUNDED, DELETED, chargeback, ...) have no rank
+ * and are never treated as a regression — refund/deletion paths always apply.
+ */
+const PAYMENT_STATUS_RANK: Record<string, number> = {
+  RECEIVED: 3,
+  RECEIVED_IN_CASH: 3,
+  DUNNING_RECEIVED: 3,
+  CONFIRMED: 2,
+  PENDING: 1,
+  AWAITING_RISK_ANALYSIS: 1,
+  OVERDUE: 1,
+}
+
+/**
+ * True when moving from `current` to `next` would step DOWN the payment ladder
+ * (e.g. received → confirmed after a late PAYMENT_CONFIRMED). Such a write must
+ * be skipped: a payment status never regresses.
+ */
+export function isPaymentStatusRegression(current?: string | null, next?: string | null): boolean {
+  if (!current || !next) return false
+  const from = PAYMENT_STATUS_RANK[current.toUpperCase()]
+  const to = PAYMENT_STATUS_RANK[next.toUpperCase()]
+  return from !== undefined && to !== undefined && to < from
+}
+
 // All possible "paid" status values (for SQL IN clauses)
 export const ALL_PAID_STATUSES = [
   ...PAID_AGREEMENT_STATUSES,

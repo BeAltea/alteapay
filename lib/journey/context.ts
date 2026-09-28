@@ -11,6 +11,7 @@ import { createHash } from "node:crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { agingDays } from "@/lib/negotiation/config"
 import { resolveMatrixRow } from "@/lib/negotiation/matrix"
+import { threadIdOf } from "@/lib/negotiation/payload"
 import type { OfferTerms } from "@/lib/negotiation/offers"
 import { maskDocument, normalizeDocument } from "./document"
 
@@ -18,6 +19,9 @@ const toCents = (reais: number) => Math.round((reais || 0) * 100)
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex")
 
 export interface SessionContext {
+  /** Chave de memória estável da sessão (negotiation_sessions.thread_id, ou
+   * `web_<session_id>` quando ausente) — viaja no TOPO do chat.turn (N8N-14). */
+  thread_id: string
   session: {
     id: string
     channel: "web_campaign" | "web_generic" | "admin_preview"
@@ -117,7 +121,7 @@ export async function buildSessionContext(
   const { data: session } = await supabase
     .from("negotiation_sessions")
     .select(
-      "id, company_id, customer_id, debt_id, primary_debt_id, debt_ids, channel, engine, identity_verified_at, consent_lgpd_at, consent_at, fulfillment_mode",
+      "id, company_id, customer_id, debt_id, primary_debt_id, debt_ids, channel, engine, identity_verified_at, consent_lgpd_at, consent_at, fulfillment_mode, thread_id",
     )
     .eq("id", sessionId)
     .maybeSingle()
@@ -213,6 +217,7 @@ export async function buildSessionContext(
     .maybeSingle()
 
   return {
+    thread_id: threadIdOf(session.id, (session as { thread_id?: string | null }).thread_id ?? null),
     session: {
       id: session.id,
       channel: (session.channel ?? "web_generic") as SessionContext["session"]["channel"],

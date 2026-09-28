@@ -193,6 +193,10 @@ describe("emitNegotiationStart (H7/H8)", () => {
     const rows = (db.engine_outbox ?? []).filter((x) => x.event_id === "evt-durable-500")
     expect(rows.length).toBe(1)
     expect(rows[0].status).toBe("pending") // NÃO perdida: reentrega no próximo flush
+    // N8N-10: nasce sob lease — os drenos só a pegam depois dele (o POST do
+    // clique é a 1ª tentativa; não correm junto com ela).
+    expect(new Date(rows[0].next_attempt_at).getTime()).toBeGreaterThan(Date.now() + 30_000)
+    expect(rows[0].attempts).toBe(0)
   })
 
   it("§C3: idempotente por event_id — 2 disparos do mesmo event_id → 1 só linha", async () => {

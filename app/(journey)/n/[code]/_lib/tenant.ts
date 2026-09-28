@@ -2,6 +2,7 @@
 // Resolve code → tenant (respeitando public_link_enabled + validade) e carrega
 // só branding/políticas do tenant para o layout white-label. Nunca expõe PII.
 import "server-only"
+import { cache } from "react"
 import { createServiceClient } from "@/lib/supabase/service"
 import { resolvePublicLink } from "@/lib/journey/public-link"
 
@@ -32,7 +33,12 @@ export type LoadPublicTenantResult =
  * (inexistente/desligado/expirado) → `ok:false` e o layout mostra a página
  * neutra "não há negociação disponível" (mesma casca, sem enumeração).
  */
-export async function loadPublicLinkTenant(code: string): Promise<LoadPublicTenantResult> {
+// Latência (10-latencia.md): layout e página do /n/{code} chamam isto no MESMO
+// render — `cache` do React deduplica por request (uma resolução em vez de duas;
+// nunca entre requests, então ligar/desligar o link continua valendo na hora).
+export const loadPublicLinkTenant = cache(loadPublicLinkTenantUncached)
+
+async function loadPublicLinkTenantUncached(code: string): Promise<LoadPublicTenantResult> {
   const link = await resolvePublicLink(code)
   if (!link.ok) return { ok: false, reason: link.reason }
 

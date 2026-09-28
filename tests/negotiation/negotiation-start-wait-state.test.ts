@@ -85,17 +85,17 @@ function sess() {
 }
 
 describe("emitNegotiationStart — limpeza de wait_state ao motor RESPONDER (M11)", () => {
-  it("SYNC {reply} persistido → wait_state e wait_started_at voltam a NULL (reload não mostra spinner)", async () => {
+  // N8N-7: texto SOLTO do motor não resolve a espera (mesma regra do client:
+  // engineTextOnly não é condução). Limpar aqui tirava o devedor da espera sem
+  // nenhum menu na tela (tests/journey/n8n7-engine-wait-states.test.ts).
+  it("SYNC {reply} só texto → bolha entra, mas wait_state PERMANECE (texto não é condução)", async () => {
     respondBody = { reply: "Vamos negociar sua dívida." }
     expect(sess()?.wait_state).toBe("aguardando_motor")
     const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
     const r = await emitNegotiationStart(SID, "evt-wait-clear")
     expect(r.ok).toBe(true)
-    // a bolha do motor entrou no histórico…
     expect((db.chat_messages ?? []).filter((m) => m.n8n_event_id === "evt-wait-clear").length).toBe(1)
-    // …e a espera foi limpa no servidor (idle no próximo reload).
-    expect(sess()?.wait_state).toBeNull()
-    expect(sess()?.wait_started_at).toBeNull()
+    expect(sess()?.wait_state).toBe("aguardando_motor")
   })
 
   it("SYNC {text, buttons} persistido → wait_state também é limpo", async () => {
@@ -126,17 +126,13 @@ describe("emitNegotiationStart — limpeza de wait_state ao motor RESPONDER (M11
   })
 
   it("idempotência SYNC↔ASYNC não re-arma a espera: 2ª entrega (duplicate) mantém wait_state limpo", async () => {
-    respondBody = { reply: "Vamos negociar sua dívida." }
+    respondBody = { text: "Escolha:", buttons: [{ id: 2, label: "À vista", value: "avista" }, { id: 3, label: "Parcelar", value: "parc_3" }] }
     const { emitNegotiationStart } = await import("@/lib/negotiation/engine")
     await emitNegotiationStart(SID, "evt-wait-idem")
     expect(sess()?.wait_state).toBeNull()
-    // re-arma a espera manualmente (simula um novo clique) e reenvia o MESMO
-    // event_id: o chatSend devolve duplicate:true (ok) → clear roda de novo,
-    // deixando idle (nunca "re-suja" a espera).
-    const s = sess()!
-    s.wait_state = "aguardando_motor"
-    s.wait_started_at = "2026-09-24T12:10:00.000Z"
+    // reenvia o MESMO event_id: duplicate:true, nenhuma escrita re-arma a espera.
     await emitNegotiationStart(SID, "evt-wait-idem")
     expect(sess()?.wait_state).toBeNull()
+    expect((db.chat_prompts ?? []).filter((p) => p.status === "active").length).toBe(1)
   })
 })

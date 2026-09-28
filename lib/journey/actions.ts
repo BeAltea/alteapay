@@ -18,20 +18,49 @@ export interface SessionCtx {
   companyId: string
   customerId: string
   debtId: string
+  /** Latência (10-latencia.md): estado da sessão lido na MESMA ida ao banco do
+   *  contexto — época corrente (C3) e o conjunto de dívidas do menu. Opcionais:
+   *  quem não os tem (contextos montados à mão, testes) lê como antes. */
+  threadEpoch?: number
+  debtIds?: string[]
+  primaryDebtId?: string | null
 }
 
 export async function loadSessionCtx(sessionId: string): Promise<SessionCtx | null> {
   const supabase = createServiceClient()
-  const { data } = await supabase
+  type Row = {
+    id: string; company_id: string; customer_id: string | null; debt_id: string | null
+    thread_epoch?: number | null; debt_ids?: string[] | null; primary_debt_id?: string | null
+  }
+  const full = await supabase
     .from("negotiation_sessions")
-    .select("id, company_id, customer_id, debt_id, outcome")
+    .select("id, company_id, customer_id, debt_id, outcome, thread_epoch, debt_ids, primary_debt_id")
     .eq("id", sessionId)
     .maybeSingle()
-  if (!data || !data.customer_id || !data.debt_id) return null
-  return {
-    sessionId: data.id, companyId: data.company_id,
-    customerId: data.customer_id, debtId: data.debt_id,
+  let row = (full.error ? null : full.data) as Row | null
+  let withState = !full.error
+  if (full.error) {
+    // Defensivo (coluna de migration pendente): leitura mínima de antes.
+    const min = await supabase
+      .from("negotiation_sessions")
+      .select("id, company_id, customer_id, debt_id, outcome")
+      .eq("id", sessionId)
+      .maybeSingle()
+    row = min.data as Row | null
+    withState = false
   }
+  if (!row || !row.customer_id || !row.debt_id) return null
+  const ctx: SessionCtx = {
+    sessionId: row.id, companyId: row.company_id,
+    customerId: row.customer_id, debtId: row.debt_id,
+  }
+  if (withState) {
+    // mesma regra de getCurrentThreadEpoch: ausente/null = época 0.
+    ctx.threadEpoch = typeof row.thread_epoch === "number" ? row.thread_epoch : 0
+    ctx.debtIds = Array.isArray(row.debt_ids) ? row.debt_ids : []
+    ctx.primaryDebtId = row.primary_debt_id ?? null
+  }
+  return ctx
 }
 
 /**
@@ -83,7 +112,12 @@ export interface DebtSummary {
   invoices: Array<{ invoice: string; due_date: string; value: number }>
 }
 
-export async function debtSummary(ctx: SessionCtx): Promise<DebtSummary> {
+export async function debtSummary(
+  ctx: SessionCtx,
+  /** Latência: `recordView:false` = leitura pura (quem chama grava o debt.viewed
+   *  quando o resumo é de fato usado — ex.: leitura antecipada do Pagar). */
+  opts?: { recordView?: boolean },
+): Promise<DebtSummary> {
   const supabase = createServiceClient()
   // A2 (N-D2-2): dívida, cedente e documento são leituras INDEPENDENTES → em
   // paralelo (antes: 5 round-trips sequenciais por chamada, e o Negociar chamava
@@ -108,10 +142,12 @@ export async function debtSummary(ctx: SessionCtx): Promise<DebtSummary> {
       .eq("id_company", ctx.companyId)
       .eq("doc", doc)
       .order("vencimento", { ascending: true }),
-    recordEvent({
-      companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
-      sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
-    }),
+    opts?.recordView === false
+      ? Promise.resolve(null)
+      : recordEvent({
+          companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
+          sessionId: ctx.sessionId, type: "debt.viewed", actor: "customer",
+        }),
   ])
   const oldest = invoices?.[0]?.vencimento ?? debt?.due_date ?? null
   return {
@@ -512,13 +548,19 @@ export async function registerPaymentClaim(
   actor: JourneyActor, eventId?: string,
 ): Promise<string> {
   const { caseId, reused } = await resolvePaymentClaimCase(ctx, details)
+  await recordPaymentClaimEvent(ctx, caseId, reused, actor, eventId)
+  return caseId
+}
+
+function recordPaymentClaimEvent(
+  ctx: SessionCtx, caseId: string, reused: boolean, actor: JourneyActor, eventId?: string,
+) {
   const existing = reused ? caseId : null
-  await recordEvent({
+  return recordEvent({
     companyId: ctx.companyId, customerId: ctx.customerId, debtId: ctx.debtId,
     sessionId: ctx.sessionId, eventId, type: "payment_claim.registered", actor,
     payload: { case_id: caseId, ...(existing ? { reused_open_case: true } : {}) },
   })
-  return caseId
 }
 
 /**
@@ -642,35 +684,47 @@ export async function transferToHumanWithOutcome(
  */
 export async function handlePaymentClaim(
   ctx: SessionCtx, actor: JourneyActor, eventId?: string,
+  /** Latência: escrita do chamador (eco do clique) que precisa ficar ANTES da
+   *  resposta no histórico — aguardada só antes de gravar a bolha. */
+  opts?: { beforeReply?: () => Promise<unknown> },
 ): Promise<{ ok: true; caseId: string; reply: string; messageId: string | null }> {
-  const caseId = await registerPaymentClaim(
+  // Latência (10-latencia.md): o caso é resolvido 1x; o evento de auditoria e a
+  // bolha de resposta dependem só do case_id → em paralelo. A copy é fixa
+  // (paymentClaimReply não usa o credor — A4 r2), então o nome do credor não é
+  // mais lido aqui (era uma ida ao banco sem efeito no texto).
+  const { caseId, reused } = await resolvePaymentClaimCase(
     ctx,
     { channel: "chat", note: "devedor informou que já pagou (Já paguei); aguardando conferência" },
-    actor,
-    eventId,
   )
-  const creditor = await resolveCreditorName({ companyId: ctx.companyId })
-  const reply = paymentClaimReply(creditor.name)
-  let messageId: string | null = null
-  try {
-    const { persistAssistantMessage } = await import("./acknowledgement")
-    // A1: resultado da ação como OUTCOME (stage 'payment_claim') — persistido
-    // ANTES de o menu ser reemitido pelo chamador. QA round 1 (M1): é a resposta
-    // a ESTE clique — fora do dedup de conteúdo de 15 min (um 2º "Já paguei" na
-    // janela ficava sem resposta visível).
-    // QA round 4 (R-24): o id volta ao chamador para o corpo do POST levar a
-    // bolha persistida (o client a aplica na hora e deduplica com o poll por id).
-    messageId = await persistAssistantMessage({
-      companyId: ctx.companyId,
-      sessionId: ctx.sessionId,
-      text: reply,
-      stage: "payment_claim",
-      snapshot: { case_id: caseId },
-      skipContentDedup: true,
-    })
-  } catch (err) {
-    console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)
+  const reply = paymentClaimReply()
+  const persistReply = async (): Promise<string | null> => {
+    try {
+      if (opts?.beforeReply) await opts.beforeReply().catch(() => {})
+      const { persistAssistantMessage } = await import("./acknowledgement")
+      // A1: resultado da ação como OUTCOME (stage 'payment_claim') — persistido
+      // ANTES de o menu ser reemitido pelo chamador. QA round 1 (M1): é a resposta
+      // a ESTE clique — fora do dedup de conteúdo de 15 min (um 2º "Já paguei" na
+      // janela ficava sem resposta visível).
+      // QA round 4 (R-24): o id volta ao chamador para o corpo do POST levar a
+      // bolha persistida (o client a aplica na hora e deduplica com o poll por id).
+      return await persistAssistantMessage({
+        companyId: ctx.companyId,
+        sessionId: ctx.sessionId,
+        text: reply,
+        stage: "payment_claim",
+        snapshot: { case_id: caseId },
+        skipContentDedup: true,
+        ...(typeof ctx.threadEpoch === "number" ? { threadEpoch: ctx.threadEpoch } : {}),
+      })
+    } catch (err) {
+      console.warn("[journey] mensagem de payment_claim ao devedor falhou (não-fatal):", (err as Error).message)
+      return null
+    }
   }
+  const [, messageId] = await Promise.all([
+    recordPaymentClaimEvent(ctx, caseId, reused, actor, eventId),
+    persistReply(),
+  ])
   return { ok: true, caseId, reply, messageId }
 }
 

@@ -157,17 +157,19 @@ export async function evaluatePublicRateLimit(input: {
 }): Promise<RateLimitDecision> {
   const supabase = createServiceClient()
 
+  // Latência (10-latencia.md): as três leituras são independentes → em paralelo.
+  // A PRECEDÊNCIA da decisão é a mesma de antes:
   // 1) IP lock — QA rodada 6 (Q1r2-5): só com a dimensão IP religada (sem fonte
   //    confiável do IP do cliente, um lock por IP bloqueia todos atrás do proxy).
-  if (ipLockEnabled() && (await isLocked(supabase, input.companyId, "ip", input.ipHash))) {
-    return { blocked: true, scope: "ip", degraded: false }
-  }
   // 2) documento lock
-  if (await isLocked(supabase, input.companyId, "document", input.docHash)) {
-    return { blocked: true, scope: "document", degraded: false }
-  }
   // 3) teto do cedente/hora → não bloqueia, mas liga o modo degradado.
-  const degraded = await isTenantOverHourlyCap(supabase, input.companyId)
+  const [ipLocked, docLocked, degraded] = await Promise.all([
+    ipLockEnabled() ? isLocked(supabase, input.companyId, "ip", input.ipHash) : Promise.resolve(false),
+    isLocked(supabase, input.companyId, "document", input.docHash),
+    isTenantOverHourlyCap(supabase, input.companyId),
+  ])
+  if (ipLocked) return { blocked: true, scope: "ip", degraded: false }
+  if (docLocked) return { blocked: true, scope: "document", degraded: false }
   return { blocked: false, degraded }
 }
 

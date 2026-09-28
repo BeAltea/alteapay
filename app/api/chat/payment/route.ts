@@ -5,6 +5,7 @@ import { verifyChatJwt, CHAT_COOKIE_NAME } from "@/lib/negotiation/crypto"
 import { createServiceClient } from "@/lib/supabase/service"
 import { isTerminalAgreement } from "@/lib/asaas-idempotency"
 import { isPendingCharge, reconcilePendingCharge } from "@/lib/journey/charge-reconcile"
+import { isSettledAgreement } from "@/lib/journey/settled-state"
 
 export const dynamic = "force-dynamic"
 export const fetchCache = "force-no-store"
@@ -58,6 +59,11 @@ export async function GET(req: NextRequest) {
   // cancelada". Sem cobrança viva, o estado é o mesmo de "ainda não há link".
   if (isTerminalAgreement(ag)) {
     return NextResponse.json({ ok: true, status: "generating", reason: "no_live_charge" })
+  }
+  // F8-02: acordo QUITADO nunca devolve o link (a página defasada não reabre a
+  // cobrança paga); o poll de mensagens traz o estado de quitado.
+  if (isSettledAgreement(ag)) {
+    return NextResponse.json({ ok: true, status: "settled" })
   }
   // N-D1-6: o poll NÃO grava payment.viewed (o devedor não abriu o link) — o
   // sinal real é o webhook PAYMENT_CHECKOUT_VIEWED / a reconciliação.

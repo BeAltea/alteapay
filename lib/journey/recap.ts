@@ -156,6 +156,23 @@ export async function buildRecap(
       .order("created_at", { ascending: false })
       .limit(200)
     if (epoch > 0) query = query.eq("thread_epoch", epoch)
+    // Latência (10-latencia.md): o primeiro nome (customers) não depende das
+    // mensagens → a leitura corre em paralelo com elas (usada só se houver recap).
+    const customerP =
+      opts.firstName === undefined && sess?.customer_id
+        ? (async () => {
+            try {
+              return await supabase
+                .from("customers")
+                .select("name, document")
+                .eq("id", sess.customer_id as string)
+                .eq("company_id", companyId)
+                .maybeSingle()
+            } catch {
+              return { data: null }
+            }
+          })()
+        : null
     let { data: rawMessages, error: msgErr } = await query
     if (msgErr && epoch > 0) {
       // coluna thread_epoch pode não existir em prod (20260935 pendente) → refaz
@@ -214,13 +231,8 @@ export async function buildRecap(
 
     // primeiro nome (A3): do chamador ou de customers.name (só aqui, na retomada).
     let firstName: string | null = opts.firstName ?? null
-    if (opts.firstName === undefined && sess?.customer_id) {
-      const { data: customer } = await supabase
-        .from("customers")
-        .select("name, document")
-        .eq("id", sess.customer_id)
-        .eq("company_id", companyId)
-        .maybeSingle()
+    if (customerP) {
+      const { data: customer } = await customerP
       const row = customer as { name?: string | null; document?: string | null } | null
       // QAB3-03: razão social/CNPJ → null → "Olá de novo." (sem nome).
       firstName = firstNameOf(row?.name, row?.document)

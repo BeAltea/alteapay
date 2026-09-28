@@ -19,6 +19,7 @@ const SID = "5e551011-0000-0000-0000-000000000001"
 
 function envelope(over: Partial<CanonicalEnvelope> = {}): CanonicalEnvelope {
   return {
+    event: "session.start",
     type: "session.start",
     contract_version: "1.0",
     event_id: "evt_deterministic_0001",

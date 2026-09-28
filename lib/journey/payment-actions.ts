@@ -26,6 +26,7 @@ import { debtSummary, registerPaymentClaim, rejectOffer, type DebtSummary, type 
 import { recordEvent } from "./events"
 import { assertAcknowledgedForPayment } from "./acknowledgement"
 import { timed } from "./server-timing"
+import { isDebtSettled } from "./settled-state"
 
 const PAID_STATUSES = new Set([
   "received", "confirmed", "paid", "RECEIVED", "CONFIRMED", "RECEIVED_IN_CASH",
@@ -127,6 +128,17 @@ async function assertOfferWithinMatrix(
   precomputedSummary?: DebtSummary,
 ): Promise<MatrixCheck> {
   const supabase = createServiceClient()
+  // Latência (10-latencia.md): com o resumo já calculado pelo chamador, a faixa
+  // da matriz não depende da oferta → as duas leituras correm em paralelo (a
+  // decisão continua: sem oferta viva → ok; sem faixa → no_matrix_row).
+  const matrixRowP = precomputedSummary
+    ? resolveMatrixRow({
+        companyId: ctx.companyId,
+        agingDays: precomputedSummary.agingDays,
+        debtValue: precomputedSummary.originalValue,
+      })
+    : null
+  matrixRowP?.catch(() => {}) // lançamento só importa se a oferta estiver viva (abaixo)
   const { data: offer } = await supabase
     .from("negotiation_offers")
     .select("terms, status")
@@ -138,12 +150,16 @@ async function assertOfferWithinMatrix(
   if (!offer?.terms) return { ok: true }
 
   // A1 (N-D1-1): reusa o debtSummary já calculado pelo chamador (payService).
-  const summary = precomputedSummary ?? (await debtSummary(ctx))
-  const row = await resolveMatrixRow({
-    companyId: ctx.companyId,
-    agingDays: summary.agingDays,
-    debtValue: summary.originalValue,
-  })
+  const row = matrixRowP
+    ? await matrixRowP
+    : await (async () => {
+        const summary = await debtSummary(ctx)
+        return resolveMatrixRow({
+          companyId: ctx.companyId,
+          agingDays: summary.agingDays,
+          debtValue: summary.originalValue,
+        })
+      })()
   if (!row) return { ok: false, code: "no_matrix_row" }
 
   const verdict = validateProposedTerms(offer.terms as OfferTerms, row)
@@ -173,7 +189,7 @@ export async function paymentCreate(
   // QA rodada 5 (latência Q2-01/Q2-02): origem do tenant, idempotência por
   // (sessão, oferta) e o guard de reconhecimento são LEITURAS independentes —
   // correm em paralelo. A ordem das DECISÕES é a mesma de antes.
-  const [origin, existingAgreementId, ackGuard] = await timed("pre_checks", () => Promise.all([
+  const [origin, existingAgreementId, ackGuard, debtPaid] = await timed("pre_checks", () => Promise.all([
     loadTenantPaymentOrigin(ctx.companyId),
     findExistingPaymentForOffer(ctx, offerId),
     assertAcknowledgedForPayment({
@@ -181,6 +197,8 @@ export async function paymentCreate(
       sessionId: ctx.sessionId,
       debtId: ctx.debtId,
     }),
+    // F8-02: dívida já quitada → nenhuma cobrança, nem o link da cobrança paga.
+    isDebtSettled({ companyId: ctx.companyId, debtId: ctx.debtId, sessionId: ctx.sessionId }),
   ]))
   // Variante A é o ÚNICO caminho (D17/GATE R0). payment_origin != 'platform' →
   // 501 not_implemented (variante B fora do escopo desta onda).
@@ -191,6 +209,13 @@ export async function paymentCreate(
       code: "not_implemented",
       message: "payment.create só opera com payment_origin='platform' (variante A)",
     }
+  }
+
+  // F8-02: o guard de cobrança viva (confirmAccept) contava o acordo PAGO como
+  // "já cobrado" e reentregava o link da cobrança paga ("cobrança ativa"); a
+  // idempotência por oferta fazia o mesmo. Dívida quitada para aqui, antes dos dois.
+  if (debtPaid) {
+    return { ok: false, status: 409, code: "debt_paid", message: "dívida já quitada — nenhuma cobrança nova" }
   }
 
   // Idempotência por (session_id, offer_id) (§4.2): 2ª chamada devolve payload
@@ -247,6 +272,7 @@ export async function paymentCreate(
   const result = await confirmAccept({
     ctx, offerId, termsHash: pre.summary.termsHash, eventId, pre: pre.summary,
     chargeNotAfter: opts?.chargeNotAfter ?? null,
+    returnPendingAudit: true,
   })
   if (!result.ok) {
     if (result.error === "ALREADY_CHARGED") {
@@ -259,7 +285,11 @@ export async function paymentCreate(
     return { ok: false, status: 422, code: result.error, message: result.error }
   }
 
-  const details = await fetchPaymentDetails(result.agreementId, ctx.companyId)
+  // Latência: a auditoria do fechamento termina em paralelo com a leitura do link.
+  const [details] = await Promise.all([
+    fetchPaymentDetails(result.agreementId, ctx.companyId),
+    result.pending ?? Promise.resolve(),
+  ])
   // CHARGE_MODE='inline': closeAgreement já criou a cobrança e gravou as URLs de
   // forma síncrona → payment_id presente → devolvemos 'created' com o link agora.
   // CHARGE_MODE='queue' (Workers 0/0, D5): sem link ainda → 'processing'; a UI/n8n
