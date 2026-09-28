@@ -10,6 +10,10 @@
 # production
 /build
 
+# local only (never pushed)
+/ops/
+/.claude/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
