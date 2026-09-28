@@ -21,7 +21,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { z } from "zod"
 
 import type { Button } from "@/lib/journey/buttons"
-import { maskDocument } from "@/lib/journey/document"
+import { maskDocument, normalizeDocument } from "@/lib/journey/document"
 import { agentChat, agentHealth, agentSessionInit, type AgentSessionInit } from "./agent-client"
 import { closeAgreement } from "./close-agreement"
 import { buildN8nOutboundHeaders, newEventId, n8nWebhookSecret, scrubN8nSecrets } from "./n8n"
@@ -627,6 +627,23 @@ export async function engineChat(input: EngineTurnInput): Promise<EngineTurnResu
 }
 
 /**
+ * Corpo do `session.init` legado para o n8n (só com N8N_SESSION_FLOW_URL), com a
+ * mesma minimização de PII dos demais eventos: 1º nome, documento mascarado +
+ * hash (sha256 dos dígitos). Nome completo e documento em claro nunca saem. O
+ * AgentSessionInit completo continua indo só ao engine `agent` (self-hosted).
+ */
+export function buildSessionInitPayload(payload: AgentSessionInit): Record<string, unknown> {
+  const { customer_name, document, ...rest } = payload
+  return {
+    type: "session.init",
+    ...rest,
+    first_name: (customer_name ?? "").trim().split(/\s+/)[0] ?? "",
+    document_masked: maskDocument(document),
+    document_hash: createHash("sha256").update(normalizeDocument(document)).digest("hex"),
+  }
+}
+
+/**
  * Semeia o contexto da sessão no engine. No n8n é opcional: o contexto viaja
  * em todo turno; se N8N_SESSION_FLOW_URL estiver configurado, notifica o fluxo
  * (ex.: para pré-carregar memória/boas-vindas). Nunca falha o handoff por isso.
@@ -639,7 +656,7 @@ export async function engineSessionInit(payload: AgentSessionInit): Promise<void
   const url = sessionFlowUrl()
   if (!url) return
   try {
-    await callN8nFlow(url, { type: "session.init", ...payload }, 15_000)
+    await callN8nFlow(url, buildSessionInitPayload(payload), 15_000)
   } catch (err) {
     console.warn("[engine:n8n] session.init flow falhou (não-fatal):", err instanceof Error ? err.message : err)
   }
@@ -920,7 +937,7 @@ export function parseKickoffReply(body: unknown): KickoffReply | null {
  * falha (contexto ausente, botões inválidos, erro de escrita) só gera um warn de
  * rótulo curto — NUNCA derruba o clique. Sem log do corpo cru/URL/segredo/PII.
  */
-async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): Promise<void> {
+async function persistKickoffReply(p: NegotiationStartPayload, body: unknown, sentAt?: string): Promise<void> {
   try {
     const parsed = parseKickoffReply(body)
     if (!parsed) return
@@ -932,6 +949,9 @@ async function persistKickoffReply(p: NegotiationStartPayload, body: unknown): P
       ctx,
       { text: parsed.text, prompt: parsed.prompt, n8n_execution_id: parsed.n8n_execution_id },
       p.event_id,
+      // N87-07: se o devedor reabriu o menu enquanto o kickoff respondia, o
+      // prompt síncrono é de uma negociação abandonada (não troca o menu).
+      { originSentAt: sentAt ?? null },
     )
     // D2/M11: a 1ª resposta SÍNCRONA do motor já entrou no histórico → a sessão
     // saiu de 'aguardando_motor' para 'negociando'. Limpa a espera no servidor
@@ -1021,6 +1041,7 @@ export async function emitNegotiationStart(
     await enqueueNegotiationStart(payload) // 1) durável, idempotente
     // N8N-16: ledger de saída ANTES do POST (o callback async correlaciona por aqui).
     const { recordN8nOutbound } = await import("./n8n-correlation")
+    const sentAt = new Date().toISOString() // N87-07: instante do envio (antes do ledger)
     await recordN8nOutbound({
       eventId: payload.event_id, sessionId: payload.session_id, companyId: payload.company_id, event: "negotiation.start",
     })
@@ -1029,7 +1050,7 @@ export async function emitNegotiationStart(
     // 4) RENDER SYNC (best-effort, NUNCA lança): se o corpo trouxer texto/prompt
     //    AUTORADO pelo n8n, persiste via chatSend com o MESMO event_id (dedupe
     //    compartilhado SYNC↔ASYNC). Corpo vazio/async → não persiste (placeholder).
-    await persistKickoffReply(payload, body).catch(() => {})
+    await persistKickoffReply(payload, body, sentAt).catch(() => {})
     return { ok: true, delivered: true, event_id: eventId }
   } catch (err) {
     // POST falhou/estourou → a linha do outbox fica 'pending' e SERÁ reentregue

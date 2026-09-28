@@ -118,6 +118,26 @@ export function isConfiguredN8nOrigin(url: string): boolean {
 }
 
 /**
+ * `callback_url` do modo assíncrono (`session.message` mode=async) aceito SÓ no
+ * host n8n configurado (mesma origem de um fluxo por env). A URL chega no corpo
+ * de uma chamada; sem esta regra a plataforma postaria um corpo assinado para
+ * qualquer destino. Também recusa URL com usuário/senha embutidos. Checado no
+ * route (422) e de novo no worker, antes de rodar o turno e sem enviar nada.
+ */
+export function isAllowedN8nCallbackUrl(url: string | null | undefined): boolean {
+  if (!url || !url.trim()) return false
+  let parsed: URL
+  try {
+    parsed = new URL(url.trim())
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false
+  if (parsed.username || parsed.password) return false
+  return isConfiguredN8nOrigin(parsed.href)
+}
+
+/**
  * Cabeçalhos do callback do modo assíncrono (worker alteapay-n8n → callback_url
  * do fluxo). Mesmo esquema do papel A (HMAC + timestamp + Event-Id + Basic),
  * para o Webhook do n8n que recebe o callback poder exigir autenticação (N8N-5).

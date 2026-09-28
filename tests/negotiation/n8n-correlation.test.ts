@@ -108,7 +108,18 @@ describe("N8N-16 — checkN8nCorrelation", () => {
     const origin = chatTurnEventId(S1, inboundId)
     const { store } = memStore({ inbound: [{ id: inboundId, session_id: S1, company_id: C1, created_at: iso(5_000) }] })
     const v = await check(store, chatSend({ origin_event_id: undefined, event_id: origin }))
-    expect(v).toMatchObject({ ok: true, covered: true, source: "chat_turn" })
+    // store sem recentInbound: o instante do turno é desconhecido (sentAt null)
+    expect(v).toMatchObject({ ok: true, covered: true, source: "chat_turn", sentAt: null })
+  })
+
+  it("N87-07: chat.turn com recentInbound → sentAt = instante da mensagem inbound", async () => {
+    const inboundId = "33333333-3333-4333-8333-333333333333"
+    const origin = chatTurnEventId(S1, inboundId)
+    const { store, mem } = memStore({ inbound: [{ id: inboundId, session_id: S1, company_id: C1, created_at: iso(5_000) }] })
+    store.recentInbound = async (sid, cid, since) =>
+      mem.inbound.filter((r) => r.session_id === sid && r.company_id === cid && r.created_at >= since).map((r) => ({ id: r.id, created_at: r.created_at }))
+    const v = await check(store, chatSend({ origin_event_id: undefined, event_id: origin }))
+    expect(v).toMatchObject({ ok: true, covered: true, source: "chat_turn", sentAt: iso(5_000) })
   })
 
   it("chat.turn de OUTRA sessão não correlaciona", async () => {
@@ -240,7 +251,17 @@ describe("N8N-16 — enforceN8nCorrelation (flag)", () => {
   it("ON: aceita correlacionado sem telemetria", async () => {
     const { store, mem } = memStore({ ledger: [ledgerRow()] })
     const body = chatSend()
-    expect(await enforceN8nCorrelation(body, body, { store, nowMs: NOW, required: true })).toEqual({ reject: false })
+    // N87-07: o gate devolve o evento de origem e QUANDO a plataforma o enviou.
+    expect(await enforceN8nCorrelation(body, body, { store, nowMs: NOW, required: true })).toEqual({
+      reject: false,
+      origin: { eventId: ORIGIN, sentAt: iso(60_000) },
+    })
     expect(mem.misses).toHaveLength(0)
+  })
+
+  it("N87-07: ação não coberta → sem origin no gate", async () => {
+    const { store } = memStore()
+    const body = { action: "ping", session_id: S1 }
+    expect(await enforceN8nCorrelation(body, body, { store, nowMs: NOW, required: true })).toEqual({ reject: false })
   })
 })

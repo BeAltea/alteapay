@@ -55,6 +55,58 @@ export function deriveTerms(offerId: string, currentAmount: number, aging: numbe
   return null
 }
 
+/**
+ * F-5 — descrição da cobrança no ASAAS (fatura/boleto que o devedor abre). Nomeia
+ * o CREDOR (quem desconfia desiste quando a fatura não diz de quem é a dívida) e
+ * um id curto do acordo (8 primeiros caracteres do uuid; o suporte acha o acordo
+ * por ele ou pelo id da cobrança). Formato:
+ *   à vista:   "VMAX — acordo 2f516142, pagamento à vista"
+ *   parcelado: "VMAX — acordo 2f516142"
+ *              (o ASAAS prefixa cada parcela: "Parcela 2 de 3. VMAX — acordo 2f516142";
+ *               por isso nenhum "parcela 1/N" aqui — F8-03)
+ *   sem nome:  "Acordo 2f516142, pagamento à vista" / "Acordo 2f516142"
+ * O nome nunca leva "plano"/"assinatura": o webhook usa essas palavras para
+ * reconhecer cobrança de assinatura da plataforma (credor com esse nome sai sem
+ * nome). Espaços colapsados e nome cortado em 60 caracteres.
+ */
+export function chargeDescription(input: {
+  creditorName?: string | null
+  agreementId: string
+  installments: number
+}): string {
+  const shortId = String(input.agreementId).slice(0, 8)
+  const name = (input.creditorName ?? "").replace(/\s+/g, " ").trim().slice(0, 60).trim()
+  const folded = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+  const usable = name.length > 0 && !folded.includes("plano") && !folded.includes("assinatura")
+  const base = usable ? `${name} — acordo ${shortId}` : `Acordo ${shortId}`
+  return input.installments === 1 ? `${base}, pagamento à vista` : base
+}
+
+/**
+ * Nome do credor com a mesma precedência da jornada (buildAckContext /
+ * resolveCreditorName): tenant_chat_config.branding.brand_name › companies.name.
+ * Nunca lança (null = descrição sem nome); sempre filtrado por company_id.
+ */
+async function loadCreditorName(
+  supabase: ReturnType<typeof createServiceClient>,
+  companyId: string,
+): Promise<string | null> {
+  try {
+    const [{ data: cfg }, { data: company }] = await Promise.all([
+      supabase.from("tenant_chat_config").select("branding").eq("company_id", companyId).maybeSingle(),
+      supabase.from("companies").select("name").eq("id", companyId).maybeSingle(),
+    ])
+    const branding = ((cfg as { branding?: unknown } | null)?.branding ?? {}) as Record<string, unknown>
+    const brand = typeof branding.brand_name === "string" ? branding.brand_name.trim() : ""
+    const companyName = typeof (company as { name?: unknown } | null)?.name === "string"
+      ? String((company as { name: string }).name).trim()
+      : ""
+    return brand || companyName || null
+  } catch {
+    return null
+  }
+}
+
 export interface JourneyClose {
   session_id: string
   offer_row_id: string // negotiation_offers.id
@@ -228,8 +280,10 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
   // "in_agreement" violava a constraint (bug D1 do diagnóstico FASE0_CHATBOT.md).
   // QA rodada 5 (Q2-01): status da dívida e espelho da jornada (beforeCharge) em
   // paralelo — os dois ANTES da cobrança. Falha no espelho = não cobra.
+  // F-5: nome do credor para a descrição da cobrança, lido UMA vez aqui, em
+  // paralelo com o status da dívida e o espelho (nada a mais no caminho crítico).
   let mirrorError: unknown = null
-  const [{ data: debtUpdated, error: debtUpdateError }] = await Promise.all([
+  const [{ data: debtUpdated, error: debtUpdateError }, , creditorName] = await Promise.all([
     supabase
       .from("debts")
       .update({ status: "in_negotiation", updated_at: new Date().toISOString() })
@@ -238,19 +292,18 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
     input.beforeCharge
       ? input.beforeCharge(agreement.id).catch((err: unknown) => { mirrorError = err })
       : Promise.resolve(),
+    loadCreditorName(supabase, company_id),
   ])
 
   if (debtUpdateError || !debtUpdated?.length) {
     console.warn("[CLOSE-AGREEMENT] Failed to update debt status:", debtUpdateError?.message ?? "0 rows")
   }
 
-  // Parcelado: o ASAAS já prefixa "Parcela N de M." em cada parcela do
-  // parcelamento (installmentCount) e replica a mesma description em todas —
-  // um sufixo fixo "parcela 1/N" contradizia o prefixo nas parcelas 2..N (F8-03).
-  const chargeDescription =
-    terms.installments === 1
-      ? `Acordo ${agreement.id} - pagamento à vista`
-      : `Acordo ${agreement.id}`
+  const description = chargeDescription({
+    creditorName,
+    agreementId: agreement.id,
+    installments: terms.installments,
+  })
 
   // Payload da cobrança — idêntico nos dois modos (fila e inline).
   const chargeJobData = {
@@ -263,7 +316,7 @@ export async function closeAgreement(input: CloseAgreementInput): Promise<CloseA
         | "UNDEFINED",
       value: terms.installments === 1 ? terms.agreedAmount : terms.installmentAmount,
       dueDate: firstDueDate,
-      description: chargeDescription,
+      description,
       externalReference: input.journey
         ? `journey_${input.journey.session_id}_${input.journey.offer_row_id}`
         : agreement.id,

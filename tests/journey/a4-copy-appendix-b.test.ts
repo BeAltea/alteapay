@@ -94,8 +94,10 @@ describe("S7/S8/S22 — 'Negociar - antes': uma frase, uma constante", () => {
   it("T2 (button/route.ts) usa as constantes — sem literal inline, sem 'Perfeito!' (S22)", () => {
     const route = src("app/api/chat/button/route.ts")
     expect(route).toContain('import { NEGOTIATION_PENDING_TEXT, NEGOTIATION_SEARCHING_TEXT } from "@/lib/journey/wait-machine"')
-    // menu de 3 opções: as parcelas seguem → S7 (com dois-pontos)
-    expect(route).toContain("const reply = NEGOTIATION_PENDING_TEXT")
+    // menu de 3 opções: S7 (com dois-pontos) só quando as parcelas seguem;
+    // sem parcelas, a frase completa (N87-10, B3-F2)
+    expect(route).toContain("const reply = presentedOffers ? NEGOTIATION_PENDING_TEXT : NEGOTIATION_SEARCHING_TEXT")
+    expect(route).toContain("precedingWrite: () => writeAck(NEGOTIATION_PENDING_TEXT)")
     // legado "Sim, reconheço": só kickoff em background, nada vem depois → frase completa (B3-F2)
     expect(route).toContain("const recognizedReply = NEGOTIATION_SEARCHING_TEXT")
     expect(route).not.toContain("const recognizedReply = NEGOTIATION_PENDING_TEXT")

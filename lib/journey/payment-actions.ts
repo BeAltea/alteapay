@@ -312,8 +312,9 @@ export async function paymentCreate(
       return { ok: false, status: 409, code: "already_charged", message: "dívida já possui cobrança viva" }
     }
     if (result.error === "CHARGE_DEFERRED") {
-      // QA rodada 5: nenhuma cobrança foi enviada ao ASAAS (prazo da função).
-      return { ok: false, status: 503, code: "charge_deferred", message: "cobrança não iniciada (tempo esgotado); tente novamente" }
+      // QA rodada 5: nenhuma cobrança foi enviada ao ASAAS (prazo da função, ou
+      // guard ASAAS indisponível — fail-closed).
+      return { ok: false, status: 503, code: "charge_deferred", message: "cobrança não iniciada (tempo esgotado ou ASAAS indisponível); tente novamente" }
     }
     return { ok: false, status: 422, code: result.error, message: result.error }
   }
@@ -539,8 +540,18 @@ export async function paymentRecord(
     return { ok: true, code: "claim", case_id: caseId }
   }
 
-  // guard independente: dívida com cobrança viva recusa o registro.
-  if (await isDebtAlreadyCharged(ctx)) {
+  // guard independente: dívida com cobrança viva recusa o registro. ASAAS
+  // indisponível → fail-closed (nada registrado; retentável).
+  let alreadyCharged: boolean
+  try {
+    alreadyCharged = await isDebtAlreadyCharged(ctx)
+  } catch (err) {
+    // AsaasGuardUnavailableError (lib/asaas) — checado pelo code (sem importar a
+    // classe: os testes mockam @/lib/asaas só com as funções usadas).
+    if ((err as { code?: unknown } | null)?.code !== "ASAAS_GUARD_UNAVAILABLE") throw err
+    return { ok: false, status: 503, code: "charge_deferred", message: "verificação no ASAAS indisponível; tente novamente" }
+  }
+  if (alreadyCharged) {
     if (args.offer_id) await rejectOffer(ctx, args.offer_id, "n8n", "already_charged", eventId)
     return { ok: false, status: 409, code: "already_charged", message: "dívida já possui cobrança viva" }
   }

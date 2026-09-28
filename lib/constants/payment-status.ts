@@ -47,6 +47,21 @@ export function isPaymentStatusRegression(current?: string | null, next?: string
   return from !== undefined && to !== undefined && to < from
 }
 
+/**
+ * Every ladder status ranked strictly ABOVE `next` (upper- and lower-case), for
+ * the WHERE of an atomic "never regress" UPDATE:
+ *   SET col = next WHERE col IS NULL OR col NOT IN (<this list>)
+ * Same ranking as isPaymentStatusRegression. Empty when `next` has no rank
+ * (refund/deletion/chargeback always apply) or nothing ranks above it.
+ */
+export function paymentStatusesRankedAbove(next?: string | null): string[] {
+  if (!next) return []
+  const to = PAYMENT_STATUS_RANK[next.toUpperCase()]
+  if (to === undefined) return []
+  const above = Object.keys(PAYMENT_STATUS_RANK).filter((s) => PAYMENT_STATUS_RANK[s] > to)
+  return above.flatMap((s) => [s, s.toLowerCase()])
+}
+
 // All possible "paid" status values (for SQL IN clauses)
 export const ALL_PAID_STATUSES = [
   ...PAID_AGREEMENT_STATUSES,

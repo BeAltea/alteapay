@@ -240,9 +240,20 @@ export async function confirmAccept(input: ConfirmAcceptInput): Promise<ConfirmA
   if (!blocked && asaasCustomerId) {
     // lido na leva do guard (readConfirmGuards) ou aqui, como antes — sempre
     // concluído e avaliado ANTES de fechar/cobrar.
-    const payments = g && g.asaasCustomerId === asaasCustomerId && g.asaasPayments
-      ? (g.asaasPayments as Awaited<ReturnType<typeof getAsaasPaymentsForCustomer>>)
-      : await timed("guard_asaas", () => getAsaasPaymentsForCustomer(asaasCustomerId))
+    let payments: Awaited<ReturnType<typeof getAsaasPaymentsForCustomer>>
+    try {
+      payments = g && g.asaasCustomerId === asaasCustomerId && g.asaasPayments
+        ? (g.asaasPayments as Awaited<ReturnType<typeof getAsaasPaymentsForCustomer>>)
+        : await timed("guard_asaas", () => getAsaasPaymentsForCustomer(asaasCustomerId))
+    } catch (err) {
+      // Fail-closed: sem a resposta do ASAAS não há como saber se já existe
+      // cobrança viva → NADA é fechado nem cobrado (zero escrita; a oferta segue
+      // 'presented'). Mesmo resultado retentável do prazo esgotado: o chat grava
+      // 'erro_cobranca' (painel com "tentar de novo") e o n8n recebe 503
+      // charge_deferred ("repita").
+      console.warn("[journey] guard ASAAS indisponível; cobrança NÃO criada:", (err as Error)?.message)
+      return { ok: false, error: "CHARGE_DEFERRED" }
+    }
     blocked = Boolean(findBlockingPayment(payments))
   }
   if (blocked) {

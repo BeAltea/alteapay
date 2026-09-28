@@ -1,5 +1,6 @@
 "use server"
 
+import { clientIpHash, resolveClientIp } from "@/lib/http/client-ip"
 import { createServerClient } from "@/lib/supabase/server"
 import { headers } from "next/headers"
 
@@ -49,8 +50,11 @@ export async function logSecurityEvent(params: LogSecurityEventParams) {
       data: { user },
     } = await supabase.auth.getUser()
 
-    // Get IP and user agent from headers
-    const ip_address = headersList.get("x-forwarded-for") || headersList.get("x-real-ip") || "Unknown"
+    // IP: nunca o 1º elemento do X-Forwarded-For (escrito pelo cliente) nem o IP
+    // em claro. Grava o hash salgado (CLIENT_IP_HASH_SALT) do IP da fonte
+    // confiável (TRUSTED_CLIENT_IP_SOURCE, lib/http/client-ip.ts); sem IP
+    // confiável ou sem sal → null. Nenhum consumidor lê o IP em claro.
+    const ip_address = clientIpHash(resolveClientIp(headersList))
     const user_agent = headersList.get("user-agent") || "Unknown"
 
     // Get user profile for additional info

@@ -143,8 +143,8 @@ Todas assinadas (§2); corpo `{ "action": …, … }`; resposta `{ "success": �
 | Ação | Para quê | Campos principais |
 |---|---|---|
 | `ping` | conectividade + saúde do engine | — |
-| `session.create` | cria sessão (registro + `deep_link` single-use TTL 24h) | `company_id`, `document` OU `debt_id`, `consent`, `identity_verified`, `debt_acknowledged` |
-| `session.message` | turno completo conduzido pela plataforma (ela chama o fluxo-cérebro) | `session_id`, `message`, `mode: sync\|async`, `callback_url`, `event_id`, `metadata` |
+| `session.create` | **desligada por padrão** (`N8N_SESSION_CREATE_ENABLED`, §24). Cria sessão (registro + `deep_link` single-use TTL 24h) | `company_id`, `document` OU `debt_id`, `consent`, `identity_verified`, `debt_acknowledged` |
+| `session.message` | turno completo conduzido pela plataforma (ela chama o fluxo-cérebro); `callback_url` só no host n8n configurado (§24) | `session_id`, `message`, `mode: sync\|async`, `callback_url`, `event_id`, `metadata` |
 | `session.record` | auditoria de conversa conduzida PELO fluxo (Papel B) | `session_id`, `direction: inbound\|outbound`, `content`, `sender?`, `provider_message_id?`; outbound: `events?`, `turn_action?`, `agreement_id?` |
 | `agreement.close` | fecha acordo com regras do servidor + enfileira cobrança | `session_id`, `offer_id: avista\|parc_N`, `event_id?` |
 | `session.redirect` | modo B: registra clique/intenção e devolve a URL oficial | `session_id`, `offer_presented?`, `confirmed_intent?` |
@@ -871,3 +871,36 @@ dois §14). Mapa: §14 N8N-14 · §15 N8N-13 · §16 N8N-1 · §17 N8N-10 · §1
   `ops/n8n-sync-fix/tools/apply-workflow.mjs`, na ordem `2 → 3 → 5 → 7 → 4 → 1.1…1.7 → 1. Main → 6`.
   O `1. Main` do N8N-16 não responde mais `200 "Workflow was started"` antes do roteamento.
 - Plano de implantação: `ops/negociacao-final/13-plano-rollout-integracao.md`.
+
+## 24. 2026-09-28 — Achados de segurança fechados
+
+| Achado | Mudança | Flag / default |
+|---|---|---|
+| `session.create` fora da correlação: quem tem o segredo HMAC criava sessão + deep link (até com `identity_verified:true`) para qualquer documento | Ação atrás de flag. OFF → **403** `n8n_session_create_disabled`, antes de qualquer leitura de banco. Nenhum fluxo do n8n usa a ação (as sessões nascem em `/n/`, `/t/`, `/c/`, handoff). `lib/negotiation/n8n-session-create.ts` | `N8N_SESSION_CREATE_ENABLED`, **OFF** |
+| `callback_url` do modo async aceitava qualquer URL | `isAllowedN8nCallbackUrl` (`lib/negotiation/n8n.ts`): mesma origem de um fluxo n8n por env (`isConfiguredN8nOrigin`), sem usuário/senha na URL. Route → **422** `callback_url_not_allowed` sem enfileirar; o worker confere de novo antes do turno e termina sem POST e sem retry | — |
+| `lib/security-logger.ts` gravava o 1º elemento cru do `x-forwarded-for` | `security_events.ip_address` = `clientIpHash(resolveClientIp(headers))`: hash salgado (`CLIENT_IP_HASH_SALT`, 16 hex) do IP da fonte confiável; sem fonte ou sem sal → `null`. Nenhum consumidor lê o IP em claro. Linhas antigas continuam com o valor cru | segue `TRUSTED_CLIENT_IP_SOURCE` |
+| `session.init` legado (só com `N8N_SESSION_FLOW_URL`) mandava nome completo e documento | Corpo = `buildSessionInitPayload` (`lib/negotiation/engine.ts`): `first_name`, `document_masked`, `document_hash` (sha256 dos dígitos). O engine `agent` (self-hosted) continua recebendo o payload completo | `N8N_SESSION_FLOW_URL` ausente em produção |
+
+Testes: `tests/webhooks/n8n.security-findings.test.ts`, `tests/negotiation/n8n-worker-callback-url.test.ts`,
+`tests/http/security-logger-ip.test.ts`, `tests/negotiation/session-init-pii.test.ts`.
+
+## 25. 2026-09-28 — Prompt de negociação abandonada (N87-07)
+
+Quando o devedor sai da conversa com o motor (**"Tentar as opções de novo"**, **"Já paguei"**
+ou **"Pagar agora"/"Pagar à vista"** na espera), a plataforma grava
+`journey_events.chat.engine_superseded` (sem PII). Um `chat.send` com `args.prompt` ou um
+`prompt.ask` cujo evento de origem (correlação §18) foi enviado **antes** dessa marca responde a
+uma negociação abandonada:
+
+- **422** `{code:'prompt_outside_window', reason:'engine_wait_superseded'}` — mesmo código do
+  N8N-8, **não re-tentar**. Nada é gravado (nem o texto: a pergunta sem os botões ficaria sem
+  resposta acima do menu reaberto). Auditoria `chat.engine_invalid_action` com o mesmo `reason`.
+- Resposta a um evento enviado **depois** da marca (ex.: o devedor clicou Negociar de novo)
+  segue as regras de sempre. Texto sem botões não é afetado (continua nota, §13).
+- Vale também para o corpo síncrono do `negotiation.start` (instante do envio = antes do POST).
+- Sem o instante do evento de origem (correlação desligada/sem registro), nada muda.
+
+"Pagar agora"/"Pagar à vista" na espera (N87-09) usam `POST /api/chat/reopen {action:'pay_now'}`:
+reabre o menu e segue pelo mesmo clique do Pagar (`/api/chat/button`, id 4). Só um toque sai da
+espera (update condicional para `gerando_cobranca`); o outro recebe `duplicate:true`. Fora da
+espera, `pay_now` = `reopen_options`.

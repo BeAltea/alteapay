@@ -12,7 +12,7 @@ export interface FakeDb {
 }
 
 interface Filter {
-  op: "eq" | "neq" | "in" | "notIn" | "gt" | "gte" | "lt" | "notNull" | "isNull" | "filterEq"
+  op: "eq" | "neq" | "in" | "notIn" | "gt" | "gte" | "lt" | "notNull" | "isNull" | "filterEq" | "or"
   col: string
   val?: any
 }
@@ -40,6 +40,8 @@ function matches(row: Row, f: Filter): boolean {
       return v != null
     case "isNull":
       return v == null
+    case "or":
+      return (f.val as Filter[]).some((sub) => matches(row, sub))
     default:
       return true
   }
@@ -107,9 +109,21 @@ class QueryBuilder {
     else this.filters.push({ op: "filterEq", col, val })
     return this
   }
-  or(_expr: string) {
-    // usado por listOffers/context (valid_until null ou > now) — no fake,
-    // ignoramos o OR e deixamos as ofertas presented passarem.
+  or(expr: string) {
+    // `col.is.null,col.not.in.(a,b)` (UPDATE condicional sem regressão do
+    // webhook ASAAS) é avaliado de verdade. Qualquer outra forma (listOffers/
+    // context: valid_until null ou > now) segue ignorada, como antes.
+    const parts = expr.match(/[^,()]+(?:\([^)]*\))?/g) ?? []
+    const subs: Filter[] = []
+    for (const raw of parts) {
+      const p = raw.trim()
+      let m: RegExpMatchArray | null
+      if ((m = p.match(/^([\w]+)\.is\.null$/))) subs.push({ op: "isNull", col: m[1] })
+      else if ((m = p.match(/^([\w]+)\.not\.in\.\(([^)]*)\)$/)))
+        subs.push({ op: "notIn", col: m[1], val: m[2].split(",").map((x) => x.trim()) })
+      else return this
+    }
+    if (subs.length > 0) this.filters.push({ op: "or", col: "", val: subs })
     return this
   }
   order(col: string, opts?: { ascending?: boolean }) {
